@@ -11,6 +11,7 @@ import {
   listCredentialAssignments,
   removeCredentialAssignment,
   SOMA_API_ENABLED,
+  BUDGET_API_ENABLED,
   type BillingStatus,
   type ProviderAuthInfo,
   type CredentialAssignment,
@@ -849,7 +850,7 @@ export default function SettingsPanel({
 
   // Fetch budget data when budget tab is selected
   useEffect(() => {
-    if (tab === 'budget') {
+    if (tab === 'budget' && BUDGET_API_ENABLED) {
       fetchBudgetData();
     }
   }, [tab, fetchBudgetData]);
@@ -912,6 +913,10 @@ export default function SettingsPanel({
           >
             Billing
           </button>
+          {/* `/api/budget/*` has no backend behind it, so the tab is hidden
+              rather than removed -- the form is finished and waiting on the
+              routes. See BUDGET_API_ENABLED. */}
+          {BUDGET_API_ENABLED && (
           <button
             onClick={() => setTab('budget')}
             className={`border-b-2 px-1 py-2.5 text-sm font-medium transition ${
@@ -920,6 +925,7 @@ export default function SettingsPanel({
           >
             Budget & Costs
           </button>
+          )}
           <button
             onClick={() => setTab('notifications')}
             className={`border-b-2 px-1 py-2.5 text-sm font-medium transition ${
@@ -955,13 +961,15 @@ export default function SettingsPanel({
           ) : tab === 'spend' ? (
             SOMA_API_ENABLED ? <SpendDashboard /> : null
           ) : tab === 'budget' ? (
-            <BudgetSettings
-              settings={budgetSettings}
-              usage={budgetUsage}
-              onSave={handleSaveBudgetSettings}
-              loading={budgetLoading}
-              error={budgetError || undefined}
-            />
+            BUDGET_API_ENABLED ? (
+              <BudgetSettings
+                settings={budgetSettings}
+                usage={budgetUsage}
+                onSave={handleSaveBudgetSettings}
+                loading={budgetLoading}
+                error={budgetError || undefined}
+              />
+            ) : null
           ) : tab === 'notifications' ? (
             <NotificationsTab />
           ) : tab === 'credentials' ? (

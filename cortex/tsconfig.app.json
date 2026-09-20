@@ -4,7 +4,14 @@
     "target": "es2023",
     "lib": ["ES2023", "DOM"],
     "module": "esnext",
-    "types": ["vite/client"],
+    /* "node" is here for the tests, which are inside `src` and so are part of
+       this build. `src/lib/api-contract.test.ts` reads
+       `crates/api/route-manifest.csv` off disk, which needs `node:fs` and
+       `process`. The cost is that browser code can now reference `process`
+       and still typecheck, where before it could not; it would still be
+       undefined at runtime. The alternative was a separate project for the
+       test files, which is tidier and a good deal more machinery. */
+    "types": ["vite/client", "node"],
     "skipLibCheck": true,
 
     /* Bundler mode */

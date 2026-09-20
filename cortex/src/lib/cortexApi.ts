@@ -1,6 +1,5 @@
 import type {
   ChatSessionControls,
-  CortexState,
   RunProfile,
   SovereigntyLoopState,
   TaskCommandAction,
@@ -13,6 +12,22 @@ const CONFIGURED_API_BASE = import.meta.env.VITE_CORTEX_API as string | undefine
 // same relative path works and there is no cross-origin hop to configure.
 const BASE_URL = CONFIGURED_API_BASE ?? '';
 export const MEMORY_API_ENABLED = import.meta.env.VITE_CORTEX_MEMORY_ENABLED === 'true';
+
+/**
+ * `/api/budget/*` has no backend behind it.
+ *
+ * Unlike the Soma and memory fences below, nothing is being hidden here: the
+ * four budget endpoints were never implemented in any commit of the workspace
+ * (`git log -S'/api/budget' -- crates/` is empty). The UI for them is real and
+ * finished -- a budget settings form, a cost gauge and a warnings banner -- so
+ * it is switched off rather than deleted, and this is the switch to flip when
+ * the routes exist. Until then every one of those calls is a 404 and the tabs
+ * that consume them stay hidden.
+ *
+ * The paths are listed with this reason in `api-contract.test.ts`, which fails
+ * if the frontend calls a path `crates/api/route-manifest.csv` does not serve.
+ */
+export const BUDGET_API_ENABLED = import.meta.env.VITE_CORTEX_BUDGET_ENABLED === 'true';
 
 /**
  * The frontend half of the Soma fence.
@@ -462,10 +477,6 @@ export async function getDeploymentStatus(): Promise<DeploymentStatus> {
   return requestJson<DeploymentStatus>('/api/deployment/status');
 }
 
-export async function getCortexState(): Promise<CortexState> {
-  return requestJson<CortexState>('/api/cortex/state');
-}
-
 export interface SomaIdentity {
   did: string;
   genome?: unknown;
@@ -855,13 +866,31 @@ export interface TaskEvidenceCheck {
   };
 }
 
+/**
+ * `/api/groups/{id}/tasks/{id}/evidence` is not served. The backend offers
+ * `/chats` and `/projection` on that task and nothing else.
+ *
+ * This one deserves care, because "was this task really finished?" is the
+ * question the whole product exists to answer. Reporting *no* evidence is the
+ * safe direction to be wrong in: the gate stays shut and the task is not shown
+ * as done. Reporting evidence that was never checked would be the bug that
+ * matters.
+ */
 export async function checkTaskEvidence(
   groupId: string,
   taskId: string,
 ): Promise<TaskEvidenceCheck> {
-  return requestJson<TaskEvidenceCheck>(
-    `/api/groups/${encodeURIComponent(groupId)}/tasks/${encodeURIComponent(taskId)}/evidence`,
-  );
+  void groupId;
+  return {
+    task_id: taskId,
+    has_evidence_backed_completion: false,
+    completion_gate: {
+      gated_done: false,
+      raw_done: false,
+      reason: 'Evidence checking is not available: the backend does not serve this route.',
+      steps: { total: 0, verified_pass: 0, failed: 0, unverified: 0 },
+    },
+  };
 }
 
 export interface IntegrationConnection {
@@ -1861,13 +1890,19 @@ export async function createAuthorityScope(
   });
 }
 
+/**
+ * `/api/authority/delegate` is not served. Its neighbours are: the backend has
+ * `/api/authority/scopes` and `DELETE /api/authority/delegations/{id}`, so you
+ * can create a scope and revoke a delegation, but not make one.
+ *
+ * Handing one account the right to act for another is not something to fake a
+ * success for, so this refuses out loud rather than returning a neutral value.
+ */
 export async function delegateAuthority(
   request: DelegateAuthorityRequest,
 ): Promise<DelegateAuthorityResponse> {
-  return requestJson<DelegateAuthorityResponse>('/api/authority/delegate', {
-    method: 'POST',
-    body: JSON.stringify(request),
-  });
+  void request;
+  throw new CortexApiError(501, 'Delegating authority is not available yet.');
 }
 
 export async function revokeAuthorityDelegation(
@@ -2474,10 +2509,14 @@ export interface ProviderStatusInfo {
 }
 
 export async function getBudgetSettings(): Promise<BudgetSettings> {
+  if (!BUDGET_API_ENABLED) return { enabled: false };
   return requestJson<BudgetSettings>('/api/budget/settings');
 }
 
 export async function updateBudgetSettings(settings: BudgetSettings): Promise<BudgetSettings> {
+  if (!BUDGET_API_ENABLED) {
+    throw new CortexApiError(501, 'Cortex budgets are not enabled.');
+  }
   return requestJson<BudgetSettings>('/api/budget/settings', {
     method: 'PUT',
     body: JSON.stringify(settings),
@@ -2485,21 +2524,40 @@ export async function updateBudgetSettings(settings: BudgetSettings): Promise<Bu
 }
 
 export async function getCurrentUsage(): Promise<UsageData> {
+  if (!BUDGET_API_ENABLED) {
+    return {
+      current_session: { cost: 0, token_count: 0, request_count: 0, duration_minutes: 0 },
+      daily: { cost: 0, budget_remaining: 0, usage_percentage: 0 },
+      weekly: { cost: 0, budget_remaining: 0, usage_percentage: 0 },
+      monthly: { cost: 0, budget_remaining: 0, usage_percentage: 0 },
+      provider_breakdown: [],
+    };
+  }
   return requestJson<UsageData>('/api/budget/usage');
 }
 
 export async function getCostWarnings(): Promise<CostWarning[]> {
+  if (!BUDGET_API_ENABLED) return [];
   return requestJson<CostWarning[]>('/api/budget/warnings');
 }
 
 export async function acknowledgeCostWarning(warningId: string): Promise<void> {
+  if (!BUDGET_API_ENABLED) {
+    throw new CortexApiError(501, 'Cortex budgets are not enabled.');
+  }
   await requestJson<void>(`/api/budget/warnings/${encodeURIComponent(warningId)}/acknowledge`, {
     method: 'POST',
   });
 }
 
+/**
+ * `/api/providers/status` is not served either, and unlike budgets it is a
+ * single endpoint inside an otherwise-working cost feature, so there is no
+ * switch worth exposing -- flipping one would only turn a hidden panel into a
+ * 404. It reports an empty provider list until the route exists.
+ */
 export async function getProviderStatus(): Promise<ProviderStatusInfo[]> {
-  return requestJson<ProviderStatusInfo[]>('/api/providers/status');
+  return [];
 }
 
 // --- BYOK API Key Management ---

@@ -85,6 +85,13 @@ jobs:
       # that silently stops running reads exactly like a suite that passes.
       #
       # Raise the number when you add tests. That is the point of it.
+      #
+      # 13 -> 17 with the four in `src/lib/api-contract.test.ts`, which checks
+      # every `/api/...` path the frontend writes against the routes
+      # `crates/api/route-manifest.csv` says the backend serves. It is the same
+      # check `crates/api/tests/route_ownership.rs` makes inside the backend,
+      # carried across the boundary, and it found fourteen paths being called
+      # against routes that had never existed.
       - name: Test Cortex
         run: |
           set -euo pipefail
@@ -94,8 +101,8 @@ jobs:
           echo "$output"
           passed=$(echo "$output" | grep -oE "Tests +[0-9]+ passed" | grep -oE "[0-9]+" | tail -1)
           echo "cortex tests passed: ${passed:-0}"
-          if [ "${passed:-0}" -lt 13 ]; then
-            echo "::error::expected at least 13 Cortex tests to run, saw ${passed:-0}"
+          if [ "${passed:-0}" -lt 17 ]; then
+            echo "::error::expected at least 17 Cortex tests to run, saw ${passed:-0}"
             exit 1
           fi
 
