@@ -116,10 +116,16 @@ Branch: `extract/cortex-standalone` in `C:\Users\Josh\Desktop\GitHub\cortex-extr
    public. A scan before the push found no credentials: one deliberately fake
    `sk-ant-api03-test-key-1234567890` in a crypto test, and placeholders in the
    `.example` files.
-5. **CI green in the new repository.** The test suite runs there, never on this
-   PC. [PR #1](https://github.com/1xmint/cortex/pull/1) was the first run. All
-   six required checks — `rust`, `cortex`, `npm-audit (cortex)`, `cargo-deny`,
-   `sandbox`, `no-default-features` — report here, and two of them were red.
+5. ~~**CI green in the new repository.**~~ **Done** —
+   [PR #6](https://github.com/1xmint/cortex/pull/6) merged on 2026-09-20 with
+   all nine checks green, including every required one: `rust` 3m49s, `cortex`
+   37s, `npm-audit (cortex)` 42s, `cargo-deny` 28s, `sandbox` 1m44s,
+   `no-default-features` 4m4s. `main` is at `59905e6c`. The test suite runs
+   there, never on this PC.
+
+   Getting there took two fixes, because
+   [PR #1](https://github.com/1xmint/cortex/pull/1) — the first run — came back
+   with two of the six red.
 
    **The window.** The repository existed for a few minutes before branch
    protection was applied to `main`, and three pull requests merged inside it:

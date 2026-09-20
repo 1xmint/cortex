@@ -55,6 +55,14 @@ completed a task; that claim belongs to `live-model.yml` and to nothing else.
 - **Phases 27–30** — the capability mechanism, and the falsification test that
   has to exist before any "better than a single model" claim does. Nothing is
   built.
+- **`bollard` is pinned at 0.18 and cannot move without work.** 0.21 relocates
+  the container and network option types and makes `container::Config`
+  private, so `crates/worker/src/sandbox/container.rs` and `sandbox/egress.rs`
+  stop compiling. The bump merged unverified in the minutes before branch
+  protection existed and was reverted. Dependabot will keep re-offering it, and
+  each attempt now fails its own checks and sits blocked, which is the right
+  outcome but not a quiet one. Porting the sandbox to the 0.21 API is a change
+  to the code that isolates untrusted work and wants its own review.
 
 ## The split, and what it unblocked
 
@@ -86,6 +94,14 @@ Every required check is unconditional and cannot pass vacuously. As of
 - `eslint` blocks on errors. Warnings are still permitted.
 - The frontend has a **test floor** — the count is asserted and may only go up,
   the same shape as the `sandbox` job.
+
+`main` requires a branch to be up to date before it merges, and `ci.yml` runs
+on pull requests only. Those two go together: with no run on `main`, the only
+thing making the merged tree the tested tree is the up-to-date requirement.
+Turning it off means a pull request can be tested against a `main` that has
+moved, and nothing ever tests the result — which is how a red commit reached
+`main` unnoticed on 2026-09-20. The repository auto-updates branches, so a
+stale pull request with auto-merge armed updates itself rather than stalling.
 
 `stub-provider-e2e` and `live-model` are `workflow_dispatch` only. The first is
 cheap and safe to run on a branch; the second spends money and is the only
