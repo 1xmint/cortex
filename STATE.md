@@ -26,6 +26,12 @@ product is sold on undeliverable. They are written up as F13–F20 in
 scripted stub, at zero API cost. Nothing here is evidence that Cortex has
 completed a task; that claim belongs to `live-model.yml` and to nothing else.
 
+**Reproduced in the standalone repository on 2026-09-20.** The same two
+verdicts, out of a tree with no Socials in it:
+[run 35536911093](https://github.com/1xmint/cortex/actions/runs/35536911093).
+The sandbox, egress and runner images built from `1xmint/cortex` as well, which
+is the part the extraction put at risk and nothing had checked until now.
+
 ## Blocked on Josh
 
 1. **`ANTHROPIC_API_KEY` as a repository secret**, scoped per

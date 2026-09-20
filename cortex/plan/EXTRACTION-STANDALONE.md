@@ -6,6 +6,14 @@ own dependency on `cortex-api` is explicitly **not** a gate; Josh took it off
 the list. Socials keeps the `1xmint/heyvera` repository and can depend on
 whatever it likes until it is repointed later.
 
+**Met on 2026-09-20.** All six steps below are done.
+[`1xmint/cortex`](https://github.com/1xmint/cortex) is public, eleven crates,
+459 files, no Socials source and no HeyVera history. *Builds* and *tests* are
+proven by [PR #6](https://github.com/1xmint/cortex/pull/6) merging with all nine
+checks green; *runs* is proven by the stubbed end-to-end run in step 6. What is
+still not proven, and is not this document's to prove, is that Cortex completes
+a task with a real model behind it.
+
 Where this sits: `docs/proposals/cortex-socials-split-inventory.md` is the
 ownership survey everything below rests on, and
 `crates/api/route-manifest.csv` (merged PR #650) is the machine-readable form
@@ -158,6 +166,33 @@ Branch: `extract/cortex-standalone` in `C:\Users\Josh\Desktop\GitHub\cortex-extr
    `ADD_TO_PROJECT_PAT` is absent, which it is, so it passes rather than
    failing; its project URL still points at the `hey-vera` org and should be
    repointed or deleted the first time anyone wants it working.
+
+6. ~~**Prove it runs, not only that it builds.**~~ **Done** — the acceptance
+   target asks for a checkout that builds, tests *and* runs, and CI answers only
+   the first two. `stub provider e2e`
+   ([run 35536911093](https://github.com/1xmint/cortex/actions/runs/35536911093))
+   was dispatched on `main` at `b6cce724` and went green in 3m:
+
+   ```
+   verdict=Verified  required_passed=2 required_total=2
+   verdict=Failed    required_passed=1 required_total=2
+   STUBBED RECEIPT (NOOP) — NONE. Nothing was delivered, so nothing was graded.
+   ```
+
+   That is the whole chain — scheduler, lease, sandbox, argv, stdout framing,
+   diff extraction, frozen checks, verdict, receipt — running out of a tree with
+   no Socials in it. The sandbox, egress and runner images all built from this
+   repository, which nothing had shown before: the Docker build context survived
+   the deletion pass too.
+
+   The proof step was read before the result was believed. It fails on a skipped
+   test, on a test that does not reach `ok`, on a missing receipt in either
+   direction, and on a NOOP that produced a receipt it should not have. It is
+   not a check that can only say yes.
+
+   **It still does not mean Cortex completed a task.** No model was consulted;
+   the provider was a script, at zero API cost. That claim belongs to
+   `live-model.yml`, which spends money and has not been run.
 
 ## Deliberately deferred, and why it is safe to defer
 
