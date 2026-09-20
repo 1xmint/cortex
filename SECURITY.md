@@ -5,7 +5,7 @@
 **Report privately. Do not open a public issue.**
 
 Use GitHub's private vulnerability reporting:
-[**Report a vulnerability**](https://github.com/hey-vera/heyvera/security/advisories/new)
+[**Report a vulnerability**](https://github.com/1xmint/cortex/security/advisories/new)
 — Security → Advisories → Report a vulnerability, on this repository.
 
 That channel is private between you and the maintainers until an advisory is
