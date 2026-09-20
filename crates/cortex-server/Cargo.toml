@@ -1,0 +1,22 @@
+[package]
+name = "cortex-server-bin"
+version.workspace = true
+publish = false  # proprietary; never goes to crates.io
+edition.workspace = true
+license.workspace = true
+description = "cortex.heyvera.org backend binary"
+
+[[bin]]
+name = "cortex-server"
+path = "src/main.rs"
+
+[dependencies]
+cortex-api = { path = "../api" }
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+axum.workspace = true
+socket2 = "0.6"
+
+[lints]
+workspace = true

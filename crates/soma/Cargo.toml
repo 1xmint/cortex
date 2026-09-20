@@ -1,0 +1,31 @@
+[package]
+name = "soma"
+version.workspace = true
+publish = false  # proprietary; never goes to crates.io
+edition.workspace = true
+license.workspace = true
+description = "Soma protocol primitives — Ed25519 identity, delegation, heartbeats, spend tracking"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+ed25519-dalek = { version = "3", features = ["rand_core"] }
+sha2 = "0.11"
+hmac = "0.13"
+rand = { workspace = true }
+base64 = "0.23"
+hex = "0.4"
+dirs-next = "2"
+
+[[bin]]
+name = "soma-ceremony"
+path = "src/bin/ceremony.rs"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+
+[lints]
+workspace = true

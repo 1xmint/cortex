@@ -1,0 +1,37 @@
+[package]
+name = "cortex-worker"
+version.workspace = true
+publish = false  # proprietary; never goes to crates.io
+edition.workspace = true
+license.workspace = true
+description = "CLI session spawner for Cortex — executes work through authenticated provider tools"
+
+[[bin]]
+name = "cortex-worker"
+path = "src/bin/worker.rs"
+
+[dependencies]
+cortex-core = { path = "../core" }
+# Fenced behind the `soma` feature, OFF by default — must stay in lockstep with
+# `cortex-api`'s feature of the same name. A worker built with the feature ON
+# demands a per-step delegation that an API built with it OFF never issues.
+soma = { path = "../soma", optional = true }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["process", "io-util", "sync"] }
+tokio-tungstenite.workspace = true
+futures-util.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
+bollard = "0.18"
+
+[features]
+default = []
+# Verify the per-step Soma delegation before executing a step. See the note on
+# the `soma` dependency: this must match `cortex-api`'s `soma` feature.
+soma = ["dep:soma"]
+
+[lints]
+workspace = true

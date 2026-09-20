@@ -1,0 +1,64 @@
+# The verification check runner: where Cortex grades a delivered tree.
+#
+# Distinct from Dockerfile.sandbox on purpose, and the distinction is the whole
+# security story of the verifier. The sandbox holds the provider CLI and a live
+# provider key, because the agent has to be able to talk to a model. This image
+# holds neither and never should — a check runner that can reach a model is a
+# check runner whose verdict can be argued with, and one that holds a credential
+# has put the credential in reach of the customer's test suite.
+#
+# The runtime constraints are enforced by the caller, not by this file
+# (`crates/api/src/check_runner.rs`): the delivered tree mounted read-only, a
+# read-only rootfs, `--network none`, an environment that is a compile-time
+# constant, cap_drop ALL, no-new-privileges, bounded CPU/memory/pids, and a
+# fresh container per check. This image only has to be a minimal, unprivileged
+# place for those constraints to apply to.
+#
+# Build and publish by digest. The deployment supplies `name@sha256:…` in
+# CORTEX_RUNNER_IMAGE; a mutable tag would make every past receipt
+# unreproducible the next time it moved, which is the one thing a receipt is
+# for.
+
+# Pinned to the toolchain CI builds with. A check that grades a tree with a
+# different compiler than the one the repository targets produces a verdict
+# about a configuration nobody ships.
+FROM rust:1.97.1-slim-bookworm
+
+# git is needed because the mounted tree is a git worktree: cargo reads
+# `.git` for some workspace layouts, and a check may legitimately shell out to
+# it. Nothing here is a network client — this image has no route off the host
+# and no way to acquire one.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates git \
+    && rm -rf /var/lib/apt/lists/*
+
+# The unprivileged user the runner runs as. The name is part of the contract
+# with `check_runner.rs`, which sets `user: "sandbox"`.
+RUN groupadd --gid 2000 sandbox \
+    && useradd --uid 2000 --gid sandbox --no-create-home --shell /usr/sbin/nologin sandbox
+
+# The mount point. The directory exists so a read-only bind lands somewhere
+# predictable; its contents come entirely from the delivered tree.
+RUN mkdir -p /work && chown sandbox:sandbox /work
+
+# The scratch mount point. The caller mounts a tmpfs here and points
+# CARGO_TARGET_DIR, CARGO_HOME, HOME and TMPDIR at it — see `SCRATCH_ENV` in
+# check_runner.rs. The directory has to exist in the image because the rootfs
+# is read-only, so it cannot be created at runtime.
+#
+# This is what makes a check executable at all. Without it, `cargo check` has
+# nowhere to write `target/`, fails on a read-only filesystem, and reports that
+# failure as a verdict about the customer's work (F9).
+RUN mkdir -p /scratch && chown sandbox:sandbox /scratch
+
+# RUSTUP_HOME and CARGO_HOME are set by the base image, and CARGO_HOME is
+# overridden at runtime to point at the scratch tmpfs. That is deliberate: the
+# toolchain itself lives under RUSTUP_HOME and stays reachable, while anything
+# cargo wants to *write* — the registry cache, its config — lands on scratch and
+# dies with the container. A check cannot warm a cache for the next one.
+
+# No ENTRYPOINT. The command is the frozen `CheckSpec`'s argv, supplied per
+# check by the runner, which is what makes it recordable on the receipt.
+
+USER sandbox
+WORKDIR /work

@@ -1,0 +1,32 @@
+name: Add To Project
+
+on:
+  workflow_dispatch:
+  issues:
+    types:
+      - opened
+      - reopened
+      - transferred
+      - labeled
+  pull_request:
+    types:
+      - opened
+      - reopened
+      - labeled
+
+permissions:
+  contents: read
+
+jobs:
+  add-to-project:
+    name: Add issue or PR to org project
+    runs-on: ubuntu-latest
+    env:
+      ADD_TO_PROJECT_PAT: ${{ secrets.ADD_TO_PROJECT_PAT }}
+    steps:
+      - name: Add to Cortex project
+        if: ${{ env.ADD_TO_PROJECT_PAT != '' && (github.event_name == 'issues' || github.event_name == 'pull_request') }}
+        uses: actions/add-to-project@5afcf98fcd03f1c2f92c3c83f58ae24323cc57fd # v2.0.0
+        with:
+          project-url: https://github.com/orgs/hey-vera/projects/1
+          github-token: ${{ env.ADD_TO_PROJECT_PAT }}

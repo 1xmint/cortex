@@ -1,0 +1,30 @@
+# Revisions that changed formatting only, and should be skipped by git blame.
+#
+# Enable it for this checkout — it is a config setting, not something a commit
+# can turn on for you:
+#
+#     git config blame.ignoreRevsFile .git-blame-ignore-revs
+#
+# GitHub's blame view reads this file automatically and needs no setup.
+#
+# Only add a commit here if it changed no behaviour at all. A commit in this
+# file is invisible in blame, so a behavioural change hidden in one becomes
+# very hard to find.
+
+# style: cargo fmt across the workspace, once (#546)
+#
+# The first and only workspace-wide format: 124 .rs files produced by
+# `cargo fmt --all` under rustfmt 1.9.0-stable (rustc 1.97.1), against the
+# rustfmt.toml added in #545. Zero manual edits.
+#
+# This is the SQUASHED sha, which is the only one that exists in main's
+# history — every PR in this repository is squash-merged, so the SHA the
+# branch had before the merge (cd83545528d8d937789d06680b6b5b4bc42164db) is
+# not an ancestor of main and blame would never reach it.
+#
+# Caveat, stated rather than hidden: the squash also folded in three
+# non-formatting files — .github/workflows/ci.yml (the fmt job),
+# CONTRIBUTING.md, and this file. Their blame is skipped along with the
+# format. 124 of the 127 files are pure whitespace and the other three are
+# new or near-new, so the trade is worth it, but it is a trade.
+84819509ba949bb63c782a9e2b28a360177e7b6f

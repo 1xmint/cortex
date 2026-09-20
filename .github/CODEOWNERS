@@ -1,0 +1,63 @@
+# Ownership for review routing.
+#
+# READ THIS FIRST: with no review requirement on `main`, this file assigns
+# reviewers and blocks nothing. It is preparation, not protection. It becomes a
+# gate only if `required_pull_request_reviews` is enabled in branch protection —
+# see cortex/plan/EXECUTION-STATE.md, "Wave 3 / Task 4", for the trade-off that
+# decision carries.
+#
+# The previous version listed `/src/`, which has never existed in this
+# repository. A pattern that matches nothing is worse than no pattern: it reads
+# as coverage and provides none.
+
+# Default owner for anything not matched below.
+* @clawnet
+
+# --- Product code ---------------------------------------------------------
+# One product lives here now. Socials moved to its own repository, and the
+# broad `/api` fallback that used to blur the two is gone with it.
+/crates/                @clawnet
+/cortex/                @clawnet
+
+# --- The boundaries a bad review actually costs something -----------------
+# Listed separately from `/crates/` not because the owner differs but because
+# CODEOWNERS is also documentation: these are the paths where "looks fine" is
+# not a sufficient review.
+
+# The sandbox is the only thing between a task and host execution.
+/crates/worker/src/sandbox/     @clawnet
+/crates/worker/src/executor.rs  @clawnet
+# Egress policy: what a capability grant is allowed to mean.
+/crates/core/src/egress.rs      @clawnet
+/crates/egress/                 @clawnet
+# Schema migrations run against a live database on a counter shared with
+# Socials, and a collision means the second one to merge is silently skipped.
+/crates/api/src/db.rs           @clawnet
+# Money.
+/crates/api/src/billing.rs      @clawnet
+/crates/api/src/stripe_client.rs @clawnet
+/crates/api/src/x402.rs         @clawnet
+# The verdict path decides what gets charged and what gets refunded.
+/crates/api/src/verification_driver.rs      @clawnet
+/crates/api/src/verification_dispatcher.rs  @clawnet
+# Work in progress, fenced out of default builds. See ADR-0003; do not
+# un-fence without clearing G1 and G2.
+/crates/soma/           @clawnet
+/crates/soma-core/      @clawnet
+/crates/soma-crypto/    @clawnet
+/crates/api/src/soma_fence.rs   @clawnet
+
+# --- Infrastructure -------------------------------------------------------
+# CI is the only thing that can block a merge, so a change here can quietly
+# remove every other gate in this file.
+/.github/               @clawnet
+# The deploy script resets the checkout and the live database is a tracked
+# file in it.
+/deploy/                @clawnet
+/scripts/               @clawnet
+
+# --- Decisions and plans --------------------------------------------------
+# ADRs record why a boundary exists. Editing one is editing the reason.
+/docs/adr/              @clawnet
+/docs/                  @clawnet
+/cortex/plan/           @clawnet

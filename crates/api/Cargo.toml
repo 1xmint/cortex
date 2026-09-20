@@ -1,0 +1,107 @@
+[package]
+name = "cortex-api"
+version.workspace = true
+publish = false  # proprietary; never goes to crates.io
+edition.workspace = true
+license.workspace = true
+description = "HTTP API server for Cortex orchestration engine"
+
+[lib]
+name = "cortex_api"
+path = "src/lib.rs"
+
+[[bin]]
+name = "cortex-server"
+path = "src/main.rs"
+
+[[bin]]
+name = "gateway-stub-proof"
+path = "src/bin/gateway-stub-proof.rs"
+required-features = ["gateway-cli-proof"]
+
+[dependencies]
+cortex-core = { path = "../core" }
+cortex-engine = { path = "../engine" }
+cortex-context = { path = "../context" }
+cortex-worker = { path = "../worker" }
+# Soma is a work-in-progress project that is not part of Cortex. It is fenced
+# behind the `soma` feature, which is OFF by default, so nothing on the Cortex
+# execution path can reach it unless a build opts in. See
+# docs/adr/ADR-0003-soma-feature-fence.md.
+soma = { path = "../soma", optional = true }
+# There is deliberately no `soma-core` dependency here. It carried the trust
+# arithmetic behind `VeraTracker`, and it depends on `soma-crypto`
+# unconditionally — so depending on it linked `soma-crypto` into every default
+# build and left the fence half open. The arithmetic now lives in
+# `cortex_core::vera` as Cortex-owned code. The compiler stops anyone *using*
+# soma-core without re-adding it here; the `no-default-features` CI job stops
+# anyone re-adding it, by failing if `cargo tree -i` can still resolve either
+# soma crate in the default graph.
+dirs-next = "2"
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tokio.workspace = true
+axum.workspace = true
+tower.workspace = true
+tower-http.workspace = true
+futures-core.workspace = true
+tokio-stream.workspace = true
+jsonwebtoken.workspace = true
+reqwest.workspace = true
+rusqlite.workspace = true
+hmac.workspace = true
+sha2.workspace = true
+hex.workspace = true
+async-stream.workspace = true
+base64.workspace = true
+aes-gcm.workspace = true
+rand.workspace = true
+futures-util.workspace = true
+which = "8"
+bollard = "0.18"
+socket2 = "0.6"
+prometheus.workspace = true
+once_cell.workspace = true
+sentry = { version = "0.49", features = ["tracing"], optional = true }
+opentelemetry = { version = "0.32", optional = true }
+opentelemetry_sdk = { version = "0.32.1", optional = true, features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.32", optional = true, features = ["grpc-tonic"] }
+tracing-opentelemetry = { version = "0.33", optional = true }
+
+[features]
+default = []
+# Compile in the Soma identity/delegation surface: the Cortex heart, the
+# `/api/soma/*` routes, the Soma header middleware, the `Soma ` authorization
+# scheme, the worker-connect delegation branch, and the per-step delegations
+# the scheduler issues. OFF by default — Soma is WIP and not part of Cortex.
+soma = ["dep:soma"]
+sentry-tracking = ["sentry"]
+otel = ["opentelemetry", "opentelemetry_sdk", "opentelemetry-otlp", "tracing-opentelemetry"]
+# Builds only the loopback proof harness used by CI. It cannot select a real
+# supplier transport and the binary refuses to start without its explicit
+# proof-mode guard.
+gateway-cli-proof = []
+
+[dev-dependencies]
+# The integration tests install no subscriber, so `tracing::error!` inside
+# the verification driver goes nowhere. A stubbed run that produced
+# `Inconclusive` with an empty execution set could therefore report only the
+# symptom and never the reason -- the driver names its failure and nothing
+# was listening.
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
+tempfile = "3"
+cortex-worker = { path = "../worker" }
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
+tokio-tungstenite = "0.30"
+futures-util = "0.3"
+uuid = { version = "1", features = ["v4"] }
+
+[lints]
+workspace = true

@@ -1,0 +1,64 @@
+# ── Stage 1: Build ──────────────────────────────────────────────
+FROM rust:1.87-slim AS builder
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    pkg-config libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src
+
+# Cache dependency build: copy manifests first
+COPY Cargo.toml Cargo.lock ./
+COPY crates/core/Cargo.toml crates/core/Cargo.toml
+COPY crates/engine/Cargo.toml crates/engine/Cargo.toml
+COPY crates/api/Cargo.toml crates/api/Cargo.toml
+COPY crates/worker/Cargo.toml crates/worker/Cargo.toml
+
+# Create minimal stub files so cargo can resolve the workspace
+RUN mkdir -p crates/core/src crates/engine/src crates/api/src crates/worker/src/bin \
+    && echo "pub fn _stub() {}" > crates/core/src/lib.rs \
+    && echo "pub fn _stub() {}" > crates/engine/src/lib.rs \
+    && echo "pub fn _stub() {}" > crates/api/src/lib.rs \
+    && echo "fn main() {}" > crates/api/src/main.rs \
+    && echo "fn main() {}" > crates/worker/src/bin/worker.rs
+
+# Build deps only
+RUN cargo build --release -p cortex-worker 2>/dev/null || true
+
+# Copy real sources and rebuild
+COPY crates/ crates/
+RUN touch crates/core/src/lib.rs crates/engine/src/lib.rs \
+         crates/api/src/lib.rs crates/api/src/main.rs \
+         crates/worker/src/bin/worker.rs \
+    && cargo build --release -p cortex-worker
+
+# ── Stage 2: Runtime ───────────────────────────────────────────
+FROM debian:bookworm-slim AS runtime
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates git \
+    && rm -rf /var/lib/apt/lists/*
+
+# Non-root user
+RUN groupadd --gid 1001 cortex \
+    && useradd --uid 1001 --gid cortex --create-home cortex
+
+# Workspace directory for git worktree isolation
+RUN mkdir -p /workspace && chown cortex:cortex /workspace
+
+COPY --from=builder --chown=cortex:cortex /src/target/release/cortex-worker /usr/local/bin/cortex-worker
+
+USER cortex
+WORKDIR /workspace
+
+ENV CORTEX_BRAIN_URL=ws://brain:3001/ws
+
+# The worker's service credential: a `cwk_` key minted on the host with
+# `cortex-worker-key issue --owner <clerk_user_id>`. Empty here so it must be
+# supplied at run time (`-e CORTEX_TOKEN=cwk_...`) rather than baked into a
+# layer. A container that starts with this unset will be refused at connect —
+# an unset CLERK_SECRET_KEY on the brain is no longer sufficient to
+# authenticate a worker. See crates/api/src/worker_key.rs.
+ENV CORTEX_TOKEN=
+
+ENTRYPOINT ["cortex-worker"]

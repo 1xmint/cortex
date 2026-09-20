@@ -1,0 +1,22 @@
+[package]
+name = "cortex-engine"
+version.workspace = true
+publish = false  # proprietary; never goes to crates.io
+edition.workspace = true
+license.workspace = true
+description = "Routing engine for Cortex — deterministic weighted scoring"
+
+[dependencies]
+cortex-core = { path = "../core" }
+clap = { version = "4", features = ["derive"] }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+tracing.workspace = true
+anyhow.workspace = true
+rusqlite.workspace = true
+
+[lints]
+workspace = true

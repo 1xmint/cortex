@@ -1,0 +1,21 @@
+# Explicit, minimal, and entirely stable-channel.
+#
+# Every option below is a default that is *pinned* rather than a preference
+# that is imposed. The point of this file is reproducibility: `cargo fmt` must
+# produce the same bytes on a contributor's machine as it does in CI, and an
+# unpinned default can change under a toolchain bump. Nightly-only options are
+# deliberately absent — a format gate that only passes on nightly is a gate
+# that blocks stable contributors.
+#
+# This file lands BEFORE the workspace is first formatted, so that the format
+# commit is reproducible from it. See CONTRIBUTING.md.
+
+edition = "2021"
+max_width = 100
+hard_tabs = false
+tab_spaces = 4
+newline_style = "Unix"
+use_field_init_shorthand = true
+use_try_shorthand = true
+reorder_imports = true
+reorder_modules = true

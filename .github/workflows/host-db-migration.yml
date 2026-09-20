@@ -1,0 +1,173 @@
+# One-time host migration for PR #411: move the live Cortex database out of the
+# git checkout.
+#
+# Why this exists as a workflow rather than a paste-into-a-terminal checklist:
+# the commands need SSH to the production host, and the only credentials for
+# that already live here (the repository's Tailscale OAuth pair). Running it
+# from Actions means it is authorised the same way a deploy
+# is, logged the same way, and repeatable — instead of depending on whoever
+# happens to have a shell open.
+#
+# ORDER IS LOAD-BEARING. any other deploy path against the same host also runs
+# `git reset --hard` on the production checkout, and the live database is
+# tracked *inside* that checkout at .cortex/cortex.db. Until this migration has
+# run, any deploy reverts production data to a committed dev snapshot. That is
+# why deploys have been frozen, and why this must run BEFORE #411 merges and
+# before the next deploy.
+#
+# THE SERVICE IS LEFT STOPPED AFTER A LIVE RUN, ON PURPOSE.
+#
+# The deployed binary is from June 3 and does not read CORTEX_DB_PATH — that
+# code arrives with #411. Restarting it after the move would point it at
+# .cortex/cortex.db, which no longer exists, and SQLite would helpfully create
+# a fresh empty one. Production would look wiped (the real data is safe in
+# /var/lib/cortex), and any write during that window would be stranded in a
+# database the new binary never opens.
+#
+# So the runbook is: migrate (service stops) -> merge #411 -> deploy (service
+# starts on a binary that reads the new paths). Production has zero users, so
+# the downtime in between costs nothing and removes the failure mode entirely.
+#
+# Defaults to a dry run. Nothing moves until someone types the confirmation
+# phrase, because this relocates a live database.
+
+name: Host DB migration (one-time, #411)
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Inspect only — report what would change, touch nothing
+        type: boolean
+        required: true
+        default: true
+      confirm:
+        description: To actually migrate, type MIGRATE (ignored when dry_run is true)
+        type: string
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cortex-production
+  cancel-in-progress: false
+
+jobs:
+  migrate:
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v5
+
+      - name: Refuse an unconfirmed live run
+        if: ${{ !inputs.dry_run }}
+        env:
+          CONFIRM: ${{ inputs.confirm }}
+        run: |
+          if [ "$CONFIRM" != "MIGRATE" ]; then
+            echo "::error::Live run requires confirm=MIGRATE. Re-run with dry_run unchecked and the phrase typed exactly."
+            exit 1
+          fi
+          echo "confirmed"
+
+      - name: Join tailnet
+        uses: tailscale/github-action@780049a30b6ff5c378a9e7b389d15ece7a204888 # v4.1.3
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:ci
+
+      # Read-only. Answers the three things nobody can currently confirm: where
+      # the database actually is, whether the destination already exists, and
+      # whether this user can sudo without a password. If the last one is false
+      # the migration cannot proceed from CI and Josh runs six lines by hand —
+      # better to learn that from an inspection than half-way through a move.
+      - name: Inspect host
+        env:
+          DEPLOY_USER: ${{ vars.DEPLOY_USER || 'deploy' }}
+          TAILSCALE_HOST: ${{ vars.TAILSCALE_HOST }}
+        run: |
+          test -n "$TAILSCALE_HOST"
+          {
+            printf 'set -uo pipefail\n'
+            printf 'echo "== service =="; systemctl is-active cortex || true\n'
+            printf 'echo "== checkout db =="; ls -la "$HOME"/claw-net/.cortex/ 2>/dev/null || echo "(no .cortex in checkout)"\n'
+            printf 'echo "== destination =="; ls -ld /var/lib/cortex 2>/dev/null || echo "(/var/lib/cortex does not exist yet)"\n'
+            printf 'echo "== env file =="; ls -l /etc/cortex/cortex.env 2>/dev/null || echo "(no /etc/cortex/cortex.env)"\n'
+            printf 'echo "== already migrated? =="; grep -q CORTEX_DB_PATH /etc/cortex/cortex.env 2>/dev/null && echo YES || echo NO\n'
+            printf 'echo "== passwordless sudo =="; sudo -n true 2>/dev/null && echo YES || echo NO\n'
+            printf 'echo "== db tracked by git? =="; cd "$HOME"/claw-net 2>/dev/null && git ls-files --error-unmatch .cortex/cortex.db >/dev/null 2>&1 && echo YES || echo NO\n'
+          } | ssh -o StrictHostKeyChecking=accept-new "${DEPLOY_USER}@${TAILSCALE_HOST}" 'bash -s'
+
+      - name: Migrate
+        if: ${{ !inputs.dry_run }}
+        env:
+          DEPLOY_USER: ${{ vars.DEPLOY_USER || 'deploy' }}
+          TAILSCALE_HOST: ${{ vars.TAILSCALE_HOST }}
+        run: |
+          test -n "$TAILSCALE_HOST"
+          # Built locally and fed over stdin, like the deploy job: nothing is
+          # pasted into an ssh argument, so remote quoting cannot be broken.
+          {
+            printf 'set -euo pipefail\n'
+            printf 'CHECKOUT="$HOME/claw-net"\n'
+            printf 'SRC="$CHECKOUT/.cortex"\n'
+            # Idempotent: a second run is a no-op rather than a second move.
+            printf 'if grep -q CORTEX_DB_PATH /etc/cortex/cortex.env 2>/dev/null; then echo "already migrated; nothing to do"; exit 0; fi\n'
+            printf 'sudo -n true || { echo "ERROR: passwordless sudo unavailable — run the six commands in cortex/plan/JOSH-ACTIONS.md by hand"; exit 1; }\n'
+            # Back up before touching anything. There is an older backup from
+            # 2026-08-02, but a two-day-old copy of a live database is not a
+            # backup of the database you are about to move.
+            printf 'STAMP=$(date +%%Y%%m%%d_%%H%%M%%S)\n'
+            printf 'sudo -n mkdir -p /home/%q/backups/pre-dbmove\n' "$DEPLOY_USER"
+            printf 'if [ -f "$SRC/cortex.db" ]; then sudo -n cp "$SRC/cortex.db" "/home/%q/backups/pre-dbmove/cortex_$STAMP.db"; echo "backed up to cortex_$STAMP.db"; fi\n' "$DEPLOY_USER"
+            printf 'sudo -n mkdir -p /var/lib/cortex\n'
+            printf 'sudo -n chown %q:%q /var/lib/cortex\n' "$DEPLOY_USER" "$DEPLOY_USER"
+            printf 'sudo -n systemctl stop cortex\n'
+            # Globs cover cortex.db-wal and cortex.db-shm: moving the database
+            # without its write-ahead log loses every committed transaction that
+            # has not been checkpointed.
+            printf 'shopt -s nullglob\n'
+            printf 'for f in "$SRC"/cortex.db*; do mv "$f" /var/lib/cortex/; done\n'
+            printf 'if [ -f "$SRC/ledger.jsonl" ]; then mv "$SRC/ledger.jsonl" /var/lib/cortex/; fi\n'
+            # routing.db is untracked, so `git clean -fd` deletes it rather than
+            # reverting it, and losing it discards every UCB statistic the
+            # router has learned. Relocating it needs CORTEX_ROUTING_DB_PATH,
+            # added to #411 alongside this change.
+            printf 'for f in "$SRC"/routing.db*; do mv "$f" /var/lib/cortex/; done\n'
+            printf 'sudo -n mkdir -p /etc/cortex\n'
+            printf "printf 'CORTEX_DB_PATH=/var/lib/cortex/cortex.db\\\\nCORTEX_LEDGER_PATH=/var/lib/cortex/ledger.jsonl\\\\nCORTEX_ROUTING_DB_PATH=/var/lib/cortex/routing.db\\\\n' | sudo -n tee -a /etc/cortex/cortex.env >/dev/null\n"
+            # The service is deliberately left STOPPED. See the runbook note at
+            # the top of this file.
+            printf 'echo "migration complete — service intentionally left stopped"\n'
+          } | ssh -o StrictHostKeyChecking=accept-new "${DEPLOY_USER}@${TAILSCALE_HOST}" 'bash -s'
+
+      - name: Verify the data landed
+        if: ${{ !inputs.dry_run }}
+        env:
+          DEPLOY_USER: ${{ vars.DEPLOY_USER || 'deploy' }}
+          TAILSCALE_HOST: ${{ vars.TAILSCALE_HOST }}
+        run: |
+          # Deliberately does NOT check the service is up: it is meant to be
+          # down until the deploy brings up a binary that reads these paths.
+          {
+            printf 'set -euo pipefail\n'
+            printf 'echo "== relocated =="; ls -la /var/lib/cortex/\n'
+            printf 'echo "== env =="; sudo -n grep -c CORTEX_ /etc/cortex/cortex.env\n'
+            printf 'echo "== checkout should now be empty of databases =="; ls -la "$HOME"/claw-net/.cortex/ 2>/dev/null || echo "(gone)"\n'
+            printf 'test -s /var/lib/cortex/cortex.db\n'
+            printf 'echo "database present and non-empty at its new home"\n'
+          } | ssh -o StrictHostKeyChecking=accept-new "${DEPLOY_USER}@${TAILSCALE_HOST}" 'bash -s'
+
+      - name: What happens next
+        run: |
+          echo "Dry run: ${{ inputs.dry_run }}"
+          echo ""
+          echo "The service is DOWN on purpose after a live run. Finish the sequence:"
+          echo "  1. Mark PR #411 ready and merge it."
+          echo "  2. Run Deploy Production (branch main) — this starts the service"
+          echo "     on a binary that reads CORTEX_DB_PATH and friends."
+          echo ""
+          echo "Production has zero users, so the gap between 1 and 2 costs nothing."

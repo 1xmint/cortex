@@ -1,0 +1,80 @@
+# The execution sandbox, with a provider CLI layered on.
+#
+# `Dockerfile.sandbox` deliberately installs no provider CLI: it is the image
+# the adversarial tests build, and those tests are about the boundary rather
+# than about any provider. This file is the other half of that sentence — the
+# published sandbox image, which is that base plus exactly one agent CLI.
+#
+# Kept separate rather than merged so the boundary tests keep testing a minimal
+# image. A CLI added to the base would mean every adversarial assertion runs
+# against a container with a package manager and a JavaScript runtime in it,
+# and "the sandbox cannot reach the network" would start being a claim about
+# node's defaults.
+#
+# Build the base first; this image is `FROM` it:
+#
+#   docker build -f Dockerfile.sandbox          -t cortex/sandbox:base .
+#   docker build -f Dockerfile.sandbox-provider -t cortex/sandbox:dev \
+#     --build-arg BASE=cortex/sandbox:base .
+#
+# Everything the base says about runtime constraints still applies and is still
+# enforced by `crates/worker/src/sandbox/container.rs`, not by this file: one
+# read-write mount at /work, one scratch tmpfs, cap_drop ALL, no-new-privileges,
+# read-only root, bounded CPU/memory/pids, default-deny egress through the
+# mediator, and mandatory teardown.
+
+ARG BASE=cortex/sandbox:base
+FROM ${BASE}
+
+# Root only to install. The image ends as `sandbox` again, below.
+USER root
+
+# Node, because the Claude CLI is distributed on npm. Pinned to a major so a
+# rebuild does not silently change the runtime under the agent — the sandbox
+# image is named on every receipt, and "it passed" has to mean something about
+# a specific image.
+RUN apt-get update && apt-get install -y --no-install-recommends curl gnupg \
+    && curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
+    && apt-get install -y --no-install-recommends nodejs \
+    && rm -rf /var/lib/apt/lists/*
+
+# The agent CLI. Version-pinned for the same reason as node: an unpinned
+# `latest` makes two receipts that name the same image incomparable.
+ARG CLAUDE_CLI_VERSION=2.1.268
+RUN npm install -g --no-fund --no-audit \
+    "@anthropic-ai/claude-code@${CLAUDE_CLI_VERSION}" \
+    && npm cache clean --force
+
+# The scratch mount point. The rootfs is read-only at runtime, so a directory
+# the caller mounts a tmpfs onto has to exist in the image. HOME, TMPDIR,
+# XDG_CACHE_HOME and XDG_CONFIG_HOME all point inside it — see `SCRATCH_ENV` in
+# `crates/worker/src/sandbox/policy.rs`.
+#
+# This is not a convenience. Without it the worktree is the sandbox's only
+# writable path, and a CLI with no HOME either refuses to start or writes its
+# config and cache into the tree it was asked to change — where they land in
+# the diff, in the git evidence, and in what the frozen checks grade.
+RUN mkdir -p /scratch && chown sandbox:sandbox /scratch
+
+# Verify the CLI actually starts, as the unprivileged user, **with the exact
+# environment the runner supplies at dispatch**. A smoke test run under
+# different variables than production tests a configuration that never happens.
+#
+# This check earned its place immediately: the first build failed here with
+# `EACCES: mkdir /home/sandbox/.claude/debug`, because the CLI insists on a
+# writable HOME even to print its own version and the user is created with
+# `--no-create-home`. That is F10 confirmed against the real CLI rather than
+# reasoned about — and it is two layers from anyone who could diagnose it if it
+# surfaces at dispatch instead, as `CliNotFound` inside a torn-down container.
+#
+# The values match `SCRATCH_ENV` in `crates/worker/src/sandbox/policy.rs`, and
+# they are the mount point itself rather than subdirectories of it: at runtime
+# the tmpfs is mounted over /scratch and hides anything created here, so
+# `/scratch/home` would not exist when the CLI looked for it.
+USER sandbox
+RUN HOME=/scratch TMPDIR=/scratch XDG_CACHE_HOME=/scratch XDG_CONFIG_HOME=/scratch     claude --version
+
+WORKDIR /work
+
+# No ENTRYPOINT. The command is supplied per job by the runner, which is what
+# makes the argv recordable on the receipt.

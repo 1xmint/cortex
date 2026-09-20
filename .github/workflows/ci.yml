@@ -1,0 +1,484 @@
+name: CI
+
+# Pull requests only, plus a manual button.
+#
+# `main` is protected with `required_status_checks.strict: true`, which means a
+# pull request cannot merge until it has been tested *against the current tip of
+# main*. The commit that lands is therefore the same tree the PR run already
+# built and tested, and the post-merge `push` run re-ran all six jobs on it —
+# measured at roughly 18 minutes of runner time per merge, duplicating work that
+# had just finished.
+#
+# Removing `push` costs one thing, stated plainly rather than discovered later:
+# a workflow run can restore caches created on its own branch or on the default
+# branch, and nothing else. With no run on `main`, no *new* default-branch cache
+# is created, so after a Cargo.lock change every PR restores a partial cache
+# until it saves its own. If PR wall-clock regresses, the fix is a single
+# `cache-warm` job gated on `push: branches: [main]` with a `shared-key`, not
+# the return of the whole matrix.
+#
+# `supply-chain.yml` already runs on `pull_request` + `schedule` with no `push`
+# trigger, so this is the pattern this repository already uses.
+#
+# Deliberately NOT added: `paths` filters or change detection. See the note on
+# the deleted `web` job below — a skipped job reports success, and every job
+# here is a required status check.
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cortex-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+
+  # The `web` job was deleted here. It gated every step on a diff grep for
+  # `^web/`, and no `web/` directory exists in this repository — so it skipped
+  # everything and reported success on every pull request ever opened, while
+  # being one of three required checks. PR #396 removed two jobs with this
+  # exact defect and left this one behind.
+  #
+  # `cortex` deliberately has no change-detection gate. A job that skips still
+  # reports success, which is how `web` stayed green for its whole life. It runs
+  # on every PR, unconditionally, so that a green check means something was
+  # actually built.
+  cortex:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: cortex
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v5
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: cortex/package-lock.json
+
+      - name: Install Cortex dependencies
+        run: npm ci
+
+      # `build` is `tsc -b && vite build`, so this is the typecheck gate too.
+      # Verified green against main before this job was made required.
+      - name: Build Cortex
+        run: npm run build
+
+      # Blocking, as of the run that cleaned it. It was advisory because
+      # `eslint .` reported errors on main and a check that always fails gets
+      # switched off. The errors are gone: three unused catch bindings became
+      # optional catches, a dropped `cause` is preserved on the rethrow, an
+      # `any` became structural, two helpers that nothing imported stopped
+      # being exported, and one lucide icon lookup carries an explicit
+      # disable with its reasoning.
+      #
+      # Warnings are still permitted -- three `react-hooks/exhaustive-deps`
+      # remain and each needs a judgement about intent, not a lint fix.
+      # The frontend had no tests at all: 25k lines of TSX and nothing that
+      # could fail. This is the floor, in the same shape as the `sandbox` job
+      # -- run them, count them, and refuse a count that went down. A suite
+      # that silently stops running reads exactly like a suite that passes.
+      #
+      # Raise the number when you add tests. That is the point of it.
+      - name: Test Cortex
+        run: |
+          set -euo pipefail
+          # NO_COLOR so the summary carries no escape codes between "Tests"
+          # and the count. Stripping them afterwards is the same job done worse.
+          output=$(NO_COLOR=1 npm test 2>&1)
+          echo "$output"
+          passed=$(echo "$output" | grep -oE "Tests +[0-9]+ passed" | grep -oE "[0-9]+" | tail -1)
+          echo "cortex tests passed: ${passed:-0}"
+          if [ "${passed:-0}" -lt 13 ]; then
+            echo "::error::expected at least 13 Cortex tests to run, saw ${passed:-0}"
+            exit 1
+          fi
+
+      - name: Lint Cortex
+        run: npm run lint
+
+  # The execution boundary, tested against a real runtime.
+  #
+  # The unit tests in crates/worker/src/sandbox assert the configuration the
+  # runner asks for. These assert what a process inside the sandbox can
+  # actually do — read a host secret, reach the Docker socket, open a
+  # connection, write outside its workspace, survive into the next task. They
+  # need a container runtime, so they are gated behind CORTEX_SANDBOX_IT and
+  # skipped on a development machine.
+  #
+  # This job is why that gate is safe. A gated adversarial test that never runs
+  # is worse than no test, because it reads like coverage.
+  sandbox:
+    runs-on: ubuntu-latest
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v5
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install 1.97.1 --profile minimal
+          rustup default 1.97.1
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      - name: Build the sandbox image
+        run: docker build -f Dockerfile.sandbox -t cortex/sandbox:ci .
+
+      # The egress mediator. Built here rather than pulled so the tests check
+      # the tree they are running against, not whatever was last published.
+      - name: Build the egress mediator image
+        run: docker build -f Dockerfile.egress -t cortex/egress:ci .
+
+      - name: Adversarial sandbox tests
+        env:
+          CORTEX_SANDBOX_IT: "1"
+          CORTEX_SANDBOX_IMAGE: cortex/sandbox:ci
+          CORTEX_EGRESS_IMAGE: cortex/egress:ci
+        run: cargo test -p cortex-worker --locked --test sandbox_adversarial
+
+      # The tests above skip silently when the gate is unset, which is exactly
+      # what this job exists to prevent. Assert that they actually executed.
+      - name: Prove the tests were not skipped
+        env:
+          CORTEX_SANDBOX_IT: "1"
+          CORTEX_SANDBOX_IMAGE: cortex/sandbox:ci
+          CORTEX_EGRESS_IMAGE: cortex/egress:ci
+        run: |
+          set -euo pipefail
+          output=$(cargo test -p cortex-worker --locked --test sandbox_adversarial -- --nocapture 2>&1)
+          echo "$output"
+          # Every test in the file must appear as run and passing. If the gate
+          # were unset they would still "pass", so count them instead.
+          passed=$(echo "$output" | grep -cE '^test [a-z_]+ \.\.\. ok' || true)
+          echo "adversarial tests passed: $passed"
+          # Raised from 10 when scoped egress added its section, and from 20
+          # when provider egress added its own. The floor is the point of this
+          # step: a gated test that never runs reads like coverage, so the
+          # count has to move whenever the file grows.
+          if [ "$passed" -lt 25 ]; then
+            echo "::error::expected at least 25 adversarial tests to run, saw $passed"
+            exit 1
+          fi
+
+  # The actual provider CLI contract, proven without an external network. The
+  # first loopback server records the request shape; the second is the real
+  # Rust stub listener and proves the CLI can consume its settled response.
+  # `--network none` is load-bearing: neither proof can contact Anthropic or
+  # spend provider money.
+  gateway-cli-shape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      SANDBOX_BASE: cortex/sandbox:gateway-shape-base
+      SANDBOX_IMAGE: cortex/sandbox:gateway-shape
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v5
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install 1.97.1 --profile minimal
+          rustup default 1.97.1
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      - name: Build the sandbox base image
+        run: docker build -f Dockerfile.sandbox -t "$SANDBOX_BASE" .
+
+      - name: Build the version-pinned Claude sandbox image
+        run: |
+          docker build -f Dockerfile.sandbox-provider \
+            --build-arg BASE="$SANDBOX_BASE" \
+            -t "$SANDBOX_IMAGE" .
+
+      - name: Capture and assert the real Claude gateway request
+        run: |
+          docker run --rm \
+            --network none \
+            --read-only \
+            --cap-drop ALL \
+            --security-opt no-new-privileges:true \
+            --user 2000:2000 \
+            --tmpfs /scratch:rw,exec,nosuid,nodev,size=268435456,mode=1777 \
+            --mount "type=bind,src=$PWD/testing/gateway-shape,dst=/fixture,readonly" \
+            -e HOME=/scratch \
+            -e TMPDIR=/scratch \
+            -e XDG_CACHE_HOME=/scratch \
+            -e XDG_CONFIG_HOME=/scratch \
+            -e npm_config_cache=/scratch/npm \
+            -e ANTHROPIC_BASE_URL=http://127.0.0.1:18080 \
+            -e ANTHROPIC_AUTH_TOKEN=cortex-shape-token \
+            -e 'ANTHROPIC_CUSTOM_HEADERS=X-Cortex-Attempt: attempt-shape-proof' \
+            "$SANDBOX_IMAGE" sh -ceu '
+              node /fixture/capture.mjs > /scratch/capture-server.log 2>&1 &
+              capture_pid=$!
+              trap "kill $capture_pid 2>/dev/null || true" EXIT
+              for delay in 1 1 1 1 1; do
+                if curl --noproxy "*" -fsS http://127.0.0.1:18080/health >/dev/null; then
+                  break
+                fi
+                sleep "$delay"
+              done
+              timeout 60 claude -p \
+                --output-format stream-json \
+                --verbose \
+                --no-session-persistence \
+                --model claude-sonnet-4-6 \
+                "Reply with exactly: cortex gateway shape stub"
+              node /fixture/assert-capture.mjs
+            '
+
+      - name: Build the feature-gated Rust stub proof listener
+        run: cargo build -p cortex-api --bin gateway-stub-proof --features gateway-cli-proof --locked
+
+      - name: Prove the real CLI consumes the Rust listener
+        run: |
+          docker run --rm \
+            --network none \
+            --read-only \
+            --cap-drop ALL \
+            --security-opt no-new-privileges:true \
+            --user 2000:2000 \
+            --tmpfs /scratch:rw,exec,nosuid,nodev,size=268435456,mode=1777 \
+            --mount "type=bind,src=$PWD/target/debug/gateway-stub-proof,dst=/usr/local/bin/gateway-stub-proof,readonly" \
+            --mount "type=bind,src=$PWD/testing/gateway-shape,dst=/fixture,readonly" \
+            -e HOME=/scratch \
+            -e TMPDIR=/scratch \
+            -e XDG_CACHE_HOME=/scratch \
+            -e XDG_CONFIG_HOME=/scratch \
+            -e npm_config_cache=/scratch/npm \
+            -e CORTEX_GATEWAY_CLI_PROOF=1 \
+            -e CORTEX_GATEWAY_PROOF_TOKEN_PATH=/scratch/gateway-token \
+            -e CORTEX_GATEWAY_PROOF_DB_PATH=/scratch/gateway.sqlite \
+            -e ANTHROPIC_BASE_URL=http://127.0.0.1:18080/internal/provider \
+            -e 'ANTHROPIC_CUSTOM_HEADERS=X-Cortex-Attempt: attempt-rust-listener-proof' \
+            "$SANDBOX_IMAGE" sh /fixture/prove-rust-listener.sh
+
+  # Formatting is a separate job from `rust` on purpose: it is seconds long and
+  # needs no dependency graph, so it must not queue behind a four-minute
+  # compile, and its own status context can be made required independently.
+  #
+  # `rustfmt.toml` pins only stable options, so this passes on the pinned
+  # toolchain rather than needing nightly. The workspace was formatted once, in
+  # a single mechanical commit recorded in .git-blame-ignore-revs; from here on
+  # a formatting drift is a one-command fix.
+  fmt:
+    runs-on: ubuntu-latest
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v5
+
+      - name: Install Rust toolchain
+        run: |
+          # Same pin as the `rust` job. rustfmt output is version-dependent, so
+          # an unpinned toolchain would make this gate fail on a rustfmt release
+          # rather than on anything a contributor did.
+          rustup toolchain install 1.97.1 --profile minimal --component rustfmt
+          rustup default 1.97.1
+          cargo fmt --version
+
+      - name: Formatting
+        # If this fails, run `cargo fmt --all` and commit the result. There is
+        # nothing to interpret: the fix is the command.
+        run: cargo fmt --all --check
+
+  rust:
+    runs-on: ubuntu-latest
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v5
+
+      - name: Install Rust toolchain
+        run: |
+          # 1.88.0 (June 2025) predates the `cfg_select!` macro, which
+          # libsqlite3-sys's build script now uses — that is why the cargo
+          # group bump in PR #435 failed to compile before reaching any of
+          # our own code. Pinned rather than `stable` so a toolchain release
+          # can never break CI unannounced.
+          rustup toolchain install 1.97.1 --profile minimal --component clippy
+          rustup default 1.97.1
+          rustc --version
+          cargo --version
+
+      # This job is the sole critical path and had no caching at all — every run
+      # recompiled the full dependency graph from scratch. Measured 3m04s-4m45s.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      - name: Check Rust workspace
+        run: cargo check --workspace --locked
+
+      - name: Test Rust workspace
+        run: cargo test --workspace --locked
+
+      # The boundary check for F4.
+      #
+      # Four `export_test_vectors` "tests" in soma-crypto wrote their own
+      # fixtures with `std::fs::write` instead of asserting against them. Three
+      # had fixed inputs so they rewrote identical bytes and looked harmless;
+      # the fourth generated a random keypair, so `cargo test` left a clean
+      # checkout dirty and the committed "golden" vector was only ever a record
+      # of the last run. A fixture the test overwrites can never disagree with
+      # the code.
+      #
+      # Nothing caught it because every assertion was *near* the boundary and
+      # not *at* it: the suite asserted on values it had just produced, and no
+      # check ever asked whether running the suite changed the repository. This
+      # step asks exactly that, and it is the one that would have caught it.
+      #
+      # It is deliberately not scoped to test-vectors/. Any test that writes
+      # into the working tree is the same defect, wherever it appears.
+      - name: The test run must not modify the working tree
+        run: |
+          if ! git diff --exit-code; then
+            echo "::error::running the test suite modified tracked files (listed above). A test that rewrites its own fixture cannot fail. Assert against the committed file instead of writing it."
+            exit 1
+          fi
+          # Tracked files are covered above; an untracked file dropped into the
+          # tree by a test is the same problem wearing a different hat.
+          untracked=$(git ls-files --others --exclude-standard)
+          if [ -n "$untracked" ]; then
+            echo "::error::the test run created untracked files:"
+            echo "$untracked"
+            exit 1
+          fi
+
+      # Optional features are invisible to `--workspace`, and `otel` had rotted
+      # to the point of not compiling at all while still pinning a dependency
+      # with an open advisory. Check the feature so it cannot rot again.
+      # `otel` is here because it rotted to the point of not compiling while
+      # still pinning a dependency with an open advisory. `sentry-tracking` was
+      # the third optional feature and was never checked at all — which is how
+      # dependabot #540 (sentry 0.35 -> 0.49) reported every required check
+      # green while `cargo check -p cortex-api --features sentry-tracking`
+      # failed with two hard errors: `ClientOptions` became non-exhaustive and
+      # `traces_sample_rate` moved off it.
+      #
+      # A green check on a bump to a crate the build never compiles is not
+      # evidence about that crate. Every optional feature in this manifest is
+      # now checked, so the next such bump fails where it should.
+      #
+      # `--all-targets`, not `--bins`: `--bins` compiles only the binaries, so
+      # a break in a test, example, or bench behind one of these features stays
+      # invisible to this job. That is the same blind spot the job exists to
+      # close, one level down -- the feature was checked, but only in the
+      # configuration least likely to be where the break is.
+      - name: Check optional features
+        run: |
+          cargo check -p cortex-api --features otel --all-targets --locked
+          cargo check -p cortex-api --features sentry-tracking --all-targets --locked
+
+      # The `soma` feature is off by default, so `--workspace` above compiles
+      # the fenced-out configuration and never the fenced-in one. Check the
+      # opt-in path too: the failure mode being prevented is a feature that
+      # silently stops compiling while still shipping in the manifest, which is
+      # exactly what happened to `otel`. Both binaries, because the API and the
+      # worker have to agree — an API without the feature issues no per-step
+      # delegation, and a worker with it rejects every step that lacks one.
+      - name: Check the Soma feature still compiles
+        run: cargo check -p cortex-api -p cortex-worker --features cortex-api/soma,cortex-worker/soma --locked
+
+      # Blocking, as of the run that finally read it. It was advisory because
+      # nobody had seen the output and wedging every PR sight-unseen is how the
+      # `web` job trained people to ignore CI. The first run reported 142
+      # warnings: the mechanical ones were fixed, six categories were allowed
+      # with reasons in `[workspace.lints.clippy]`, and the rest were real
+      # enough to be worth the diff -- a dead fail-open `is_admin`, a stale
+      # `SCHEMA_VERSION = 59` against a schema at v67, a `classify_failure`
+      # parameter whose only reader was a branch with two identical arms.
+      #
+      # The allow list is in the root `Cargo.toml` rather than in flags here,
+      # so a local `cargo clippy` sees exactly what CI sees.
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+
+  # A feature that is off by default is a feature nothing compiles, and a
+  # configuration nothing compiles is a configuration that rots. `otel` proved
+  # that: it stopped building entirely while still pinning a dependency with an
+  # open advisory, and `--workspace` never noticed because optional features are
+  # invisible to it.
+  #
+  # This job compiles and tests the workspace with every default feature off. It
+  # is the gate on the Soma fence: `crates/api` and `crates/worker` must build,
+  # and their `soma_fence` tests must pass, with no Soma in the tree at all.
+  #
+  # No `paths:` filter and no change detection, for the same reason `sandbox`
+  # has none — a required check that sometimes does not report never goes green
+  # and wedges the repository.
+  no-default-features:
+    runs-on: ubuntu-latest
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v5
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install 1.97.1 --profile minimal
+          rustup default 1.97.1
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      # The assertion the `soma` feature gate cannot make for itself.
+      #
+      # A `#[cfg(feature = "soma")]` gate only fences the code it is written on.
+      # It says nothing about what is *linked*, so a Cortex crate could — and
+      # did — depend on `soma-core`, which depends on `soma-crypto`
+      # unconditionally, and pull the whole crypto crate into a build with the
+      # feature off. Nothing in Rust catches that; only the dependency graph
+      # shows it.
+      #
+      # `cargo tree -i <pkg>` exits non-zero when the package is not in the
+      # graph, so a *successful* invocation here is the failure.
+      - name: No soma crate is in the default graph
+        run: |
+          set -uo pipefail
+          status=0
+          for crate in soma soma-core soma-crypto; do
+            if cargo tree -p cortex-api --no-default-features --locked -i "$crate" >/dev/null 2>&1; then
+              echo "::error::$crate is reachable from cortex-api with default features off"
+              cargo tree -p cortex-api --no-default-features --locked -i "$crate" || true
+              status=1
+            fi
+            if cargo tree -p cortex-worker --no-default-features --locked -i "$crate" >/dev/null 2>&1; then
+              echo "::error::$crate is reachable from cortex-worker with default features off"
+              cargo tree -p cortex-worker --no-default-features --locked -i "$crate" || true
+              status=1
+            fi
+          done
+          exit "$status"
+
+      # The other direction: with the feature ON the fence must actually reach
+      # Soma. If this stops resolving, the `soma` feature has silently become a
+      # no-op and the "on" configuration is no longer being tested.
+      - name: The soma feature still reaches soma
+        run: cargo tree -p cortex-api --features soma --locked -i soma >/dev/null
+
+      - name: Check the workspace with no default features
+        run: cargo check --workspace --no-default-features --locked
+
+      - name: Test the workspace with no default features
+        run: cargo test --workspace --no-default-features --locked
+
+      # The fence's own assertions. They are `#[cfg(not(feature = "soma"))]`, so
+      # they exist only in this configuration — if they stop being collected the
+      # fence is no longer being checked by anything, and a count that can only
+      # go up catches that where a passing run would not.
+      - name: Prove the fence assertions ran
+        run: |
+          set -euo pipefail
+          output=$(cargo test -p cortex-api --locked --no-default-features soma_ -- --nocapture 2>&1)
+          echo "$output"
+          passed=$(echo "$output" | grep -cE '^test [a-z_:]+ \.\.\. ok' || true)
+          echo "soma fence assertions passed: $passed"
+          if [ "$passed" -lt 6 ]; then
+            echo "::error::expected at least 6 soma fence assertions to run, saw $passed"
+            exit 1
+          fi

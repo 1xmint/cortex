@@ -1,0 +1,27 @@
+target/
+.git/
+.github/
+node_modules/
+.cortex/
+.claude/
+.dualbrain/
+.dual-brain/
+.replit-tools/
+packages/
+pulse/
+web/
+# 152 MB of reference-only material that was entering every build context.
+archive/
+
+# Dev files
+*.md
+!crates/**/*.md
+.env
+.env.*
+!.env.example
+docker-compose*.yml
+Dockerfile*
+Caddyfile*
+.gitignore
+.replit
+replit.nix

@@ -1,0 +1,51 @@
+title: "[Idea] "
+labels:
+  - idea
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this form for broad ideas before implementation starts.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What problem are we actually trying to solve?
+      placeholder: Describe the pain or opportunity in plain language.
+    validations:
+      required: true
+  - type: textarea
+    id: idea
+    attributes:
+      label: Broad idea
+      description: Describe the idea simply before jumping into implementation.
+      placeholder: Explain the high-level concept.
+    validations:
+      required: true
+  - type: textarea
+    id: ten_out_of_ten
+    attributes:
+      label: What would make this 10/10?
+      description: Name the production-quality, trust, safety, or usability bar.
+      placeholder: What would make this truly production-ready?
+  - type: dropdown
+    id: likely_owner
+    attributes:
+      label: Likely repo owner
+      options:
+        - claw-net
+        - pulse
+        - Soma
+        - cross-repo
+    validations:
+      required: true
+  - type: textarea
+    id: first_consumer
+    attributes:
+      label: First consumer
+      description: Which repo, product, or package consumes this first?
+  - type: textarea
+    id: risks
+    attributes:
+      label: Risks or open questions
+      description: What are the hardest unknowns?

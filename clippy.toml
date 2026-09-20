@@ -1,0 +1,24 @@
+# Clippy configuration. Minimal on purpose.
+#
+# `clippy` currently runs in the `rust` CI job as an advisory step
+# (`continue-on-error: true`) — see the comment in .github/workflows/ci.yml.
+# It has never been read end to end, so its warning count is unmeasured and
+# making it blocking sight-unseen would wedge every PR. This file exists so
+# that when someone does read that first full run, the thresholds they tune are
+# recorded in one reviewable place rather than scattered across `#[allow]`
+# attributes.
+#
+# Only thresholds are set here. No lint is silenced.
+
+# The workspace has several genuinely wide constructor and handler signatures
+# (axum extractors in particular). The default of 7 fires constantly on those
+# without indicating a real problem.
+too-many-arguments-threshold = 10
+
+# `db.rs` is very large and holds long but linear SQL-building functions.
+# Raised so the lint marks genuine complexity rather than length.
+cognitive-complexity-threshold = 30
+
+# Type complexity fires on the split websocket sink/stream types the worker
+# protocol uses, which have no shorter honest spelling.
+type-complexity-threshold = 350

@@ -1,0 +1,46 @@
+# The egress mediator: the only host on a task's network with a route out.
+#
+# One of these runs per attempt. It reads a `CONNECT host:port` line, checks it
+# against an allowlist supplied on argv, opens a socket, and copies bytes. It
+# never terminates TLS, so it cannot read what it forwards, and it holds no
+# credential a task could want — its entire configuration is the allowlist.
+#
+# The image is minimal for a security reason rather than an efficiency one.
+# This binary sits between model-authored code and the internet, so everything
+# in the image is inside the trust boundary. There is no shell, no package
+# manager, and no interpreter: `scratch` plus one statically linked binary.
+# Nothing here can be used to do anything except proxy.
+#
+# Build and publish by digest. The deployment supplies `name@sha256:…` in
+# CORTEX_EGRESS_IMAGE, and that digest is recorded on every job that used it —
+# "what could this task reach" is only answerable if you know what was
+# enforcing the answer.
+
+FROM rust:1.97.1-alpine AS build
+
+# musl gives a static binary, which is what makes a `scratch` final stage
+# possible. A dynamically linked binary would drag a libc and a loader into the
+# trust boundary for no benefit.
+RUN apk add --no-cache musl-dev
+
+WORKDIR /src
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+
+RUN cargo build --release --locked --bin cortex-egress \
+    --target x86_64-unknown-linux-musl \
+    && strip target/x86_64-unknown-linux-musl/release/cortex-egress
+
+FROM scratch
+
+# CA certificates are *not* copied in, and that is deliberate: the mediator
+# never validates a certificate because it never terminates TLS. The task's own
+# client does the validating, end to end, against the host it named.
+
+COPY --from=build /src/target/x86_64-unknown-linux-musl/release/cortex-egress /cortex-egress
+
+# Unprivileged by uid. `scratch` has no /etc/passwd to name a user in, and the
+# number is what the kernel enforces anyway.
+USER 2001:2001
+
+ENTRYPOINT ["/cortex-egress"]

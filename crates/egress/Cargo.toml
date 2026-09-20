@@ -1,0 +1,22 @@
+[package]
+name = "cortex-egress"
+version.workspace = true
+publish = false  # proprietary; never goes to crates.io
+edition.workspace = true
+license.workspace = true
+description = "The egress mediator — a per-attempt CONNECT proxy enforcing a host allowlist"
+
+[[bin]]
+name = "cortex-egress"
+path = "src/main.rs"
+
+# Deliberately minimal. This binary sits between a task and the internet, so
+# every dependency it carries is a dependency inside the trust boundary. It
+# needs sockets and a way to say what it did, and nothing else — no TLS stack
+# (it never terminates TLS), no HTTP library (it parses one request line), no
+# serialization (its configuration is argv).
+[dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "io-util", "time"] }
+
+[lints]
+workspace = true

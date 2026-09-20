@@ -1,0 +1,25 @@
+[package]
+name = "cortex-tui"
+version.workspace = true
+publish = false  # proprietary; never goes to crates.io
+edition.workspace = true
+license.workspace = true
+description = "Terminal UI client for Cortex — a thin client over the Cortex HTTP API"
+
+[[bin]]
+name = "cortex"
+path = "src/main.rs"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+tokio = { workspace = true }
+reqwest.workspace = true
+futures-util.workspace = true
+dirs-next = "2"
+ratatui = "0.30"
+crossterm = { version = "0.28", features = ["event-stream"] }
+
+[lints]
+workspace = true

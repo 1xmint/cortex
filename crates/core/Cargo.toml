@@ -1,0 +1,17 @@
+[package]
+name = "cortex-core"
+version.workspace = true
+publish = false  # proprietary; never goes to crates.io
+edition.workspace = true
+license.workspace = true
+description = "Core domain types for Cortex orchestration engine"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+
+[lints]
+workspace = true

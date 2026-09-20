@@ -1,0 +1,25 @@
+[package]
+name = "soma-crypto"
+version.workspace = true
+publish = false  # proprietary; never goes to crates.io
+edition.workspace = true
+license.workspace = true
+description = "Cryptographic primitives for the Soma Protocol — composite signatures, BLAKE3, AEAD, hybrid key agreement"
+
+[dependencies]
+ed25519-dalek = { workspace = true }
+blake3 = "1"
+chacha20poly1305 = "0.11"
+x25519-dalek = { version = "3", features = ["static_secrets"] }
+fips204 = "0.4"
+fips203 = "0.4"
+rand_core = { version = "0.6", features = ["getrandom"] }
+zeroize = { version = "1", features = ["derive"] }
+hex = { workspace = true }
+serde = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+
+[lints]
+workspace = true

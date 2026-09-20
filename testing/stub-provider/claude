@@ -1,0 +1,146 @@
+#!/bin/sh
+# A STUB. NOT A MODEL. NOT A PROVIDER.
+#
+# This executable impersonates the Claude CLI's *interface* so that the wiring
+# around a provider call can be exercised without buying a token. It contains
+# no intelligence of any kind: it reads the prompt, matches one sentinel, and
+# writes a diff that was decided by a human before the run started.
+#
+# WHY THIS IS AN EXECUTABLE AND NOT A RUST TEST DOUBLE
+#
+# `ScriptedRunner` already exists and is swapped in at a trait boundary. Five
+# wiring findings (F0, F9, F10, F11, F12) survived it, because everything below
+# the trait -- argv construction, the container, the unprivileged user, HOME,
+# the worktree mount, stdout framing, the commit, the diff extraction -- is
+# exactly the part a trait double replaces. So this runs as a real process, in
+# the real sandbox image, invoked by the real `build_command` argv, and its
+# stdout is parsed by the real `extract_claude_*` functions.
+#
+# THE CONTRACT IT MUST HONOUR (from crates/worker/src/executor.rs)
+#
+#   argv:   -p --output-format stream-json --verbose --no-session-persistence
+#           [--model <id>] <PROMPT>
+#           The prompt is the LAST argument. build_command pushes it last.
+#   cwd:    /work, the mounted worktree.
+#   stdout: newline-delimited JSON. `extract_claude_files` reads
+#           type=assistant -> message.content[] -> tool_use{name=Write,
+#           input.file_path}. `extract_claude_usage` reads type=result ->
+#           usage{input_tokens,output_tokens,...}.
+#
+# If any of those change, this stub must fail loudly rather than quietly write
+# nothing -- a stub that silently no-ops would manufacture exactly the vacuous
+# green this whole exercise exists to prevent.
+
+set -eu
+
+# ---------------------------------------------------------------------------
+# Refuse to run unless the credential is the sentinel non-key.
+#
+# The guard is built on ANTHROPIC_API_KEY rather than a flag of our own, and
+# that is forced rather than chosen. `sanctioned_env` in
+# crates/worker/src/sandbox/policy.rs admits exactly ONE variable from the host
+# -- the routed provider's credential -- plus the constant SCRATCH_ENV. There
+# is no sanctioned path for a test to pass a control variable into the sandbox,
+# and inventing one would mean editing the allowlist that makes the sandbox
+# worth trusting.
+#
+# Keying off the credential turns that constraint into the stronger property:
+#
+#   * a REAL key present  -> this stub refuses, so it can never stand in front
+#                            of a credential that could be spent
+#   * no key at all       -> refuses
+#   * the sentinel        -> runs, and the sentinel authenticates nothing, so a
+#                            real CLI reached by mistake would fail auth rather
+#                            than bill
+#
+# Zero API cost is therefore structural, not a promise in a comment.
+# ---------------------------------------------------------------------------
+STUB_SENTINEL_KEY="STUB-PROVIDER-NOT-A-REAL-KEY"
+
+if [ "${ANTHROPIC_API_KEY:-}" != "$STUB_SENTINEL_KEY" ]; then
+    echo "STUB PROVIDER REFUSED." >&2
+    echo "This is not a model and cannot answer anything." >&2
+    echo "It runs only when ANTHROPIC_API_KEY is exactly the sentinel non-key," >&2
+    echo "which authenticates nothing. A real credential here is refused on" >&2
+    echo "purpose: a stub must never stand in front of spendable money." >&2
+    exit 64
+fi
+
+# The prompt is the last argument.
+PROMPT=""
+for a in "$@"; do PROMPT="$a"; done
+
+if [ -z "$PROMPT" ]; then
+    echo "STUB PROVIDER: no prompt in argv -- build_command's contract changed." >&2
+    exit 65
+fi
+
+# Keep the rendered context as evidence. /scratch is the tmpfs the policy
+# mounts; /work is the graded tree and must not be polluted.
+printf '%s' "$PROMPT" > /scratch/rendered-prompt.txt 2>/dev/null || true
+
+# ---------------------------------------------------------------------------
+# Read the rendered context to choose the canned diff.
+#
+# Deliberately keyed off the prompt rather than an env var: requirement is that
+# the stub reads the context from where the real provider reads it. If the
+# context never reached the prompt -- which is precisely F8 -- neither sentinel
+# matches and this exits non-zero instead of inventing a diff.
+# ---------------------------------------------------------------------------
+if printf '%s' "$PROMPT" | grep -q 'STUB-SCENARIO: PASS'; then
+    SCENARIO=pass
+elif printf '%s' "$PROMPT" | grep -q 'STUB-SCENARIO: FAIL'; then
+    SCENARIO=fail
+elif printf '%s' "$PROMPT" | grep -q 'STUB-SCENARIO: NOOP'; then
+    SCENARIO=noop
+else
+    echo "STUB PROVIDER: no scenario sentinel in the rendered prompt." >&2
+    echo "The context did not reach the model. That is the F8 shape." >&2
+    echo "--- first 400 bytes of what did arrive ---" >&2
+    printf '%s' "$PROMPT" | head -c 400 >&2
+    exit 66
+fi
+
+TARGET="src/lib.rs"
+[ -f "$TARGET" ] || { echo "STUB PROVIDER: $TARGET absent; /work is not the subject worktree." >&2; exit 67; }
+
+# ---------------------------------------------------------------------------
+# The canned diffs. The subject ships `a - b` and a test asserting add(2,2)==4.
+#
+#   pass -> `a + b`, which the frozen cargo-test check genuinely passes
+#   fail -> `a * b`, which it genuinely fails (2*2==4 slips through, 10*5!=15
+#           does not, so the check fails on the second assertion)
+#
+# The failing variant is a real edit, not a no-op. A stub that "fails" by doing
+# nothing would prove only that an empty tree fails, which is not the same
+# claim as "a bad diff is caught".
+#
+#   noop -> no edit at all. A separate claim again: the provider ran cleanly,
+#           said something, and changed nothing. That is F16, and it is the one
+#           direction the other two cannot reach, because both of them deliver.
+# ---------------------------------------------------------------------------
+if [ "$SCENARIO" = pass ]; then
+    sed -i 's/    a - b/    a + b/' "$TARGET"
+elif [ "$SCENARIO" = fail ]; then
+    sed -i 's/    a - b/    a * b/' "$TARGET"
+fi
+
+# The noop scenario deliberately leaves the tree alone, so the edit check below
+# would be asserting the opposite of what it wants.
+if [ "$SCENARIO" != noop ]; then
+    grep -q '    a - b' "$TARGET" && { echo "STUB PROVIDER: edit did not apply." >&2; exit 68; }
+else
+    grep -q '    a - b' "$TARGET" || { echo "STUB PROVIDER: noop scenario changed the tree." >&2; exit 69; }
+fi
+
+# ---------------------------------------------------------------------------
+# stream-json on stdout, in the shape the real parsers expect.
+# ---------------------------------------------------------------------------
+printf '%s\n' '{"type":"system","subtype":"init","model":"STUB-NOT-A-MODEL","cwd":"/work"}'
+printf '%s\n' '{"type":"assistant","message":{"content":[{"type":"text","text":"STUBBED PROVIDER — no model was consulted. Applied a pre-decided '"$SCENARIO"' diff."},{"type":"tool_use","name":"Write","input":{"file_path":"/work/src/lib.rs"}}]}}'
+
+# Token counts are ZERO on purpose. Inventing plausible usage would put a
+# fabricated number into the spend ledger and onto a receipt, and a fabricated
+# cost is worse than an obviously impossible one. Zero is checkable: any
+# non-zero spend attributed to this run came from somewhere else.
+printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"num_turns":1,"result":"STUBBED PROVIDER RUN — NOT EVIDENCE OF A COMPLETED TASK","usage":{"input_tokens":0,"output_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}'

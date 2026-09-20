@@ -1,0 +1,13 @@
+Copyright (c) hey-vera. All rights reserved.
+
+No open-source licence has been granted for this repository.
+
+This file exists so that the absence of a LICENSE file reads as a deliberate
+choice rather than an oversight. The licensing terms for this software have not
+been decided. Until a LICENSE file is added, no permission is granted to use,
+copy, modify, or distribute this software.
+
+Note for maintainers: `[workspace.package]` in Cargo.toml declares
+`license = "MIT"`. That metadata contradicts this file and should be reconciled
+when the licensing decision is made. The crates are marked unpublishable
+(#463), so the metadata is not currently reaching a registry.

@@ -1,0 +1,57 @@
+services:
+  brain:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    init: true
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - CORTEX_PORT=3001
+      # The verification dispatcher refuses to start without this. One
+      # container, one dispatcher — see deploy/cortex-api.service.
+      - CORTEX_SINGLE_NODE=1
+      - CORTEX_DB_PATH=/data/cortex.db
+      # Uncomment and set these for BYOS (Bring Your Own Subscription) mode:
+      # - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      # - OPENAI_API_KEY=${OPENAI_API_KEY}
+    volumes:
+      - cortex-data:/data
+    networks:
+      - cortex
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:3001/api/health"]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"   # HTTP/3
+    volumes:
+      - ./Caddyfile.docker:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    networks:
+      - cortex
+    depends_on:
+      brain:
+        condition: service_healthy
+
+volumes:
+  cortex-data:
+  caddy-data:
+  caddy-config:
+
+networks:
+  cortex:

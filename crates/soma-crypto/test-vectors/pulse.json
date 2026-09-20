@@ -1,0 +1,32 @@
+{
+  "pulse_tree": {
+    "leaf_digests": [
+      {
+        "digest_hex": "03c8291faefe3e8cb24597725b59a3f1bb103e8777c6b59ef2c4db3a634c8fe1",
+        "index": 0,
+        "payload_hex": "0162697274682d7061796c6f6164",
+        "prev_root_hex": "0000000000000000000000000000000000000000000000000000000000000000",
+        "soma_balance": 1000,
+        "timestamp": 1716000000000
+      },
+      {
+        "digest_hex": "02267121dc3357fd20f9acf96a9f58db72aea96d7ab7e705d553fbb152259fcf",
+        "index": 1,
+        "payload_hex": "0273657373696f6e2d656e76656c6f7065",
+        "prev_root_hex": "03c8291faefe3e8cb24597725b59a3f1bb103e8777c6b59ef2c4db3a634c8fe1",
+        "soma_balance": 950,
+        "timestamp": 1716000060000
+      }
+    ],
+    "running_roots": [
+      {
+        "after_index": 0,
+        "root_hex": "03c8291faefe3e8cb24597725b59a3f1bb103e8777c6b59ef2c4db3a634c8fe1"
+      },
+      {
+        "after_index": 1,
+        "root_hex": "d73662b2f4932b28f48b281652cb2627d35674dc6def672feda4bd03120a5636"
+      }
+    ]
+  }
+}

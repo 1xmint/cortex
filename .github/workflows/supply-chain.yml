@@ -1,0 +1,73 @@
+# Dependency-review and cargo-deny were deleted from main; repo-level code
+# scanning is disabled. That left a Rust workspace handling Ed25519 signing,
+# JWTs and payments with no dependency gating of any kind, while the repo
+# carries 115 open vulnerability alerts.
+#
+# CodeQL is deliberately NOT restored here. The previous CodeQL workflow was
+# already failing when it was removed, and re-adding a red check that nobody
+# can action is how gates get ignored — the same failure mode as the `web` job
+# and the midnight-UTC flake. Restore it separately, once someone can watch the
+# first run. cargo-deny is the idiomatic dependency gate for Rust regardless.
+name: Supply chain
+
+on:
+  pull_request:
+    branches: [main]
+  schedule:
+    # Advisory databases move without our code changing, so also run weekly.
+    - cron: '17 6 * * 1'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: supply-chain-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # actions/dependency-review-action is NOT used here. It was tried and it
+  # cannot work on this repository:
+  #
+  #   "Dependency review is not supported on this repository. Please ensure
+  #    that Dependency graph is enabled along with GitHub Advanced Security"
+  #
+  # This repository has `code_security` disabled, so the action fails
+  # structurally on every PR rather than on any actual dependency problem.
+  # Enabling GHAS is a billing decision; until then, npm audit and cargo-deny
+  # cover the same ground without it.
+
+  # Advisory. Neither app has been audited, so the finding count is unknown and
+  # a blocking gate would be red on arrival — which is how the `web` job and the
+  # midnight flake taught this repo to ignore CI. Triage, then make it blocking.
+  # Triaged 2026-08-05 (task B2). Cortex is now BLOCKING: its high-severity
+  # findings were reviewed one by one, one was fixed, and the rest are recorded
+  # with a reason and a review date in .github/npm-audit-allowlist.json. An
+  # advisory nobody has justified fails the build; so does a justification
+  # nobody has revisited.
+  npm-audit:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        app: [cortex]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v5
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: ${{ matrix.app }}/package-lock.json
+      - name: npm audit gate
+        run: node scripts/npm-audit-gate.mjs ${{ matrix.app }} --level=high
+
+  # Blocking as of the B2 triage (2026-08-05). The first read was clean: no
+  # vulnerabilities, no unmaintained crates, no licence violations, no unknown
+  # sources. The only errors were wildcard path dependencies between our own
+  # crates, now allowed in deny.toml with the reasoning written down.
+  cargo-deny:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v5
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          command: check advisories bans sources

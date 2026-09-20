@@ -1,0 +1,22 @@
+[package]
+name = "cortex-context"
+version.workspace = true
+publish = false  # proprietary; never goes to crates.io
+edition.workspace = true
+license.workspace = true
+description = "Repo map and symbol graph — the context engine for Cortex planning"
+
+[dependencies]
+rusqlite.workspace = true
+serde.workspace = true
+sha2.workspace = true
+hex.workspace = true
+streaming-iterator = "0.1.9"
+tracing.workspace = true
+tree-sitter = "0.27.0"
+tree-sitter-javascript = "0.25.0"
+tree-sitter-rust = "0.24.2"
+tree-sitter-typescript = "0.23.2"
+
+[lints]
+workspace = true

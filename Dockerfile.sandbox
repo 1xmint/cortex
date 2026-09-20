@@ -1,0 +1,53 @@
+# The execution sandbox: where model-authored code runs.
+#
+# Distinct from Dockerfile.worker on purpose. The worker is a Cortex service —
+# it holds a brain token, talks to the API, and owns Git credentials. This image
+# holds none of that and never should: a sandbox that carries a provider key can
+# spend Cortex's money, and one that carries Git credentials can push.
+#
+# The runtime constraints are enforced by the caller, not by this file
+# (`crates/worker/src/sandbox/container.rs`): empty environment, one read-write
+# mount at /work, cap_drop ALL, no-new-privileges, read-only root, bounded
+# CPU/memory/pids, default-deny egress, and mandatory teardown. This image only
+# has to be a minimal, unprivileged place for those constraints to apply to.
+#
+# Build and publish by digest. The deployment supplies `name@sha256:…` in
+# CORTEX_SANDBOX_IMAGE; a mutable tag would make every past receipt
+# unreproducible the next time it moved. Enforcing that the configured value is
+# a digest is the signed runner registry's job (Phase 0.3), not this file's.
+
+FROM debian:bookworm-slim
+
+# git is needed because the workspace is a worktree.
+#
+# curl and netcat are here for two reasons, both deliberate. A real task
+# resolving a dependency needs an HTTP client, and the adversarial tests need to
+# open a socket from inside to prove the boundary holds — a boundary checked
+# only from outside is a boundary nobody tested.
+#
+# Neither widens anything. Egress is denied unless a capability grant and a
+# matching allowlist entry agree, and even then the only route off the network
+# is the mediator. A tool that can open a socket into a network with no route
+# out is a tool that can fail informatively.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates git curl netcat-openbsd \
+    && rm -rf /var/lib/apt/lists/*
+
+# The unprivileged user the runner runs as. The name is part of the contract
+# with `container.rs`, which sets `user: "sandbox"`.
+RUN groupadd --gid 2000 sandbox \
+    && useradd --uid 2000 --gid sandbox --no-create-home --shell /usr/sbin/nologin sandbox
+
+# The mount point. The directory exists so a bind mount lands somewhere
+# predictable; its contents come entirely from the mounted worktree.
+RUN mkdir -p /work && chown sandbox:sandbox /work
+
+# Provider CLIs are layered on top of this base in the published image. They are
+# deliberately not installed here: this file is what the adversarial tests build
+# and run, and those tests are about the boundary rather than about any provider.
+
+USER sandbox
+WORKDIR /work
+
+# No ENTRYPOINT. The command is supplied per job by the runner, which is what
+# makes the argv recordable on the receipt.

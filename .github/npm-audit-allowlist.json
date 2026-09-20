@@ -1,0 +1,24 @@
+{
+  "_comment": [
+    "Advisories we have looked at and chosen not to act on, per app.",
+    "Every entry needs a reason a reviewer can check and a review_by date.",
+    "An expired entry fails the build on purpose: an exception nobody has",
+    "revisited is an exception nobody is accountable for.",
+    "Enforced by scripts/npm-audit-gate.mjs."
+  ],
+
+  "cortex": {
+    "react-router": {
+      "advisory": "GHSA-qwww-vcr4-c8h2",
+      "severity": "high",
+      "reason": "RSC Mode CSRF bypass — the vulnerable surface is React Server Components with server actions. Cortex is a client-only Vite SPA using declarative <BrowserRouter> (App.tsx): no data router, no loaders or actions, no SSR, no RSC. The advisory's only fix is a downgrade to 7.11.0, which would trade a functional regression for a risk we do not carry. Re-evaluate if Cortex ever adopts framework mode or the data router.",
+      "review_by": "2026-11-05"
+    },
+    "react-router-dom": {
+      "advisory": "GHSA-qwww-vcr4-c8h2",
+      "severity": "high",
+      "reason": "Flagged only because it depends on react-router; same reasoning and same review date.",
+      "review_by": "2026-11-05"
+    }
+  }
+}

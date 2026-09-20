@@ -1,0 +1,15 @@
+cortex.heyvera.org {
+	# API and WebSocket — proxy everything to the Brain
+	reverse_proxy brain:3001 {
+		# WebSocket support (axum serves WS on upgrade)
+		header_up X-Forwarded-Proto {scheme}
+	}
+
+	# Security headers
+	header {
+		X-Content-Type-Options    nosniff
+		X-Frame-Options           DENY
+		Referrer-Policy           strict-origin-when-cross-origin
+		Strict-Transport-Security "max-age=63072000; includeSubDomains; preload"
+	}
+}

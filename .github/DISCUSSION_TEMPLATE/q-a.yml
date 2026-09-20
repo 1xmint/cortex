@@ -1,0 +1,21 @@
+title: "[Question] "
+labels:
+  - question
+body:
+  - type: textarea
+    id: question
+    attributes:
+      label: Question
+      description: Ask a focused question about the repo, architecture, or process.
+    validations:
+      required: true
+  - type: textarea
+    id: context
+    attributes:
+      label: Context
+      description: Include enough context so someone can answer well.
+  - type: textarea
+    id: attempted
+    attributes:
+      label: What have you checked already?
+      description: Docs, files, experiments, or assumptions you've already looked at.

@@ -1,0 +1,58 @@
+# Cortex — Caddy reverse proxy config
+# Deploy to /etc/caddy/Caddyfile on the Cortex host.
+#
+# SPA:  /var/www/cortex        (the Cortex frontend, built from cortex/)
+# API:  localhost:3001         (cortex-api, the only backend this file knows)
+#
+# This file used to carry five other sites — the HeyVera SPA, the Socials API,
+# Pulse, Radar and the ClawNet marketing site. They belong to the HeyVera
+# repository and were removed when Cortex became its own repository. If a
+# request for one of those arrives here it should 404, not be quietly proxied
+# somewhere; that is the point of not having a broad fallback.
+
+cortex.heyvera.org {
+	# API routes - MUST be first for priority.
+	#
+	# /v1 is listed route by route, not as /v1/*. The only two Cortex routes
+	# under it are health and ready; everything else that used to live there
+	# was Socials (/v1/social/*, /v1/pulse/*). Naming the two means a Socials
+	# URL is refused at the edge instead of travelling to a backend that no
+	# longer answers it.
+	#
+	# /metrics and /internal/provider/v1/messages are real routes and are
+	# deliberately NOT here. Prometheus scrapes over the private network and
+	# the provider endpoint is for the worker; neither belongs on the public
+	# hostname. Adding them would be a change in exposure, not a fix.
+	@api path /api/* /v1/health /v1/ready
+	handle @api {
+		reverse_proxy localhost:3001 {
+			header_up Host {upstream_hostport}
+			header_up X-Real-IP {remote}
+			header_up X-Forwarded-For {remote}
+			header_up X-Forwarded-Proto {scheme}
+		}
+	}
+
+	# Static assets with caching
+	@assets path /assets/*
+	handle @assets {
+		root * /var/www/cortex
+		file_server
+		header Cache-Control "public, max-age=31536000, immutable"
+	}
+
+	# SPA fallback for all other requests
+	handle {
+		root * /var/www/cortex
+		try_files {path} /index.html
+		file_server
+		header Cache-Control "no-cache, no-store, must-revalidate"
+	}
+
+	# Security headers
+	header {
+		X-Content-Type-Options nosniff
+		X-Frame-Options DENY
+		Referrer-Policy strict-origin-when-cross-origin
+	}
+}

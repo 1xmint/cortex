@@ -1,0 +1,37 @@
+node_modules/
+dist/
+data/
+.env
+*.log
+*.tsbuildinfo
+web/vite.config.d.ts
+web/vite.config.js
+.DS_Store
+.replit-tools/
+
+# Dual-brain / orchestrator (retired)
+.claude/
+.dual-brain/
+dual-brain/
+packages/dual-brain/
+cortex/.dual-brain/
+.cache/claude-cli-nodejs/
+
+# Runtime state — never commit. A tracked database is reverted by `git reset
+# --hard` during deploy, so committing one turns every deploy into data loss.
+.cortex/
+cortex/.cortex/
+*.db
+*.db-shm
+*.db-wal
+
+# Added by cargo
+/target
+
+target-gnullvm/
+target-msvc/
+
+# A verbatim node_modules tree that escaped the `node_modules/` rule above by
+# being renamed. 6,290 files / 145 MB — 89% of this repo's bytes — under a
+# directory README.md marks "reference only, do not build from".
+archive/root-node-modules/

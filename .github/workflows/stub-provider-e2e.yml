@@ -1,0 +1,190 @@
+# The chain either side of a provider call, at zero API cost.
+#
+# `live-model.yml` is the one job in this repository that spends money. This is
+# its cheap twin, and the two are deliberately near-identical: same steps, same
+# images built from the tree, same receipt printed at the end. The single
+# difference is which executable answers to the name `claude` inside the
+# sandbox.
+#
+# It exists because every finding to date -- F0, F9, F10, F11, F12 -- lived in
+# the wiring around the model call and not in the model call. Wiring bugs do not
+# need a model to reproduce, and paying for one to watch them reproduce is a bad
+# trade. So this runs the whole chain -- scheduler, lease, sandbox, argv,
+# stdout framing, diff extraction, frozen checks, verdict, receipt -- against a
+# scripted provider, twice, in both directions.
+#
+# WHAT A GREEN RUN HERE DOES NOT MEAN
+#
+# It does not mean Cortex completed a task. No model was consulted. Nothing
+# produced by this workflow may be cited as evidence of task completion; that
+# claim belongs to `live-model.yml` and to nothing else. The artifact name, the
+# receipt body and the job summary all say so, because a log gets quoted out of
+# its surroundings and the disclaimer has to survive the quoting.
+#
+# Unlike `live-model.yml` this is safe to run on a pull request. It is
+# `workflow_dispatch` anyway, for now: it builds four images and runs cargo in a
+# container twice, so it is slow rather than expensive, and #548 is still
+# measuring what the post-merge burn actually is.
+
+name: stub provider e2e
+
+on:
+  workflow_dispatch:
+    inputs:
+      reason:
+        description: "Why this run is being made (recorded in the log)"
+        required: false
+        default: "wave 6 / task 4 — exercise the wiring with a stubbed provider"
+
+concurrency:
+  group: stub-provider-e2e
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  stub-provider-e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      CARGO_TERM_COLOR: always
+      SANDBOX_BASE: cortex/sandbox:base
+      SANDBOX_IMAGE: cortex/sandbox:STUBBED
+      EGRESS_IMAGE: cortex/egress:STUBBED
+      RUNNER_IMAGE: cortex/runner:STUBBED
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v5
+
+      # The inverse of live-model.yml's first step, and the reason this job is
+      # safe to run freely.
+      #
+      # There, a missing credential is fatal because the claim is "a model ran".
+      # Here, a PRESENT credential is fatal because the claim is "nothing was
+      # spent". A job that quietly held a live key while reporting zero cost
+      # would be the same class of untrue-but-green this repository keeps
+      # finding, pointed at the billing statement.
+      - name: Refuse to run beside a real provider credential
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          if [ -n "${ANTHROPIC_API_KEY}" ]; then
+            echo "::error::ANTHROPIC_API_KEY is present in this job's environment."
+            echo "This workflow asserts zero API cost. It will not run while a"
+            echo "spendable credential is in scope -- not because the stub would"
+            echo "use it, but because 'nothing was spent' must not be a claim"
+            echo "anyone has to verify by reading a Dockerfile."
+            exit 1
+          fi
+          echo "no provider credential in scope; zero API cost is structural"
+          echo "reason: ${{ inputs.reason }}"
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install 1.97.1 --profile minimal
+          rustup default 1.97.1
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      # Built from the tree, not pulled, for the same reason live-model.yml
+      # builds its own: the run should check the code it is running against.
+      - name: Build the sandbox base image
+        run: docker build -f Dockerfile.sandbox -t "$SANDBOX_BASE" .
+
+      # This build is itself an assertion. Dockerfile.sandbox-stub ends with a
+      # smoke test that hands the stub a real-looking key and requires exit 64.
+      # If the refusal guard is ever removed, this step fails here rather than
+      # the stub silently becoming usable as a drop-in provider.
+      - name: Build the STUBBED sandbox image (and prove it refuses a credential)
+        run: |
+          docker build -f Dockerfile.sandbox-stub \
+            --build-arg BASE="$SANDBOX_BASE" \
+            -t "$SANDBOX_IMAGE" .
+
+      - name: Build the egress mediator image
+        run: docker build -f Dockerfile.egress -t "$EGRESS_IMAGE" .
+
+      - name: Build the check runner image
+        run: docker build -f Dockerfile.runner -t "$RUNNER_IMAGE" .
+
+      - name: One task, end to end, both directions, no model
+        id: stub
+        env:
+          CORTEX_STUB_PROVIDER_IT: "1"
+          CORTEX_SANDBOX_IMAGE: cortex/sandbox:STUBBED
+          CORTEX_EGRESS_IMAGE: cortex/egress:STUBBED
+          CORTEX_RUNNER_IMAGE: cortex/runner:STUBBED
+          CORTEX_SINGLE_NODE: "1"
+          # The sentinel non-key. It authenticates nothing; the stub refuses to
+          # run without exactly this value, and refuses to run with a real one.
+          ANTHROPIC_API_KEY: STUB-PROVIDER-NOT-A-REAL-KEY
+        run: |
+          set -euo pipefail
+          cargo test -p cortex-api --locked --test step_end_to_end \
+            a_stubbed_provider_drives_one_task_to_a_verdict_in_both_directions \
+            -- --nocapture --exact 2>&1 | tee stub-provider.log
+
+      # A gated test passes when it skips, because a skip is a return. That is
+      # the right shape for the test and the wrong shape for a claim, so the
+      # claim is checked separately -- the same hole live-model.yml closes.
+      #
+      # Both directions are checked by name. A run that produced only the green
+      # half would satisfy "the test passed" while proving the weaker thing.
+      - name: Prove both directions actually ran
+        run: |
+          set -euo pipefail
+          if grep -q "SKIPPED: a_stubbed_provider_drives_one_task" stub-provider.log; then
+            echo "::error::the stubbed test skipped; nothing was exercised."
+            exit 1
+          fi
+          if ! grep -qE '^test a_stubbed_provider_drives_one_task_to_a_verdict_in_both_directions \.\.\. ok' stub-provider.log; then
+            echo "::error::the stubbed test did not run to a pass."
+            exit 1
+          fi
+          for direction in PASS FAIL; do
+            if ! grep -q "STUBBED RECEIPT (${direction})" stub-provider.log; then
+              echo "::error::no receipt printed for the ${direction} direction."
+              echo "A pipeline that only produces green has not been tested."
+              exit 1
+            fi
+          done
+          # The third direction asserts the opposite, so it is checked for the
+          # opposite: NOOP delivers nothing, and a receipt for it would mean the
+          # verifier graded a tree the worker never delivered.
+          #
+          # Two fixed strings rather than one pattern spanning them: the line
+          # between them carries an em dash, and a `.` wildcard matches one byte
+          # of a three-byte character.
+          if ! grep -qF "STUBBED RECEIPT (NOOP)" stub-provider.log ||
+             ! grep -qF "Nothing was delivered" stub-provider.log; then
+            echo "::error::the NOOP direction did not report an absent receipt."
+            echo "A step that delivered nothing must not be graded."
+            exit 1
+          fi
+          echo "a passing and a failing diff were graded; a no-op diff was not"
+
+      # Say it in the job summary too. The log is where this gets quoted from,
+      # and the artifact name is where it gets filed under.
+      - name: Record what this run does not prove
+        if: always()
+        run: |
+          {
+            echo "### Stubbed provider run"
+            echo
+            echo "**No model was consulted.** This job exercises the wiring either"
+            echo "side of a provider call with a scripted stub."
+            echo
+            echo "It is **not** evidence that Cortex completed a task. That claim"
+            echo "belongs to \`live-model.yml\` and to nothing else."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the stubbed receipts
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          # Named so it cannot be filed beside live-model-receipt and mistaken
+          # for it later.
+          name: STUBBED-NOT-EVIDENCE-of-task-completion
+          path: stub-provider.log
+          retention-days: 30

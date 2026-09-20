@@ -1,0 +1,20 @@
+{
+  "blake3": [
+    {
+      "input_hex": "736f6d612070726f746f636f6c",
+      "output_hex": "87d17b21ec4e4e21bcbb8d2a84efc58b51cdea3533efec3c332a53f95b1ab9c2"
+    },
+    {
+      "input_hex": "",
+      "output_hex": "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262"
+    }
+  ],
+  "blake3_kdf": [
+    {
+      "context": "soma.heart.sign.v1",
+      "key_hex": "726f6f742d7365637265742d6d6174657269616c2d666f722d74657374696e67",
+      "output_hex": "4e6ce313047886f7704280fee4852c39cbc0ba31666d3d9b7cfa2a0e7328d677",
+      "output_len": 32
+    }
+  ]
+}

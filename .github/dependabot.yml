@@ -1,0 +1,98 @@
+# Previously this file targeted npm at `/` and `/dashboard`. Neither exists —
+# there is no root package.json and no dashboard directory — so both scheduled
+# jobs failed every day, and the app (cortex) plus the whole
+# Rust workspace got no scheduled updates at all.
+#
+# Note that repo-level "Dependabot security updates" scans every manifest in the
+# tree regardless of what is configured here. The archive/ directory that used
+# to generate a flood of those — 357 package.json files under a tree nobody
+# built from — was deleted with the Socials split.
+#
+# Schedule is MONTHLY, not weekly, and that is a cost decision with a stated
+# tradeoff.
+#
+# Weekly across four ecosystems produced faster than they were merged: seven
+# sat open simultaneously, every one of them BEHIND, because `main` is
+# protected with `strict: true` and each merge invalidates every other open
+# PR. Each one then costs a branch update plus a full CI run to recover. The
+# backlog was not a review problem, it was an arrival-rate problem.
+#
+# What this gives up: a non-security dependency update may now wait up to a
+# month. That is acceptable because it is NOT the security path — repo-level
+# Dependabot *security* updates are a separate setting and are unaffected by
+# this interval, and `cargo-deny` plus `npm-audit (cortex)` and
+# `npm-audit (cortex)` is a required check, so an advisory blocks merges
+# regardless of when a bump PR happens to arrive.
+#
+# Grouping is deliberately unchanged. See the notes on each group below.
+version: 2
+updates:
+  - package-ecosystem: npm
+    directory: /cortex
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 5
+    groups:
+      cortex-npm:
+        patterns:
+          - "*"
+    ignore:
+      # TypeScript 7 is ahead of the linter. `typescript-eslint` peers on
+      # `typescript >=4.8.4 <6.1.0` on every published stable release, so a
+      # bump to 7.x makes `npm ci` fail ERESOLVE before a single file is
+      # compiled — which is exactly how PR #427 broke the required `cortex`
+      # check. Lift this the day typescript-eslint widens its peer range.
+      - dependency-name: typescript
+        versions: [">=7.0.0"]
+
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 5
+    groups:
+      # Minor and patch only. A major arrives as its own PR, ungrouped.
+      #
+      # This grouping used to be `patterns: ["*"]` with no update-type split,
+      # and PR #499 is what that produces: twenty-eight crates in one branch,
+      # fifteen of them major, welded to thirteen harmless ones. It could not
+      # compile — bollard 0.18 -> 0.21 moved half its module tree — so none of
+      # the safe bumps could land either, and the review it needed was a
+      # 3,900-line diff spanning a web framework arriving through Sentry and
+      # five RustCrypto majors.
+      #
+      # The rule was already written in this file for rusqlite: "upgrade these
+      # deliberately, in their own PR, where the diff is reviewable." It just
+      # applied to one crate. It applies to all of them now.
+      cargo:
+        patterns:
+          - "*"
+        update-types:
+          - minor
+          - patch
+    ignore:
+      # Both need a code migration, and grouping them with thirty-odd harmless
+      # bumps means none of the group can land — including security fixes.
+      # Ignoring the majors here is not "never upgrade": it is "upgrade these
+      # deliberately, in their own PR, where the diff is reviewable".
+      #
+      # rand's ignore is lifted: the 0.10 migration landed deliberately in
+      # #474, and key generation no longer goes through rand_core, so a future
+      # rand major cannot reach the crypto path the way this one did.
+      #
+      # rusqlite 0.35 -> 0.40 spans several breaking releases and every
+      # database call site in the workspace goes through it.
+      - dependency-name: rusqlite
+        update-types: ["version-update:semver-major"]
+
+  # Grouped so action bumps arrive as one PR. Ungrouped, this produced five
+  # separate stale branches that were never merged.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 5
+    groups:
+      github-actions:
+        patterns:
+          - "*"

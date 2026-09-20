@@ -1,0 +1,85 @@
+[workspace]
+members = [
+    "crates/core",
+    "crates/engine",
+    "crates/api",
+    "crates/worker",
+    "crates/soma",
+    "crates/soma-crypto",
+    "crates/soma-core",
+    "crates/tui",
+    "crates/cortex-server",
+    "crates/context",
+    "crates/egress",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+# Clippy runs as a required check with `-D warnings`, so everything not named
+# here is an error. This list is the "or allow" half of "fix or allow", and each
+# entry says why rather than just silencing a number.
+#
+# Add to it only with a reason. A lint allowed because nobody wanted to read it
+# is how the gate stops meaning anything, which is the failure mode this file
+# exists to avoid.
+[workspace.lints.clippy]
+# ~17 sites, all the same guarded pagination shape in the Socials code:
+# `if a.is_some() && b.is_some() { … a.unwrap() … }`. Provably safe, and
+# rewriting them is a large diff in the other product lane. Worth doing when
+# that lane is next open; not worth a blind sweep from here.
+unnecessary_unwrap = "allow"
+# Inherent `from_str` methods that predate any `FromStr` impl. Renaming seven
+# call sites to satisfy a naming lint buys nothing.
+should_implement_trait = "allow"
+# The executor and verifier entry points genuinely carry this many parameters,
+# and one already has an explicit `#[allow]` with its own reasoning. Grouping
+# them into structs is a refactor with its own risk, not a lint fix.
+too_many_arguments = "allow"
+# Both want the same remedy — boxing an error or a large variant — which
+# changes public signatures across crates. Deliberately deferred rather than
+# done under a lint sweep.
+result_large_err = "allow"
+large_enum_variant = "allow"
+# One site, a `std::sync::Mutex` used to serialise tests that share mock state.
+# The guard is held across an await on purpose; an async mutex there would let
+# the tests interleave, which is the thing being prevented.
+await_holding_lock = "allow"
+# One site: a `timeout(...)` wrapped around a stream read, then a match on the
+# message inside it. Collapsing the two reads as one pattern hides that the
+# outer arm is about the timeout and the inner one about the message.
+collapsible_match = "allow"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+anyhow = "1"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "registry"] }
+tokio = { version = "1", features = ["full"] }
+axum = { version = "0.8", features = ["ws"] }
+tower = "0.5"
+tower-http = { version = "0.7", features = ["cors", "fs"] }
+futures-core = "0.3"
+tokio-stream = "0.1"
+jsonwebtoken = "11.0"
+reqwest = { version = "0.12", features = ["json", "rustls-tls", "stream"], default-features = false }
+aes-gcm = "0.10"
+rand = "0.10"
+rusqlite = { version = "0.35", features = ["bundled"] }
+ed25519-dalek = { version = "3", features = ["rand_core"] }
+sha2 = "0.11"
+hmac = "0.13"
+base64 = "0.23"
+hex = "0.4"
+async-stream = "0.3"
+futures-util = "0.3"
+prometheus = "0.14"
+once_cell = "1"
+tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }

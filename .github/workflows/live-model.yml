@@ -1,0 +1,155 @@
+# The one job in this repository that spends money.
+#
+# It runs the whole chain against a live provider: a step dispatched, leased,
+# sandboxed, granted egress, framed with context, handed to a real model, and
+# the diff it produces graded by checks Cortex executes itself. Until this
+# passes, "Cortex can complete a task" is unproven — no other job here covers
+# a model producing a diff, and the checkpoint says so.
+#
+# `workflow_dispatch` only, deliberately. It is not on push, not on pull
+# request, and not on a schedule:
+#
+# - It costs a provider call per run, and a spend decision is Josh's, not a
+#   side effect of opening a pull request.
+# - It needs a provider credential in CI. ADR-0004's mitigation is a
+#   shortest-lived, narrowest-scoped key with a spend cap on the key itself.
+#   The fewer contexts that key is handed to, the smaller that decision is.
+#
+# So this is a button somebody presses, and the receipt it prints is the
+# evidence.
+
+name: live model
+
+on:
+  workflow_dispatch:
+    inputs:
+      reason:
+        description: "Why this run is being spent (recorded in the log)"
+        required: false
+        default: "wave 5 — prove Cortex can complete a task"
+
+# One at a time. Two concurrent runs would double the spend and race for the
+# same Docker daemon.
+concurrency:
+  group: live-model
+  cancel-in-progress: false
+
+jobs:
+  live-model:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      CARGO_TERM_COLOR: always
+      SANDBOX_BASE: cortex/sandbox:base
+      SANDBOX_IMAGE: cortex/sandbox:live
+      EGRESS_IMAGE: cortex/egress:live
+      RUNNER_IMAGE: cortex/runner:live
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v5
+
+      # First, and hard. A missing credential must stop the job here, with a
+      # message naming the fix — not thirty minutes later inside a container,
+      # and never as a skip. A green run of this workflow has to mean a model
+      # ran.
+      - name: Require the provider credential
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          if [ -z "${ANTHROPIC_API_KEY}" ]; then
+            echo "::error::ANTHROPIC_API_KEY is not set for this repository."
+            echo "This workflow exists to prove a model was invoked; without a"
+            echo "key it can only report a pass over nothing, which is the"
+            echo "failure mode it was written to prevent."
+            echo ""
+            echo "Add a scoped key per ADR-0004: shortest-lived, narrowest"
+            echo "scope, with a spend cap on the key itself."
+            exit 1
+          fi
+          echo "provider credential present"
+          echo "reason: ${{ inputs.reason }}"
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install 1.97.1 --profile minimal
+          rustup default 1.97.1
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      # Built here rather than pulled, so the run checks the tree it is running
+      # against and not whatever was last published.
+      - name: Build the sandbox base image
+        run: docker build -f Dockerfile.sandbox -t "$SANDBOX_BASE" .
+
+      - name: Build the sandbox image with the provider CLI
+        run: |
+          docker build -f Dockerfile.sandbox-provider \
+            --build-arg BASE="$SANDBOX_BASE" \
+            -t "$SANDBOX_IMAGE" .
+
+      - name: Build the egress mediator image
+        run: docker build -f Dockerfile.egress -t "$EGRESS_IMAGE" .
+
+      - name: Build the check runner image
+        run: docker build -f Dockerfile.runner -t "$RUNNER_IMAGE" .
+
+      - name: One task, end to end, against a real model
+        id: live
+        env:
+          CORTEX_LIVE_MODEL_IT: "1"
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          CORTEX_SANDBOX_IMAGE: cortex/sandbox:live
+          CORTEX_EGRESS_IMAGE: cortex/egress:live
+          CORTEX_RUNNER_IMAGE: cortex/runner:live
+          CORTEX_SINGLE_NODE: "1"
+        run: |
+          set -euo pipefail
+          cargo test -p cortex-api --locked --test step_end_to_end \
+            cortex_completes_one_real_task_end_to_end -- --nocapture --exact \
+            2>&1 | tee live-model.log
+
+      # The step above passes when the test is skipped, because a skip is a
+      # return rather than a failure — that is the correct shape for a gated
+      # test and the wrong shape for a claim. So the claim is checked here.
+      #
+      # Both directions, because each alone has a hole: the banner can be
+      # absent because the test was filtered out entirely, and the `ok` line
+      # appears whether or not the body ran.
+      - name: Prove a model was actually invoked
+        run: |
+          set -euo pipefail
+          if grep -q "SKIPPED: cortex_completes_one_real_task_end_to_end" live-model.log; then
+            echo "::error::the live test skipped. This workflow reports a model"
+            echo "invocation; it did not happen, and a pass here would be the"
+            echo "third check to report green while covering nothing."
+            exit 1
+          fi
+          if ! grep -qE '^test cortex_completes_one_real_task_end_to_end \.\.\. ok' live-model.log; then
+            echo "::error::the live test did not run to a pass."
+            exit 1
+          fi
+          if ! grep -q "RECEIPT — the first task Cortex has completed" live-model.log; then
+            echo "::error::no receipt was printed, so there is no evidence to keep."
+            exit 1
+          fi
+          echo "a model was invoked, the diff was graded, and a receipt exists"
+
+      # The evidence. Kept as an artifact because the checkpoint quotes it, and
+      # a quote should come from a run rather than from a summary somebody
+      # wrote afterwards.
+      #
+      # 90 days is deliberate and is NOT the repository default — the default was
+      # lowered to 14 days, and this step overrides it upwards on purpose. This
+      # workflow is workflow_dispatch-only because it spends money on a provider
+      # call, so it runs rarely and its output is a single small log. Losing the
+      # receipt of the one run that proved Cortex can complete a task, because a
+      # retention sweep aimed at 60 MB of screenshots caught it, would be the
+      # expensive mistake here. The artifact is kilobytes; the run it documents
+      # is not repeatable for free.
+      - name: Upload the receipt
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: live-model-receipt
+          path: live-model.log
+          retention-days: 90

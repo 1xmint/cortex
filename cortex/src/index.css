@@ -1,0 +1,334 @@
+@import "tailwindcss";
+
+/*
+ * Cortex design tokens — one color system, dark-first.
+ *
+ * Semantics, not swatches: components reference roles (--surface, --line,
+ * --ok) so a theme is a token block, never a component edit. The light block
+ * below overrides the same roles; mission-control surfaces are written
+ * against tokens and work in both. The chat doorway (pane six) still carries
+ * BYOK-era hardcoded colors and remains dark until its own rewrite.
+ */
+:root {
+  color-scheme: dark;
+  /* Base */
+  --bg: #0d0f0f;
+  --panel: #141717;
+  --composer: #1a1e1e;
+  --assistant-bubble: #191d1d;
+  --user-bubble: #2d3a37;
+  --accent: #9cc7b8;
+  --accent-soft: #263c36;
+  --fg: #f2f4f3;
+  --muted-strong: #c8d0cc;
+  --muted: #8f9a96;
+  --focus-ring: #b9d8cc;
+  /* Surfaces & hairlines */
+  --surface: rgba(255, 255, 255, 0.02);
+  --surface-raised: rgba(255, 255, 255, 0.045);
+  --surface-hover: rgba(255, 255, 255, 0.06);
+  --surface-active: rgba(255, 255, 255, 0.09);
+  --inset: rgba(0, 0, 0, 0.3);
+  --line: rgba(255, 255, 255, 0.08);
+  --line-faint: rgba(255, 255, 255, 0.05);
+  --line-strong: rgba(255, 255, 255, 0.14);
+  /* Status — the one vocabulary for pass/fail/pending across all panes */
+  --ok: #34d399;
+  --ok-strong: #6ee7b7;
+  --ok-soft: rgba(52, 211, 153, 0.12);
+  --ok-line: rgba(52, 211, 153, 0.28);
+  --err: #f87171;
+  --err-strong: #fca5a5;
+  --err-soft: rgba(248, 113, 113, 0.12);
+  --err-line: rgba(248, 113, 113, 0.28);
+  --warn: #fbbf24;
+  --warn-strong: #fcd34d;
+  --warn-soft: rgba(251, 191, 36, 0.12);
+  --warn-line: rgba(251, 191, 36, 0.28);
+  --info: #7dd3fc;
+  --info-soft: rgba(125, 211, 252, 0.12);
+  /* Type */
+  --font-mono: "Berkeley Mono", "JetBrains Mono", "Cascadia Code", ui-monospace,
+    SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+:root[data-theme="light"] {
+  color-scheme: light;
+  --bg: #f4f6f5;
+  --panel: #ffffff;
+  --composer: #ffffff;
+  --assistant-bubble: #eef1f0;
+  --user-bubble: #dbe8e3;
+  --accent: #2c6e5a;
+  --accent-soft: #d7e8e1;
+  --fg: #17201d;
+  --muted-strong: #3d4a45;
+  --muted: #64716c;
+  --focus-ring: #2c6e5a;
+  --surface: rgba(15, 30, 25, 0.025);
+  --surface-raised: rgba(15, 30, 25, 0.05);
+  --surface-hover: rgba(15, 30, 25, 0.07);
+  --surface-active: rgba(15, 30, 25, 0.1);
+  --inset: rgba(15, 30, 25, 0.06);
+  --line: rgba(15, 30, 25, 0.12);
+  --line-faint: rgba(15, 30, 25, 0.07);
+  --line-strong: rgba(15, 30, 25, 0.2);
+  --ok: #047857;
+  --ok-strong: #065f46;
+  --ok-soft: rgba(4, 120, 87, 0.1);
+  --ok-line: rgba(4, 120, 87, 0.3);
+  --err: #b91c1c;
+  --err-strong: #991b1b;
+  --err-soft: rgba(185, 28, 28, 0.08);
+  --err-line: rgba(185, 28, 28, 0.3);
+  --warn: #a16207;
+  --warn-strong: #854d0e;
+  --warn-soft: rgba(161, 98, 7, 0.1);
+  --warn-line: rgba(161, 98, 7, 0.3);
+  --info: #0369a1;
+  --info-soft: rgba(3, 105, 161, 0.08);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  min-height: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font-family:
+    Inter,
+    system-ui,
+    -apple-system,
+    BlinkMacSystemFont,
+    "Segoe UI",
+    sans-serif;
+}
+
+body.cortex-resizing {
+  cursor: col-resize;
+  user-select: none;
+}
+
+button,
+textarea,
+input {
+  font: inherit;
+}
+
+button,
+a,
+input,
+textarea,
+select,
+[role="button"] {
+  -webkit-tap-highlight-color: transparent;
+}
+
+:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
+}
+
+::selection {
+  background: rgba(185, 201, 143, 0.35);
+}
+
+/*
+ * Mission-control type scale. Four sizes, no ad-hoc values:
+ * pane-title 14/600 · body 13 · meta 12 · micro 11 (labels, uppercase).
+ * Check output and identifiers are always mono.
+ */
+.t-title {
+  font-size: 0.875rem;
+  font-weight: 600;
+  color: var(--fg);
+}
+
+.t-body {
+  font-size: 0.8125rem;
+  line-height: 1.45;
+}
+
+.t-meta {
+  font-size: 0.75rem;
+  line-height: 1.4;
+}
+
+.t-micro {
+  font-size: 0.6875rem;
+  line-height: 1.35;
+}
+
+.t-label {
+  font-size: 0.6875rem;
+  font-weight: 500;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.t-mono {
+  font-family: var(--font-mono);
+  font-variant-ligatures: none;
+}
+
+.glass {
+  background: rgba(20, 23, 23, 0.7);
+  backdrop-filter: blur(16px);
+  border: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+.glass-strong {
+  background: rgba(20, 23, 23, 0.85);
+  backdrop-filter: blur(24px);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+@media (max-width: 1023px) {
+  .task-manager-panels {
+    grid-template-columns: 1fr !important;
+  }
+}
+
+@media (min-width: 1800px) {
+  :root {
+    --panel: #121616;
+  }
+}
+
+@media (pointer: coarse) {
+  button,
+  [role="button"] {
+    min-height: 36px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    scroll-behavior: auto !important;
+    transition-duration: 0.001ms !important;
+  }
+}
+
+@media (prefers-contrast: more) {
+  :root {
+    --bg: #050606;
+    --panel: #101414;
+    --composer: #111818;
+    --accent: #c7f3df;
+    --fg: #ffffff;
+    --muted-strong: #e0e9e5;
+    --muted: #b8c5bf;
+    --focus-ring: #ffffff;
+  }
+}
+
+/* Micro-animations */
+@keyframes fade-in {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes scale-in {
+  from {
+    transform: scale(0.95);
+    opacity: 0;
+  }
+  to {
+    transform: scale(1);
+    opacity: 1;
+  }
+}
+
+@keyframes slide-up {
+  from {
+    transform: translateY(16px);
+    opacity: 0;
+  }
+  to {
+    transform: translateY(0);
+    opacity: 1;
+  }
+}
+
+.animate-fade-in {
+  animation: fade-in 300ms ease-out both;
+}
+
+.animate-scale-in {
+  animation: scale-in 200ms ease-out both;
+}
+
+.animate-slide-up {
+  animation: slide-up 300ms ease-out both;
+}
+
+.btn-primary {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.5rem;
+  border-radius: 0.75rem;
+  background: linear-gradient(135deg, var(--accent), #7fb7a4);
+  color: #06100d;
+  font-weight: 600;
+  box-shadow: 0 10px 24px rgba(156, 199, 184, 0.16), inset 0 1px 0 rgba(255, 255, 255, 0.22);
+  transition: transform 150ms ease, filter 150ms ease, box-shadow 150ms ease;
+}
+
+.btn-primary:hover:not(:disabled) {
+  filter: brightness(1.08);
+  box-shadow: 0 14px 30px rgba(156, 199, 184, 0.22), inset 0 1px 0 rgba(255, 255, 255, 0.28);
+}
+
+.btn-primary:active:not(:disabled) {
+  transform: scale(0.98);
+}
+
+.btn-primary:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
+.btn-secondary {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.5rem;
+  border-radius: 0.75rem;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  background: transparent;
+  color: var(--fg);
+  transition: background-color 150ms ease, border-color 150ms ease, transform 150ms ease;
+}
+
+.btn-secondary:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.05);
+}
+
+.btn-secondary:active:not(:disabled) {
+  transform: scale(0.98);
+}
+
+.btn-secondary:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}

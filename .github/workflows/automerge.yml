@@ -1,0 +1,77 @@
+name: Auto-merge
+
+# Arms GitHub's auto-merge on every pull request. GitHub then merges it only
+# once the required status checks on the protected branch pass; if they fail,
+# the PR simply sits there. Nothing here bypasses a check.
+#
+# The checks are therefore the only thing standing between a change and main.
+# That is why the hollow CI jobs had to be deleted before this workflow was
+# allowed to exist: a required check that always reports green is not a gate,
+# and automating merges on top of one automates merging unverified code.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: automerge-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  arm:
+    runs-on: ubuntu-latest
+    # Draft PRs are an explicit statement that the author is not finished.
+    if: github.event.pull_request.draft == false
+    steps:
+      - name: Enable auto-merge
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR: ${{ github.event.pull_request.html_url }}
+        # Squash keeps main readable: one commit per pull request.
+        #
+        # This step used to end in `|| echo "could not arm auto-merge"`, which
+        # made every outcome a success. Observed on PR #545: GitHub's GraphQL
+        # API returned 503, `gh pr merge --auto` failed, the echo swallowed it,
+        # the job reported green, and the pull request sat green-but-open with
+        # nobody looking because the merge automation said it had run.
+        #
+        # That is the same defect shape as the deleted `web` job — a step that
+        # cannot fail is not a step — and it sits on the merge path, so it is
+        # worse. It now retries with backoff and FAILS if it cannot arm.
+        #
+        # The original comment's reasoning still holds for one case, and only
+        # one: a PR that GitHub *refuses* to arm (conflicts, or a protection
+        # rule forbidding auto-merge) should stay open for a human rather than
+        # fail the build. That case is distinguished by its message and exits 0.
+        # A transport failure is not that case.
+        run: |
+          set -uo pipefail
+          for attempt in 1 2 3 4 5; do
+            out=$(gh pr merge --auto --squash "$PR" 2>&1) && {
+              echo "auto-merge armed on attempt ${attempt}"
+              exit 0
+            }
+            echo "attempt ${attempt} failed: ${out}"
+
+            # A refusal is a decision, not a fault. Retrying will not change it,
+            # and the pull request should be left open for a person.
+            case "$out" in
+              *"not mergeable"* | *"does not allow"* | *"not enabled"* | *"not allowed"*)
+                echo "::notice::auto-merge was refused, not unavailable; leaving the pull request open for a human"
+                exit 0
+                ;;
+            esac
+
+            if [ "$attempt" -lt 5 ]; then
+              delay=$((attempt * attempt * 5))
+              echo "retrying in ${delay}s"
+              sleep "$delay"
+            fi
+          done
+
+          echo "::error::could not arm auto-merge after 5 attempts. The pull request is NOT armed and will not merge on its own."
+          exit 1

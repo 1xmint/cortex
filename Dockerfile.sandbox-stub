@@ -1,0 +1,81 @@
+# The execution sandbox with a STUB standing in for the provider CLI.
+#
+# THIS IMAGE CONTAINS NO MODEL AND NO PROVIDER. Nothing built from it can be
+# cited as evidence that Cortex completed a task. It exists to exercise the
+# wiring either side of the provider call -- scheduler, lease, sandbox, argv,
+# stdout framing, diff extraction, frozen checks, verdict, receipt -- at zero
+# API cost, because every finding to date (F0, F9, F10, F11, F12) lived in that
+# wiring and not in the model call.
+#
+# It is the exact peer of `Dockerfile.sandbox-provider`: same base, same user,
+# same /scratch, same absence of an ENTRYPOINT. The only difference is which
+# executable answers to the name `claude`. That symmetry is the point -- a stub
+# that ran in a friendlier image would prove things about the friendlier image.
+#
+#   docker build -f Dockerfile.sandbox      -t cortex/sandbox:base .
+#   docker build -f Dockerfile.sandbox-stub -t cortex/sandbox:STUBBED \
+#     --build-arg BASE=cortex/sandbox:base .
+#
+# The tag is shouted for a reason. `CORTEX_SANDBOX_IMAGE` appears in logs and in
+# the execution job, so an operator skimming output sees STUBBED rather than
+# something that reads like a release tag.
+
+ARG BASE=cortex/sandbox:base
+FROM ${BASE}
+
+USER root
+
+# Deliberately NOT installed: node, npm, any real CLI, any network client
+# beyond what the base already carries. The stub is a shell script, so this
+# image is strictly smaller in capability than the provider image. A stub that
+# needed a JavaScript runtime would be a second thing to trust.
+COPY testing/stub-provider/claude /usr/local/bin/claude
+RUN chmod 0755 /usr/local/bin/claude
+
+# ---------------------------------------------------------------------------
+# NO Rust toolchain here, and its absence is now load-bearing.
+#
+# This image used to install cargo, solely to get past F13: the worker read
+# CORTEX_SANDBOX_IMAGE for its own required checks, so they ran inside this
+# sandbox image, found no toolchain, exited 127, and -- while the auto-commit
+# was still gated on them -- suppressed delivery entirely.
+#
+# Both halves of that are fixed. The worker now runs its required checks in the
+# check-runner image (`check_runner_image()`, CORTEX_RUNNER_IMAGE) which is
+# built from `Dockerfile.runner` and does carry a toolchain, and the checks no
+# longer gate the commit at all (F14).
+#
+# So this image is once again the exact peer of `Dockerfile.sandbox-provider`,
+# differing only in which executable answers to the name `claude`, which is the
+# symmetry the header claims. It is also the assertion: if the stubbed run
+# still reaches a verdict and a receipt from an image with no cargo in it, the
+# checks demonstrably ran somewhere else, which is precisely what F13's fix
+# claims. Re-adding cargo here would silently retire that proof.
+
+# Same scratch mount point as the provider image, for the same reason: the
+# rootfs is read-only at runtime and HOME/TMPDIR/XDG_* all point at /scratch
+# (see SCRATCH_ENV in crates/worker/src/sandbox/policy.rs). Without it the
+# worktree is the only writable path and the stub's own scribbles would land in
+# the diff that the frozen checks grade.
+RUN mkdir -p /scratch && chown sandbox:sandbox /scratch
+
+# A label, so `docker inspect` answers the question too. Anyone who has to ask
+# "was this real?" should be able to find out without reading the Dockerfile.
+LABEL org.cortex.provider="STUB" \
+      org.cortex.evidence="NONE — this image cannot demonstrate task completion"
+
+USER sandbox
+
+# Prove the stub refuses to run unmarked, at build time, as the unprivileged
+# user. The provider image smoke-tests `claude --version` here and that check
+# immediately caught F10; this is the same idea pointed at the property that
+# actually matters for a stub -- that it cannot be mistaken for a provider.
+#
+# Exit 64 is the refusal. A zero exit here would mean the guard is gone.
+RUN HOME=/scratch TMPDIR=/scratch XDG_CACHE_HOME=/scratch XDG_CONFIG_HOME=/scratch \
+    sh -c 'claude -p "probe"; s=$?; [ "$s" -eq 64 ] || { echo "stub did not refuse: exit $s" >&2; exit 1; }'
+
+WORKDIR /work
+
+# No ENTRYPOINT, matching the provider image: the command is supplied per job
+# by the runner, which is what makes the argv recordable.

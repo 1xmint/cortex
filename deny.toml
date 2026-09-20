@@ -1,0 +1,61 @@
+# cargo-deny configuration.
+#
+# Triaged 2026-08-05 (task B2), and the result was better than expected: across
+# the whole workspace cargo-deny reported **no vulnerabilities, no unmaintained
+# crates, no licence violations and no unknown sources**. Every error was
+# `wildcard`, and all six were our own path dependencies (see [bans] below).
+#
+# The job is therefore blocking from now on. It is worth being precise about
+# why that is safe: a gate that has been read once and found clean is a gate
+# that will be believed the first time it goes red — which is the opposite of
+# what the `web` job and the midnight flake taught this repo.
+
+[advisories]
+# `deny` is the default in cargo-deny v2 for vulnerabilities; unmaintained
+# crates are warned about rather than failing the build, because a transitive
+# unmaintained dep is rarely actionable the day you find it.
+unmaintained = "workspace"
+yanked = "deny"
+ignore = [
+    # Add RustSec IDs here with a one-line reason and a date, e.g.
+    # { id = "RUSTSEC-0000-0000", reason = "no upgrade path yet; revisit 2026-10" },
+]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+# Cargo.toml pins workspace deps with caret ranges, which is fine; wildcards
+# are not — they make the lockfile the only thing standing between you and an
+# unreviewed major bump.
+#
+# That reasoning is about registry dependencies. It does not apply to a sibling
+# crate in this repo: `cortex-core = { path = "../core" }` has no version, which
+# cargo-deny reads as `*`, but it is pinned by being in the same commit. All six
+# wildcard errors in the first triaged run were exactly this, so allowing them
+# is what lets the check block on the case it was actually written for.
+allow-wildcard-paths = true
+highlight = "all"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+
+[licenses]
+# The workspace itself is MIT (Cargo.toml). This list covers what a typical
+# axum/tokio/rusqlite tree pulls in. Anything outside it should be a
+# deliberate decision, not a silent one.
+version = 2
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+    "MPL-2.0",
+    "CC0-1.0",
+]
+confidence-threshold = 0.9

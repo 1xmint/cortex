@@ -1,0 +1,23 @@
+FROM node:22-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git ca-certificates curl \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN npm install -g @anthropic-ai/claude-code @openai/codex
+
+# Verify CLI binaries are accessible after global install
+RUN claude --version || true
+RUN codex --version || true
+
+RUN groupadd -g 2000 sandbox \
+    && useradd -u 2000 -g sandbox -m -s /bin/bash sandbox
+
+# Ensure global node bin is on PATH for the sandbox user
+ENV PATH="/usr/local/bin:${PATH}"
+
+USER sandbox
+WORKDIR /home/sandbox
+
+# Keep container running for exec access
+CMD ["bash", "-c", "while true; do sleep 30; done"]
