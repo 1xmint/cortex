@@ -206,23 +206,74 @@ fn literal_manifest_exactly_matches_cortex_router() {
     );
 }
 
+/// The Caddyfile is the edge, and since the split it carries one site. The
+/// guarantee it has to keep is that every path it forwards is a path the
+/// backend still serves. `/v1` is therefore named route by route: a broad
+/// `/v1/*` proxy would forward the deleted `/v1/social/*` and `/v1/pulse/*`
+/// surface to a backend that no longer answers it.
+///
+/// This replaced a test that asserted the HeyVera sites explicitly 404'd the
+/// Cortex paths and vice versa. Those sites live in the HeyVera repository
+/// now, so that boundary is not this file's to prove.
 #[test]
-fn caddy_has_explicit_product_matchers_and_deny_fallbacks() {
-    let apex = caddy_site("\nheyvera.org, www.heyvera.org {");
-    let api = caddy_site("\napi.heyvera.org {");
+fn caddy_forwards_only_paths_the_cortex_backend_serves() {
+    for host in [
+        "\nheyvera.org, www.heyvera.org {",
+        "\napi.heyvera.org {",
+        "\npulse.heyvera.org {",
+    ] {
+        assert!(
+            !CADDYFILE.contains(host),
+            "{host:?} belongs to the HeyVera repository and must not come back"
+        );
+    }
+    assert_eq!(
+        CADDYFILE.matches(".heyvera.org {").count(),
+        1,
+        "the Caddyfile serves the Cortex host and nothing else"
+    );
+    assert!(!CADDYFILE.contains("localhost:3402"), "legacy ClawNet port");
 
-    for site in [apex, api] {
-        let site = site.replace("\r\n", "\n");
-        assert!(site.contains("@heyvera_api path /api/health"));
-        assert!(site.contains("handle /api/* {\n\t\trespond \"Not found\" 404"));
-        assert!(site.contains("handle /v1/* {\n\t\trespond \"Not found\" 404"));
-        assert!(!site.contains("handle /api/* {\n\t\treverse_proxy"));
-        assert!(!site.contains("localhost:3402"));
+    // Comments here describe the sites that were removed, so judge the
+    // directives alone.
+    let site = caddy_site("\ncortex.heyvera.org {").replace("\r\n", "\n");
+    let directives = site
+        .lines()
+        .filter(|line| !line.trim_start().starts_with('#'))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert!(
+        directives.contains("@api path /api/* /v1/health /v1/ready"),
+        "the two Cortex /v1 routes are named one by one"
+    );
+    for absent in ["/v1/*", "/v1/social", "/v1/pulse"] {
+        assert!(
+            !directives.contains(absent),
+            "{absent} would reach a backend that no longer serves it"
+        );
     }
 
-    assert!(api.contains("@cortex_api path /api/chat"));
-    assert!(api.contains("/api/billing/referral/validate"));
-    assert!(apex.contains("/api/clerk/webhooks"));
+    // Real routes that are deliberately off the public hostname: Prometheus
+    // scrapes over the private network, and the provider endpoint is the
+    // worker's. Publishing either is a change in exposure, not a fix.
+    for private in ["/metrics", "/internal/"] {
+        assert!(
+            !directives.contains(private),
+            "{private} must not be exposed on the public hostname"
+        );
+    }
+
+    let upstreams = directives
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("reverse_proxy "))
+        .map(|rest| rest.trim_end_matches('{').trim())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        upstreams,
+        vec!["localhost:3001"],
+        "cortex-api is the only backend this file knows"
+    );
 }
 
 /// Negative probe: no `/v1/social/*` or `/v1/pulse/*` surface leaked back into
