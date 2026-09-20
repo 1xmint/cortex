@@ -63,6 +63,14 @@ completed a task; that claim belongs to `live-model.yml` and to nothing else.
   each attempt now fails its own checks and sits blocked, which is the right
   outcome but not a quiet one. Porting the sandbox to the 0.21 API is a change
   to the code that isolates untrusted work and wants its own review.
+- **`aes-gcm` is pinned at 0.10.3 for the same reason.** 0.11 stops re-exporting
+  `OsRng` from `aes_gcm::aead`, so `crates/api/src/crypto.rs` fails to compile
+  with `error[E0432]: unresolved import`. Dependabot's
+  [#7](https://github.com/1xmint/cortex/pull/7) is blocked on its own red `rust`
+  check, which is the system working. The line in question fills the nonce that
+  makes each encryption unique; reusing one breaks AES-GCM outright, so moving
+  the randomness to `rand_core` is a small edit that still wants reading
+  carefully.
 
 ## The split, and what it unblocked
 
