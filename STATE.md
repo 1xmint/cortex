@@ -36,23 +36,12 @@ completed a task; that claim belongs to `live-model.yml` and to nothing else.
 2. **A worker key on the host.** `cortex-worker-key` mints it;
    `/etc/cortex/worker.env` holds it as `CORTEX_TOKEN`. Production is at v66,
    healthy, and cannot execute without it.
-3. **Where the new repository lives, and whether it is public.** The split is
-   finished in this checkout — the Rust workspace, the repository shell and the
-   naming all done, `cargo check --workspace --all-targets` and both clippy
-   gates silent — and the destination is the only thing left. The
-   recommendation is private, with a single fresh commit and no HeyVera
-   history: that satisfies the history-scrub gate by having no history to
-   scrub, and it is the only version that can be undone. Going public is a
-   separate decision.
-
-   Two answers are needed, and neither can be given from here. **The name:**
-   `hey-vera/Cortex` already holds the plain one — archived since 2026-05-19,
-   284 KB, three commits, kept only for a `Cargo.toml` that shows how to depend
-   on Soma. Renaming it frees the name and GitHub leaves a redirect, so nothing
-   linking to it breaks; the alternative is a second-choice name forever. That
-   rename is a change to a shared repository, so it needs Josh's hand or his
-   say-so. **The visibility:** private unless he says otherwise.
-   `cortex/plan/EXTRACTION-STANDALONE.md` is the resume trail.
+3. ~~**Where the new repository lives, and whether it is public.**~~
+   **Answered 2026-09-20:** public, at
+   [`1xmint/cortex`](https://github.com/1xmint/cortex). The split is finished
+   and this repository is the result — one commit, no HeyVera history, 459
+   files. `cortex/plan/EXTRACTION-STANDALONE.md` is the record of how it was
+   done and what was deliberately left behind.
 
 ## Blocked on nobody, not yet started
 

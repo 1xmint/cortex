@@ -96,20 +96,38 @@ Branch: `extract/cortex-standalone` in `C:\Users\Josh\Desktop\GitHub\cortex-extr
    crates rather than renamed. `README.md`, `AGENTS.md`, `CONTRIBUTING.md`,
    `SECURITY.md`, `STATE.md`, `docs/ARCHITECTURE.md`, `replit.md` and the bug
    report template now describe one product. `HEYVERA-VISION.md` is deleted.
-4. **New repository, private, fresh history.** The history scrub gate in the
-   inventory is satisfied by not carrying HeyVera's history at all: a single
-   initial commit. Private first — going public is a separate decision, and
-   reversing a public push is not possible.
+4. ~~**New repository, fresh history.**~~ **Done** —
+   [`1xmint/cortex`](https://github.com/1xmint/cortex), public, one commit
+   (`cfbb1df8`), 459 files, no parent. The history-scrub gate is satisfied by
+   having no history to scrub: the commit was built with `git commit-tree` from
+   the finished tree, so pushing it carried none of the old repository's
+   objects. HeyVera's history stays in `1xmint/heyvera`, where it belongs.
 
-   **The name `cortex` is taken.** `hey-vera/Cortex` exists, archived since
-   2026-05-19, 284 KB, three commits. Its own description says it is superseded
-   and kept for one thing: a `Cargo.toml` showing the right way to depend on
-   Soma. The recommendation is to rename that relic (GitHub leaves a redirect,
-   so nothing that links to it breaks) and give the live repository the plain
-   name. The alternative is an awkward second-choice name forever.
+   Josh chose public and chose the name; the recommendation on this page had
+   been private, and it is recorded here unchanged rather than rewritten to
+   agree with what happened. `1xmint/cortex` had been forwarding to the
+   archived relic `hey-vera/Cortex` — that repository was created here and
+   later transferred out, and GitHub keeps a pointer. Taking the name back
+   drops the pointer. The relic itself is untouched and still reachable at its
+   own address.
+
+   Private vulnerability reporting is on, so the link in `SECURITY.md`
+   resolves. Secret scanning and push protection came on by default with
+   public. A scan before the push found no credentials: one deliberately fake
+   `sk-ant-api03-test-key-1234567890` in a crypto test, and placeholders in the
+   `.example` files.
 5. **CI green in the new repository.** The test suite runs there, never on this
-   PC. `stub-provider-e2e` is cheap and safe; `live-model` spends real money and
-   stays `workflow_dispatch`.
+   PC. [PR #1](https://github.com/1xmint/cortex/pull/1) is the first run and
+   exists to prove the six required checks — `rust`, `cortex`,
+   `npm-audit (cortex)`, `cargo-deny`, `sandbox`, `no-default-features` —
+   actually report here.
+
+   Nothing that spends money or touches the host runs on a pull request:
+   `live-model`, `stub-provider-e2e` and `host-db-migration` are all
+   `workflow_dispatch` only. `add-to-project` runs but skips its own body when
+   `ADD_TO_PROJECT_PAT` is absent, which it is, so it passes rather than
+   failing; its project URL still points at the `hey-vera` org and should be
+   repointed or deleted the first time anyone wants it working.
 
 ## Deliberately deferred, and why it is safe to defer
 
