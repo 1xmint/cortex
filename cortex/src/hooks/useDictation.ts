@@ -49,7 +49,9 @@ export function useDictation({ onTranscript }: UseDictationOptions) {
   // had a chance to re-render must still be caught here.
   const startingRef = useRef(false);
   const onTranscriptRef = useRef(onTranscript);
-  onTranscriptRef.current = onTranscript;
+  useEffect(() => {
+    onTranscriptRef.current = onTranscript;
+  }, [onTranscript]);
 
   const releaseMic = useCallback(() => {
     streamRef.current?.getTracks().forEach((track) => track.stop());

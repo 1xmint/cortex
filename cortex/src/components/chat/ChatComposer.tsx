@@ -87,7 +87,9 @@ export default function ChatComposer({
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   const [ghostText, setGhostText] = useState('');
   const draftRef = useRef(draft);
-  draftRef.current = draft;
+  useEffect(() => {
+    draftRef.current = draft;
+  }, [draft]);
 
   const dictation = useDictation({
     onTranscript: useCallback((text: string) => {
