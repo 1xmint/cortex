@@ -110,6 +110,8 @@ pub(crate) enum LiveSessionError {
     NotFound,
     /// The caller does not own this session.
     Forbidden,
+    /// The user already has a live voice session open.
+    AlreadyOpen,
 }
 
 impl LiveSessionError {
@@ -131,6 +133,10 @@ impl LiveSessionError {
             LiveSessionError::Forbidden => {
                 (StatusCode::FORBIDDEN, "That is not your voice session.")
             }
+            LiveSessionError::AlreadyOpen => (
+                StatusCode::CONFLICT,
+                "You already have a live voice session open. End it first.",
+            ),
         };
         (
             status,
@@ -287,19 +293,77 @@ pub(crate) async fn start_session(
     user_id: &str,
     sdp: &str,
     now_ms: i64,
-) -> Result<(String, String), LiveSessionError> {
+) -> Result<(String, String, String), LiveSessionError> {
     let supplier_key = match mode {
         // Stub never leaves the machine and never spends: no session is
         // actually running, so there is no usage to hold credits against.
         LiveVoiceMode::Stub => {
-            return Ok((
-                format!("stub-live-{}", uuid::Uuid::new_v4()),
-                "stub-answer-sdp".to_string(),
-            ));
+            let stub_id = format!("stub-live-{}", uuid::Uuid::new_v4());
+            return Ok((stub_id.clone(), "stub-answer-sdp".to_string(), stub_id));
         }
         LiveVoiceMode::Live(key) => key,
     };
 
+    // A server-generated id, minted before anything else touches the
+    // ledger or OpenAI, so a reservation key never has to wait on a
+    // supplier response that may never come.
+    let local_id = uuid::Uuid::new_v4().to_string();
+
+    // One live session per user. The check and the placeholder insert
+    // happen under the same lock acquisition so two concurrent starts for
+    // the same user cannot both pass the check before either inserts.
+    {
+        let mut sessions = state.voice_sessions.lock().unwrap();
+        if sessions.values().any(|handle| handle.user_id == user_id) {
+            return Err(LiveSessionError::AlreadyOpen);
+        }
+        let (close_tx, _close_rx) = mpsc::channel(1);
+        sessions.insert(
+            local_id.clone(),
+            VoiceSessionHandle {
+                user_id: user_id.to_string(),
+                close_tx,
+            },
+        );
+    }
+
+    let result = start_live_session(
+        state,
+        &supplier_key,
+        http_base,
+        ws_base,
+        signing_key,
+        limits,
+        user_id,
+        sdp,
+        now_ms,
+        local_id.clone(),
+    )
+    .await;
+
+    if result.is_err() {
+        state.voice_sessions.lock().unwrap().remove(&local_id);
+    }
+    result
+}
+
+/// The reserve-mint-attach-and-launch pipeline for a real (non-stub) live
+/// session, split out of [`start_session`] so the one-session-per-user
+/// placeholder in the caller has a single, simple cleanup point: remove
+/// `local_id` from `state.voice_sessions` on any `Err` this returns.
+#[allow(clippy::too_many_arguments)]
+async fn start_live_session(
+    state: &Arc<AppState>,
+    supplier_key: &str,
+    http_base: &str,
+    ws_base: &str,
+    signing_key: &str,
+    limits: SpendLimits,
+    user_id: &str,
+    sdp: &str,
+    now_ms: i64,
+    local_id: String,
+) -> Result<(String, String, String), LiveSessionError> {
     let db = state.db.as_ref().ok_or(LiveSessionError::Unavailable)?;
     let price_list = db
         .active_price_list()
@@ -326,8 +390,7 @@ pub(crate) async fn start_session(
         return Err(LiveSessionError::NotEnoughCredits);
     }
 
-    let session_uuid = uuid::Uuid::new_v4().to_string();
-    let run_id = format!("voice:{session_uuid}");
+    let run_id = format!("voice:{local_id}");
     let expires_at_ms = now_ms + SESSION_LEASE_MS;
     let Some((authorization_id, _signed)) =
         provider_gateway_http::create_authorization_and_capability(
@@ -356,13 +419,10 @@ pub(crate) async fn start_session(
         expires_at_ms,
     );
 
-    let starter = OpenAiLiveSessions::with_base_url(http_base);
-    let (session_id, answer_sdp) = starter.start(&supplier_key, sdp).await.map_err(|detail| {
-        tracing::error!(user_id, %detail, "voice: openai live session POST failed");
-        LiveSessionError::SupplierFailed
-    })?;
-
-    let segment_key = format!("voice:{session_id}:0");
+    // Reserve the first segment before OpenAI is ever asked to start a
+    // session: the hold has to exist before any supplier cost can be run
+    // up, not after.
+    let segment_key = format!("voice:{local_id}:0");
     if db
         .reserve_provider_request(
             &claims,
@@ -375,30 +435,61 @@ pub(crate) async fn start_session(
     {
         tracing::error!(
             user_id,
-            session_id = %session_id,
-            "voice: first segment reservation failed right after the session started"
+            "voice: first segment reservation failed before the session could start"
         );
-        return Err(LiveSessionError::Unavailable);
+        return Err(LiveSessionError::NotEnoughCredits);
     }
 
-    let sideband = WsSideband::attach(ws_base, &session_id, &supplier_key)
-        .await
-        .map_err(|detail| {
-            tracing::error!(user_id, session_id = %session_id, %detail, "voice: sideband attach failed");
-            LiveSessionError::SupplierFailed
-        })?;
+    let starter = OpenAiLiveSessions::with_base_url(http_base);
+    let (session_id, answer_sdp) = match starter.start(supplier_key, sdp).await {
+        Ok(started) => started,
+        Err(detail) => {
+            tracing::error!(user_id, %detail, "voice: openai live session POST failed");
+            let _ =
+                db.release_provider_request(&segment_key, "openai session start failed", now_ms);
+            return Err(LiveSessionError::SupplierFailed);
+        }
+    };
 
+    let sideband = match WsSideband::attach(ws_base, &session_id, supplier_key).await {
+        Ok(sideband) => sideband,
+        Err(detail) => {
+            tracing::error!(
+                user_id,
+                session_id = %session_id,
+                %detail,
+                "voice: sideband attach failed after the openai session already started"
+            );
+            let _ = db.mark_provider_request_unresolved(
+                &segment_key,
+                None,
+                "sideband attach failed after session start",
+                now_ms,
+            );
+            return Err(LiveSessionError::SupplierFailed);
+        }
+    };
+
+    // The placeholder inserted under `local_id` in `start_session` is
+    // replaced here, now that the real session id is known, with the same
+    // close channel — nothing that could race the one-per-user check is
+    // still pending.
     let (close_tx, close_rx) = mpsc::channel(1);
-    state.voice_sessions.lock().unwrap().insert(
-        session_id.clone(),
-        VoiceSessionHandle {
-            user_id: user_id.to_string(),
-            close_tx,
-        },
-    );
+    {
+        let mut sessions = state.voice_sessions.lock().unwrap();
+        sessions.remove(&local_id);
+        sessions.insert(
+            session_id.clone(),
+            VoiceSessionHandle {
+                user_id: user_id.to_string(),
+                close_tx,
+            },
+        );
+    }
 
     let loop_state = state.clone();
     let loop_session_id = session_id.clone();
+    let loop_local_id = local_id.clone();
     let loop_user_id = user_id.to_string();
     let micros_per_credit = price_list.micros_per_credit;
     tokio::spawn(async move {
@@ -407,6 +498,7 @@ pub(crate) async fn start_session(
             sideband,
             claims,
             loop_session_id,
+            loop_local_id,
             loop_user_id,
             rate,
             micros_per_credit,
@@ -417,7 +509,7 @@ pub(crate) async fn start_session(
         .await;
     });
 
-    Ok((session_id, answer_sdp))
+    Ok((session_id, answer_sdp, local_id))
 }
 
 /// Ask the session owned at `session_id` to close. Only the owner may do
@@ -440,10 +532,18 @@ pub(crate) async fn close_session(
     Ok(())
 }
 
+/// One credit hold still open (or partly consumed) against the durable
+/// reservation table, keyed by `voice:{local_id}:{index}`.
+#[derive(Clone, Copy)]
+struct Segment {
+    index: i64,
+    reserved_micro: i64,
+}
+
 /// Owns the sideband for one session's whole life: settles and renews
-/// credit segments off `session.usage.updated`, settles the last one off
-/// `session.closed`, and — if the socket disappears without a
-/// `session.closed` — leaves the open segment `unresolved` for
+/// credit segments off `session.usage.updated`, settles whatever is left
+/// off `session.closed`, and — if the socket disappears without a
+/// `session.closed` — leaves every still-open segment `unresolved` for
 /// reconciliation instead of inventing a final cost.
 #[allow(clippy::too_many_arguments)]
 async fn run_billing_loop(
@@ -451,6 +551,7 @@ async fn run_billing_loop(
     mut sideband: WsSideband,
     claims: GatewayCapability,
     session_id: String,
+    local_id: String,
     user_id: String,
     rate: crate::pricing::ModelPrice,
     micros_per_credit: i64,
@@ -463,7 +564,12 @@ async fn run_billing_loop(
         return;
     };
 
-    let mut segment_index: i64 = 0;
+    let mut segments: std::collections::VecDeque<Segment> = std::collections::VecDeque::new();
+    segments.push_back(Segment {
+        index: 0,
+        reserved_micro: segment0_micro,
+    });
+    let mut next_segment_index: i64 = 0;
     let mut reserved_so_far_micro = segment0_micro;
     let mut settled_so_far_micro: i64 = 0;
     let segment_micro = rate.cost_micros(SEGMENT_SECONDS, 0, 0);
@@ -489,45 +595,89 @@ async fn run_billing_loop(
                             .and_then(Value::as_i64)
                             .unwrap_or(0);
                         let observed_total = rate.cost_micros(seconds, 0, 0);
-                        let threshold_crossed = observed_total.saturating_mul(SETTLE_THRESHOLD_NUM)
-                            >= reserved_so_far_micro.saturating_mul(SETTLE_THRESHOLD_DEN);
-                        if !threshold_crossed {
-                            continue;
-                        }
-                        settle_segment(
+                        let budget_exhausted = settle_up_to(
                             db,
                             &user_id,
                             &session_id,
-                            segment_index,
-                            observed_total,
+                            &local_id,
+                            &mut segments,
                             &mut settled_so_far_micro,
+                            observed_total,
+                            false,
                             micros_per_credit,
                             now_ms(),
                         );
 
-                        let remaining = max_micro_usd - reserved_so_far_micro;
-                        let next_micro = remaining.min(segment_micro);
-                        segment_index += 1;
-                        let renewed = next_micro > 0
-                            && db
-                                .reserve_provider_request(
+                        let mut cap_exhausted = false;
+                        let mut reserve_refused = false;
+                        if !budget_exhausted {
+                            loop {
+                                let threshold_crossed = observed_total.saturating_mul(SETTLE_THRESHOLD_NUM)
+                                    >= reserved_so_far_micro.saturating_mul(SETTLE_THRESHOLD_DEN);
+                                if !threshold_crossed {
+                                    break;
+                                }
+                                let remaining_cap = max_micro_usd - reserved_so_far_micro;
+                                if remaining_cap <= 0 {
+                                    cap_exhausted = true;
+                                    break;
+                                }
+                                let next_micro = remaining_cap.min(segment_micro);
+                                let candidate_index = next_segment_index + 1;
+                                let key = format!("voice:{local_id}:{candidate_index}");
+                                match db.reserve_provider_request(
                                     &claims,
-                                    &format!("voice:{session_id}:{segment_index}"),
-                                    &format!("voice-segment:{segment_index}"),
+                                    &key,
+                                    &format!("voice-segment:{candidate_index}"),
                                     next_micro,
                                     now_ms(),
-                                )
-                                .is_ok();
-                        if renewed {
-                            reserved_so_far_micro += next_micro;
-                        } else if warning_deadline.is_none() {
-                            sideband
-                                .send(serde_json::json!({
-                                    "type": "session.instructions.append",
-                                    "instructions": WARNING_TEXT,
-                                }))
-                                .await;
-                            warning_deadline = Some(tokio::time::Instant::now() + WARNING_GRACE);
+                                ) {
+                                    Ok(_) => {
+                                        next_segment_index = candidate_index;
+                                        segments.push_back(Segment {
+                                            index: candidate_index,
+                                            reserved_micro: next_micro,
+                                        });
+                                        reserved_so_far_micro += next_micro;
+                                    }
+                                    Err(_) => {
+                                        reserve_refused = true;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+
+                        if budget_exhausted {
+                            // Item D: a settle's credit deduction failing is
+                            // budget exhaustion, exactly like a refused
+                            // renewal — stop renewing and head for the
+                            // goodbye path.
+                            if warning_deadline.is_none() {
+                                sideband
+                                    .send(serde_json::json!({
+                                        "type": "session.instructions.append",
+                                        "instructions": WARNING_TEXT,
+                                    }))
+                                    .await;
+                                warning_deadline = Some(tokio::time::Instant::now() + WARNING_GRACE);
+                            }
+                        } else if cap_exhausted || reserve_refused {
+                            let overrun = observed_total >= reserved_so_far_micro;
+                            if overrun {
+                                sideband
+                                    .send(serde_json::json!({"type": "session.close"}))
+                                    .await;
+                                warning_deadline = None;
+                            } else if warning_deadline.is_none() {
+                                sideband
+                                    .send(serde_json::json!({
+                                        "type": "session.instructions.append",
+                                        "instructions": WARNING_TEXT,
+                                    }))
+                                    .await;
+                                warning_deadline = Some(tokio::time::Instant::now() + WARNING_GRACE);
+                            }
                         }
                     }
                     Some("session.closed") => {
@@ -536,13 +686,15 @@ async fn run_billing_loop(
                             .and_then(Value::as_i64)
                             .unwrap_or(0);
                         let observed_total = rate.cost_micros(seconds, 0, 0);
-                        settle_segment(
+                        settle_up_to(
                             db,
                             &user_id,
                             &session_id,
-                            segment_index,
-                            observed_total,
+                            &local_id,
+                            &mut segments,
                             &mut settled_so_far_micro,
+                            observed_total,
+                            true,
                             micros_per_credit,
                             now_ms(),
                         );
@@ -563,60 +715,121 @@ async fn run_billing_loop(
     }
 
     if !closed_cleanly {
-        let segment_key = format!("voice:{session_id}:{segment_index}");
-        let _ = db.mark_provider_request_unresolved(
-            &segment_key,
-            None,
-            "sideband dropped without session.closed",
-            now_ms(),
-        );
+        for seg in segments.drain(..) {
+            let key = format!("voice:{local_id}:{}", seg.index);
+            let _ = db.mark_provider_request_unresolved(
+                &key,
+                None,
+                "sideband dropped without session.closed",
+                now_ms(),
+            );
+        }
         tracing::error!(
             session_id = %session_id,
-            "voice: sideband dropped without session.closed; reservation left unresolved for reconciliation"
+            "voice: sideband dropped without session.closed; open reservation(s) left unresolved for reconciliation"
         );
     }
 
     state.voice_sessions.lock().unwrap().remove(&session_id);
 }
 
+/// Settles every fully-consumed segment at the front of `segments` against
+/// `observed_total_micro`, in order: a segment only ever settles for
+/// exactly its own `reserved_micro` (never more — that is what used to let
+/// a late-arriving usage jump land as a `mismatch`), except the final
+/// segment on `is_final`, which settles for whatever is left, including
+/// zero. Usage that still exceeds every reservation once `is_final` is true
+/// is charged directly as an overrun rather than forced through settle.
+///
+/// Returns whether a credit deduction failed during this call — budget
+/// exhaustion the caller must stop renewing against (item D).
 #[allow(clippy::too_many_arguments)]
-fn settle_segment(
+fn settle_up_to(
     db: &crate::db::Database,
     user_id: &str,
     session_id: &str,
-    segment_index: i64,
-    observed_total_micro: i64,
+    local_id: &str,
+    segments: &mut std::collections::VecDeque<Segment>,
     settled_so_far_micro: &mut i64,
+    observed_total_micro: i64,
+    is_final: bool,
     micros_per_credit: i64,
     now_ms: i64,
-) {
-    let segment_key = format!("voice:{session_id}:{segment_index}");
-    let observed_segment = (observed_total_micro - *settled_so_far_micro).max(0);
-    if db
-        .settle_provider_request(&segment_key, observed_segment, None, now_ms)
-        .is_err()
-    {
-        tracing::error!(session_id, segment_index, "voice: segment settle failed");
-        return;
+) -> bool {
+    let mut budget_exhausted = false;
+    while let Some(seg) = segments.front().copied() {
+        let remaining = observed_total_micro - *settled_so_far_micro;
+        let settle_amount = if remaining >= seg.reserved_micro {
+            Some(seg.reserved_micro)
+        } else if is_final {
+            Some(remaining.max(0))
+        } else {
+            None
+        };
+        let Some(amount) = settle_amount else {
+            break;
+        };
+        segments.pop_front();
+        let key = format!("voice:{local_id}:{}", seg.index);
+        match db.settle_provider_request(&key, amount, None, now_ms) {
+            Ok(_) => {
+                *settled_so_far_micro += amount;
+                let credits = ceil_div(amount, micros_per_credit);
+                if credits > 0 {
+                    if let Err(error) = db.deduct_credits(
+                        user_id,
+                        credits,
+                        "Cortex live voice",
+                        &ChargeKey::per_unit(&key),
+                    ) {
+                        tracing::error!(
+                            user_id,
+                            session_id,
+                            segment_index = seg.index,
+                            %error,
+                            "voice: segment settled but charging credits failed"
+                        );
+                        budget_exhausted = true;
+                    }
+                }
+            }
+            Err(error) => {
+                tracing::error!(
+                    session_id,
+                    segment_index = seg.index,
+                    %error,
+                    "voice: segment settle failed"
+                );
+            }
+        }
     }
-    *settled_so_far_micro += observed_segment;
-    let credits = ceil_div(observed_segment, micros_per_credit);
-    if credits > 0 {
-        if let Err(error) = db.deduct_credits(
-            user_id,
-            credits,
-            "Cortex live voice",
-            &ChargeKey::per_unit(&segment_key),
-        ) {
+
+    if is_final {
+        let remaining = observed_total_micro - *settled_so_far_micro;
+        if remaining > 0 {
+            let key = format!("voice:{local_id}:overrun");
             tracing::error!(
                 user_id,
                 session_id,
-                segment_index,
-                %error,
-                "voice: segment settled but charging credits failed"
+                remaining,
+                "voice: usage exceeded every reservation; charging the excess directly rather than settling it"
             );
+            let credits = ceil_div(remaining, micros_per_credit);
+            if credits > 0 {
+                if let Err(error) = db.deduct_credits(
+                    user_id,
+                    credits,
+                    "Cortex live voice overrun",
+                    &ChargeKey::per_unit(&key),
+                ) {
+                    tracing::error!(user_id, session_id, %error, "voice: overrun charge failed");
+                }
+            }
+            *settled_so_far_micro = observed_total_micro;
         }
     }
+
+    budget_exhausted
 }
 
 #[derive(Debug, Serialize, PartialEq)]
@@ -670,7 +883,7 @@ pub async fn live_session_start(
         now_ms,
     )
     .await
-    .map(|(session_id, sdp)| Json(LiveSessionStartResponse { session_id, sdp }))
+    .map(|(session_id, sdp, _local_id)| Json(LiveSessionStartResponse { session_id, sdp }))
     .map_err(LiveSessionError::into_response)
 }
 
@@ -710,6 +923,14 @@ mod fake_live {
         /// `session.close` and answer it with `session.closed`. `false`
         /// drops the connection instead — a sideband failure.
         pub respond_to_client_close: bool,
+        /// Refuse the WebSocket upgrade on `/attach` outright — exercises
+        /// the "sideband attach failed after session start" path.
+        pub refuse_attach: bool,
+        /// Sleep this long right after sending the first usage event,
+        /// giving a test room to mutate the database mid-script (e.g.
+        /// draining a balance to exercise a failed settle) before the rest
+        /// of the script arrives.
+        pub pause_after_first_event: Option<std::time::Duration>,
     }
 
     async fn fake_start(
@@ -726,13 +947,17 @@ mod fake_live {
     async fn fake_attach(
         State(script): State<StdArc<FakeLiveScript>>,
         ws: WsUpgrade,
-    ) -> impl IntoResponse {
+    ) -> axum::response::Response {
+        if script.refuse_attach {
+            return (StatusCode::FORBIDDEN, "attach refused").into_response();
+        }
         ws.on_upgrade(move |socket| drive_fake_session(socket, (*script).clone()))
+            .into_response()
     }
 
     async fn drive_fake_session(mut socket: WebSocket, script: FakeLiveScript) {
         let mut last_seconds = 0i64;
-        for seconds in &script.usage_events {
+        for (index, seconds) in script.usage_events.iter().enumerate() {
             last_seconds = *seconds;
             let message = serde_json::json!({
                 "type": "session.usage.updated",
@@ -744,6 +969,11 @@ mod fake_live {
                 .is_err()
             {
                 return;
+            }
+            if index == 0 {
+                if let Some(pause) = script.pause_after_first_event {
+                    tokio::time::sleep(pause).await;
+                }
             }
         }
         if script.send_closed_after_script {
@@ -835,7 +1065,7 @@ mod tests {
         let (_dir, state) = test_state().await;
         let balance_before = state.db.as_ref().unwrap().get_credit_balance_row(USER);
 
-        let (session_id, sdp) = start_session(
+        let (session_id, sdp, _local_id) = start_session(
             &state,
             LiveVoiceMode::Stub,
             OPENAI_HTTP_BASE,
@@ -865,10 +1095,12 @@ mod tests {
             usage_events: vec![100, 240, 300, 480, 600, 650],
             send_closed_after_script: true,
             respond_to_client_close: true,
+            refuse_attach: false,
+            pause_after_first_event: None,
         })
         .await;
 
-        let (session_id, _sdp) = start_session(
+        let (session_id, _sdp, local_id) = start_session(
             &state,
             LiveVoiceMode::Live("sk-test-supplier-0123456789".into()),
             &http_base,
@@ -906,14 +1138,14 @@ mod tests {
         );
 
         for n in 0..3 {
-            let key = format!("voice:{session_id}:{n}");
+            let key = format!("voice:{local_id}:{n}");
             let reservation = db
                 .get_provider_reservation(&key)
                 .expect("reservation exists");
             assert_eq!(reservation.status, "settled", "segment {n} must be settled");
         }
         assert!(
-            db.get_provider_reservation(&format!("voice:{session_id}:3"))
+            db.get_provider_reservation(&format!("voice:{local_id}:3"))
                 .is_none(),
             "no fourth segment should have been opened"
         );
@@ -941,10 +1173,12 @@ mod tests {
             usage_events: vec![80, 100, 120, 150, 200],
             send_closed_after_script: false,
             respond_to_client_close: true,
+            refuse_attach: false,
+            pause_after_first_event: None,
         })
         .await;
 
-        let (session_id, _sdp) = start_session(
+        let (session_id, _sdp, local_id) = start_session(
             &state,
             LiveVoiceMode::Live("sk-test-supplier-0123456789".into()),
             &http_base,
@@ -964,14 +1198,19 @@ mod tests {
 
         let db = state.db.as_ref().unwrap();
         let reservation = db
-            .get_provider_reservation(&format!("voice:{session_id}:0"))
+            .get_provider_reservation(&format!("voice:{local_id}:0"))
             .expect("segment 0 exists");
         assert_eq!(reservation.status, "settled");
-        // The whole scripted call never reached 240s; the close only ever
-        // had at most 200s of usage to settle against.
-        assert!(reservation.observed_micro_usd.unwrap() <= rate.cost_micros(200, 0, 0));
+        // segment 0's full reservation (120s) is exactly what it settles
+        // for; usage that arrived after the session was told to close
+        // (up to 200s) is charged as an overrun, not folded into the
+        // segment settle.
+        assert_eq!(
+            reservation.observed_micro_usd.unwrap(),
+            rate.cost_micros(120, 0, 0)
+        );
         assert!(
-            db.get_provider_reservation(&format!("voice:{session_id}:1"))
+            db.get_provider_reservation(&format!("voice:{local_id}:1"))
                 .is_none(),
             "the balance could not fund a second segment"
         );
@@ -984,10 +1223,12 @@ mod tests {
             usage_events: vec![50, 100],
             send_closed_after_script: false,
             respond_to_client_close: false,
+            refuse_attach: false,
+            pause_after_first_event: None,
         })
         .await;
 
-        let (session_id, _sdp) = start_session(
+        let (session_id, _sdp, local_id) = start_session(
             &state,
             LiveVoiceMode::Live("sk-test-supplier-0123456789".into()),
             &http_base,
@@ -1005,11 +1246,11 @@ mod tests {
 
         let db = state.db.as_ref().unwrap();
         let reservation = db
-            .get_provider_reservation(&format!("voice:{session_id}:0"))
+            .get_provider_reservation(&format!("voice:{local_id}:0"))
             .expect("segment 0 exists");
         assert_eq!(reservation.status, "unresolved");
         assert_eq!(
-            db.provider_spend_row_count(&format!("voice:{session_id}:0")),
+            db.provider_spend_row_count(&format!("voice:{local_id}:0")),
             0
         );
     }
@@ -1021,10 +1262,12 @@ mod tests {
             usage_events: vec![10],
             send_closed_after_script: false,
             respond_to_client_close: true,
+            refuse_attach: false,
+            pause_after_first_event: None,
         })
         .await;
 
-        let (session_id, _sdp) = start_session(
+        let (session_id, _sdp, _local_id) = start_session(
             &state,
             LiveVoiceMode::Live("sk-test-supplier-0123456789".into()),
             &http_base,
@@ -1045,6 +1288,175 @@ mod tests {
 
         // Clean up: the owner can still close it.
         close_session(&state, USER, &session_id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_refused_sideband_attach_leaves_segment_zero_unresolved_not_reserved() {
+        let (_dir, state) = test_state().await;
+        let (http_base, ws_base) = spawn(FakeLiveScript {
+            usage_events: vec![],
+            send_closed_after_script: false,
+            respond_to_client_close: false,
+            refuse_attach: true,
+            pause_after_first_event: None,
+        })
+        .await;
+
+        let error = start_session(
+            &state,
+            LiveVoiceMode::Live("sk-test-supplier-0123456789".into()),
+            &http_base,
+            &ws_base,
+            SIGNING_KEY,
+            ample_limits(),
+            USER,
+            "offer-sdp",
+            0,
+        )
+        .await
+        .expect_err("a refused attach must fail start_session");
+        assert_eq!(error, LiveSessionError::SupplierFailed);
+
+        // The failed attempt's own reservation is the only row in the
+        // table; its key carries the server-generated local id, which the
+        // caller never sees on an error path, so recover it from the row
+        // itself.
+        let db = state.db.as_ref().unwrap();
+        let request_key: String = db
+            .conn()
+            .query_row(
+                "SELECT request_key FROM provider_request_reservations \
+                 ORDER BY created_at DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("the pre-start reservation was persisted");
+        let reservation = db
+            .get_provider_reservation(&request_key)
+            .expect("reservation exists");
+        assert_eq!(
+            reservation.status, "unresolved",
+            "segment 0 must be marked unresolved, not left dangling as reserved"
+        );
+        assert!(state.voice_sessions.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_second_start_for_the_same_user_is_refused_with_409() {
+        let (_dir, state) = test_state().await;
+        let (http_base, ws_base) = spawn(FakeLiveScript {
+            usage_events: vec![],
+            send_closed_after_script: false,
+            respond_to_client_close: true,
+            refuse_attach: false,
+            pause_after_first_event: None,
+        })
+        .await;
+
+        let (session_id, _sdp, _local_id) = start_session(
+            &state,
+            LiveVoiceMode::Live("sk-test-supplier-0123456789".into()),
+            &http_base,
+            &ws_base,
+            SIGNING_KEY,
+            ample_limits(),
+            USER,
+            "offer-sdp",
+            0,
+        )
+        .await
+        .expect("first live start must succeed");
+
+        let db = state.db.as_ref().unwrap();
+        let reservations_before = db.conn().query_row(
+            "SELECT COUNT(*) FROM provider_request_reservations",
+            [],
+            |row| row.get::<_, i64>(0),
+        );
+
+        let error = start_session(
+            &state,
+            LiveVoiceMode::Live("sk-test-supplier-0123456789".into()),
+            &http_base,
+            &ws_base,
+            SIGNING_KEY,
+            ample_limits(),
+            USER,
+            "offer-sdp",
+            0,
+        )
+        .await
+        .expect_err("a second start for the same user must be refused");
+        assert_eq!(error, LiveSessionError::AlreadyOpen);
+
+        let reservations_after = db.conn().query_row(
+            "SELECT COUNT(*) FROM provider_request_reservations",
+            [],
+            |row| row.get::<_, i64>(0),
+        );
+        assert_eq!(
+            reservations_before, reservations_after,
+            "the refused second start must not have reserved anything"
+        );
+        assert_eq!(state.voice_sessions.lock().unwrap().len(), 1);
+
+        close_session(&state, USER, &session_id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_settle_that_cannot_charge_credits_closes_the_session() {
+        let (_dir, state) = test_state_with_balance(0).await;
+        let db = state.db.as_ref().unwrap();
+        let price_list = db.active_price_list().unwrap();
+        let rate = price_list.model("openai", "gpt-live-1").cloned().unwrap();
+        let segment_micro = rate.cost_micros(SEGMENT_SECONDS, 0, 0);
+        let segment_credits = ceil_div(segment_micro, price_list.micros_per_credit);
+        // Exactly enough to fund (and later settle) segment 0 — until the
+        // test drains it mid-script.
+        db.init_credit_balance(USER, segment_credits).unwrap();
+
+        // A harmless first event (below the 80% renewal threshold), a real
+        // pause for the test to drain the balance, then a second event that
+        // lands exactly on the segment boundary and forces a full settle.
+        let (http_base, ws_base) = spawn(FakeLiveScript {
+            usage_events: vec![10, SEGMENT_SECONDS],
+            send_closed_after_script: false,
+            respond_to_client_close: true,
+            refuse_attach: false,
+            pause_after_first_event: Some(std::time::Duration::from_millis(300)),
+        })
+        .await;
+
+        let (session_id, _sdp, _local_id) = start_session(
+            &state,
+            LiveVoiceMode::Live("sk-test-supplier-0123456789".into()),
+            &http_base,
+            &ws_base,
+            SIGNING_KEY,
+            ample_limits(),
+            USER,
+            "offer-sdp",
+            0,
+        )
+        .await
+        .expect("live start must succeed with exactly enough balance for segment 0");
+
+        // Give the fake time to send the first event, then drain the
+        // balance to zero before it sends the segment-crossing one.
+        tokio::time::sleep(StdDuration::from_millis(100)).await;
+        let balance = db.get_credit_balance_row(USER).unwrap();
+        let drainable = balance.subscription_remaining + balance.pack_remaining;
+        db.deduct_credits(
+            USER,
+            drainable,
+            "test drain",
+            &cortex_core::billing_binding::ChargeKey::per_unit("test:drain"),
+        )
+        .expect("draining the balance directly must succeed");
+
+        // The failed deduction stops renewal and heads for the goodbye
+        // path, which needs the full warning grace before it closes.
+        wait_until_session_gone_with_timeout(&state, &session_id, StdDuration::from_secs(40)).await;
     }
 
     #[test]
