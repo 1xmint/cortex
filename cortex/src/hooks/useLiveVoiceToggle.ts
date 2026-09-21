@@ -164,7 +164,13 @@ export function useLiveVoiceToggle() {
       const pc = new RTCPeerConnection();
       pcRef.current = pc;
       const [track] = stream.getTracks();
-      if (track) pc.addTrack(track, stream);
+      if (track) {
+        pc.addTrack(track, stream);
+        // The OS/browser can end the mic track on its own (device
+        // unplugged, another app took it) without the peer connection ever
+        // noticing -- end the session the same way the toggle would.
+        track.addEventListener('ended', () => stop());
+      }
 
       pc.addEventListener('track', (event: RTCTrackEvent) => {
         const audio = audioRef.current ?? new Audio();

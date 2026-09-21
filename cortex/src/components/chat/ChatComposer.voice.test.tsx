@@ -60,7 +60,17 @@ function installFakePeerConnection() {
 }
 
 function installFakeMediaDevices(overrides: { getUserMedia?: () => Promise<MediaStream> } = {}) {
-  const fakeTrack = { stop: vi.fn() };
+  const trackListeners: Record<string, Array<() => void>> = {};
+  const fakeTrack = {
+    stop: vi.fn(),
+    addEventListener: (name: string, cb: () => void) => {
+      trackListeners[name] ??= [];
+      trackListeners[name].push(cb);
+    },
+    emit: (name: string) => {
+      for (const cb of trackListeners[name] ?? []) cb();
+    },
+  };
   const fakeStream = { getTracks: () => [fakeTrack] } as unknown as MediaStream;
   const getUserMedia = overrides.getUserMedia ?? vi.fn(async () => fakeStream);
   Object.defineProperty(navigator, 'mediaDevices', {
@@ -527,6 +537,35 @@ describe('ChatComposer voice controls', () => {
     });
 
     expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+  });
+
+  it('ends the session when the mic track ends on its own', async () => {
+    const { fakeTrack } = installFakeMediaDevices();
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
+      const url = String(input);
+      const method = init?.method ?? 'GET';
+      if (url.includes('/api/voice/live/sessions') && method === 'POST') {
+        return jsonResponse({ session_id: 'sess-10', sdp: 'fake-answer-sdp' });
+      }
+      if (url.includes('/api/voice/live/sessions/') && method === 'DELETE') {
+        return jsonResponse({});
+      }
+      return jsonResponse({}, 404);
+    });
+
+    render(<ChatComposer draft="" onDraftChange={noop} onSend={noop} />);
+    await act(async () => {
+      fireEvent.click(screen.getByLabelText('Start live voice'));
+    });
+    await waitFor(() => expect(screen.getByLabelText('End live voice')).toBeInTheDocument());
+
+    act(() => {
+      (fakeTrack as unknown as { emit: (name: string) => void }).emit('ended');
+    });
+
+    await waitFor(() => expect(screen.getByLabelText('Start live voice')).toBeInTheDocument());
+    const deleteCalls = fetchSpy.mock.calls.filter(([, init]) => (init?.method ?? 'GET') === 'DELETE');
+    expect(deleteCalls.length).toBe(1);
   });
 
   it('shows the server refusal message for dictation (e.g. insufficient credits)', async () => {
