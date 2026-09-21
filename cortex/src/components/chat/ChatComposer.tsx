@@ -242,7 +242,7 @@ export default function ChatComposer({
             <button
               type="button"
               disabled={disabled || liveVoice.status !== 'idle'}
-              aria-label={dictation.status === 'listening' ? 'Stop dictation' : 'Start dictation'}
+              aria-label="Dictation"
               aria-pressed={dictation.status === 'listening'}
               onClick={dictation.toggle}
               className={`inline-flex h-10 w-10 min-h-[44px] min-w-[44px] items-center justify-center rounded-full border transition active:scale-95 disabled:cursor-not-allowed disabled:opacity-50 sm:min-h-0 sm:min-w-0 ${
@@ -260,7 +260,7 @@ export default function ChatComposer({
             <button
               type="button"
               disabled={(disabled && liveVoice.status === 'idle') || dictation.status !== 'idle'}
-              aria-label={liveVoice.status === 'active' ? 'End live voice' : 'Start live voice'}
+              aria-label="Live voice"
               aria-pressed={liveVoice.status === 'active'}
               onClick={liveVoice.toggle}
               className={`inline-flex h-10 w-10 min-h-[44px] min-w-[44px] items-center justify-center rounded-full border transition active:scale-95 disabled:cursor-not-allowed disabled:opacity-50 sm:min-h-0 sm:min-w-0 ${

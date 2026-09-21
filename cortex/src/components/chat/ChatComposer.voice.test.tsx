@@ -109,8 +109,8 @@ describe('ChatComposer voice controls', () => {
     installFakeMediaDevices();
     render(<ChatComposer draft="" onDraftChange={noop} onSend={noop} />);
     const buttons = screen.getAllByRole('button');
-    const micIndex = buttons.findIndex((b) => b.getAttribute('aria-label') === 'Start dictation');
-    const liveIndex = buttons.findIndex((b) => b.getAttribute('aria-label') === 'Start live voice');
+    const micIndex = buttons.findIndex((b) => b.getAttribute('aria-label') === 'Dictation');
+    const liveIndex = buttons.findIndex((b) => b.getAttribute('aria-label') === 'Live voice');
     const sendIndex = buttons.findIndex((b) => b.getAttribute('aria-label') === 'Send message');
     expect(micIndex).toBeGreaterThanOrEqual(0);
     expect(liveIndex).toBe(micIndex + 1);
@@ -129,7 +129,7 @@ describe('ChatComposer voice controls', () => {
     render(<ChatComposer draft="" onDraftChange={noop} onSend={noop} />);
 
     await act(async () => {
-      fireEvent.click(screen.getByLabelText('Start dictation'));
+      fireEvent.click(screen.getByLabelText('Dictation'));
     });
 
     expect(await screen.findByRole('alert')).toHaveTextContent(/microphone access was denied/i);
@@ -151,7 +151,7 @@ describe('ChatComposer voice controls', () => {
     });
 
     render(<ChatComposer draft="" onDraftChange={noop} onSend={noop} />);
-    const button = screen.getByLabelText('Start live voice');
+    const button = screen.getByLabelText('Live voice');
 
     await act(async () => {
       fireEvent.click(button);
@@ -165,10 +165,10 @@ describe('ChatComposer voice controls', () => {
     );
     expect(postCalls.length).toBe(1);
 
-    await waitFor(() => expect(screen.getByLabelText('End live voice')).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByLabelText('Live voice')).toHaveAttribute('aria-pressed', 'true'));
 
     await act(async () => {
-      fireEvent.click(screen.getByLabelText('End live voice'));
+      fireEvent.click(screen.getByLabelText('Live voice'));
     });
 
     const deleteCalls = fetchSpy.mock.calls.filter(([, init]) => (init?.method ?? 'GET') === 'DELETE');
@@ -192,9 +192,9 @@ describe('ChatComposer voice controls', () => {
     const { unmount } = render(<ChatComposer draft="" onDraftChange={noop} onSend={noop} />);
 
     await act(async () => {
-      fireEvent.click(screen.getByLabelText('Start live voice'));
+      fireEvent.click(screen.getByLabelText('Live voice'));
     });
-    await waitFor(() => expect(screen.getByLabelText('End live voice')).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByLabelText('Live voice')).toHaveAttribute('aria-pressed', 'true'));
 
     await act(async () => {
       unmount();
@@ -223,7 +223,7 @@ describe('ChatComposer voice controls', () => {
 
     render(<ChatComposer draft="" onDraftChange={noop} onSend={noop} />);
     await act(async () => {
-      fireEvent.click(screen.getByLabelText('Start live voice'));
+      fireEvent.click(screen.getByLabelText('Live voice'));
     });
 
     expect(await screen.findByRole('alert')).toHaveTextContent(/already have a live voice session open/i);
@@ -253,7 +253,7 @@ describe('ChatComposer voice controls', () => {
     });
 
     const { unmount } = render(<ChatComposer draft="" onDraftChange={noop} onSend={noop} />);
-    fireEvent.click(screen.getByLabelText('Start live voice'));
+    fireEvent.click(screen.getByLabelText('Live voice'));
 
     await act(async () => {
       unmount();
@@ -293,7 +293,7 @@ describe('ChatComposer voice controls', () => {
     });
 
     const { unmount } = render(<ChatComposer draft="" onDraftChange={noop} onSend={noop} />);
-    fireEvent.click(screen.getByLabelText('Start live voice'));
+    fireEvent.click(screen.getByLabelText('Live voice'));
     await act(async () => {
       await Promise.resolve();
     });
@@ -339,7 +339,7 @@ describe('ChatComposer voice controls', () => {
 
     render(<ChatComposer draft="" onDraftChange={noop} onSend={noop} />);
     await act(async () => {
-      fireEvent.click(screen.getByLabelText('Start live voice'));
+      fireEvent.click(screen.getByLabelText('Live voice'));
     });
 
     expect(await screen.findByRole('alert')).toBeInTheDocument();
@@ -348,9 +348,9 @@ describe('ChatComposer voice controls', () => {
 
     // The next start is not blocked by the failed one.
     await act(async () => {
-      fireEvent.click(screen.getByLabelText('Start live voice'));
+      fireEvent.click(screen.getByLabelText('Live voice'));
     });
-    await waitFor(() => expect(screen.getByLabelText('End live voice')).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByLabelText('Live voice')).toHaveAttribute('aria-pressed', 'true'));
   });
 
   it('pagehide sends session.close on the data channel then one keepalive DELETE', async () => {
@@ -369,9 +369,9 @@ describe('ChatComposer voice controls', () => {
 
     render(<ChatComposer draft="" onDraftChange={noop} onSend={noop} />);
     await act(async () => {
-      fireEvent.click(screen.getByLabelText('Start live voice'));
+      fireEvent.click(screen.getByLabelText('Live voice'));
     });
-    await waitFor(() => expect(screen.getByLabelText('End live voice')).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByLabelText('Live voice')).toHaveAttribute('aria-pressed', 'true'));
 
     await act(async () => {
       window.dispatchEvent(new Event('pagehide'));
@@ -406,10 +406,10 @@ describe('ChatComposer voice controls', () => {
 
       render(<ChatComposer draft="" onDraftChange={noop} onSend={noop} />);
       await act(async () => {
-        fireEvent.click(screen.getByLabelText('Start live voice'));
+        fireEvent.click(screen.getByLabelText('Live voice'));
         await vi.runOnlyPendingTimersAsync();
       });
-      expect(screen.getByLabelText('End live voice')).toBeInTheDocument();
+      expect(screen.getByLabelText('Live voice')).toHaveAttribute('aria-pressed', 'true');
       const tokenAtStart = await getAuthTokenSpy.mock.results[0].value;
 
       await act(async () => {
@@ -463,9 +463,9 @@ describe('ChatComposer voice controls', () => {
 
     const { unmount } = render(<ChatComposer draft="" onDraftChange={noop} onSend={noop} />);
     await act(async () => {
-      fireEvent.click(screen.getByLabelText('Start live voice'));
+      fireEvent.click(screen.getByLabelText('Live voice'));
     });
-    await waitFor(() => expect(screen.getByLabelText('End live voice')).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByLabelText('Live voice')).toHaveAttribute('aria-pressed', 'true'));
 
     const remoteTrack = { id: 'remote-track' };
     act(() => {
@@ -498,16 +498,16 @@ describe('ChatComposer voice controls', () => {
 
     render(<ChatComposer draft="" onDraftChange={noop} onSend={noop} />);
     await act(async () => {
-      fireEvent.click(screen.getByLabelText('Start live voice'));
+      fireEvent.click(screen.getByLabelText('Live voice'));
     });
-    await waitFor(() => expect(screen.getByLabelText('End live voice')).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByLabelText('Live voice')).toHaveAttribute('aria-pressed', 'true'));
 
     act(() => {
       lastPeerConnection?.lastDataChannel?.emitMessage({ type: 'session.closed', reason: 'expired' });
     });
 
     expect(await screen.findByRole('alert')).toHaveTextContent(/credits ran out/i);
-    await waitFor(() => expect(screen.getByLabelText('Start live voice')).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByLabelText('Live voice')).toHaveAttribute('aria-pressed', 'false'));
     const deleteCalls = fetchSpy.mock.calls.filter(([, init]) => (init?.method ?? 'GET') === 'DELETE');
     expect(deleteCalls.length).toBe(1);
   });
@@ -528,12 +528,12 @@ describe('ChatComposer voice controls', () => {
 
     render(<ChatComposer draft="" onDraftChange={noop} onSend={noop} />);
     await act(async () => {
-      fireEvent.click(screen.getByLabelText('Start live voice'));
+      fireEvent.click(screen.getByLabelText('Live voice'));
     });
-    await waitFor(() => expect(screen.getByLabelText('End live voice')).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByLabelText('Live voice')).toHaveAttribute('aria-pressed', 'true'));
 
     await act(async () => {
-      fireEvent.click(screen.getByLabelText('End live voice'));
+      fireEvent.click(screen.getByLabelText('Live voice'));
     });
 
     expect(screen.queryByRole('alert')).not.toBeInTheDocument();
@@ -555,15 +555,15 @@ describe('ChatComposer voice controls', () => {
 
     render(<ChatComposer draft="" onDraftChange={noop} onSend={noop} />);
     await act(async () => {
-      fireEvent.click(screen.getByLabelText('Start live voice'));
+      fireEvent.click(screen.getByLabelText('Live voice'));
     });
-    await waitFor(() => expect(screen.getByLabelText('End live voice')).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByLabelText('Live voice')).toHaveAttribute('aria-pressed', 'true'));
 
     act(() => {
       (fakeTrack as unknown as { emit: (name: string) => void }).emit('ended');
     });
 
-    await waitFor(() => expect(screen.getByLabelText('Start live voice')).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByLabelText('Live voice')).toHaveAttribute('aria-pressed', 'false'));
     const deleteCalls = fetchSpy.mock.calls.filter(([, init]) => (init?.method ?? 'GET') === 'DELETE');
     expect(deleteCalls.length).toBe(1);
   });
@@ -584,19 +584,19 @@ describe('ChatComposer voice controls', () => {
 
     const { rerender } = render(<ChatComposer draft="" onDraftChange={noop} onSend={noop} />);
     await act(async () => {
-      fireEvent.click(screen.getByLabelText('Start live voice'));
+      fireEvent.click(screen.getByLabelText('Live voice'));
     });
-    await waitFor(() => expect(screen.getByLabelText('End live voice')).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByLabelText('Live voice')).toHaveAttribute('aria-pressed', 'true'));
 
     rerender(<ChatComposer draft="" disabled onDraftChange={noop} onSend={noop} />);
-    const button = screen.getByLabelText('End live voice');
+    const button = screen.getByLabelText('Live voice');
     expect(button).not.toBeDisabled();
 
     await act(async () => {
       fireEvent.click(button);
     });
 
-    await waitFor(() => expect(screen.getByLabelText('Start live voice')).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByLabelText('Live voice')).toHaveAttribute('aria-pressed', 'false'));
   });
 
   it('unmounting while the mic prompt is pending never requests a dictation token', async () => {
@@ -613,7 +613,7 @@ describe('ChatComposer voice controls', () => {
     const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async () => jsonResponse({}, 404));
 
     const { unmount } = render(<ChatComposer draft="" onDraftChange={noop} onSend={noop} />);
-    fireEvent.click(screen.getByLabelText('Start dictation'));
+    fireEvent.click(screen.getByLabelText('Dictation'));
 
     await act(async () => {
       unmount();
@@ -658,9 +658,9 @@ describe('ChatComposer voice controls', () => {
     const { rerender } = render(<Wrapper />);
 
     await act(async () => {
-      fireEvent.click(screen.getByLabelText('Start dictation'));
+      fireEvent.click(screen.getByLabelText('Dictation'));
     });
-    await waitFor(() => expect(screen.getByLabelText('Stop dictation')).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByLabelText('Dictation')).toHaveAttribute('aria-pressed', 'true'));
 
     const dc = lastPeerConnection?.lastDataChannel;
     act(() => {
@@ -690,7 +690,7 @@ describe('ChatComposer voice controls', () => {
 
     render(<ChatComposer draft="" onDraftChange={noop} onSend={noop} />);
     await act(async () => {
-      fireEvent.click(screen.getByLabelText('Start dictation'));
+      fireEvent.click(screen.getByLabelText('Dictation'));
     });
 
     expect(await screen.findByRole('alert')).toHaveTextContent(/not enough credits for dictation/i);
