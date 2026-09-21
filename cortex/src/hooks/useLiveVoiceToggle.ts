@@ -66,9 +66,13 @@ export function useLiveVoiceToggle() {
    *
    * `useBeacon` is for the tab-closing paths (`pagehide`/`beforeunload`),
    * where a normal `fetch` can be aborted mid-flight by the navigation; a
-   * `keepalive` fetch is allowed to outlive the page. It reads the token
-   * cached at session start rather than asking Clerk again, since there is
-   * no guarantee anything async gets to finish once `pagehide` has fired.
+   * `keepalive` fetch is allowed to outlive the page. It reads whatever
+   * token is currently cached in `tokenRef` rather than asking Clerk again,
+   * since there is no guarantee anything async gets to finish once
+   * `pagehide` has fired -- `tokenRef` is refreshed periodically while a
+   * session is active (see the refresh effect below) precisely so that
+   * cached token is never more than ~30s stale, since Clerk tokens only
+   * last ~60s and a session can run far longer than that.
    */
   const sendClose = useCallback((useBeacon: boolean) => {
     const id = sessionIdRef.current;
@@ -208,8 +212,34 @@ export function useLiveVoiceToggle() {
     }
   }, [status, start, stop]);
 
+  // Refresh the cached auth token every 30s while a session is active, so
+  // the keepalive DELETE sent from `pagehide` (which cannot await Clerk)
+  // never carries a token old enough for the server to reject with a 401.
   useEffect(() => {
-    const handlePageHide = () => sendClose(true);
+    if (status !== 'active') return;
+    const interval = window.setInterval(() => {
+      void getAuthToken().then((token) => {
+        tokenRef.current = token;
+      });
+    }, 30000);
+    return () => window.clearInterval(interval);
+  }, [status]);
+
+  useEffect(() => {
+    const handlePageHide = () => {
+      // `session.close` is synchronous and needs no auth, so it goes out
+      // first, over the data channel, even if the keepalive DELETE below
+      // ends up racing the page's actual teardown.
+      const dc = dcRef.current;
+      if (dc && dc.readyState === 'open') {
+        try {
+          dc.send(JSON.stringify({ type: 'session.close' }));
+        } catch {
+          // Best-effort; the keepalive DELETE below still runs.
+        }
+      }
+      sendClose(true);
+    };
     window.addEventListener('pagehide', handlePageHide);
     window.addEventListener('beforeunload', handlePageHide);
     return () => {

@@ -3,6 +3,7 @@ import '@testing-library/jest-dom/vitest';
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
+import * as cortexApi from '../../lib/cortexApi';
 import ChatComposer from './ChatComposer';
 
 /**
@@ -10,14 +11,27 @@ import ChatComposer from './ChatComposer';
  * an offer, take a remote description, and fire `connectionstatechange`
  * listeners when a test flips `connectionState` -- no real network anywhere.
  */
+let lastPeerConnection: FakePeerConnection | null = null;
+
 class FakePeerConnection {
   connectionState = 'new';
+  iceGatheringState = 'complete';
   private listeners: Record<string, Array<() => void>> = {};
   addTrack = vi.fn();
-  createDataChannel = vi.fn(() => ({
-    addEventListener: vi.fn(),
-    close: vi.fn(),
-  }));
+  lastDataChannel: { readyState: string; send: ReturnType<typeof vi.fn>; addEventListener: ReturnType<typeof vi.fn>; close: ReturnType<typeof vi.fn> } | null = null;
+  createDataChannel = vi.fn(() => {
+    const dc = {
+      readyState: 'open',
+      send: vi.fn(),
+      addEventListener: vi.fn(),
+      close: vi.fn(),
+    };
+    this.lastDataChannel = dc;
+    return dc;
+  });
+  constructor() {
+    lastPeerConnection = this;
+  }
   createOffer = vi.fn(async () => ({ type: 'offer', sdp: 'fake-offer-sdp' }));
   setLocalDescription = vi.fn(async () => undefined);
   setRemoteDescription = vi.fn(async () => undefined);
@@ -318,6 +332,83 @@ describe('ChatComposer voice controls', () => {
       fireEvent.click(screen.getByLabelText('Start live voice'));
     });
     await waitFor(() => expect(screen.getByLabelText('End live voice')).toBeInTheDocument());
+  });
+
+  it('pagehide sends session.close on the data channel then one keepalive DELETE', async () => {
+    installFakeMediaDevices();
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
+      const url = String(input);
+      const method = init?.method ?? 'GET';
+      if (url.includes('/api/voice/live/sessions') && method === 'POST') {
+        return jsonResponse({ session_id: 'sess-5', sdp: 'fake-answer-sdp' });
+      }
+      if (url.includes('/api/voice/live/sessions/') && method === 'DELETE') {
+        return jsonResponse({});
+      }
+      return jsonResponse({}, 404);
+    });
+
+    render(<ChatComposer draft="" onDraftChange={noop} onSend={noop} />);
+    await act(async () => {
+      fireEvent.click(screen.getByLabelText('Start live voice'));
+    });
+    await waitFor(() => expect(screen.getByLabelText('End live voice')).toBeInTheDocument());
+
+    await act(async () => {
+      window.dispatchEvent(new Event('pagehide'));
+    });
+
+    expect(lastPeerConnection?.lastDataChannel?.send).toHaveBeenCalledWith(
+      JSON.stringify({ type: 'session.close' }),
+    );
+    const deleteCalls = fetchSpy.mock.calls.filter(([, init]) => (init?.method ?? 'GET') === 'DELETE');
+    expect(deleteCalls.length).toBe(1);
+  });
+
+  it('refreshes the auth token every ~30s so the pagehide DELETE carries a fresh one', async () => {
+    vi.useFakeTimers();
+    try {
+      installFakeMediaDevices();
+      let tokenCount = 0;
+      const getAuthTokenSpy = vi
+        .spyOn(cortexApi, 'getAuthToken')
+        .mockImplementation(async () => `token-${(tokenCount += 1)}`);
+      const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
+        const url = String(input);
+        const method = init?.method ?? 'GET';
+        if (url.includes('/api/voice/live/sessions') && method === 'POST') {
+          return jsonResponse({ session_id: 'sess-6', sdp: 'fake-answer-sdp' });
+        }
+        if (url.includes('/api/voice/live/sessions/') && method === 'DELETE') {
+          return jsonResponse({});
+        }
+        return jsonResponse({}, 404);
+      });
+
+      render(<ChatComposer draft="" onDraftChange={noop} onSend={noop} />);
+      await act(async () => {
+        fireEvent.click(screen.getByLabelText('Start live voice'));
+        await vi.runOnlyPendingTimersAsync();
+      });
+      expect(screen.getByLabelText('End live voice')).toBeInTheDocument();
+      const tokenAtStart = await getAuthTokenSpy.mock.results[0].value;
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(31000);
+      });
+
+      await act(async () => {
+        window.dispatchEvent(new Event('pagehide'));
+      });
+
+      const deleteCalls = fetchSpy.mock.calls.filter(([, init]) => (init?.method ?? 'GET') === 'DELETE');
+      expect(deleteCalls.length).toBe(1);
+      const deleteAuthHeader = new Headers(deleteCalls[0][1]?.headers).get('Authorization');
+      expect(deleteAuthHeader).toBe(`Bearer token-${tokenCount}`);
+      expect(deleteAuthHeader).not.toBe(`Bearer ${tokenAtStart}`);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('shows the server refusal message for dictation (e.g. insufficient credits)', async () => {
