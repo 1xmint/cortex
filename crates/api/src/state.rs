@@ -523,7 +523,7 @@ impl AppState {
         // Captured before `decision` is moved into the frame below.
         let provider_egress = cortex_core::egress::derive_provider_egress(decision.provider);
         let provider_gateway = self.db.as_ref().and_then(|db| {
-            crate::provider_gateway_http::issue_stub_access(
+            crate::provider_gateway_http::issue_access(
                 db,
                 user_id,
                 &run_id,
