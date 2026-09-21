@@ -102,6 +102,9 @@ pub struct TransportResponse {
 pub enum TransportFailureKind {
     /// The transport can prove no bytes reached the supplier.
     NotSent,
+    /// The supplier answered, and the answer was a refusal it does not bill:
+    /// a bad request, a rate limit, an overload. Nothing was spent.
+    Rejected,
     /// A timeout says nothing about whether the supplier accepted the call.
     Timeout,
     /// Any other ambiguous network or supplier failure.
@@ -327,11 +330,9 @@ impl<'a, T: ProviderTransport> ProviderGateway<'a, T> {
             }
             Err(failure) => {
                 let reservation = match failure.kind {
-                    TransportFailureKind::NotSent => self.db.release_provider_request(
-                        &request.request_key,
-                        &failure.message,
-                        now_ms,
-                    ),
+                    TransportFailureKind::NotSent | TransportFailureKind::Rejected => self
+                        .db
+                        .release_provider_request(&request.request_key, &failure.message, now_ms),
                     TransportFailureKind::Timeout | TransportFailureKind::Unknown => {
                         self.db.mark_provider_request_unresolved(
                             &request.request_key,
@@ -990,6 +991,29 @@ mod tests {
             fixture
                 .db
                 .get_provider_reservation("not-sent")
+                .unwrap()
+                .status,
+            "released"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_supplier_refusal_releases_capacity() {
+        let fixture = Fixture::new(100_000, 100_000);
+        let gateway = fixture.gateway(Err(TransportFailure {
+            kind: TransportFailureKind::Rejected,
+            upstream_request_id: Some("req_refused".into()),
+            message: "anthropic returned 429 Too Many Requests".into(),
+        }));
+        let error = gateway
+            .forward(fixture.request(&gateway, "refused"), NOW)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, GatewayError::Transport(_)));
+        assert_eq!(
+            fixture
+                .db
+                .get_provider_reservation("refused")
                 .unwrap()
                 .status,
             "released"

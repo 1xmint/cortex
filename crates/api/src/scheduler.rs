@@ -705,7 +705,7 @@ async fn dispatch_step(state: &AppState, step: &StepRef) -> DispatchOutcome {
     // the repository, and nothing a customer can put in a repository may
     // influence which provider is reachable.
     let provider_egress = derive_provider_egress(decision.provider);
-    let provider_gateway = crate::provider_gateway_http::issue_stub_access(
+    let provider_gateway = crate::provider_gateway_http::issue_access(
         db,
         &step.user_id,
         &step.run_id,

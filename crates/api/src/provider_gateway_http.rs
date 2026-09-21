@@ -1,8 +1,15 @@
 //! Capability-authenticated Anthropic Messages surface for the private gateway.
 //!
-//! This increment is intentionally stub-only. A production supplier transport
-//! does not exist here, so setting any mode other than the exact `stub` value
-//! leaves the listener unavailable.
+//! Off unless `CORTEX_PROVIDER_GATEWAY_MODE` says otherwise, and it can say
+//! exactly two things:
+//!
+//! - `stub`: answers every call itself with a fixed reply. Nothing leaves the
+//!   machine and nothing is spent. This is what the proofs run against.
+//! - `live`: calls Anthropic on Cortex's own key, read from
+//!   `CORTEX_ANTHROPIC_SUPPLIER_KEY`. This spends real money, inside the same
+//!   reservation and cap as the stub. Without the key, `live` stays off.
+//!
+//! Any other value, or none, leaves the listener unavailable.
 
 use std::future::Future;
 
@@ -21,7 +28,34 @@ use crate::state::AppState;
 const STUB_SUPPLIER_KEY: &str = "STUB-PROVIDER-NOT-A-REAL-KEY";
 const GATEWAY_BASE_URL: &str = "https://cortex.heyvera.org/internal/provider";
 
-pub(crate) fn issue_stub_access(
+/// Anthropic keys are far longer than this; anything shorter is a typo or a
+/// placeholder, and a placeholder must not switch real spending on.
+const MIN_SUPPLIER_KEY_LEN: usize = 20;
+
+enum GatewayMode {
+    Stub,
+    Live { supplier_key: String },
+}
+
+fn gateway_mode() -> Option<GatewayMode> {
+    match std::env::var("CORTEX_PROVIDER_GATEWAY_MODE").as_deref() {
+        Ok("stub") => Some(GatewayMode::Stub),
+        Ok("live") => {
+            let supplier_key = std::env::var("CORTEX_ANTHROPIC_SUPPLIER_KEY")
+                .ok()
+                .filter(|key| key.trim().len() >= MIN_SUPPLIER_KEY_LEN);
+            if supplier_key.is_none() {
+                tracing::error!(
+                    "gateway mode is live but CORTEX_ANTHROPIC_SUPPLIER_KEY is absent; gateway stays off"
+                );
+            }
+            supplier_key.map(|supplier_key| GatewayMode::Live { supplier_key })
+        }
+        _ => None,
+    }
+}
+
+pub(crate) fn issue_access(
     db: &crate::db::Database,
     user_id: &str,
     run_id: &str,
@@ -31,9 +65,7 @@ pub(crate) fn issue_stub_access(
     lease_deadline_ms: i64,
     now_ms: i64,
 ) -> Option<cortex_core::protocol::ProviderGatewayAccess> {
-    if std::env::var("CORTEX_PROVIDER_GATEWAY_MODE").as_deref() != Ok("stub")
-        || provider != cortex_core::provider::ProviderId::Claude
-    {
+    if gateway_mode().is_none() || provider != cortex_core::provider::ProviderId::Claude {
         return None;
     }
     let signing_key = std::env::var("CORTEX_PROVIDER_GATEWAY_SIGNING_KEY").ok()?;
@@ -45,7 +77,7 @@ pub(crate) fn issue_stub_access(
     let funded_micro_usd = positive_env("CORTEX_PROVIDER_GATEWAY_FUNDED_MICRO_USD")?;
     let price_list = db.active_price_list()?;
     if price_list.model("claude", model).is_none() {
-        tracing::error!(model, "stub gateway has no immutable model rate");
+        tracing::error!(model, "gateway has no immutable model rate");
         return None;
     }
     db.set_supplier_capacity("claude", funded_micro_usd, now_ms)
@@ -135,13 +167,13 @@ pub async fn messages(
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Response {
-    if std::env::var("CORTEX_PROVIDER_GATEWAY_MODE").as_deref() != Ok("stub") {
+    let Some(mode) = gateway_mode() else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             "provider gateway is disabled",
         )
             .into_response();
-    }
+    };
     let Ok(signing_key) = std::env::var("CORTEX_PROVIDER_GATEWAY_SIGNING_KEY") else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -163,19 +195,50 @@ pub async fn messages(
         )
             .into_response();
     };
-    handle_stub_message(
-        db,
-        signing_key.as_bytes(),
-        &headers,
-        body,
-        chrono::Utc::now().timestamp_millis(),
-    )
-    .await
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    match mode {
+        GatewayMode::Stub => {
+            handle_stub_message(db, signing_key.as_bytes(), &headers, body, now_ms).await
+        }
+        GatewayMode::Live { supplier_key } => {
+            handle_message(
+                db,
+                signing_key.as_bytes(),
+                &supplier_key,
+                crate::supplier_anthropic::AnthropicTransport::new(),
+                &headers,
+                body,
+                now_ms,
+            )
+            .await
+        }
+    }
 }
 
 async fn handle_stub_message(
     db: &crate::db::Database,
     signing_key: &[u8],
+    headers: &HeaderMap,
+    body: Value,
+    now_ms: i64,
+) -> Response {
+    handle_message(
+        db,
+        signing_key,
+        STUB_SUPPLIER_KEY,
+        StubTransport,
+        headers,
+        body,
+        now_ms,
+    )
+    .await
+}
+
+async fn handle_message<T: ProviderTransport>(
+    db: &crate::db::Database,
+    signing_key: &[u8],
+    supplier_key: &str,
+    transport: T,
     headers: &HeaderMap,
     body: Value,
     now_ms: i64,
@@ -188,7 +251,7 @@ async fn handle_stub_message(
     else {
         return (StatusCode::UNAUTHORIZED, "missing gateway bearer").into_response();
     };
-    let gateway = ProviderGateway::new(db, signing_key, STUB_SUPPLIER_KEY, StubTransport);
+    let gateway = ProviderGateway::new(db, signing_key, supplier_key, transport);
     let capability = SignedCapability::from_exposed(token);
     let claims = match gateway.verified_claims(&capability) {
         Ok(claims) => claims,
@@ -231,7 +294,7 @@ async fn handle_stub_message(
     };
     match gateway.forward(request, now_ms).await {
         Ok(outcome) => match outcome.body {
-            Some(body) if wants_stream => stub_stream_response(&body),
+            Some(body) if wants_stream => message_as_sse(&body),
             Some(body) => Json(body).into_response(),
             None => (
                 StatusCode::CONFLICT,
@@ -243,7 +306,16 @@ async fn handle_stub_message(
     }
 }
 
-fn stub_stream_response(message: &Value) -> Response {
+/// A finished message, replayed as the event stream Anthropic would have sent.
+///
+/// The gateway settles on the finished message (see `supplier_anthropic.rs`
+/// for why), so a caller that asked for a stream gets it all at once. Each
+/// block is sent whole in one delta rather than in pieces, which every client
+/// that reads the stream accepts: text as a `text_delta`, a tool call's input
+/// as one `input_json_delta`, thinking as a `thinking_delta` plus its
+/// `signature_delta`. A block kind with no delta form is sent complete in its
+/// `content_block_start`.
+fn message_as_sse(message: &Value) -> Response {
     fn push_event(output: &mut String, name: &str, data: Value) {
         output.push_str("event: ");
         output.push_str(name);
@@ -252,11 +324,21 @@ fn stub_stream_response(message: &Value) -> Response {
         output.push_str("\n\n");
     }
 
+    let id = message
+        .get("id")
+        .cloned()
+        .unwrap_or_else(|| Value::from("msg_cortex_gateway"));
     let model = message.get("model").cloned().unwrap_or(Value::Null);
-    let text = message
-        .pointer("/content/0/text")
-        .and_then(Value::as_str)
-        .unwrap_or("cortex gateway stub");
+    let stop_reason = message
+        .get("stop_reason")
+        .cloned()
+        .unwrap_or_else(|| Value::from("end_turn"));
+    let stop_sequence = message.get("stop_sequence").cloned().unwrap_or(Value::Null);
+    let blocks = message
+        .get("content")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
     let input_tokens = message
         .pointer("/usage/input_tokens")
         .and_then(Value::as_i64)
@@ -272,7 +354,7 @@ fn stub_stream_response(message: &Value) -> Response {
         serde_json::json!({
             "type": "message_start",
             "message": {
-                "id": "msg_cortex_stub",
+                "id": id,
                 "type": "message",
                 "role": "assistant",
                 "model": model,
@@ -283,35 +365,70 @@ fn stub_stream_response(message: &Value) -> Response {
             }
         }),
     );
-    push_event(
-        &mut stream,
-        "content_block_start",
-        serde_json::json!({
-            "type": "content_block_start",
-            "index": 0,
-            "content_block": {"type": "text", "text": ""}
-        }),
-    );
-    push_event(
-        &mut stream,
-        "content_block_delta",
-        serde_json::json!({
-            "type": "content_block_delta",
-            "index": 0,
-            "delta": {"type": "text_delta", "text": text}
-        }),
-    );
-    push_event(
-        &mut stream,
-        "content_block_stop",
-        serde_json::json!({"type": "content_block_stop", "index": 0}),
-    );
+    for (index, block) in blocks.iter().enumerate() {
+        let kind = block.get("type").and_then(Value::as_str).unwrap_or("");
+        let field = |name: &str| block.get(name).cloned().unwrap_or(Value::Null);
+        let (start, deltas) = match kind {
+            "text" => (
+                serde_json::json!({"type": "text", "text": ""}),
+                vec![serde_json::json!({"type": "text_delta", "text": field("text")})],
+            ),
+            "tool_use" => (
+                serde_json::json!({
+                    "type": "tool_use",
+                    "id": field("id"),
+                    "name": field("name"),
+                    "input": {}
+                }),
+                vec![serde_json::json!({
+                    "type": "input_json_delta",
+                    "partial_json": block
+                        .get("input")
+                        .map(Value::to_string)
+                        .unwrap_or_else(|| "{}".into())
+                })],
+            ),
+            "thinking" => (
+                serde_json::json!({"type": "thinking", "thinking": ""}),
+                vec![
+                    serde_json::json!({"type": "thinking_delta", "thinking": field("thinking")}),
+                    serde_json::json!({"type": "signature_delta", "signature": field("signature")}),
+                ],
+            ),
+            _ => (block.clone(), Vec::new()),
+        };
+        push_event(
+            &mut stream,
+            "content_block_start",
+            serde_json::json!({
+                "type": "content_block_start",
+                "index": index,
+                "content_block": start
+            }),
+        );
+        for delta in deltas {
+            push_event(
+                &mut stream,
+                "content_block_delta",
+                serde_json::json!({
+                    "type": "content_block_delta",
+                    "index": index,
+                    "delta": delta
+                }),
+            );
+        }
+        push_event(
+            &mut stream,
+            "content_block_stop",
+            serde_json::json!({"type": "content_block_stop", "index": index}),
+        );
+    }
     push_event(
         &mut stream,
         "message_delta",
         serde_json::json!({
             "type": "message_delta",
-            "delta": {"stop_reason": "end_turn", "stop_sequence": null},
+            "delta": {"stop_reason": stop_reason, "stop_sequence": stop_sequence},
             "usage": {"output_tokens": output_tokens}
         }),
     );
@@ -606,5 +723,32 @@ mod tests {
             .db
             .get_provider_reservation("claude:auth-http:http-request-1")
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn a_replayed_stream_keeps_every_block_and_the_real_stop_reason() {
+        let response = message_as_sse(&serde_json::json!({
+            "id": "msg_real",
+            "model": MODEL,
+            "stop_reason": "tool_use",
+            "content": [
+                {"type": "thinking", "thinking": "plan", "signature": "sig"},
+                {"type": "text", "text": "running it"},
+                {"type": "tool_use", "id": "toolu_1", "name": "Bash", "input": {"command": "ls"}}
+            ],
+            "usage": {"input_tokens": 9, "output_tokens": 3}
+        }));
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.contains(r#""id":"msg_real""#));
+        assert!(body.contains(r#""signature_delta""#));
+        assert!(body.contains(r#""text":"running it""#));
+        assert!(body.contains(r#""name":"Bash""#));
+        assert!(body.contains(r#""partial_json":"{\"command\":\"ls\"}""#));
+        assert!(body.contains(r#""index":2"#));
+        assert!(body.contains(r#""stop_reason":"tool_use""#));
+        assert_eq!(body.matches("event: content_block_stop\n").count(), 3);
     }
 }
