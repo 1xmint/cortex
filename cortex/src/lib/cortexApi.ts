@@ -70,7 +70,7 @@ async function fetchWithRetry(
   throw lastError;
 }
 
-function apiUrl(path: string) {
+export function apiUrl(path: string) {
   const base = BASE_URL.replace(/\/$/, '');
   if (!base) return path;
   if (base.endsWith('/api') && path.startsWith('/api/')) {
@@ -96,7 +96,13 @@ export function setSomaDelegation(delegation: SomaDelegation | null) {
   _somaDelegation = delegation;
 }
 
-async function getAuthToken(): Promise<string | null> {
+/**
+ * Exposed (not just `authedFetch`-internal) for callers that need the raw
+ * bearer token themselves -- e.g. a `fetch(..., { keepalive: true })` sent
+ * from a `pagehide` handler, where there is no time left to route through
+ * the retry/JSON plumbing below.
+ */
+export async function getAuthToken(): Promise<string | null> {
   if (!_tokenGetter) return null;
   return _tokenGetter();
 }

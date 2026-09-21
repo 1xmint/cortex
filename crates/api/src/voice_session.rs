@@ -2105,7 +2105,7 @@ mod tests {
         let (http_base, ws_base) = spawn(FakeLiveScript {
             // 450s = 375_000 micro-USD at this test's rate = 4 credits, so
             // the drop-cleanup charge is provably nonzero (300s and 330s
-            // both round down to 3 credits and would make the delta 0).
+            // both round up to 3 credits and would make the delta 0).
             usage_events: vec![80, SEGMENT_SECONDS, SEGMENT_SECONDS + 150],
             send_closed_after_script: false,
             respond_to_client_close: false,

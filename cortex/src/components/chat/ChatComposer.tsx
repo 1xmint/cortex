@@ -1,6 +1,8 @@
-import { ArrowRight, ArrowUp, Square } from 'lucide-react';
+import { ArrowRight, ArrowUp, AudioLines, Mic, MicOff, Square } from 'lucide-react';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type { FormEvent, KeyboardEvent } from 'react';
+import { useDictation } from '../../hooks/useDictation';
+import { useLiveVoiceToggle } from '../../hooks/useLiveVoiceToggle';
 
 const BUILTIN_PHRASES = [
   'create task',
@@ -84,6 +86,24 @@ export default function ChatComposer({
   const canSend = draft.trim().length > 0 && !disabled && !locked;
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   const [ghostText, setGhostText] = useState('');
+  const draftRef = useRef(draft);
+  useEffect(() => {
+    draftRef.current = draft;
+  }, [draft]);
+
+  const dictation = useDictation({
+    onTranscript: useCallback((text: string) => {
+      // Update the ref synchronously, before notifying the parent: two
+      // transcript fragments can arrive before React re-renders and hands
+      // this closure a fresh `draft` prop, and each must build on the
+      // other rather than both starting from the same stale draft.
+      const next = draftRef.current + text;
+      draftRef.current = next;
+      onDraftChange(next);
+    }, [onDraftChange]),
+  });
+  const liveVoice = useLiveVoiceToggle();
+  const voiceError = dictation.error ?? liveVoice.error;
 
   const recomputeGhost = useCallback((value: string) => {
     setGhostText(computeGhostText(value));
@@ -211,9 +231,46 @@ export default function ChatComposer({
             </div>
           )}
         </div>
+        {voiceError && (
+          <p className="px-3 pb-1 text-xs text-red-400" role="alert">
+            {voiceError}
+          </p>
+        )}
         <div className="flex items-center justify-end px-1 pb-1">
           {/* Action Buttons */}
           <div className="flex items-center gap-2">
+            <button
+              type="button"
+              disabled={disabled || liveVoice.status !== 'idle'}
+              aria-label="Dictation"
+              aria-pressed={dictation.status === 'listening'}
+              onClick={dictation.toggle}
+              className={`inline-flex h-10 w-10 min-h-[44px] min-w-[44px] items-center justify-center rounded-full border transition active:scale-95 disabled:cursor-not-allowed disabled:opacity-50 sm:min-h-0 sm:min-w-0 ${
+                dictation.status === 'listening'
+                  ? 'border-transparent bg-[var(--accent)] text-black'
+                  : 'border-white/10 bg-white/8 text-white hover:bg-white/12'
+              }`}
+            >
+              {dictation.status === 'listening' ? (
+                <MicOff className="h-4 w-4" />
+              ) : (
+                <Mic className="h-4 w-4" />
+              )}
+            </button>
+            <button
+              type="button"
+              disabled={(disabled && liveVoice.status === 'idle') || dictation.status !== 'idle'}
+              aria-label="Live voice"
+              aria-pressed={liveVoice.status === 'active'}
+              onClick={liveVoice.toggle}
+              className={`inline-flex h-10 w-10 min-h-[44px] min-w-[44px] items-center justify-center rounded-full border transition active:scale-95 disabled:cursor-not-allowed disabled:opacity-50 sm:min-h-0 sm:min-w-0 ${
+                liveVoice.status === 'active'
+                  ? 'border-transparent bg-[var(--accent)] text-black'
+                  : 'border-white/10 bg-white/8 text-white hover:bg-white/12'
+              }`}
+            >
+              <AudioLines className={`h-4 w-4 ${liveVoice.status === 'connecting' ? 'animate-pulse' : ''}`} />
+            </button>
             {disabled && onStop ? (
               <button
                 type="button"
