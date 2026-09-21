@@ -13,6 +13,8 @@ import { describe, expect, it } from 'vitest';
  *
  * It found seven when it was written, including the only screen that could
  * open a pull request for a finished run, against a route the backend serves.
+ * That one is settled: the button lives on RunsPane now and the old screen is
+ * deleted, which is what an entry below is supposed to end in.
  *
  * Every unreachable file has to be named below with what is true about it and
  * what would resolve it. That is the point: an orphan you have to write a
@@ -37,13 +39,6 @@ const KNOWN_UNREACHABLE: Record<string, string> = {
   // /api/github/status/{import_id} are all served. Importing a repo is
   // reachable nowhere in the running app.
   'components/onboarding/RepoImport.tsx': 'built, backend served, never wired',
-
-  // Superseded as a runs view by components/mission/RunsPane.tsx, which is on
-  // /runs -- except for one thing. RunPanel is the only screen that calls
-  // createRunPullRequest, and POST /api/runs/{id}/pr is served. So "open the
-  // PR for this run" is a backend that works and a button nothing renders.
-  // Lift that into RunsPane, then delete this file.
-  'components/runs/RunPanel.tsx': 'superseded, except it holds the only PR button',
 
   // The budget UI. Unreachable because /api/budget/* has never existed in any
   // commit -- see BUDGET_API_ENABLED in cortexApi.ts. These stay until that

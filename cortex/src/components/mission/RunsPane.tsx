@@ -1,7 +1,16 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { Link } from 'react-router';
-import { Activity, BadgeCheck, ChevronDown, ChevronRight, RefreshCw } from 'lucide-react';
 import {
+  Activity,
+  BadgeCheck,
+  ChevronDown,
+  ChevronRight,
+  ExternalLink,
+  GitPullRequest,
+  RefreshCw,
+} from 'lucide-react';
+import {
+  createRunPullRequest,
   getRun,
   listRuns,
   streamRun,
@@ -28,6 +37,14 @@ import { EmptyState, ErrorState, PaneHeader, SkeletonRows, StatusChip, StatusIco
  * verification badge either, even though a worker report exists for it. The
  * report is the worker's account of its own work; rendering it with a check
  * mark is how a claim we never checked reaches a customer as though we had.
+ *
+ * A run that finished can have its branch pushed and a pull request opened
+ * from here, against POST /api/runs/{id}/pr. That button used to live on
+ * components/runs/RunPanel.tsx, which this pane superseded and nothing routed
+ * to, so the backend worked and no screen could reach it. The wording under
+ * the button says what was not verified, for the same reason the step rows
+ * do: a pull request is where this work stops being ours and starts being
+ * somebody's to review.
  */
 
 // Delivered and verifying are absent on purpose: work handed over but not
@@ -41,6 +58,12 @@ const TERMINAL = new Set([
   'cancelled',
   'completed',
 ]);
+
+// A run that finished without failing is the only kind worth offering a pull
+// request for. The backend decides for real -- it answers 422 "run has no
+// branch" when the run changed nothing -- but there is no reason to show a
+// button for a run that was cancelled or that crashed.
+const SHIPPABLE = new Set(['verified', 'manual_override', 'completed']);
 
 function StepRow({ step, runId }: { step: RunStep; runId: string }) {
   const [expanded, setExpanded] = useState(false);
@@ -136,6 +159,36 @@ export default function RunsPane() {
   const [error, setError] = useState<string | null>(null);
   const [live, setLive] = useState(false);
   const streamRef = useRef<AbortController | null>(null);
+
+  // Keyed by run, not reset on switch. A RunSummary carries no pr_url, so
+  // once you leave a run the app forgets it has a pull request; holding the
+  // id means clicking back to it still shows the link instead of a button
+  // that would push the same branch a second time. It also makes a slow
+  // request that lands after a switch harmless: it belongs to a run that is
+  // no longer on screen, so nothing renders it.
+  const [pr, setPr] = useState<{ runId: string; url: string; branch: string } | null>(null);
+  const [prPending, setPrPending] = useState<string | null>(null);
+  const [prError, setPrError] = useState<{ runId: string; message: string } | null>(null);
+
+  const openPullRequest = useCallback(async (runId: string) => {
+    setPrPending(runId);
+    setPrError(null);
+    try {
+      const created = await createRunPullRequest(runId);
+      setPr({ runId, url: created.pr_url, branch: created.branch });
+    } catch (err) {
+      // The backend's own words. "run has no branch — no changes were made",
+      // "PR creation requires a run-owned write lease" and "access denied"
+      // each tell the user something different and something actionable;
+      // flattening them into "could not create pull request" does not.
+      setPrError({
+        runId,
+        message: err instanceof Error ? err.message : 'could not open a pull request',
+      });
+    } finally {
+      setPrPending((current) => (current === runId ? null : current));
+    }
+  }, []);
 
   const loadRuns = useCallback(async () => {
     try {
@@ -313,6 +366,54 @@ export default function RunsPane() {
                       the receipt — a badge with nothing behind it is worse than
                       no badge.
                     </p>
+                  )}
+
+                  {/* Below the verification note on purpose. Opening a pull
+                      request is the moment this run's work leaves the machine
+                      and asks a person to look at it, so what was and was not
+                      checked belongs above the button, not after it. */}
+                  {detail.status && SHIPPABLE.has(detail.status) && (
+                    <div className="mt-3 rounded-lg border border-[var(--line)] bg-[var(--surface)] px-3 py-2.5">
+                      {pr?.runId === detail.id ? (
+                        <a
+                          href={pr.url}
+                          target="_blank"
+                          rel="noreferrer"
+                          className="t-body inline-flex items-center gap-1.5 text-[var(--accent)] hover:underline"
+                        >
+                          <GitPullRequest className="h-3.5 w-3.5" aria-hidden />
+                          Pull request open
+                          <ExternalLink className="h-3 w-3" aria-hidden />
+                        </a>
+                      ) : (
+                        <button
+                          type="button"
+                          disabled={prPending === detail.id}
+                          onClick={() => void openPullRequest(detail.id)}
+                          className="t-body inline-flex items-center gap-1.5 rounded-md border border-[var(--line)] bg-[var(--surface-raised)] px-2.5 py-1 text-[var(--fg)] transition-colors hover:bg-[var(--surface-hover)] disabled:cursor-not-allowed disabled:opacity-50"
+                        >
+                          <GitPullRequest
+                            className={`h-3.5 w-3.5 ${prPending === detail.id ? 'animate-pulse' : ''}`}
+                            aria-hidden
+                          />
+                          {prPending === detail.id ? 'Pushing the branch…' : 'Open pull request'}
+                        </button>
+                      )}
+
+                      <p className="t-micro mt-1.5 text-[var(--muted)]">
+                        {pr?.runId === detail.id
+                          ? `Branch ${pr.branch} is pushed. Nothing is merged — the pull request is where a person decides that.`
+                          : anyReceipts
+                            ? "Pushes this run's branch and opens a pull request. Nothing is merged."
+                            : "Pushes this run's branch and opens a pull request. Nothing in this run has been verified, and nothing is merged."}
+                      </p>
+
+                      {prError?.runId === detail.id && (
+                        <p className="t-micro mt-1.5 rounded border border-[var(--err-line)] bg-[var(--err-soft)] px-2.5 py-1.5 text-[var(--err-strong)]">
+                          {prError.message}
+                        </p>
+                      )}
+                    </div>
                   )}
                 </div>
               )}
