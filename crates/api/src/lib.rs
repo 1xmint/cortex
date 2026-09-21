@@ -32,6 +32,7 @@ pub mod mission_control;
 pub mod pricing;
 pub mod provider_gateway;
 mod provider_gateway_http;
+mod supplier_anthropic;
 pub mod verification_dispatcher;
 pub mod verification_driver;
 // pub mod memory; // removed for Context-Flow Pipeline deployment
