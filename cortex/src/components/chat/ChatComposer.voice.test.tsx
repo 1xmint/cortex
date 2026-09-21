@@ -485,7 +485,7 @@ describe('ChatComposer voice controls', () => {
     expect(instances[0].srcObject).toBeNull();
   });
 
-  it('a server-initiated session.closed (credits ran out) shows a message and sends one DELETE', async () => {
+  it('a server-initiated session.closed (credits ran out, reason close_requested) shows the credits message and sends one DELETE', async () => {
     installFakeMediaDevices();
     const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
       const url = String(input);
@@ -505,14 +505,78 @@ describe('ChatComposer voice controls', () => {
     });
     await waitFor(() => expect(screen.getByLabelText('Live voice')).toHaveAttribute('aria-pressed', 'true'));
 
+    // No toggle-off happened first -- this is the server's own credits
+    // close, which (per crates/api/src/voice_session.rs's billing loop)
+    // arrives as `close_requested`, the same reason a user stop produces.
     act(() => {
-      lastPeerConnection?.lastDataChannel?.emitMessage({ type: 'session.closed', reason: 'expired' });
+      lastPeerConnection?.lastDataChannel?.emitMessage({ type: 'session.closed', reason: 'close_requested' });
     });
 
     expect(await screen.findByRole('alert')).toHaveTextContent(/credits ran out/i);
     await waitFor(() => expect(screen.getByLabelText('Live voice')).toHaveAttribute('aria-pressed', 'false'));
     const deleteCalls = fetchSpy.mock.calls.filter(([, init]) => (init?.method ?? 'GET') === 'DELETE');
     expect(deleteCalls.length).toBe(1);
+  });
+
+  it('a session.closed with reason expired shows the time-limit message, not the credits message', async () => {
+    installFakeMediaDevices();
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
+      const url = String(input);
+      const method = init?.method ?? 'GET';
+      if (url.includes('/api/voice/live/sessions') && method === 'POST') {
+        return jsonResponse({ session_id: 'sess-8b', sdp: 'fake-answer-sdp' });
+      }
+      if (url.includes('/api/voice/live/sessions/') && method === 'DELETE') {
+        return jsonResponse({});
+      }
+      return jsonResponse({}, 404);
+    });
+
+    render(<ChatComposer draft="" onDraftChange={noop} onSend={noop} />);
+    await act(async () => {
+      fireEvent.click(screen.getByLabelText('Live voice'));
+    });
+    await waitFor(() => expect(screen.getByLabelText('Live voice')).toHaveAttribute('aria-pressed', 'true'));
+
+    act(() => {
+      lastPeerConnection?.lastDataChannel?.emitMessage({ type: 'session.closed', reason: 'expired' });
+    });
+
+    const alert = await screen.findByRole('alert');
+    expect(alert).toHaveTextContent(/time limit/i);
+    expect(alert).not.toHaveTextContent(/credits/i);
+  });
+
+  it('a user toggle-off followed by session.closed close_requested shows no message', async () => {
+    installFakeMediaDevices();
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
+      const url = String(input);
+      const method = init?.method ?? 'GET';
+      if (url.includes('/api/voice/live/sessions') && method === 'POST') {
+        return jsonResponse({ session_id: 'sess-8c', sdp: 'fake-answer-sdp' });
+      }
+      if (url.includes('/api/voice/live/sessions/') && method === 'DELETE') {
+        return jsonResponse({});
+      }
+      return jsonResponse({}, 404);
+    });
+
+    render(<ChatComposer draft="" onDraftChange={noop} onSend={noop} />);
+    await act(async () => {
+      fireEvent.click(screen.getByLabelText('Live voice'));
+    });
+    await waitFor(() => expect(screen.getByLabelText('Live voice')).toHaveAttribute('aria-pressed', 'true'));
+
+    const dc = lastPeerConnection?.lastDataChannel;
+    await act(async () => {
+      fireEvent.click(screen.getByLabelText('Live voice'));
+    });
+
+    act(() => {
+      dc?.emitMessage({ type: 'session.closed', reason: 'close_requested' });
+    });
+
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
   });
 
   it('a user-requested toggle-off shows no error', async () => {

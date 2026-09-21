@@ -7,15 +7,21 @@ export type LiveVoiceStatus = 'idle' | 'connecting' | 'active';
 
 /**
  * `session.closed`'s `reason` (per the GPT-Live WebRTC guide) is
- * `close_requested` when *we* asked for the close (the toggle, an unmount,
- * a tab close); anything else is the model or Cortex ending the call out
- * from under the UI -- most commonly `expired`, which is what a session
- * that ran out of the credits Cortex is willing to extend it looks like
- * from the browser's side.
+ * `close_requested` when the app sent `session.close` or hung up --
+ * `expired` is the OpenAI-side duration limit. The Cortex SERVER also sends
+ * `session.close` on its own sideband connection when a session's credits
+ * run out (`crates/api/src/voice_session.rs`'s billing loop), which reaches
+ * the browser as `session.closed` with reason `close_requested` too -- the
+ * same reason a user-initiated stop produces. `closeRequestedRef` is what
+ * tells those two apart: it is only set when *this* browser asked for the
+ * close, so a `close_requested` the browser didn't ask for is the credits
+ * close, and a `close_requested` it did ask for stays silent.
  */
-function sessionClosedMessage(reason: unknown): string | null {
-  if (reason === 'close_requested') return null;
-  if (reason === 'expired') return 'Live voice ended: your credits ran out.';
+function sessionClosedMessage(reason: unknown, closeRequestedByUs: boolean): string | null {
+  if (reason === 'close_requested') {
+    return closeRequestedByUs ? null : 'Live voice ended: your credits ran out.';
+  }
+  if (reason === 'expired') return 'Live voice ended: the session reached its time limit.';
   const label = typeof reason === 'string' && reason ? reason.replace(/_/g, ' ') : 'the connection ended';
   return `Live voice ended. ${label}.`;
 }
@@ -63,9 +69,11 @@ function microphoneErrorMessage(error: unknown): string {
  * A continuous spoken conversation with gpt-live-1, brokered through
  * `POST /api/voice/live/sessions` / `DELETE /api/voice/live/sessions/{id}`
  * (`crates/api/src/voice_session.rs`). The server bills this in segments and
- * can close the call itself when credits run out -- when that happens the
- * browser sees its WebRTC connection to OpenAI end, same as any other
- * disconnect, and this hook reacts the same way it would to a failure.
+ * can close the call itself when credits run out, over its own sideband
+ * connection -- when that happens the browser gets a `session.closed`
+ * message with reason `close_requested`, the same reason a user-initiated
+ * stop produces, so `closeRequestedRef` is what this hook checks to tell a
+ * credits close from its own toggle-off.
  *
  * Every path that can end this session -- the toggle, an unmount, the tab
  * closing, and the connection failing on its own -- funnels through
@@ -93,6 +101,12 @@ export function useLiveVoiceToggle() {
   // stranded open and billed.
   const cancelledRef = useRef(false);
   const disconnectTimerRef = useRef<number | null>(null);
+  // Set whenever this browser itself asked for the close -- the toggle's
+  // `stop()` or the pagehide handler -- before anything is sent. Checked by
+  // the `session.closed` handler to tell the server's own credits-close
+  // (which arrives as reason `close_requested`, same as a user-initiated
+  // one) apart from a stop the user actually asked for.
+  const closeRequestedRef = useRef(false);
 
   const releaseLocal = useCallback(() => {
     dcRef.current?.close();
@@ -154,6 +168,7 @@ export function useLiveVoiceToggle() {
 
   const stop = useCallback(() => {
     cancelledRef.current = true;
+    closeRequestedRef.current = true;
     sendClose(false);
     releaseLocal();
     setStatus('idle');
@@ -163,6 +178,7 @@ export function useLiveVoiceToggle() {
     if (startingRef.current || status !== 'idle') return;
     startingRef.current = true;
     cancelledRef.current = false;
+    closeRequestedRef.current = false;
     setError(null);
     setStatus('connecting');
     // A cancellation (unmount or user stop) can land between any two awaits
@@ -223,7 +239,7 @@ export function useLiveVoiceToggle() {
           // The server can end this call on its own (credits ran out,
           // OpenAI hung up, ...); a silent toggle-off would hide that from
           // the user, so only a close *we* asked for stays quiet.
-          const message = sessionClosedMessage(payload.reason);
+          const message = sessionClosedMessage(payload.reason, closeRequestedRef.current);
           if (message) setError(message);
           sendClose(false);
           releaseLocal();
@@ -286,6 +302,17 @@ export function useLiveVoiceToggle() {
 
       setStatus('active');
     } catch (err) {
+      if (cancelledRef.current) {
+        // A user cancel (stop, or unmount) landed while this was still
+        // connecting -- `bailIfCancelled` above already handles that on
+        // every await it guards, but a rejection thrown between two of
+        // those (or by one of the calls it guards, e.g. `setRemoteDescription`)
+        // lands here instead. Either way it is not a failure worth
+        // reporting to the user.
+        sendClose(false);
+        releaseLocal();
+        return;
+      }
       // A failure here can land after the POST already opened (and is
       // billing) a session -- e.g. setRemoteDescription rejecting. Closing
       // it is the first thing this does, before anything else about the
@@ -322,15 +349,21 @@ export function useLiveVoiceToggle() {
   useEffect(() => {
     if (status !== 'active') return;
     const interval = window.setInterval(() => {
-      void getAuthToken().then((token) => {
-        tokenRef.current = token;
-      });
+      void getAuthToken()
+        .then((token) => {
+          tokenRef.current = token;
+        })
+        .catch(() => {
+          // Best-effort refresh; a failure here leaves the previous token
+          // cached, which is still good for a while.
+        });
     }, 30000);
     return () => window.clearInterval(interval);
   }, [status]);
 
   useEffect(() => {
     const handlePageHide = () => {
+      closeRequestedRef.current = true;
       // `session.close` is synchronous and needs no auth, so it goes out
       // first, over the data channel, even if the keepalive DELETE below
       // ends up racing the page's actual teardown.
@@ -344,11 +377,13 @@ export function useLiveVoiceToggle() {
       }
       sendClose(true);
     };
+    // `pagehide` only -- not `beforeunload`, which also fires when the
+    // browser is merely asking whether to leave (e.g. a "Leave site?"
+    // prompt the user then cancels), which would end the call for a tab
+    // that never actually closed.
     window.addEventListener('pagehide', handlePageHide);
-    window.addEventListener('beforeunload', handlePageHide);
     return () => {
       window.removeEventListener('pagehide', handlePageHide);
-      window.removeEventListener('beforeunload', handlePageHide);
       // A plain unmount (in-app navigation) keeps the tab alive, so the
       // regular DELETE path is reliable here -- no need for the beacon.
       cancelledRef.current = true;
