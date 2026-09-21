@@ -69,12 +69,56 @@ pub(crate) fn issue_access(
         return None;
     }
     let signing_key = std::env::var("CORTEX_PROVIDER_GATEWAY_SIGNING_KEY").ok()?;
+    let limits = SpendLimits::from_env()?;
+    let expires_at_ms = lease_deadline_ms;
+    let (authorization_id, signed) = create_authorization_and_capability(
+        db,
+        &signing_key,
+        user_id,
+        run_id,
+        attempt_id,
+        model,
+        limits.max_micro_usd,
+        limits.funded_micro_usd,
+        expires_at_ms,
+        now_ms,
+    )?;
+    Some(cortex_core::protocol::ProviderGatewayAccess {
+        authorization_id,
+        run_id: run_id.to_string(),
+        attempt_id: attempt_id.to_string(),
+        provider: "claude".into(),
+        model: model.to_string(),
+        base_url: GATEWAY_BASE_URL.into(),
+        expires_at_ms,
+        bearer: cortex_core::protocol::GatewayBearer::new(signed.expose()),
+    })
+}
+
+/// The reusable core of a spend authorization plus its signed capability.
+///
+/// `issue_access` (a run, handed the capability over HTTP) and chat (paid by
+/// Cortex, calling the gateway in-process) are the same trust boundary — one
+/// durable authorization row, funded supplier capacity, one signature over an
+/// immutable rate — so this is the one place that boundary gets built. The
+/// caller owns picking `max_micro_usd` (a run reads it from env; chat caps it
+/// at the user's own balance) and the deadline; everything else is identical.
+pub(crate) fn create_authorization_and_capability(
+    db: &crate::db::Database,
+    signing_key: &str,
+    user_id: &str,
+    run_id: &str,
+    attempt_id: &str,
+    model: &str,
+    max_micro_usd: i64,
+    funded_micro_usd: i64,
+    expires_at_ms: i64,
+    now_ms: i64,
+) -> Option<(String, SignedCapability)> {
     if signing_key.len() < 32 {
         tracing::error!("gateway signing key must contain at least 32 bytes");
         return None;
     }
-    let max_micro_usd = positive_env("CORTEX_PROVIDER_GATEWAY_MAX_MICRO_USD")?;
-    let funded_micro_usd = positive_env("CORTEX_PROVIDER_GATEWAY_FUNDED_MICRO_USD")?;
     let price_list = db.active_price_list()?;
     if price_list.model("claude", model).is_none() {
         tracing::error!(model, "gateway has no immutable model rate");
@@ -82,7 +126,6 @@ pub(crate) fn issue_access(
     }
     db.set_supplier_capacity("claude", funded_micro_usd, now_ms)
         .ok()?;
-    let expires_at_ms = lease_deadline_ms;
     if expires_at_ms <= now_ms {
         return None;
     }
@@ -111,19 +154,29 @@ pub(crate) fn issue_access(
         expires_at_ms,
     );
     let signed = sign_capability(signing_key.as_bytes(), &claims).ok()?;
-    Some(cortex_core::protocol::ProviderGatewayAccess {
-        authorization_id,
-        run_id: run_id.to_string(),
-        attempt_id: attempt_id.to_string(),
-        provider: "claude".into(),
-        model: model.to_string(),
-        base_url: GATEWAY_BASE_URL.into(),
-        expires_at_ms,
-        bearer: cortex_core::protocol::GatewayBearer::new(signed.expose()),
-    })
+    Some((authorization_id, signed))
 }
 
-fn positive_env(name: &str) -> Option<i64> {
+/// The operator's two spending numbers: the most one authorization may spend,
+/// and how much Cortex has funded the supplier with. Read once from the
+/// environment by the caller and passed down, so nothing below reads process
+/// state that a test running alongside could change.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SpendLimits {
+    pub max_micro_usd: i64,
+    pub funded_micro_usd: i64,
+}
+
+impl SpendLimits {
+    pub(crate) fn from_env() -> Option<Self> {
+        Some(Self {
+            max_micro_usd: positive_env("CORTEX_PROVIDER_GATEWAY_MAX_MICRO_USD")?,
+            funded_micro_usd: positive_env("CORTEX_PROVIDER_GATEWAY_FUNDED_MICRO_USD")?,
+        })
+    }
+}
+
+pub(crate) fn positive_env(name: &str) -> Option<i64> {
     std::env::var(name)
         .ok()?
         .parse()
@@ -132,7 +185,7 @@ fn positive_env(name: &str) -> Option<i64> {
 }
 
 #[derive(Clone, Copy)]
-struct StubTransport;
+pub(crate) struct StubTransport;
 
 impl ProviderTransport for StubTransport {
     fn forward(
@@ -160,6 +213,59 @@ impl ProviderTransport for StubTransport {
             }),
         }))
     }
+}
+
+/// Either transport the gateway can run against, behind one type so a caller
+/// that only knows "the gateway is usable" doesn't need to be generic.
+pub(crate) enum GatewayTransport {
+    Stub(StubTransport),
+    Live(crate::supplier_anthropic::AnthropicTransport),
+}
+
+impl ProviderTransport for GatewayTransport {
+    async fn forward(
+        &self,
+        supplier_key: &str,
+        request: &GatewayRequest,
+    ) -> Result<TransportResponse, TransportFailure> {
+        match self {
+            GatewayTransport::Stub(t) => t.forward(supplier_key, request).await,
+            GatewayTransport::Live(t) => t.forward(supplier_key, request).await,
+        }
+    }
+}
+
+/// What chat needs to know to pay for its own reply: the gateway is on, and
+/// here is what to sign with and who to call. Stub mode keeps this usable —
+/// and free — in CI; live mode is only reachable with a real supplier key.
+pub(crate) struct GatewayUsable {
+    pub signing_key: String,
+    pub supplier_key: String,
+    pub transport: GatewayTransport,
+}
+
+/// Whether the gateway can be called right now, and with what. Returns
+/// `None` for exactly the reasons `messages` above would answer
+/// `SERVICE_UNAVAILABLE`: no mode configured, or a signing key that is
+/// missing or too short to trust.
+pub(crate) fn gateway_usable() -> Option<GatewayUsable> {
+    let mode = gateway_mode()?;
+    let signing_key = std::env::var("CORTEX_PROVIDER_GATEWAY_SIGNING_KEY").ok()?;
+    if signing_key.len() < 32 {
+        return None;
+    }
+    Some(match mode {
+        GatewayMode::Stub => GatewayUsable {
+            signing_key,
+            supplier_key: STUB_SUPPLIER_KEY.into(),
+            transport: GatewayTransport::Stub(StubTransport),
+        },
+        GatewayMode::Live { supplier_key } => GatewayUsable {
+            signing_key,
+            supplier_key,
+            transport: GatewayTransport::Live(crate::supplier_anthropic::AnthropicTransport::new()),
+        },
+    })
 }
 
 pub async fn messages(
