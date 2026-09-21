@@ -461,6 +461,13 @@ async fn start_live_session(
     }
 
     let run_id = format!("voice:{local_id}");
+    // The authorization row's primary key is `gateway-auth:{attempt_id}` —
+    // a literal `"live"` here collided on every second voice session ever
+    // started (by anyone), since `create_spend_authorization` would then
+    // try to insert the exact same row id twice and fail. `local_id` is a
+    // fresh UUID per call, so this keeps every session's attempt id unique
+    // the way `chat_paid`'s `chat-reply:{reply_id}` already does.
+    let attempt_id = format!("live:{local_id}");
     let expires_at_ms = now_ms + SESSION_LEASE_MS;
     let Some((authorization_id, _signed)) =
         provider_gateway_http::create_authorization_and_capability(
@@ -468,7 +475,7 @@ async fn start_live_session(
             signing_key,
             user_id,
             &run_id,
-            "live",
+            &attempt_id,
             LIVE_PROVIDER,
             LIVE_MODEL,
             max_micro_usd,
@@ -483,7 +490,7 @@ async fn start_live_session(
         authorization_id,
         user_id,
         &run_id,
-        "live",
+        &attempt_id,
         LIVE_PROVIDER,
         LIVE_MODEL,
         expires_at_ms,
@@ -1667,7 +1674,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_dropped_sideband_leaves_one_unresolved_reservation_and_charges_nothing_extra() {
+    async fn a_dropped_sideband_charges_the_observed_remainder() {
+        // Neither scripted event (50s, 100s) ever crosses the 80% renewal
+        // threshold or the segment boundary, so segment 0 never settles —
+        // it is only the drop-cleanup path's direct `:drop` charge that
+        // must bill for the 100s actually observed.
         let (_dir, state) = test_state().await;
         let (http_base, ws_base) = spawn(FakeLiveScript {
             usage_events: vec![50, 100],
@@ -1696,6 +1707,8 @@ mod tests {
         wait_until_session_gone(&state, &session_id).await;
 
         let db = state.db.as_ref().unwrap();
+        let price_list = db.active_price_list().unwrap();
+        let rate = price_list.model("openai", "gpt-live-1").cloned().unwrap();
         let reservation = db
             .get_provider_reservation(&format!("voice:{local_id}:0"))
             .expect("segment 0 exists");
@@ -1703,6 +1716,30 @@ mod tests {
         assert_eq!(
             db.provider_spend_row_count(&format!("voice:{local_id}:0")),
             0
+        );
+
+        let expected_credits = ceil_div(rate.cost_micros(100, 0, 0), price_list.micros_per_credit);
+        // 100s = 83_333 micro-USD at this test's rate, ceil-divided by
+        // 100_000 micros/credit = 1 credit; pinned literally so a change to
+        // `rate` or `ceil_div` that silently zeroed the delta cannot make
+        // this test pass by agreeing with itself.
+        assert_eq!(expected_credits, 1);
+        let balance = db.get_credit_balance_row(USER).unwrap();
+        let spent_credits = 1_000_000_000 - balance.subscription_remaining;
+        assert_eq!(spent_credits, expected_credits);
+
+        let drop_key_prefix = format!("voice:{local_id}:drop%");
+        let ledger_rows: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM credit_transactions WHERE idempotency_key LIKE ?1",
+                [&drop_key_prefix],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            ledger_rows >= 1,
+            "the observed remainder must be charged directly on drop"
         );
     }
 
@@ -2324,10 +2361,20 @@ mod tests {
         // process, so the startup sweep is the only thing that reconciles
         // it.
         let (_dir, state) = test_state().await;
+        // `respond_to_client_close: true` here (unlike the drop tests) is
+        // load-bearing: with `false` the fake has nothing left to do once
+        // its empty `usage_events` script runs out and no self-close is
+        // scripted, so it drops the connection immediately after attach —
+        // the sideband-drop cleanup then races the test's own `before`
+        // check and can mark segment 0 `unresolved` before the test ever
+        // gets to sweep it, which is not what a live "reserved" segment at
+        // restart looks like. Waiting on the client's own `session.close`
+        // (never sent here) keeps the sideband open and the reservation
+        // `reserved` until the test explicitly sweeps it.
         let (http_base, ws_base) = spawn(FakeLiveScript {
             usage_events: vec![],
             send_closed_after_script: false,
-            respond_to_client_close: false,
+            respond_to_client_close: true,
             refuse_attach: false,
             pause_after_first_event: None,
             ..Default::default()
