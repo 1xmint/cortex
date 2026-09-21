@@ -20,6 +20,32 @@ function sessionClosedMessage(reason: unknown): string | null {
   return `Live voice ended. ${label}.`;
 }
 
+/**
+ * The offer sent to Cortex should carry every ICE candidate this browser
+ * can gather, not just the ones gathered by the time `createOffer`
+ * resolves -- otherwise a network with slow candidate gathering loses
+ * connectivity options it should have had. Caps the wait rather than
+ * blocking forever on a browser/network that never reports `complete`.
+ */
+function waitForIceGatheringComplete(pc: RTCPeerConnection, timeoutMs = 2000): Promise<void> {
+  if (pc.iceGatheringState === 'complete') return Promise.resolve();
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      pc.removeEventListener('icegatheringstatechange', onChange);
+      window.clearTimeout(timer);
+      resolve();
+    };
+    const onChange = () => {
+      if (pc.iceGatheringState === 'complete') finish();
+    };
+    pc.addEventListener('icegatheringstatechange', onChange);
+    const timer = window.setTimeout(finish, timeoutMs);
+  });
+}
+
 function microphoneErrorMessage(error: unknown): string {
   if (error instanceof Error && error.name === 'NotAllowedError') {
     return 'Microphone access was denied. Allow microphone access to use live voice.';
@@ -206,8 +232,10 @@ export function useLiveVoiceToggle() {
       if (bailIfCancelled()) return;
       await pc.setLocalDescription(offer);
       if (bailIfCancelled()) return;
+      await waitForIceGatheringComplete(pc);
+      if (bailIfCancelled()) return;
 
-      const response = await startLiveVoiceSession(offer.sdp ?? '');
+      const response = await startLiveVoiceSession(pc.localDescription?.sdp ?? offer.sdp ?? '');
       sessionIdRef.current = response.session_id;
       if (bailIfCancelled()) return;
 
