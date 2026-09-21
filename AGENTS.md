@@ -62,6 +62,10 @@ where somebody presses the button. **Open a PR as draft if it is not ready**, an
 be aware that a stacked PR merges into its base branch as soon as *that* base's
 checks pass, which collapses stacks without asking.
 
+**Always true:** A ready pull request merges itself when checks pass; a draft
+does not. Payment, sign-in and data-deleting changes stay drafts until an
+independent review passes.
+
 Anything not on the required list is advisory and cannot stop a merge, however
 red it is. CONTRIBUTING has the live list and the command to read it.
 
