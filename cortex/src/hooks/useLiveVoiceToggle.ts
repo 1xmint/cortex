@@ -178,6 +178,11 @@ export function useLiveVoiceToggle() {
 
       setStatus('active');
     } catch (err) {
+      // A failure here can land after the POST already opened (and is
+      // billing) a session -- e.g. setRemoteDescription rejecting. Closing
+      // it is the first thing this does, before anything else about the
+      // failure is handled.
+      sendClose(false);
       releaseLocal();
       if (err instanceof CortexApiError) {
         setError(

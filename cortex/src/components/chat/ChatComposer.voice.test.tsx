@@ -279,6 +279,47 @@ describe('ChatComposer voice controls', () => {
     expect(deleteCalls.length).toBe(1);
   });
 
+  it('a post-POST failure (setRemoteDescription rejecting) still sends one DELETE and unblocks the next start', async () => {
+    installFakeMediaDevices();
+    let call = 0;
+    (
+      globalThis as unknown as {
+        RTCPeerConnection: new () => FakePeerConnection;
+      }
+    ).RTCPeerConnection = class extends FakePeerConnection {
+      setRemoteDescription = vi.fn(async () => {
+        call += 1;
+        if (call === 1) throw new Error('boom');
+      });
+    };
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
+      const url = String(input);
+      const method = init?.method ?? 'GET';
+      if (url.includes('/api/voice/live/sessions') && method === 'POST') {
+        return jsonResponse({ session_id: `sess-${call}`, sdp: 'fake-answer-sdp' });
+      }
+      if (url.includes('/api/voice/live/sessions/') && method === 'DELETE') {
+        return jsonResponse({});
+      }
+      return jsonResponse({}, 404);
+    });
+
+    render(<ChatComposer draft="" onDraftChange={noop} onSend={noop} />);
+    await act(async () => {
+      fireEvent.click(screen.getByLabelText('Start live voice'));
+    });
+
+    expect(await screen.findByRole('alert')).toBeInTheDocument();
+    const deleteCalls = fetchSpy.mock.calls.filter(([, init]) => (init?.method ?? 'GET') === 'DELETE');
+    expect(deleteCalls.length).toBe(1);
+
+    // The next start is not blocked by the failed one.
+    await act(async () => {
+      fireEvent.click(screen.getByLabelText('Start live voice'));
+    });
+    await waitFor(() => expect(screen.getByLabelText('End live voice')).toBeInTheDocument());
+  });
+
   it('shows the server refusal message for dictation (e.g. insufficient credits)', async () => {
     installFakeMediaDevices();
     vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
