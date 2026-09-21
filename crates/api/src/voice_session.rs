@@ -612,8 +612,12 @@ async fn run_billing_loop(
                         let mut reserve_refused = false;
                         if !budget_exhausted {
                             loop {
-                                let threshold_crossed = observed_total.saturating_mul(SETTLE_THRESHOLD_NUM)
-                                    >= reserved_so_far_micro.saturating_mul(SETTLE_THRESHOLD_DEN);
+                                // observed/reserved_so_far >= 4/5 (80%), kept
+                                // integer as observed*5 >= reserved*4: DEN
+                                // multiplies observed, NUM multiplies
+                                // reserved_so_far.
+                                let threshold_crossed = observed_total.saturating_mul(SETTLE_THRESHOLD_DEN)
+                                    >= reserved_so_far_micro.saturating_mul(SETTLE_THRESHOLD_NUM);
                                 if !threshold_crossed {
                                     break;
                                 }
