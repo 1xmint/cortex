@@ -31,6 +31,7 @@ mod supplier_openai;
 pub mod verification_dispatcher;
 pub mod verification_driver;
 mod voice;
+mod voice_session;
 // pub mod memory; // removed for Context-Flow Pipeline deployment
 // mod orchestrator; // removed for Context-Flow Pipeline deployment
 mod ratelimit;
@@ -386,6 +387,14 @@ pub fn build_cortex_router(state: Arc<AppState>) -> Router {
     let rate_limited = Router::new()
         .route("/api/chat", post(chat::chat))
         .route("/api/voice/dictation/token", post(voice::dictation_token))
+        .route(
+            "/api/voice/live/sessions",
+            post(voice_session::live_session_start),
+        )
+        .route(
+            "/api/voice/live/sessions/{id}",
+            delete(voice_session::live_session_close),
+        )
         .route("/api/runs", get(routes::list_runs).post(routes::create_run))
         .route("/api/runs/estimate", post(routes::estimate_run))
         .route("/api/runs/{id}", get(routes::get_run))

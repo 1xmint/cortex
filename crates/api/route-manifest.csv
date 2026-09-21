@@ -78,6 +78,8 @@ cortex,GET,/api/user/profile
 cortex,POST,/api/user/repos/select
 cortex,GET|POST,/api/user/routing
 cortex,POST,/api/voice/dictation/token
+cortex,POST,/api/voice/live/sessions
+cortex,DELETE,/api/voice/live/sessions/{id}
 cortex,GET,/api/ws
 cortex,POST,/internal/provider/v1/messages
 duplicate,GET,/api/admin/audit-log

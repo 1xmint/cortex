@@ -63,6 +63,7 @@ base64.workspace = true
 aes-gcm.workspace = true
 rand.workspace = true
 futures-util.workspace = true
+tokio-tungstenite.workspace = true
 which = "8"
 bollard = "0.18"
 socket2 = "0.6"
@@ -99,9 +100,6 @@ tempfile = "3"
 cortex-worker = { path = "../worker" }
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
-tokio-tungstenite = "0.30"
-futures-util = "0.3"
-uuid = { version = "1", features = ["v4"] }
 
 [lints]
 workspace = true

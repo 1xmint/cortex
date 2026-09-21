@@ -46,7 +46,7 @@ const OPENAI_BASE_URL: &str = "https://api.openai.com";
 const MIN_SUPPLIER_KEY_LEN: usize = 20;
 const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(30);
 
-fn ceil_div(numerator: i64, denominator: i64) -> i64 {
+pub(crate) fn ceil_div(numerator: i64, denominator: i64) -> i64 {
     (numerator + denominator - 1) / denominator
 }
 
