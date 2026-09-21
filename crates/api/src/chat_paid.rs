@@ -129,8 +129,12 @@ pub(crate) async fn send_paid_reply<T: ProviderTransport>(
     reply_id: &str,
     now_ms: i64,
 ) -> Result<PaidReply, PaidReplyError> {
+    // Chat is paid by Cortex on the Anthropic path only (`ProviderPath::Cortex`);
+    // a run that wants a different supplier goes through the HTTP gateway
+    // instead, where the provider comes from the caller's own capability.
+    const PROVIDER: &str = "claude";
     let price_list = db.active_price_list().ok_or(PaidReplyError::Unavailable)?;
-    if price_list.model("claude", model).is_none() {
+    if price_list.model(PROVIDER, model).is_none() {
         tracing::error!(model, "chat: no price for this model tier; refusing");
         return Err(PaidReplyError::Unavailable);
     }
@@ -159,6 +163,7 @@ pub(crate) async fn send_paid_reply<T: ProviderTransport>(
         user_id,
         &run_id,
         &attempt_id,
+        PROVIDER,
         model,
         max_micro_usd,
         limits.funded_micro_usd,
@@ -179,6 +184,7 @@ pub(crate) async fn send_paid_reply<T: ProviderTransport>(
         tenant_id: user_id.to_string(),
         run_id,
         attempt_id,
+        provider: PROVIDER.to_string(),
         model: model.to_string(),
         max_output_tokens: MAX_OUTPUT_TOKENS,
         body,

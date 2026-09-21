@@ -453,13 +453,36 @@ pub fn seed_models() -> Vec<ModelPrice> {
             200_000,
             "fast",
         ),
+        // Rates verified against https://developers.openai.com/api/docs/pricing
+        // on 2026-09-21 (published per-1M rates divided by 1,000, in micros):
+        // gpt-5.5 $5/$30 per 1M, gpt-5.4 $2.50/$15 per 1M, gpt-5-mini $0.25/$2
+        // per 1M. The prior rows here were 2x the published input rate for
+        // gpt-5.5 and gpt-5.4, and both rates for gpt-5-mini.
         m(
-            "openai", "gpt-5.5", 10_000, 40_000, 5_000, 400_000, "frontier",
+            "openai", "gpt-5.5", 5_000, 30_000, 5_000, 400_000, "frontier",
         ),
         m(
-            "openai", "gpt-5.4", 5_000, 15_000, 5_000, 400_000, "balanced",
+            "openai", "gpt-5.4", 2_500, 15_000, 5_000, 400_000, "balanced",
         ),
-        m("openai", "gpt-5-mini", 400, 1_600, 5_000, 400_000, "fast"),
+        m("openai", "gpt-5-mini", 250, 2_000, 5_000, 400_000, "fast"),
+        // Voice rows are priced per SECOND, not per token: "input" is seconds
+        // of session, so `cost_micros(seconds, 0, 0)` is the cost. Reusing the
+        // token-shaped row avoids a schema change, and input is the one field
+        // the gateway already reserves against. `context_window` is the
+        // longest session Cortex allows, in seconds.
+        // gpt-live-1: $0.05/min billed per second = 833.33 micros/s, rounded
+        // up so a minute never costs less than the supplier charges us.
+        m("openai", "gpt-live-1", 833_334, 0, 0, 7_200, "voice"),
+        // gpt-4o-mini-transcribe: $0.003/min = 50 micros/s.
+        m(
+            "openai",
+            "gpt-4o-mini-transcribe",
+            50_000,
+            0,
+            0,
+            7_200,
+            "transcribe",
+        ),
         m(
             "gemini",
             "gemini-3-pro",
@@ -677,6 +700,48 @@ mod tests {
 
         // Cached tokens are not double-counted as uncached.
         assert_eq!(model.cost_micros(2_000, 1_000, 0), 300 + 3_000);
+    }
+
+    #[test]
+    fn the_corrected_openai_rows_match_published_pricing() {
+        // Verified against https://developers.openai.com/api/docs/pricing on
+        // 2026-09-21: gpt-5.5 $5/$30, gpt-5.4 $2.50/$15, gpt-5-mini $0.25/$2,
+        // all per 1M tokens (so /1000 for the per-1k micros stored here).
+        let models = seed_models();
+        let rate = |id: &str| {
+            models
+                .iter()
+                .find(|m| m.provider == "openai" && m.model_id == id)
+                .unwrap()
+        };
+
+        let gpt_5_5 = rate("gpt-5.5");
+        assert_eq!(gpt_5_5.input_micros_per_1k, 5_000);
+        assert_eq!(gpt_5_5.output_micros_per_1k, 30_000);
+
+        let gpt_5_4 = rate("gpt-5.4");
+        assert_eq!(gpt_5_4.input_micros_per_1k, 2_500);
+        assert_eq!(gpt_5_4.output_micros_per_1k, 15_000);
+
+        let gpt_5_mini = rate("gpt-5-mini");
+        assert_eq!(gpt_5_mini.input_micros_per_1k, 250);
+        assert_eq!(gpt_5_mini.output_micros_per_1k, 2_000);
+    }
+
+    #[test]
+    fn voice_rows_charge_per_second_at_published_rates() {
+        let models = seed_models();
+        let rate = |id: &str| {
+            models
+                .iter()
+                .find(|m| m.provider == "openai" && m.model_id == id)
+                .unwrap()
+        };
+        // One minute of gpt-live-1 is $0.05 = 50_000 micros, rounded up by at
+        // most one micro.
+        let minute = rate("gpt-live-1").cost_micros(60, 0, 0);
+        assert!((50_000..=50_001).contains(&minute), "got {minute}");
+        assert_eq!(rate("gpt-4o-mini-transcribe").cost_micros(60, 0, 0), 3_000);
     }
 
     #[test]

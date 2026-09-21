@@ -47,6 +47,7 @@ async fn main() -> anyhow::Result<()> {
         "gateway-cli-proof-tenant",
         "gateway-cli-proof-run",
         ATTEMPT_ID,
+        "claude",
         MODEL,
         expires_at_ms,
     );

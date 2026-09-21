@@ -17,7 +17,12 @@ use thiserror::Error;
 use crate::db::{Database, ProviderReservation};
 
 const CAPABILITY_VERSION: u32 = 1;
-const SUPPORTED_PROVIDER: &str = "claude";
+
+/// Every supplier the gateway will sign a capability for. The provider is
+/// carried in the capability and the request rather than being one hardcoded
+/// constant, so a new entry here (plus a supplier file and a transport arm)
+/// is the whole cost of a third supplier.
+pub(crate) const KNOWN_PROVIDERS: &[&str] = &["claude", "openai"];
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GatewayCapability {
@@ -37,6 +42,7 @@ impl GatewayCapability {
         tenant_id: impl Into<String>,
         run_id: impl Into<String>,
         attempt_id: impl Into<String>,
+        provider: impl Into<String>,
         model: impl Into<String>,
         expires_at_ms: i64,
     ) -> Self {
@@ -46,7 +52,7 @@ impl GatewayCapability {
             tenant_id: tenant_id.into(),
             run_id: run_id.into(),
             attempt_id: attempt_id.into(),
-            provider: SUPPORTED_PROVIDER.to_string(),
+            provider: provider.into(),
             model: model.into(),
             expires_at_ms,
         }
@@ -78,6 +84,7 @@ pub struct GatewayRequest {
     pub tenant_id: String,
     pub run_id: String,
     pub attempt_id: String,
+    pub provider: String,
     pub model: String,
     pub max_output_tokens: i64,
     pub body: Value,
@@ -368,7 +375,7 @@ pub fn sign_capability(
     )))
 }
 
-fn verify_capability(
+pub(crate) fn verify_capability(
     signing_key: &[u8],
     signed: &SignedCapability,
 ) -> Result<GatewayCapability, GatewayError> {
@@ -395,7 +402,8 @@ fn validate_scope(
     request: &GatewayRequest,
     now_ms: i64,
 ) -> Result<(), GatewayError> {
-    if claims.version != CAPABILITY_VERSION || claims.provider != SUPPORTED_PROVIDER {
+    if claims.version != CAPABILITY_VERSION || !KNOWN_PROVIDERS.contains(&claims.provider.as_str())
+    {
         return Err(GatewayError::UnsupportedProvider);
     }
     if claims.expires_at_ms <= now_ms {
@@ -404,6 +412,7 @@ fn validate_scope(
     if claims.tenant_id != request.tenant_id
         || claims.run_id != request.run_id
         || claims.attempt_id != request.attempt_id
+        || claims.provider != request.provider
         || claims.model != request.model
     {
         return Err(GatewayError::ScopeMismatch);
@@ -527,6 +536,7 @@ fn request_digest(request: &GatewayRequest) -> Result<String, GatewayError> {
         request.tenant_id.as_bytes(),
         request.run_id.as_bytes(),
         request.attempt_id.as_bytes(),
+        request.provider.as_bytes(),
         request.model.as_bytes(),
     ] {
         digest.update((field.len() as u64).to_be_bytes());
@@ -550,6 +560,7 @@ mod tests {
 
     const NOW: i64 = 1_800_000_000_000;
     const MODEL: &str = "claude-sonnet-5";
+    const PROVIDER: &str = "claude";
 
     #[derive(Clone)]
     struct StubTransport<'a> {
@@ -590,14 +601,14 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let db = Database::open(&dir.path().join("gateway.sqlite"));
             let price_list_id = db.active_price_list().unwrap().id;
-            db.set_supplier_capacity(SUPPORTED_PROVIDER, capacity_micro_usd, NOW)
+            db.set_supplier_capacity(PROVIDER, capacity_micro_usd, NOW)
                 .unwrap();
             let authorization = SpendAuthorization {
                 id: "auth-1".into(),
                 user_id: "tenant-1".into(),
                 run_id: "run-1".into(),
                 attempt_id: "attempt-1".into(),
-                provider: SUPPORTED_PROVIDER.into(),
+                provider: PROVIDER.into(),
                 model: MODEL.into(),
                 price_list_id,
                 max_micro_usd,
@@ -612,6 +623,7 @@ mod tests {
                     authorization.user_id,
                     authorization.run_id,
                     authorization.attempt_id,
+                    authorization.provider,
                     authorization.model,
                     authorization.expires_at_ms,
                 ),
@@ -629,6 +641,7 @@ mod tests {
                 tenant_id: self.claims.tenant_id.clone(),
                 run_id: self.claims.run_id.clone(),
                 attempt_id: self.claims.attempt_id.clone(),
+                provider: self.claims.provider.clone(),
                 model: self.claims.model.clone(),
                 max_output_tokens: 100,
                 body: serde_json::json!({
@@ -819,6 +832,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn capability_scoped_to_one_provider_is_rejected_for_another() {
+        let fixture = Fixture::new(100_000, 100_000);
+        let gateway = fixture.gateway(success(None));
+
+        let mut cross_provider = fixture.request(&gateway, "cross-provider");
+        cross_provider.provider = "openai".into();
+        assert_eq!(
+            gateway.forward(cross_provider, NOW).await.unwrap_err(),
+            GatewayError::ScopeMismatch
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_provider_capability_is_rejected() {
+        let fixture = Fixture::new(100_000, 100_000);
+        let gateway = fixture.gateway(success(None));
+
+        let mut bogus_claims = fixture.claims.clone();
+        bogus_claims.provider = "not-a-real-supplier".into();
+        let signed = gateway.issue_capability(&bogus_claims).unwrap();
+        let mut request = fixture.request(&gateway, "unknown-provider");
+        request.provider = bogus_claims.provider.clone();
+        request.capability = signed;
+        assert_eq!(
+            gateway.forward(request, NOW).await.unwrap_err(),
+            GatewayError::UnsupportedProvider
+        );
+    }
+
+    #[tokio::test]
     async fn bounded_cli_tool_definitions_are_admitted() {
         let fixture = Fixture::new(100_000, 100_000);
         let gateway = fixture.gateway(success(Some(ObservedUsage {
@@ -893,7 +936,7 @@ mod tests {
         let body_len = serde_json::to_vec(&request.body).unwrap().len() as i64;
         let rate = probe
             .db
-            .gateway_model_rate("auth-1", SUPPORTED_PROVIDER, MODEL, NOW)
+            .gateway_model_rate("auth-1", PROVIDER, MODEL, NOW)
             .unwrap();
         let one_request = upper_bound_cost(
             body_len,
@@ -946,7 +989,7 @@ mod tests {
         let body_len = serde_json::to_vec(&first.body).unwrap().len() as i64;
         let rate = fixture
             .db
-            .gateway_model_rate("auth-1", SUPPORTED_PROVIDER, MODEL, NOW)
+            .gateway_model_rate("auth-1", PROVIDER, MODEL, NOW)
             .unwrap();
         let one_request = upper_bound_cost(
             body_len,
