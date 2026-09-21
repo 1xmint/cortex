@@ -1,4 +1,4 @@
-import { requestJson } from './cortexApi';
+import { apiUrl, CortexApiError, getAuthToken, requestJson } from './cortexApi';
 
 /**
  * The frontend half of `POST /api/voice/dictation/token`
@@ -51,7 +51,29 @@ export async function startLiveVoiceSession(sdp: string): Promise<LiveSessionSta
  * every call here is a real request against a paid session.
  */
 export async function closeLiveVoiceSession(sessionId: string): Promise<void> {
-  await requestJson<unknown>(`/api/voice/live/sessions/${encodeURIComponent(sessionId)}`, {
+  const headers: Record<string, string> = {};
+  const token = await getAuthToken();
+  if (token) headers.Authorization = `Bearer ${token}`;
+  const res = await fetch(apiUrl(`/api/voice/live/sessions/${encodeURIComponent(sessionId)}`), {
     method: 'DELETE',
+    headers,
   });
+  if (!res.ok) {
+    let message = `Cortex API ${res.status}`;
+    try {
+      const body = await res.json();
+      if (typeof body?.error === 'string') message = body.error;
+    } catch {
+      // No JSON body -- fall back to the generic message above.
+    }
+    throw new CortexApiError(res.status, message, res.headers.get('Retry-After'));
+  }
+  // A successful DELETE is commonly a 204 with no body; parsing that as
+  // JSON throws even though the request succeeded.
+  if (res.status === 204) return;
+  try {
+    await res.json();
+  } catch {
+    // No body to parse -- still a success.
+  }
 }
