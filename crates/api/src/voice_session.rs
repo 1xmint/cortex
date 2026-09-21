@@ -1878,7 +1878,10 @@ mod tests {
 
         let attach_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let (http_base, ws_base) = spawn(FakeLiveScript {
-            usage_events: vec![80, SEGMENT_SECONDS, SEGMENT_SECONDS + 30],
+            // 450s = 375_000 micro-USD at this test's rate = 4 credits, so
+            // the drop-cleanup charge is provably nonzero (300s and 330s
+            // both round down to 3 credits and would make the delta 0).
+            usage_events: vec![80, SEGMENT_SECONDS, SEGMENT_SECONDS + 150],
             send_closed_after_script: false,
             respond_to_client_close: false,
             refuse_attach: false,
@@ -1912,14 +1915,34 @@ mod tests {
             .expect("segment 0 exists");
         assert_eq!(reservation.status, "settled");
 
-        let overrun_key = format!("voice:{local_id}:overrun");
+        // The overrun charge goes straight through `deduct_credits` — it
+        // never creates a `provider_request_reservations` row, so
+        // `provider_spend_row_count` (which joins on that table) can only
+        // ever read 0 for it. Count the ledger rows it actually writes
+        // instead: `deduct_credits` fans one idempotency key out into a
+        // `:subscription`/`:pack` suffixed row per bucket it draws from,
+        // so match on the prefix.
+        let drop_key_prefix = format!("voice:{local_id}:drop%");
+        let ledger_rows: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM credit_transactions WHERE idempotency_key LIKE ?1",
+                [&drop_key_prefix],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert!(
-            db.provider_spend_row_count(&overrun_key) > 0,
-            "usage past every reservation must be charged directly as an overrun on drop"
+            ledger_rows >= 1,
+            "usage past every reservation must be charged directly on drop"
         );
 
-        let expected_total_micro = rate.cost_micros(SEGMENT_SECONDS + 30, 0, 0);
+        let expected_total_micro = rate.cost_micros(SEGMENT_SECONDS + 150, 0, 0);
         let expected_credits = ceil_div(expected_total_micro, price_list.micros_per_credit);
+        // 450s = 375_000 micro-USD at this test's price = 4 credits;
+        // pinned literally so a change to `rate` or `ceil_div` that
+        // silently zeroed the delta cannot make this test pass by
+        // agreeing with itself.
+        assert_eq!(expected_credits, 4);
         let balance = db.get_credit_balance_row(USER).unwrap();
         let spent_credits = 1_000_000_000 - balance.subscription_remaining;
         assert_eq!(spent_credits, expected_credits);
