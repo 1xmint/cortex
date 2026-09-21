@@ -629,6 +629,55 @@ describe('ChatComposer voice controls', () => {
     expect(fakeTrack.stop).toHaveBeenCalled();
   });
 
+  it('lands two transcript deltas that arrive before a re-render, and adds a space on completed', async () => {
+    installFakeMediaDevices();
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
+      const url = String(input);
+      if (url.includes('/api/voice/dictation/token')) {
+        return jsonResponse({ token: 'tok', expires_at: 0, seconds: 60 });
+      }
+      if (url.includes('api.openai.com')) {
+        return {
+          ok: true,
+          status: 200,
+          headers: new Headers(),
+          json: async () => ({}),
+          text: async () => 'fake-answer-sdp',
+        } as Response;
+      }
+      return jsonResponse({}, 404);
+    });
+
+    let draft = '';
+    const onDraftChange = vi.fn((value: string) => {
+      draft = value;
+    });
+    function Wrapper() {
+      return <ChatComposer draft={draft} onDraftChange={onDraftChange} onSend={noop} />;
+    }
+    const { rerender } = render(<Wrapper />);
+
+    await act(async () => {
+      fireEvent.click(screen.getByLabelText('Start dictation'));
+    });
+    await waitFor(() => expect(screen.getByLabelText('Stop dictation')).toBeInTheDocument());
+
+    const dc = lastPeerConnection?.lastDataChannel;
+    act(() => {
+      dc?.emitMessage({ type: 'conversation.item.input_audio_transcription.delta', delta: 'hello' });
+      dc?.emitMessage({ type: 'conversation.item.input_audio_transcription.delta', delta: ' world' });
+    });
+
+    expect(draft).toBe('hello world');
+
+    act(() => {
+      dc?.emitMessage({ type: 'conversation.item.input_audio_transcription.completed' });
+    });
+    expect(draft).toBe('hello world ');
+
+    rerender(<Wrapper />);
+  });
+
   it('shows the server refusal message for dictation (e.g. insufficient credits)', async () => {
     installFakeMediaDevices();
     vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {

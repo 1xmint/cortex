@@ -93,7 +93,13 @@ export default function ChatComposer({
 
   const dictation = useDictation({
     onTranscript: useCallback((text: string) => {
-      onDraftChange(draftRef.current + text);
+      // Update the ref synchronously, before notifying the parent: two
+      // transcript fragments can arrive before React re-renders and hands
+      // this closure a fresh `draft` prop, and each must build on the
+      // other rather than both starting from the same stale draft.
+      const next = draftRef.current + text;
+      draftRef.current = next;
+      onDraftChange(next);
     }, [onDraftChange]),
   });
   const liveVoice = useLiveVoiceToggle();

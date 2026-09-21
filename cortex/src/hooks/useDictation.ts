@@ -132,6 +132,10 @@ export function useDictation({ onTranscript }: UseDictationOptions) {
             typeof payload.delta === 'string'
           ) {
             onTranscriptRef.current(payload.delta);
+          } else if (payload.type === 'conversation.item.input_audio_transcription.completed') {
+            // A completed turn has no trailing space of its own; add one so
+            // the next utterance doesn't run into this one.
+            onTranscriptRef.current(' ');
           }
         } catch {
           // Not JSON, or not a shape we handle -- ignore.
