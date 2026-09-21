@@ -34,16 +34,6 @@ const KNOWN_UNREACHABLE: Record<string, string> = {
   // /api/github/status/{import_id} are all served. Importing a repo is
   // reachable nowhere in the running app.
   'components/onboarding/RepoImport.tsx': 'built, backend served, never wired',
-
-  // The budget UI. Unreachable because /api/budget/* has never existed in any
-  // commit -- see BUDGET_API_ENABLED in cortexApi.ts. These stay until that
-  // backend is built or the feature is dropped; they are the reason the
-  // decision is worth making rather than a pile to clear.
-  'components/CostGauge.tsx': 'budget UI, no backend',
-  'components/cost/CostStatus.tsx': 'budget UI, no backend',
-  'components/cost/CostWarning.tsx': 'budget UI, no backend',
-  'components/cost/EnhancedCostGauge.tsx': 'budget UI, no backend',
-  'lib/useCostAwareness.ts': 'budget UI, no backend',
 };
 
 const rel = (file: string): string => file.slice(SRC.length + 1).split(sep).join('/');

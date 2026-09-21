@@ -1,7 +1,6 @@
 import { useCallback, useEffect, useState } from 'react';
 import {
   Archive,
-  ExternalLink,
   FolderOpen,
   GitBranch,
   Loader2,
@@ -11,21 +10,17 @@ import {
   Plus,
   RefreshCw,
   Search,
-  Trash2,
-  Upload
+  Trash2
 } from 'lucide-react';
 import {
   listProjects,
   deleteProject,
   updateProject,
-  syncProject,
-  getProjectWorkspaceUrl,
   type Project
 } from '../../lib/projectApi';
 
 interface ProjectsListProps {
   onCreateProject: () => void;
-  onImportProject: () => void;
   onSelectProject: (project: Project) => void;
 }
 
@@ -52,38 +47,14 @@ function ProjectCard({
   project,
   onSelect,
   onUpdate,
-  onDelete,
-  onSync,
-  onOpenWorkspace
+  onDelete
 }: {
   project: Project;
   onSelect: (project: Project) => void;
   onUpdate: (id: string, updates: Partial<Project>) => void;
   onDelete: (id: string) => void;
-  onSync: (id: string) => void;
-  onOpenWorkspace: (id: string) => void;
 }) {
   const [menuOpen, setMenuOpen] = useState(false);
-  const [syncing, setSyncing] = useState(false);
-  const [openingWorkspace, setOpeningWorkspace] = useState(false);
-
-  const handleSync = useCallback(async () => {
-    setSyncing(true);
-    try {
-      await onSync(project.id);
-    } finally {
-      setSyncing(false);
-    }
-  }, [project.id, onSync]);
-
-  const handleOpenWorkspace = useCallback(async () => {
-    setOpeningWorkspace(true);
-    try {
-      await onOpenWorkspace(project.id);
-    } finally {
-      setOpeningWorkspace(false);
-    }
-  }, [project.id, onOpenWorkspace]);
 
   const statusColor = {
     creating: 'text-blue-400',
@@ -137,34 +108,6 @@ function ProjectCard({
                   onClick={() => setMenuOpen(false)}
                 />
                 <div className="absolute right-0 top-6 z-20 min-w-48 py-1 bg-[var(--panel)] border border-white/10 rounded-lg shadow-xl">
-                  <button
-                    onClick={handleOpenWorkspace}
-                    disabled={openingWorkspace}
-                    className="w-full px-3 py-2 text-left text-xs text-white hover:bg-white/8 flex items-center gap-2"
-                  >
-                    {openingWorkspace ? (
-                      <Loader2 className="h-3 w-3 animate-spin" />
-                    ) : (
-                      <ExternalLink className="h-3 w-3" />
-                    )}
-                    Open Workspace
-                  </button>
-
-                  {project.repoUrl && (
-                    <button
-                      onClick={handleSync}
-                      disabled={syncing}
-                      className="w-full px-3 py-2 text-left text-xs text-white hover:bg-white/8 flex items-center gap-2"
-                    >
-                      {syncing ? (
-                        <Loader2 className="h-3 w-3 animate-spin" />
-                      ) : (
-                        <RefreshCw className="h-3 w-3" />
-                      )}
-                      Sync with Git
-                    </button>
-                  )}
-
                   <button
                     onClick={() => {
                       const newStatus = project.status === 'active' ? 'paused' : 'active';
@@ -235,7 +178,7 @@ function ProjectCard({
   );
 }
 
-export default function ProjectsList({ onCreateProject, onImportProject, onSelectProject }: ProjectsListProps) {
+export default function ProjectsList({ onCreateProject, onSelectProject }: ProjectsListProps) {
   const [projects, setProjects] = useState<Project[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -279,25 +222,6 @@ export default function ProjectsList({ onCreateProject, onImportProject, onSelec
       setProjects(prev => prev.filter(p => p.id !== projectId));
     } catch (err) {
       console.error('Failed to delete project:', err);
-    }
-  }, []);
-
-  const handleSyncProject = useCallback(async (projectId: string) => {
-    try {
-      await syncProject(projectId);
-      // Refresh projects to get updated stats
-      await loadProjects();
-    } catch (err) {
-      console.error('Failed to sync project:', err);
-    }
-  }, [loadProjects]);
-
-  const handleOpenWorkspace = useCallback(async (projectId: string) => {
-    try {
-      const workspaceUrl = await getProjectWorkspaceUrl(projectId);
-      window.open(workspaceUrl, '_blank');
-    } catch (err) {
-      console.error('Failed to open workspace:', err);
     }
   }, []);
 
@@ -352,13 +276,6 @@ export default function ProjectsList({ onCreateProject, onImportProject, onSelec
           <p className="text-sm text-[var(--muted)]">Manage your development projects</p>
         </div>
         <div className="flex items-center gap-2">
-          <button
-            onClick={onImportProject}
-            className="inline-flex items-center gap-2 px-4 py-2 bg-white/10 text-white border border-white/20 rounded-lg hover:bg-white/15 transition"
-          >
-            <Upload className="h-4 w-4" />
-            Import
-          </button>
           <button
             onClick={onCreateProject}
             className="inline-flex items-center gap-2 px-4 py-2 bg-[var(--accent)] text-black font-medium rounded-lg hover:brightness-110 transition"
@@ -434,8 +351,6 @@ export default function ProjectsList({ onCreateProject, onImportProject, onSelec
               onSelect={onSelectProject}
               onUpdate={handleUpdateProject}
               onDelete={handleDeleteProject}
-              onSync={handleSyncProject}
-              onOpenWorkspace={handleOpenWorkspace}
             />
           ))}
         </div>

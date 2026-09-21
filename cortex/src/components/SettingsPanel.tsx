@@ -1,29 +1,16 @@
-import { useCallback, useEffect, useState } from 'react';
-import { AlertTriangle, CheckCircle, ExternalLink, Key, Loader2, Star, Trash2, User, X, XCircle } from 'lucide-react';
+import { useState } from 'react';
+import { AlertTriangle, User, X } from 'lucide-react';
 import { useUser } from '@clerk/clerk-react';
 import {
-  getAuthStatus,
-  startAuth,
-  submitAuthCode,
-  deleteCredential,
-  setDefaultCredential,
-  assignCredential,
-  listCredentialAssignments,
-  removeCredentialAssignment,
   SOMA_API_ENABLED,
-  BUDGET_API_ENABLED,
   type BillingStatus,
-  type ProviderAuthInfo,
-  type CredentialAssignment,
 } from '../lib/cortexApi';
 import BillingPage from './billing/BillingPage';
 import SpendDashboard from './spend/SpendDashboard';
 import IntegrationSetup from './integrations/IntegrationSetup';
-import BudgetSettings from './settings/BudgetSettings';
 import type { RunProfile } from '../types';
-import { getBudgetSettings, updateBudgetSettings, getCurrentUsage, type BudgetSettings as BudgetSettingsType, type UsageData } from '../lib/cortexApi';
 
-type SettingsTab = 'providers' | 'integrations' | 'spend' | 'billing' | 'budget' | 'notifications' | 'account' | 'apikeys' | 'credentials';
+type SettingsTab = 'integrations' | 'spend' | 'billing' | 'notifications' | 'account';
 
 const RUN_PROFILE_LABELS: Record<RunProfile, string> = {
   auto: 'Auto (adaptive)',
@@ -148,7 +135,7 @@ function NotificationsTab() {
   );
 }
 
-function AccountTab({ providers }: { providers: ProviderAuthInfo[] }) {
+function AccountTab() {
   const { user } = useUser();
   const [defaultProfile, setDefaultProfile] = useState<RunProfile>(readDefaultProfile);
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
@@ -217,45 +204,6 @@ function AccountTab({ providers }: { providers: ProviderAuthInfo[] }) {
           <p className="mt-1 text-[10px] text-[var(--muted)]">
             Sets the initial routing profile for new sessions.
           </p>
-        </div>
-      </section>
-
-      {/* Connected accounts */}
-      <section className="flex flex-col gap-3">
-        <h3 className="text-xs font-semibold uppercase tracking-wider text-[var(--muted)]">
-          Connected accounts
-        </h3>
-        <div className="rounded-xl border border-white/8 bg-white/[0.02]">
-          {providers.length === 0 ? (
-            <p className="px-4 py-3 text-sm text-[var(--muted)]">No providers connected yet.</p>
-          ) : (
-            providers.map((p, idx) => (
-              <div
-                key={p.provider}
-                className={`flex items-center justify-between px-4 py-3 ${idx < providers.length - 1 ? 'border-b border-white/6' : ''}`}
-              >
-                <div className="flex items-center gap-2">
-                  <div className="flex h-7 w-7 items-center justify-center rounded-md bg-white/6 text-[10px] font-bold uppercase text-[var(--muted-strong)]">
-                    {p.provider === 'claude' ? 'CL' : 'OA'}
-                  </div>
-                  <span className="text-sm text-white">
-                    {p.provider === 'claude' ? 'Claude (Anthropic)' : 'OpenAI (Codex)'}
-                  </span>
-                </div>
-                {p.authenticated ? (
-                  <div className="flex items-center gap-1 text-xs text-emerald-300">
-                    <CheckCircle className="h-3 w-3" />
-                    Connected
-                  </div>
-                ) : (
-                  <div className="flex items-center gap-1 text-xs text-[var(--muted)]">
-                    <XCircle className="h-3 w-3" />
-                    Not connected
-                  </div>
-                )}
-              </div>
-            ))
-          )}
         </div>
       </section>
 
@@ -333,456 +281,6 @@ function AccountTab({ providers }: { providers: ProviderAuthInfo[] }) {
   );
 }
 
-function CredentialsTab({ isAdmin }: { isAdmin?: boolean }) {
-  const [credentials, setCredentials] = useState<ProviderAuthInfo[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [addingProvider, setAddingProvider] = useState<string | null>(null);
-  // Operator-funded model: credentials are operator API keys. Subscription
-  // (OAuth) credentials are not a supported path — Anthropic's Feb 2026 terms
-  // update prohibits subscription tokens in third-party tools (enforced from
-  // 2026-04-04). See cortex/plan/PLAN-2026-08.md §3.
-  const addType: 'subscription' | 'api_key' = 'api_key';
-  const [codeInput, setCodeInput] = useState('');
-  const [labelInput, setLabelInput] = useState('');
-  const [submitting, setSubmitting] = useState(false);
-  const [authInfo, setAuthInfo] = useState<{ auth_url?: string; message?: string } | null>(null);
-  const [error, setError] = useState<string | null>(null);
-
-  // Assignments state
-  const [assignments, setAssignments] = useState<CredentialAssignment[]>([]);
-  const [assignmentsLoading, setAssignmentsLoading] = useState(true);
-  const [showAssignForm, setShowAssignForm] = useState(false);
-  const [assignCredId, setAssignCredId] = useState('');
-  const [assignTargetType, setAssignTargetType] = useState('project');
-  const [assignTargetId, setAssignTargetId] = useState('');
-  const [assignSubmitting, setAssignSubmitting] = useState(false);
-
-  const fetchCredentials = useCallback(async () => {
-    try {
-      const creds = await getAuthStatus();
-      setCredentials(creds);
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      setError(`Failed to load credentials: ${msg}`);
-    } finally {
-      setLoading(false);
-    }
-  }, []);
-
-  const fetchAssignments = useCallback(async () => {
-    setAssignmentsLoading(true);
-    try {
-      const list = await listCredentialAssignments();
-      setAssignments(list);
-    } catch {
-      // silent — assignments are optional
-    } finally {
-      setAssignmentsLoading(false);
-    }
-  }, []);
-
-  useEffect(() => {
-    fetchCredentials();
-    fetchAssignments();
-  }, [fetchCredentials, fetchAssignments]);
-
-  const handleDelete = async (credentialId: string) => {
-    try {
-      await deleteCredential(credentialId);
-      await fetchCredentials();
-    } catch {
-      setError('Failed to delete credential');
-    }
-  };
-
-  const handleSetDefault = async (credentialId: string) => {
-    try {
-      await setDefaultCredential(credentialId);
-      await fetchCredentials();
-    } catch {
-      setError('Failed to set default');
-    }
-  };
-
-  const handleStartAdd = async (provider: string) => {
-    setAddingProvider(provider);
-    setError(null);
-    setAuthInfo(null);
-    setCodeInput('');
-    setLabelInput('');
-    try {
-      const result = await startAuth(provider, addType);
-      setAuthInfo({ auth_url: result.auth_url ?? undefined, message: result.message });
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      setError(`Failed to start auth flow: ${msg}`);
-      setAddingProvider(null);
-    }
-  };
-
-  const handleSubmitCode = async () => {
-    if (!addingProvider || !codeInput.trim()) return;
-    setSubmitting(true);
-    setError(null);
-    try {
-      const result = await submitAuthCode(
-        addingProvider,
-        codeInput.trim(),
-        labelInput.trim() || undefined,
-        addType,
-      );
-      if (result.success) {
-        setAddingProvider(null);
-        setCodeInput('');
-        setLabelInput('');
-        setAuthInfo(null);
-        await fetchCredentials();
-      } else {
-        setError(result.message);
-      }
-    } catch {
-      setError('Failed to submit credential');
-    } finally {
-      setSubmitting(false);
-    }
-  };
-
-  const handleCancelAdd = () => {
-    setAddingProvider(null);
-    setCodeInput('');
-    setLabelInput('');
-    setAuthInfo(null);
-    setError(null);
-  };
-
-  const handleAssign = async () => {
-    if (!assignCredId) return;
-    setAssignSubmitting(true);
-    try {
-      await assignCredential(assignCredId, assignTargetType, assignTargetId.trim() || undefined);
-      setShowAssignForm(false);
-      setAssignCredId('');
-      setAssignTargetType('project');
-      setAssignTargetId('');
-      await fetchAssignments();
-    } catch {
-      setError('Failed to create assignment');
-    } finally {
-      setAssignSubmitting(false);
-    }
-  };
-
-  const handleRemoveAssignment = async (assignmentId: string) => {
-    try {
-      await removeCredentialAssignment(assignmentId);
-      await fetchAssignments();
-    } catch {
-      setError('Failed to remove assignment');
-    }
-  };
-
-  if (loading) {
-    return (
-      <div className="flex flex-col gap-2 py-4">
-        {[0, 1, 2].map((i) => (
-          <div key={i} className="rounded-lg border border-white/8 bg-white/[0.02] p-4 flex items-center gap-3">
-            <div className="h-8 w-8 shrink-0 rounded-lg bg-white/6 animate-pulse" />
-            <div className="flex flex-col gap-2">
-              <div className="h-3 w-32 rounded bg-white/8 animate-pulse" />
-              <div className="h-3 w-20 rounded bg-white/8 animate-pulse" />
-            </div>
-          </div>
-        ))}
-      </div>
-    );
-  }
-
-  return (
-    <div className="flex flex-col gap-4">
-      <div>
-        <h3 className="text-sm font-medium text-white mb-1">Your Credentials</h3>
-        <p className="text-xs text-[var(--muted)]">
-          Manage your AI provider subscriptions and API keys. You can add multiple credentials per provider.
-        </p>
-      </div>
-
-      {error && (
-        <div className="rounded-lg bg-red-500/10 border border-red-500/20 px-3 py-2 text-xs text-red-300">
-          {error}
-        </div>
-      )}
-
-      {credentials.length === 0 ? (
-        <div className="rounded-lg border border-white/8 bg-white/[0.02] px-4 py-6 text-center text-sm text-[var(--muted)]">
-          <Key className="text-[var(--muted)] opacity-40 h-8 w-8 mx-auto mb-2" />
-          No credentials yet. Add a subscription or API key below.
-        </div>
-      ) : (
-        <div className="flex flex-col gap-2">
-          {credentials.map((cred) => (
-            <div
-              key={cred.credential_id}
-              className="flex items-center justify-between rounded-lg border border-white/8 bg-white/[0.02] px-4 py-3"
-            >
-              <div className="flex items-center gap-3">
-                <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-white/6 text-xs font-bold uppercase text-[var(--muted-strong)]">
-                  {cred.provider === 'claude' ? 'CL' : 'OA'}
-                </div>
-                <div>
-                  <div className="flex items-center gap-2">
-                    <span className="text-sm font-medium text-white">
-                      {cred.label || `${cred.provider} ${cred.credential_type}`}
-                    </span>
-                    <span className="rounded bg-white/8 px-1.5 py-0.5 text-[10px] font-medium text-[var(--muted)]">
-                      {cred.credential_type}
-                    </span>
-                    {cred.is_default && (
-                      <span className="rounded bg-emerald-500/20 px-1.5 py-0.5 text-[10px] font-medium text-emerald-300">
-                        default
-                      </span>
-                    )}
-                    <span className={`rounded px-1.5 py-0.5 text-[10px] font-medium ${
-                      cred.status === 'active' ? 'bg-emerald-500/10 text-emerald-400' :
-                      cred.status === 'expired' ? 'bg-amber-500/10 text-amber-400' :
-                      'bg-red-500/10 text-red-400'
-                    }`}>
-                      {cred.status}
-                    </span>
-                  </div>
-                  {cred.email && (
-                    <div className="text-xs text-[var(--muted)]">{cred.email}</div>
-                  )}
-                </div>
-              </div>
-
-              <div className="flex items-center gap-1">
-                {!cred.is_default && cred.status === 'active' && (
-                  <button
-                    onClick={() => handleSetDefault(cred.credential_id)}
-                    className="rounded p-1.5 text-[var(--muted)] hover:bg-white/8 hover:text-amber-300 transition"
-                    title="Set as default"
-                  >
-                    <Star className="h-3.5 w-3.5" />
-                  </button>
-                )}
-                <button
-                  onClick={() => handleDelete(cred.credential_id)}
-                  className="rounded p-1.5 text-[var(--muted)] hover:bg-white/8 hover:text-red-400 transition"
-                  title="Remove credential"
-                >
-                  <Trash2 className="h-3.5 w-3.5" />
-                </button>
-              </div>
-            </div>
-          ))}
-        </div>
-      )}
-
-      {/* Add credential section */}
-      <div className="border-t border-white/8 pt-4">
-        <h4 className="text-sm font-medium text-white mb-3">Add Credential</h4>
-
-        {!addingProvider ? (
-          <div className="flex flex-col gap-3">
-            {isAdmin && (
-              <p className="mb-2 text-xs text-[var(--muted)]">
-                Operator API keys. Subscription credentials are not supported —
-                provider terms prohibit subscription tokens in third-party tools.
-              </p>
-            )}
-            <div className="flex gap-2">
-              <button
-                onClick={() => handleStartAdd('claude')}
-                className="flex-1 rounded-lg border border-white/8 bg-white/[0.02] px-4 py-3 text-sm text-white hover:bg-white/6 transition"
-              >
-                + Claude (Anthropic)
-              </button>
-              <button
-                onClick={() => handleStartAdd('openai')}
-                className="flex-1 rounded-lg border border-white/8 bg-white/[0.02] px-4 py-3 text-sm text-white hover:bg-white/6 transition"
-              >
-                + OpenAI
-              </button>
-            </div>
-          </div>
-        ) : (
-          <div className="rounded-lg border border-white/8 bg-white/[0.02] p-4">
-            <div className="flex items-center justify-between mb-3">
-              <span className="text-sm font-medium text-white">
-                {`Add ${addingProvider === 'claude' ? 'Claude' : 'OpenAI'} API Key`}
-              </span>
-              <button onClick={handleCancelAdd} className="text-xs text-[var(--muted)] hover:text-white">
-                Cancel
-              </button>
-            </div>
-
-            {!authInfo && (
-              <div className="flex items-center gap-2 py-4 text-sm text-[var(--muted)]">
-                <Loader2 className="h-4 w-4 animate-spin" />
-                Setting up container...
-              </div>
-            )}
-
-            {authInfo?.auth_url && (
-              <div className="mb-4">
-                <a
-                  href={authInfo.auth_url}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="inline-flex items-center gap-2 rounded-lg bg-[var(--accent)] px-4 py-2.5 text-sm font-medium text-white hover:opacity-90 transition"
-                >
-                  {`Open ${addingProvider === 'claude' ? 'Anthropic Console' : 'OpenAI Platform'}`}
-                  <ExternalLink className="h-3.5 w-3.5" />
-                </a>
-              </div>
-            )}
-
-            {authInfo?.message && (
-              <p className="text-xs text-[var(--muted)] mb-3 whitespace-pre-line">{authInfo.message}</p>
-            )}
-
-            {authInfo && (
-              <div className="flex flex-col gap-2">
-                <input
-                  type="text"
-                  value={labelInput}
-                  onChange={(e) => setLabelInput(e.target.value)}
-                  placeholder="Label (optional, e.g. 'Work Claude')"
-                  className="rounded-lg border border-white/10 bg-white/5 px-3 py-2 text-sm text-white placeholder:text-[var(--muted)] focus:border-[var(--accent)] focus:outline-none"
-                />
-                <input
-                  type="password"
-                  value={codeInput}
-                  onChange={(e) => setCodeInput(e.target.value)}
-                  placeholder={addType === 'api_key' ? 'Paste API key...' : 'Paste auth token or code...'}
-                  className="rounded-lg border border-white/10 bg-white/5 px-3 py-2 text-sm text-white placeholder:text-[var(--muted)] focus:border-[var(--accent)] focus:outline-none"
-                  onKeyDown={(e) => e.key === 'Enter' && handleSubmitCode()}
-                />
-                <button
-                  onClick={handleSubmitCode}
-                  disabled={submitting || !codeInput.trim()}
-                  className="btn-primary rounded-lg px-4 py-2 text-sm disabled:opacity-50"
-                >
-                  {submitting ? 'Connecting...' : addType === 'api_key' ? 'Save API Key' : 'Connect Subscription'}
-                </button>
-              </div>
-            )}
-          </div>
-        )}
-      </div>
-
-      {/* Assignments section */}
-      <div className="border-t border-white/8 pt-4">
-        <div className="flex items-center justify-between mb-3">
-          <h4 className="text-sm font-medium text-white">Assignments</h4>
-          {!showAssignForm && credentials.length > 0 && (
-            <button
-              onClick={() => {
-                setShowAssignForm(true);
-                setAssignCredId(credentials[0]?.credential_id ?? '');
-              }}
-              className="rounded px-2 py-1 text-xs bg-white/6 text-[var(--muted)] hover:text-white transition"
-            >
-              + Assign
-            </button>
-          )}
-        </div>
-        <p className="text-xs text-[var(--muted)] mb-3">
-          Assign credentials to projects or teams so they can use a specific provider account.
-        </p>
-
-        {showAssignForm && (
-          <div className="rounded-lg border border-white/8 bg-white/[0.02] p-3 mb-3 flex flex-col gap-2">
-            <div className="flex items-center justify-between">
-              <span className="text-xs font-medium text-white">New assignment</span>
-              <button
-                onClick={() => setShowAssignForm(false)}
-                className="text-xs text-[var(--muted)] hover:text-white"
-              >
-                Cancel
-              </button>
-            </div>
-            <select
-              value={assignCredId}
-              onChange={(e) => setAssignCredId(e.target.value)}
-              className="w-full rounded-lg border border-white/10 bg-[var(--composer)] px-3 py-2 text-sm text-white focus:border-[var(--accent)]/50 focus:outline-none"
-            >
-              {credentials.map((c) => (
-                <option key={c.credential_id} value={c.credential_id}>
-                  {c.label || `${c.provider} ${c.credential_type}`}
-                </option>
-              ))}
-            </select>
-            <select
-              value={assignTargetType}
-              onChange={(e) => setAssignTargetType(e.target.value)}
-              className="w-full rounded-lg border border-white/10 bg-[var(--composer)] px-3 py-2 text-sm text-white focus:border-[var(--accent)]/50 focus:outline-none"
-            >
-              <option value="project">Project</option>
-              <option value="team">Team</option>
-              <option value="global">Global (all)</option>
-            </select>
-            {assignTargetType !== 'global' && (
-              <input
-                type="text"
-                value={assignTargetId}
-                onChange={(e) => setAssignTargetId(e.target.value)}
-                placeholder={`${assignTargetType === 'project' ? 'Project' : 'Team'} ID`}
-                className="rounded-lg border border-white/10 bg-white/5 px-3 py-2 text-sm text-white placeholder:text-[var(--muted)] focus:border-[var(--accent)] focus:outline-none"
-              />
-            )}
-            <button
-              onClick={handleAssign}
-              disabled={assignSubmitting || !assignCredId || (assignTargetType !== 'global' && !assignTargetId.trim())}
-              className="rounded-lg bg-[var(--accent)] px-4 py-2 text-sm font-medium text-white hover:opacity-90 transition disabled:opacity-50"
-            >
-              {assignSubmitting ? 'Assigning...' : 'Save Assignment'}
-            </button>
-          </div>
-        )}
-
-        {assignmentsLoading ? (
-          <div className="flex items-center gap-2 py-4 text-xs text-[var(--muted)]">
-            <Loader2 className="h-3.5 w-3.5 animate-spin" />
-            Loading assignments...
-          </div>
-        ) : assignments.length === 0 ? (
-          <div className="rounded-lg border border-white/8 bg-white/[0.02] px-4 py-4 text-center text-xs text-[var(--muted)]">
-            No assignments yet.
-          </div>
-        ) : (
-          <div className="flex flex-col gap-2">
-            {assignments.map((a) => {
-              const cred = credentials.find((c) => c.credential_id === a.credential_id);
-              const credLabel = cred ? (cred.label || `${cred.provider} ${cred.credential_type}`) : a.credential_id.slice(0, 8);
-              return (
-                <div
-                  key={a.id}
-                  className="flex items-center justify-between rounded-lg border border-white/8 bg-white/[0.02] px-4 py-2.5"
-                >
-                  <div className="flex flex-col gap-0.5">
-                    <span className="text-sm text-white">{credLabel}</span>
-                    <span className="text-xs text-[var(--muted)]">
-                      {a.target_type}{a.target_id ? ` — ${a.target_id}` : ''}
-                    </span>
-                  </div>
-                  <button
-                    onClick={() => handleRemoveAssignment(a.id)}
-                    className="rounded p-1.5 text-[var(--muted)] hover:bg-white/8 hover:text-red-400 transition"
-                    title="Remove assignment"
-                  >
-                    <Trash2 className="h-3.5 w-3.5" />
-                  </button>
-                </div>
-              );
-            })}
-          </div>
-        )}
-      </div>
-    </div>
-  );
-}
-
 interface SettingsPanelProps {
   onClose: () => void;
   initialTab?: SettingsTab;
@@ -793,77 +291,20 @@ interface SettingsPanelProps {
 
 export default function SettingsPanel({
   onClose,
-  initialTab = 'providers',
+  initialTab = 'account',
   billing,
-  isAdmin,
 }: SettingsPanelProps) {
   const [tab, setTab] = useState<SettingsTab>(initialTab);
-  const [providers, setProviders] = useState<ProviderAuthInfo[]>([]);
-
-  // Budget settings state
-  const [budgetSettings, setBudgetSettings] = useState<BudgetSettingsType | null>(null);
-  const [budgetUsage, setBudgetUsage] = useState<UsageData | null>(null);
-  const [budgetLoading, setBudgetLoading] = useState(false);
-  const [budgetError, setBudgetError] = useState<string | null>(null);
-
-  const fetchStatus = useCallback(async () => {
-    try {
-      const status = await getAuthStatus();
-      setProviders(status);
-    } catch {
-      // silent
-    }
-  }, []);
-
-  useEffect(() => { fetchStatus(); }, [fetchStatus]);
-
-  const fetchBudgetData = useCallback(async () => {
-    setBudgetLoading(true);
-    setBudgetError(null);
-    try {
-      const [settings, usage] = await Promise.all([
-        getBudgetSettings(),
-        getCurrentUsage(),
-      ]);
-      setBudgetSettings(settings);
-      setBudgetUsage(usage);
-    } catch (err) {
-      setBudgetError(err instanceof Error ? err.message : 'Failed to load budget data');
-    } finally {
-      setBudgetLoading(false);
-    }
-  }, []);
-
-  const handleSaveBudgetSettings = useCallback(async (settings: BudgetSettingsType) => {
-    try {
-      const updated = await updateBudgetSettings(settings);
-      setBudgetSettings(updated);
-      // Refresh usage data after updating settings
-      const usage = await getCurrentUsage();
-      setBudgetUsage(usage);
-    } catch (err) {
-      throw new Error(err instanceof Error ? err.message : 'Failed to save budget settings', {
-        cause: err,
-      });
-    }
-  }, []);
-
-  // Fetch budget data when budget tab is selected
-  useEffect(() => {
-    if (tab === 'budget' && BUDGET_API_ENABLED) {
-      fetchBudgetData();
-    }
-  }, [tab, fetchBudgetData]);
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-3 backdrop-blur-sm sm:p-6">
-      <div className={`relative flex max-h-[min(44rem,calc(100dvh-1.5rem))] w-full flex-col overflow-hidden rounded-2xl border border-white/8 bg-[var(--panel)] animate-scale-in shadow-2xl sm:max-h-[min(44rem,calc(100dvh-3rem))] ${tab === 'billing' || tab === 'budget' ? 'max-w-2xl' : 'max-w-lg'}`}>
+      <div className={`relative flex max-h-[min(44rem,calc(100dvh-1.5rem))] w-full flex-col overflow-hidden rounded-2xl border border-white/8 bg-[var(--panel)] animate-scale-in shadow-2xl sm:max-h-[min(44rem,calc(100dvh-3rem))] ${tab === 'billing' ? 'max-w-2xl' : 'max-w-lg'}`}>
         {/* Header */}
         <div className="shrink-0 border-b border-white/6 px-5 py-4">
           <div className="flex items-center justify-between gap-4">
             <div>
               <h2 className="text-base font-semibold text-white">Settings</h2>
-              <p className="mt-0.5 text-xs text-[var(--muted)]">Provider subscriptions and account connections.</p>
+              <p className="mt-0.5 text-xs text-[var(--muted)]">Account, billing, and integration settings.</p>
             </div>
             <button
               onClick={onClose}
@@ -877,14 +318,6 @@ export default function SettingsPanel({
 
         {/* Tabs */}
         <div className="flex shrink-0 gap-4 border-b border-white/6 px-5">
-          <button
-            onClick={() => setTab('providers')}
-            className={`border-b-2 px-1 py-2.5 text-sm font-medium transition ${
-              tab === 'providers' ? 'border-[var(--accent)] text-white' : 'border-transparent text-[var(--muted)] hover:text-white'
-            }`}
-          >
-            Subscriptions
-          </button>
           <button
             onClick={() => setTab('integrations')}
             className={`border-b-2 px-1 py-2.5 text-sm font-medium transition ${
@@ -913,19 +346,6 @@ export default function SettingsPanel({
           >
             Billing
           </button>
-          {/* `/api/budget/*` has no backend behind it, so the tab is hidden
-              rather than removed -- the form is finished and waiting on the
-              routes. See BUDGET_API_ENABLED. */}
-          {BUDGET_API_ENABLED && (
-          <button
-            onClick={() => setTab('budget')}
-            className={`border-b-2 px-1 py-2.5 text-sm font-medium transition ${
-              tab === 'budget' ? 'border-[var(--accent)] text-white' : 'border-transparent text-[var(--muted)] hover:text-white'
-            }`}
-          >
-            Budget & Costs
-          </button>
-          )}
           <button
             onClick={() => setTab('notifications')}
             className={`border-b-2 px-1 py-2.5 text-sm font-medium transition ${
@@ -942,14 +362,6 @@ export default function SettingsPanel({
           >
             Account
           </button>
-          <button
-            onClick={() => setTab('credentials')}
-            className={`border-b-2 px-1 py-2.5 text-sm font-medium transition ${
-              tab === 'credentials' ? 'border-[var(--accent)] text-white' : 'border-transparent text-[var(--muted)] hover:text-white'
-            }`}
-          >
-            Credentials
-          </button>
         </div>
 
         {/* Content */}
@@ -960,24 +372,10 @@ export default function SettingsPanel({
             <IntegrationSetup />
           ) : tab === 'spend' ? (
             SOMA_API_ENABLED ? <SpendDashboard /> : null
-          ) : tab === 'budget' ? (
-            BUDGET_API_ENABLED ? (
-              <BudgetSettings
-                settings={budgetSettings}
-                usage={budgetUsage}
-                onSave={handleSaveBudgetSettings}
-                loading={budgetLoading}
-                error={budgetError || undefined}
-              />
-            ) : null
           ) : tab === 'notifications' ? (
             <NotificationsTab />
-          ) : tab === 'credentials' ? (
-            <CredentialsTab isAdmin={isAdmin} />
-          ) : tab === 'account' ? (
-            <AccountTab providers={providers} />
           ) : (
-            <CredentialsTab isAdmin={isAdmin} />
+            <AccountTab />
           )}
         </div>
       </div>

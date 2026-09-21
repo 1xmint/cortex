@@ -1,14 +1,13 @@
 import { useState } from 'react';
-import { ArrowLeft, ArrowRight, CheckCircle, Code2, MessageSquare, Settings, Shield, Terminal, FolderPlus } from 'lucide-react';
+import { ArrowLeft, ArrowRight, CheckCircle, Code2, MessageSquare, Shield, Terminal, FolderPlus } from 'lucide-react';
 import { markOnboardingComplete, saveOnboardingStep, getOnboardingStep } from '../../lib/onboarding';
-import ProviderStep from './ProviderStep';
 
 interface OnboardingFlowProps {
   userId: string;
   onComplete: () => void;
 }
 
-const TOTAL_STEPS = 4;
+const TOTAL_STEPS = 3;
 
 function ProgressDots({ current }: { current: number }) {
   return (
@@ -102,121 +101,7 @@ function WelcomeStep({ onNext, onSkip }: { onNext: () => void; onSkip: () => voi
   );
 }
 
-// Step 2: Connect Provider
-function ConnectProviderStep({
-  onNext,
-  onBack,
-  onSkip,
-}: {
-  onNext: () => void;
-  onBack: () => void;
-  onSkip: () => void;
-}) {
-  const [showProviderSetup, setShowProviderSetup] = useState(false);
-
-  if (showProviderSetup) {
-    return (
-      <div className="flex flex-col gap-4">
-        <div>
-          <h2 className="text-base font-semibold text-white">Connect your AI providers</h2>
-          <p className="mt-1.5 text-sm text-[var(--muted)]">
-            Set up your Claude and OpenAI subscriptions directly here.
-          </p>
-        </div>
-
-        <div className="rounded-xl border border-white/8 bg-white/[0.02] p-1">
-          <ProviderStep onNext={onNext} />
-        </div>
-
-        <button
-          type="button"
-          onClick={() => setShowProviderSetup(false)}
-          className="inline-flex items-center gap-1 text-sm text-[var(--muted)] transition hover:text-white"
-        >
-          <ArrowLeft className="h-4 w-4" />
-          Back to overview
-        </button>
-      </div>
-    );
-  }
-
-  return (
-    <div className="flex flex-col gap-6">
-      <div>
-        <h2 className="text-base font-semibold text-white">Connect your AI providers</h2>
-        <p className="mt-1.5 text-sm text-[var(--muted)]">
-          Cortex uses your own Claude and OpenAI subscriptions. Connect at least
-          one provider to run agents.
-        </p>
-      </div>
-
-      <div className="flex flex-col gap-3">
-        {[
-          { initials: 'CL', label: 'Claude (Anthropic)', description: 'claude.ai Pro subscription' },
-          { initials: 'OA', label: 'OpenAI (Codex)', description: 'ChatGPT Plus/Pro subscription' },
-        ].map(({ initials, label, description }) => (
-          <div
-            key={label}
-            className="flex items-center gap-3 rounded-xl border border-white/8 bg-white/[0.025] px-4 py-3"
-          >
-            <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-white/6 text-xs font-bold text-[var(--muted-strong)]">
-              {initials}
-            </div>
-            <div className="min-w-0 flex-1">
-              <div className="text-sm font-medium text-white">{label}</div>
-              <div className="text-xs text-[var(--muted)]">{description}</div>
-            </div>
-          </div>
-        ))}
-      </div>
-
-      <div className="rounded-xl border border-[var(--accent)]/20 bg-[var(--accent-soft)] p-4">
-        <p className="text-xs text-[var(--muted)]">
-          ✨ We'll guide you through connecting your subscriptions step-by-step.
-          This takes about 1 minute per provider.
-        </p>
-        <button
-          type="button"
-          onClick={() => setShowProviderSetup(true)}
-          className="mt-3 inline-flex items-center gap-1.5 text-xs font-medium text-[var(--accent)] transition hover:brightness-110"
-        >
-          <Settings className="h-3.5 w-3.5" />
-          Set up providers now
-        </button>
-      </div>
-
-      <div className="flex flex-col gap-3">
-        <div className="flex items-center justify-between">
-          <button
-            type="button"
-            onClick={onBack}
-            className="inline-flex items-center gap-1 text-sm text-[var(--muted)] transition hover:text-white"
-          >
-            <ArrowLeft className="h-4 w-4" />
-            Back
-          </button>
-          <button
-            type="button"
-            onClick={onNext}
-            className="inline-flex h-9 items-center gap-2 rounded-lg bg-[var(--accent-soft)] px-4 text-sm font-medium text-[var(--accent)] transition hover:bg-[var(--accent)]/20 active:scale-95"
-          >
-            Continue
-            <ArrowRight className="h-4 w-4" />
-          </button>
-        </div>
-        <button
-          type="button"
-          onClick={onSkip}
-          className="text-center text-xs text-[var(--muted)] transition hover:text-white"
-        >
-          I'll set up later
-        </button>
-      </div>
-    </div>
-  );
-}
-
-// Step 3: Create Project
+// Step 2: Create Project
 function ProjectStep({
   onNext,
   onBack,
@@ -321,7 +206,7 @@ function ProjectStep({
   );
 }
 
-// Step 4: First Task
+// Step 3: First Task
 function FirstTaskStep({
   onComplete,
   onBack,
@@ -458,23 +343,16 @@ export default function OnboardingFlow({ userId, onComplete }: OnboardingFlowPro
           />
         )}
         {step === 1 && (
-          <ConnectProviderStep
+          <ProjectStep
             onNext={() => goToStep(2)}
             onBack={() => goToStep(0)}
             onSkip={completeOnboarding}
           />
         )}
         {step === 2 && (
-          <ProjectStep
-            onNext={() => goToStep(3)}
-            onBack={() => goToStep(1)}
-            onSkip={completeOnboarding}
-          />
-        )}
-        {step === 3 && (
           <FirstTaskStep
             onComplete={completeOnboarding}
-            onBack={() => goToStep(2)}
+            onBack={() => goToStep(1)}
             onSkip={completeOnboarding}
           />
         )}

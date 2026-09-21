@@ -4,7 +4,6 @@ import { X } from 'lucide-react';
 import ProjectsList from './ProjectsList';
 import ProjectDashboard from './ProjectDashboard';
 import ProjectSetupWizard from './ProjectSetupWizard';
-import ProjectImportModal from './ProjectImportModal';
 import { useAuthGate } from '../../lib/useAuthGate';
 import SignInScreen from '../auth/SignInScreen';
 import type { Project } from '../../lib/projectApi';
@@ -14,14 +13,9 @@ export default function ProjectsView() {
   const navigate = useNavigate();
   const { isLoaded, isSignedIn, clerkEnabled } = useAuthGate();
   const [showSetupWizard, setShowSetupWizard] = useState(false);
-  const [showImportModal, setShowImportModal] = useState(false);
 
   const handleCreateProject = useCallback(() => {
     setShowSetupWizard(true);
-  }, []);
-
-  const handleImportProject = useCallback(() => {
-    setShowImportModal(true);
   }, []);
 
   const handleSelectProject = useCallback((project: Project) => {
@@ -39,15 +33,6 @@ export default function ProjectsView() {
 
   const handleSetupCancel = useCallback(() => {
     setShowSetupWizard(false);
-  }, []);
-
-  const handleImportComplete = useCallback((newProjectId: string) => {
-    setShowImportModal(false);
-    navigate(`/projects/${newProjectId}`);
-  }, [navigate]);
-
-  const handleImportCancel = useCallback(() => {
-    setShowImportModal(false);
   }, []);
 
   const handleOpenProjectChat = useCallback((projectId: string) => {
@@ -103,7 +88,6 @@ export default function ProjectsView() {
         ) : (
           <ProjectsList
             onCreateProject={handleCreateProject}
-            onImportProject={handleImportProject}
             onSelectProject={handleSelectProject}
           />
         )}
@@ -114,14 +98,6 @@ export default function ProjectsView() {
         <ProjectSetupWizard
           onComplete={handleSetupComplete}
           onCancel={handleSetupCancel}
-        />
-      )}
-
-      {/* Import Modal */}
-      {showImportModal && (
-        <ProjectImportModal
-          onComplete={handleImportComplete}
-          onClose={handleImportCancel}
         />
       )}
     </div>
