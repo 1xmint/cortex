@@ -8,6 +8,7 @@ import { lazy, Suspense } from 'react';
  */
 
 const LedgerView = lazy(() => import('../ledger/LedgerView'));
+const UsageView = lazy(() => import('../usage/UsageView'));
 const AdminView = lazy(() => import('../admin/AdminView'));
 
 function Loading() {
@@ -20,10 +21,26 @@ function Loading() {
 export { default as RunsPane } from './RunsPane';
 export { default as ReceiptsPane } from './ReceiptsPane';
 
+/**
+ * Spend above, then why each model was picked.
+ *
+ * The nav calls this pane "credits, spend, refunds", and until now it showed
+ * none of those — LedgerView renders routing decisions, which is a different
+ * question. UsageView had the spend the whole time, against GET /api/usage
+ * and GET /api/usage/daily, both served, and nothing in the app rendered it.
+ *
+ * They go together rather than into a pane of their own: they are the same
+ * card twice, built to the same shape, and they answer two halves of one
+ * question. SURFACE.md says six panes, and a seventh for one card would be a
+ * worse answer than a truthful nav hint.
+ */
 export function LedgerPane() {
   return (
     <Suspense fallback={<Loading />}>
-      <LedgerView />
+      <div className="min-h-0 flex-1 space-y-4 overflow-y-auto p-4">
+        <UsageView />
+        <LedgerView />
+      </div>
     </Suspense>
   );
 }
