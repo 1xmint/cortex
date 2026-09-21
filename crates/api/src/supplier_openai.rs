@@ -1,16 +1,14 @@
-//! The real wire to Anthropic, on Cortex's own key.
+//! The real wire to OpenAI, on Cortex's own key.
 //!
 //! One supplier per file. The gateway in `provider_gateway.rs` decides whether
 //! a call may happen and what it is allowed to cost; this file only makes the
-//! call and reports honestly what came back. Codex, OpenCode Zen and the rest
-//! each get a file shaped like this one when they are added.
+//! call and reports honestly what came back. Mirrors `supplier_anthropic.rs`.
 //!
 //! Every call goes upstream with `stream: false`, whatever the caller asked
 //! for. The full answer carries the one usage figure the gateway settles
-//! against, so spend is known exactly before a single byte reaches the caller.
-//! A caller that wanted a stream gets the finished message replayed as one;
-//! see `message_as_sse` in `provider_gateway_http.rs`. The cost of that choice
-//! is latency: the caller sees nothing until the model is done.
+//! against, so spend is known exactly before a single byte reaches the
+//! caller. A caller that wanted a stream gets the finished message replayed
+//! as one; see `message_as_sse` in `provider_gateway_http.rs`.
 
 use std::future::Future;
 use std::time::Duration;
@@ -22,22 +20,21 @@ use crate::provider_gateway::{
     TransportResponse,
 };
 
-const ANTHROPIC_BASE_URL: &str = "https://api.anthropic.com";
-const ANTHROPIC_VERSION: &str = "2023-06-01";
+const OPENAI_BASE_URL: &str = "https://api.openai.com";
 
 /// Long enough for a large non-streamed answer. A timeout leaves the spend
 /// reserved rather than guessed at, so erring long costs nothing but waiting.
 const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(600);
 
 #[derive(Clone)]
-pub(crate) struct AnthropicTransport {
+pub(crate) struct OpenAiTransport {
     client: reqwest::Client,
     base_url: String,
 }
 
-impl AnthropicTransport {
+impl OpenAiTransport {
     pub(crate) fn new() -> Self {
-        Self::with_base_url(ANTHROPIC_BASE_URL)
+        Self::with_base_url(OPENAI_BASE_URL)
     }
 
     pub(crate) fn with_base_url(base_url: impl Into<String>) -> Self {
@@ -52,14 +49,14 @@ impl AnthropicTransport {
     }
 }
 
-impl ProviderTransport for AnthropicTransport {
+impl ProviderTransport for OpenAiTransport {
     fn forward(
         &self,
         supplier_key: &str,
         request: &GatewayRequest,
     ) -> impl Future<Output = Result<TransportResponse, TransportFailure>> + Send {
         let client = self.client.clone();
-        let url = format!("{}/v1/messages", self.base_url.trim_end_matches('/'));
+        let url = format!("{}/v1/responses", self.base_url.trim_end_matches('/'));
         let key = supplier_key.to_string();
         let mut body = request.body.clone();
         if let Some(fields) = body.as_object_mut() {
@@ -69,21 +66,20 @@ impl ProviderTransport for AnthropicTransport {
         async move {
             let response = client
                 .post(&url)
-                .header("x-api-key", &key)
-                .header("anthropic-version", ANTHROPIC_VERSION)
+                .header("Authorization", format!("Bearer {key}"))
                 .json(&body)
                 .send()
                 .await
                 .map_err(|error| TransportFailure {
                     kind: send_failure_kind(&error),
                     upstream_request_id: None,
-                    message: format!("anthropic request failed: {}", without_url(&error)),
+                    message: format!("openai request failed: {}", without_url(&error)),
                 })?;
 
             let status = response.status();
             let upstream_request_id = response
                 .headers()
-                .get("request-id")
+                .get("x-request-id")
                 .and_then(|value| value.to_str().ok())
                 .map(str::to_owned);
             let text = response.text().await.map_err(|error| TransportFailure {
@@ -93,21 +89,21 @@ impl ProviderTransport for AnthropicTransport {
                     TransportFailureKind::Unknown
                 },
                 upstream_request_id: upstream_request_id.clone(),
-                message: format!("anthropic response was cut off: {}", without_url(&error)),
+                message: format!("openai response was cut off: {}", without_url(&error)),
             })?;
 
             if !status.is_success() {
                 return Err(TransportFailure {
                     kind: status_failure_kind(status.as_u16()),
                     upstream_request_id,
-                    message: format!("anthropic returned {status}: {}", error_message(&text)),
+                    message: format!("openai returned {status}: {}", error_message(&text)),
                 });
             }
 
             let body: Value = serde_json::from_str(&text).map_err(|_| TransportFailure {
                 kind: TransportFailureKind::Unknown,
                 upstream_request_id: upstream_request_id.clone(),
-                message: "anthropic returned success with a body that is not JSON".into(),
+                message: "openai returned success with a body that is not JSON".into(),
             })?;
             let usage = observed_usage(&body);
             Ok(TransportResponse {
@@ -131,11 +127,11 @@ fn send_failure_kind(error: &reqwest::Error) -> TransportFailureKind {
     }
 }
 
-/// Anthropic does not bill a request it refuses. Its 4xx answers and 529
-/// (overloaded) are refusals. A 500 is its own fault and says nothing
-/// certain about what ran, so it is treated as unknown rather than free.
+/// OpenAI does not bill a request it refuses. Its 4xx answers (including 429)
+/// are refusals. A 5xx is its own fault and says nothing certain about what
+/// ran, so it is treated as unknown rather than free.
 fn status_failure_kind(status: u16) -> TransportFailureKind {
-    if (400..500).contains(&status) || status == 529 {
+    if (400..500).contains(&status) {
         TransportFailureKind::Rejected
     } else {
         TransportFailureKind::Unknown
@@ -164,39 +160,24 @@ fn error_message(text: &str) -> String {
         .unwrap_or_else(|| text.chars().take(300).collect())
 }
 
-/// Anthropic's usage, in the gateway's terms.
-///
-/// Anthropic reports three kinds of input separately; the gateway's
-/// `input_tokens` is all of them, with `cached_input_tokens` the part read
-/// from cache. Writing to the cache costs more than plain input, and the
-/// price list has no rate for it, so each written token is counted as
-/// several input tokens: 1.25 for the five-minute cache, 2 for the hour-long
-/// one, rounded up. When the split is not reported, all of it is counted at
-/// the dearer rate. The ledger may overstate a cache write; it never
-/// understates one.
+/// OpenAI's usage, in the gateway's terms. The Responses API reports total
+/// input tokens plus, separately, how many of those were served from cache;
+/// unlike Anthropic there is no separate cache-write charge to account for.
+/// When `cached_tokens` is absent, none of the input is counted as cached
+/// rather than guessed at.
 fn observed_usage(body: &Value) -> Option<ObservedUsage> {
     let usage = body.get("usage")?;
-    let count = |field: &str| usage.get(field).and_then(Value::as_i64).unwrap_or(0);
-    let plain = usage.get("input_tokens")?.as_i64()?;
+    let input = usage.get("input_tokens")?.as_i64()?;
     let output = usage.get("output_tokens")?.as_i64()?;
-    let cache_read = count("cache_read_input_tokens");
-    let cache_write = count("cache_creation_input_tokens");
-
-    let split = usage.get("cache_creation");
-    let short = split
-        .and_then(|s| s.get("ephemeral_5m_input_tokens"))
-        .and_then(Value::as_i64);
-    let long = split
-        .and_then(|s| s.get("ephemeral_1h_input_tokens"))
-        .and_then(Value::as_i64);
-    let write_as_input = match (short, long) {
-        (Some(short), Some(long)) => (short * 5 + 3) / 4 + long * 2,
-        _ => cache_write * 2,
-    };
+    let cached = usage
+        .get("input_tokens_details")
+        .and_then(|details| details.get("cached_tokens"))
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
 
     Some(ObservedUsage {
-        input_tokens: plain + write_as_input + cache_read,
-        cached_input_tokens: cache_read,
+        input_tokens: input,
+        cached_input_tokens: cached,
         output_tokens: output,
     })
 }
@@ -212,19 +193,19 @@ mod tests {
 
     type Seen = Arc<Mutex<Vec<(HeaderMap, Value)>>>;
 
-    /// A stand-in Anthropic on a local port: answers with `status` and
-    /// `reply`, and keeps what it was sent.
-    async fn fake_anthropic(status: StatusCode, reply: Value) -> (String, Seen) {
+    /// A stand-in OpenAI on a local port: answers with `status` and `reply`,
+    /// and keeps what it was sent.
+    async fn fake_openai(status: StatusCode, reply: Value) -> (String, Seen) {
         let seen: Seen = Arc::default();
         let log = seen.clone();
         let app = axum::Router::new().route(
-            "/v1/messages",
+            "/v1/responses",
             post(move |headers: HeaderMap, Json(body): Json<Value>| {
                 let log = log.clone();
                 let reply = reply.clone();
                 async move {
                     log.lock().unwrap().push((headers, body));
-                    (status, [("request-id", "req_fake_1")], Json(reply))
+                    (status, [("x-request-id", "req_fake_1")], Json(reply))
                 }
             }),
         );
@@ -240,11 +221,11 @@ mod tests {
             tenant_id: "tenant".into(),
             run_id: "run".into(),
             attempt_id: "attempt".into(),
-            provider: "claude".into(),
-            model: "claude-sonnet-4-6".into(),
+            provider: "openai".into(),
+            model: "gpt-5.5".into(),
             max_output_tokens: 100,
             body: serde_json::json!({
-                "model": "claude-sonnet-4-6",
+                "model": "gpt-5.5",
                 "max_tokens": 100,
                 "stream": stream,
                 "messages": [{"role": "user", "content": "hi"}]
@@ -254,32 +235,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sends_the_key_as_a_header_and_never_asks_upstream_to_stream() {
-        let (url, seen) = fake_anthropic(
+    async fn sends_the_key_as_a_bearer_header_and_never_asks_upstream_to_stream() {
+        let (url, seen) = fake_openai(
             StatusCode::OK,
             serde_json::json!({
-                "type": "message",
-                "content": [{"type": "text", "text": "hello"}],
-                "usage": {"input_tokens": 10, "output_tokens": 4}
+                "type": "response",
+                "output": [{"type": "message", "content": [{"type": "output_text", "text": "hello"}]}],
+                "usage": {"input_tokens": 10, "output_tokens": 4, "input_tokens_details": {"cached_tokens": 2}}
             }),
         )
         .await;
-        let response = AnthropicTransport::with_base_url(url)
+        let response = OpenAiTransport::with_base_url(url)
             .forward("sk-test-supplier", &request(true))
             .await
             .unwrap();
 
         let seen = seen.lock().unwrap();
         let (headers, body) = &seen[0];
-        assert_eq!(headers["x-api-key"], "sk-test-supplier");
-        assert_eq!(headers["anthropic-version"], ANTHROPIC_VERSION);
+        assert_eq!(headers["authorization"], "Bearer sk-test-supplier");
         assert_eq!(body["stream"], false);
         assert_eq!(response.upstream_request_id.as_deref(), Some("req_fake_1"));
         assert_eq!(
             response.usage,
             Some(ObservedUsage {
                 input_tokens: 10,
-                cached_input_tokens: 0,
+                cached_input_tokens: 2,
                 output_tokens: 4,
             })
         );
@@ -287,12 +267,12 @@ mod tests {
 
     #[tokio::test]
     async fn a_refusal_is_rejected_so_the_reservation_is_released() {
-        let (url, _) = fake_anthropic(
+        let (url, _) = fake_openai(
             StatusCode::TOO_MANY_REQUESTS,
-            serde_json::json!({"type": "error", "error": {"type": "rate_limit_error", "message": "slow down"}}),
+            serde_json::json!({"error": {"type": "rate_limit_error", "message": "slow down"}}),
         )
         .await;
-        let failure = AnthropicTransport::with_base_url(url)
+        let failure = OpenAiTransport::with_base_url(url)
             .forward("sk-test-supplier", &request(false))
             .await
             .unwrap_err();
@@ -303,12 +283,12 @@ mod tests {
 
     #[tokio::test]
     async fn a_server_error_stays_unknown_so_the_reservation_is_kept() {
-        let (url, _) = fake_anthropic(
+        let (url, _) = fake_openai(
             StatusCode::INTERNAL_SERVER_ERROR,
-            serde_json::json!({"type": "error", "error": {"type": "api_error", "message": "boom"}}),
+            serde_json::json!({"error": {"type": "api_error", "message": "boom"}}),
         )
         .await;
-        let failure = AnthropicTransport::with_base_url(url)
+        let failure = OpenAiTransport::with_base_url(url)
             .forward("sk-test-supplier", &request(false))
             .await
             .unwrap_err();
@@ -321,7 +301,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         drop(listener);
-        let failure = AnthropicTransport::with_base_url(format!("http://{address}"))
+        let failure = OpenAiTransport::with_base_url(format!("http://{address}"))
             .forward("sk-test-supplier", &request(false))
             .await
             .unwrap_err();
@@ -330,32 +310,9 @@ mod tests {
     }
 
     #[test]
-    fn cache_writes_are_never_understated() {
-        let split = observed_usage(&serde_json::json!({"usage": {
-            "input_tokens": 10,
-            "output_tokens": 5,
-            "cache_read_input_tokens": 100,
-            "cache_creation_input_tokens": 12,
-            "cache_creation": {"ephemeral_5m_input_tokens": 8, "ephemeral_1h_input_tokens": 4}
-        }}))
-        .unwrap();
-        // 10 plain + ceil(8 * 1.25) = 10 + 4 * 2 = 8 + 100 read
-        assert_eq!(split.input_tokens, 10 + 10 + 8 + 100);
-        assert_eq!(split.cached_input_tokens, 100);
-
-        let unsplit = observed_usage(&serde_json::json!({"usage": {
-            "input_tokens": 10,
-            "output_tokens": 5,
-            "cache_creation_input_tokens": 12
-        }}))
-        .unwrap();
-        assert_eq!(unsplit.input_tokens, 10 + 24);
-    }
-
-    #[test]
     fn a_message_without_usage_reports_none() {
         assert_eq!(
-            observed_usage(&serde_json::json!({"type": "message"})),
+            observed_usage(&serde_json::json!({"type": "response"})),
             None
         );
     }

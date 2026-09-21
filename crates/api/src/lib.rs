@@ -27,6 +27,7 @@ pub mod pricing;
 pub mod provider_gateway;
 mod provider_gateway_http;
 mod supplier_anthropic;
+mod supplier_openai;
 pub mod verification_dispatcher;
 pub mod verification_driver;
 // pub mod memory; // removed for Context-Flow Pipeline deployment

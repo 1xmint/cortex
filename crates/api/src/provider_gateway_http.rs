@@ -1,13 +1,16 @@
-//! Capability-authenticated Anthropic Messages surface for the private gateway.
+//! Capability-authenticated provider surface for the private gateway.
 //!
 //! Off unless `CORTEX_PROVIDER_GATEWAY_MODE` says otherwise, and it can say
 //! exactly two things:
 //!
 //! - `stub`: answers every call itself with a fixed reply. Nothing leaves the
 //!   machine and nothing is spent. This is what the proofs run against.
-//! - `live`: calls Anthropic on Cortex's own key, read from
-//!   `CORTEX_ANTHROPIC_SUPPLIER_KEY`. This spends real money, inside the same
-//!   reservation and cap as the stub. Without the key, `live` stays off.
+//! - `live`: calls the supplier named in the verified capability, on Cortex's
+//!   own key for that supplier (`CORTEX_ANTHROPIC_SUPPLIER_KEY` for Claude,
+//!   `CORTEX_OPENAI_SUPPLIER_KEY` for OpenAI). This spends real money, inside
+//!   the same reservation and cap as the stub. Live mode is on as soon as at
+//!   least one supplier key is present; a request for a provider without a
+//!   funded key is refused the same way an unknown provider would be.
 //!
 //! Any other value, or none, leaves the listener unavailable.
 
@@ -34,22 +37,41 @@ const MIN_SUPPLIER_KEY_LEN: usize = 20;
 
 enum GatewayMode {
     Stub,
-    Live { supplier_key: String },
+    /// One key per supplier the operator has funded. Live mode is on as soon
+    /// as at least one supplier has a key; a request for a provider without
+    /// one fails the same way an unknown provider would.
+    Live {
+        supplier_keys: std::collections::HashMap<String, String>,
+    },
 }
+
+/// Every env var that can fund a supplier in live mode, paired with the
+/// provider label it funds. Adding a supplier is one entry here.
+const SUPPLIER_KEY_ENV_VARS: &[(&str, &str)] = &[
+    ("claude", "CORTEX_ANTHROPIC_SUPPLIER_KEY"),
+    ("openai", "CORTEX_OPENAI_SUPPLIER_KEY"),
+];
 
 fn gateway_mode() -> Option<GatewayMode> {
     match std::env::var("CORTEX_PROVIDER_GATEWAY_MODE").as_deref() {
         Ok("stub") => Some(GatewayMode::Stub),
         Ok("live") => {
-            let supplier_key = std::env::var("CORTEX_ANTHROPIC_SUPPLIER_KEY")
-                .ok()
-                .filter(|key| key.trim().len() >= MIN_SUPPLIER_KEY_LEN);
-            if supplier_key.is_none() {
+            let supplier_keys: std::collections::HashMap<String, String> = SUPPLIER_KEY_ENV_VARS
+                .iter()
+                .filter_map(|(provider, env_var)| {
+                    std::env::var(env_var)
+                        .ok()
+                        .filter(|key| key.trim().len() >= MIN_SUPPLIER_KEY_LEN)
+                        .map(|key| (provider.to_string(), key))
+                })
+                .collect();
+            if supplier_keys.is_empty() {
                 tracing::error!(
-                    "gateway mode is live but CORTEX_ANTHROPIC_SUPPLIER_KEY is absent; gateway stays off"
+                    "gateway mode is live but no supplier key is present; gateway stays off"
                 );
+                return None;
             }
-            supplier_key.map(|supplier_key| GatewayMode::Live { supplier_key })
+            Some(GatewayMode::Live { supplier_keys })
         }
         _ => None,
     }
@@ -65,9 +87,15 @@ pub(crate) fn issue_access(
     lease_deadline_ms: i64,
     now_ms: i64,
 ) -> Option<cortex_core::protocol::ProviderGatewayAccess> {
-    if gateway_mode().is_none() || provider != cortex_core::provider::ProviderId::Claude {
+    if gateway_mode().is_none()
+        || !matches!(
+            provider,
+            cortex_core::provider::ProviderId::Claude | cortex_core::provider::ProviderId::Openai
+        )
+    {
         return None;
     }
+    let provider_label = cortex_core::egress::provider_grant_name(provider);
     let signing_key = std::env::var("CORTEX_PROVIDER_GATEWAY_SIGNING_KEY").ok()?;
     let limits = SpendLimits::from_env()?;
     let expires_at_ms = lease_deadline_ms;
@@ -77,6 +105,7 @@ pub(crate) fn issue_access(
         user_id,
         run_id,
         attempt_id,
+        provider_label,
         model,
         limits.max_micro_usd,
         limits.funded_micro_usd,
@@ -87,7 +116,7 @@ pub(crate) fn issue_access(
         authorization_id,
         run_id: run_id.to_string(),
         attempt_id: attempt_id.to_string(),
-        provider: "claude".into(),
+        provider: provider_label.into(),
         model: model.to_string(),
         base_url: GATEWAY_BASE_URL.into(),
         expires_at_ms,
@@ -109,6 +138,7 @@ pub(crate) fn create_authorization_and_capability(
     user_id: &str,
     run_id: &str,
     attempt_id: &str,
+    provider: &str,
     model: &str,
     max_micro_usd: i64,
     funded_micro_usd: i64,
@@ -119,12 +149,16 @@ pub(crate) fn create_authorization_and_capability(
         tracing::error!("gateway signing key must contain at least 32 bytes");
         return None;
     }
-    let price_list = db.active_price_list()?;
-    if price_list.model("claude", model).is_none() {
-        tracing::error!(model, "gateway has no immutable model rate");
+    if !crate::provider_gateway::KNOWN_PROVIDERS.contains(&provider) {
+        tracing::error!(provider, "gateway does not know this supplier");
         return None;
     }
-    db.set_supplier_capacity("claude", funded_micro_usd, now_ms)
+    let price_list = db.active_price_list()?;
+    if price_list.model(provider, model).is_none() {
+        tracing::error!(provider, model, "gateway has no immutable model rate");
+        return None;
+    }
+    db.set_supplier_capacity(provider, funded_micro_usd, now_ms)
         .ok()?;
     if expires_at_ms <= now_ms {
         return None;
@@ -136,7 +170,7 @@ pub(crate) fn create_authorization_and_capability(
             user_id: user_id.to_string(),
             run_id: run_id.to_string(),
             attempt_id: attempt_id.to_string(),
-            provider: "claude".into(),
+            provider: provider.to_string(),
             model: model.to_string(),
             price_list_id: price_list.id,
             max_micro_usd,
@@ -150,6 +184,7 @@ pub(crate) fn create_authorization_and_capability(
         user_id,
         run_id,
         attempt_id,
+        provider,
         model,
         expires_at_ms,
     );
@@ -220,6 +255,7 @@ impl ProviderTransport for StubTransport {
 pub(crate) enum GatewayTransport {
     Stub(StubTransport),
     Live(crate::supplier_anthropic::AnthropicTransport),
+    LiveOpenAi(crate::supplier_openai::OpenAiTransport),
 }
 
 impl ProviderTransport for GatewayTransport {
@@ -231,7 +267,22 @@ impl ProviderTransport for GatewayTransport {
         match self {
             GatewayTransport::Stub(t) => t.forward(supplier_key, request).await,
             GatewayTransport::Live(t) => t.forward(supplier_key, request).await,
+            GatewayTransport::LiveOpenAi(t) => t.forward(supplier_key, request).await,
         }
+    }
+}
+
+/// The live transport for a provider label, or `None` if the gateway does
+/// not have a supplier file for it. One new supplier is one new match arm.
+fn live_transport_for(provider: &str) -> Option<GatewayTransport> {
+    match provider {
+        "claude" => Some(GatewayTransport::Live(
+            crate::supplier_anthropic::AnthropicTransport::new(),
+        )),
+        "openai" => Some(GatewayTransport::LiveOpenAi(
+            crate::supplier_openai::OpenAiTransport::new(),
+        )),
+        _ => None,
     }
 }
 
@@ -248,6 +299,10 @@ pub(crate) struct GatewayUsable {
 /// `None` for exactly the reasons `messages` above would answer
 /// `SERVICE_UNAVAILABLE`: no mode configured, or a signing key that is
 /// missing or too short to trust.
+///
+/// Chat is the Anthropic path only (`ProviderPath::Cortex` in `chat_paid.rs`),
+/// so this always resolves the Claude supplier; a run reaching the gateway
+/// over HTTP is the path that can ask for any known provider.
 pub(crate) fn gateway_usable() -> Option<GatewayUsable> {
     let mode = gateway_mode()?;
     let signing_key = std::env::var("CORTEX_PROVIDER_GATEWAY_SIGNING_KEY").ok()?;
@@ -260,9 +315,9 @@ pub(crate) fn gateway_usable() -> Option<GatewayUsable> {
             supplier_key: STUB_SUPPLIER_KEY.into(),
             transport: GatewayTransport::Stub(StubTransport),
         },
-        GatewayMode::Live { supplier_key } => GatewayUsable {
+        GatewayMode::Live { mut supplier_keys } => GatewayUsable {
             signing_key,
-            supplier_key,
+            supplier_key: supplier_keys.remove("claude")?,
             transport: GatewayTransport::Live(crate::supplier_anthropic::AnthropicTransport::new()),
         },
     })
@@ -306,12 +361,11 @@ pub async fn messages(
         GatewayMode::Stub => {
             handle_stub_message(db, signing_key.as_bytes(), &headers, body, now_ms).await
         }
-        GatewayMode::Live { supplier_key } => {
-            handle_message(
+        GatewayMode::Live { supplier_keys } => {
+            handle_live_message(
                 db,
                 signing_key.as_bytes(),
-                &supplier_key,
-                crate::supplier_anthropic::AnthropicTransport::new(),
+                &supplier_keys,
                 &headers,
                 body,
                 now_ms,
@@ -319,6 +373,55 @@ pub async fn messages(
             .await
         }
     }
+}
+
+/// Live mode can hold keys for more than one supplier, so which transport and
+/// key to use is decided from the verified capability's own provider claim,
+/// never from anything the caller asserts unsigned.
+async fn handle_live_message(
+    db: &crate::db::Database,
+    signing_key: &[u8],
+    supplier_keys: &std::collections::HashMap<String, String>,
+    headers: &HeaderMap,
+    body: Value,
+    now_ms: i64,
+) -> Response {
+    let Some(token) = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+    else {
+        return (StatusCode::UNAUTHORIZED, "missing gateway bearer").into_response();
+    };
+    let capability = SignedCapability::from_exposed(token);
+    let claims = match crate::provider_gateway::verify_capability(signing_key, &capability) {
+        Ok(claims) => claims,
+        Err(_) => return (StatusCode::UNAUTHORIZED, "invalid gateway bearer").into_response(),
+    };
+    let Some(supplier_key) = supplier_keys.get(claims.provider.as_str()) else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "gateway has no supplier key for this provider",
+        )
+            .into_response();
+    };
+    let Some(transport) = live_transport_for(&claims.provider) else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "gateway has no live transport for this provider",
+        )
+            .into_response();
+    };
+    handle_message(
+        db,
+        signing_key,
+        supplier_key,
+        transport,
+        headers,
+        body,
+        now_ms,
+    )
+    .await
 }
 
 async fn handle_stub_message(
@@ -368,7 +471,7 @@ async fn handle_message<T: ProviderTransport>(
         .and_then(|value| value.to_str().ok())
         .filter(|value| !value.trim().is_empty())
     {
-        Some(explicit) => format!("claude:{}:{explicit}", claims.authorization_id),
+        Some(explicit) => format!("{}:{}:{explicit}", claims.provider, claims.authorization_id),
         None => {
             let attempt = headers
                 .get("x-cortex-attempt")
@@ -379,7 +482,8 @@ async fn handle_message<T: ProviderTransport>(
             use sha2::Digest as _;
             let encoded = serde_json::to_vec(&body).unwrap_or_default();
             format!(
-                "claude:{}:sha256:{}",
+                "{}:{}:sha256:{}",
+                claims.provider,
                 claims.authorization_id,
                 hex::encode(sha2::Sha256::digest(encoded))
             )
@@ -393,6 +497,7 @@ async fn handle_message<T: ProviderTransport>(
         tenant_id: claims.tenant_id,
         run_id: claims.run_id,
         attempt_id: claims.attempt_id,
+        provider: claims.provider,
         model: claims.model,
         max_output_tokens,
         body,
@@ -674,6 +779,7 @@ mod tests {
                     "tenant-http",
                     "run-http",
                     "attempt-http",
+                    "claude",
                     MODEL,
                     NOW + 60_000,
                 ),

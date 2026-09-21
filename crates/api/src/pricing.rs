@@ -453,13 +453,18 @@ pub fn seed_models() -> Vec<ModelPrice> {
             200_000,
             "fast",
         ),
+        // Rates verified against https://developers.openai.com/api/docs/pricing
+        // on 2026-09-21 (published per-1M rates divided by 1,000, in micros):
+        // gpt-5.5 $5/$30 per 1M, gpt-5.4 $2.50/$15 per 1M, gpt-5-mini $0.25/$2
+        // per 1M. The prior rows here were 2x the published input rate for
+        // gpt-5.5 and gpt-5.4, and both rates for gpt-5-mini.
         m(
-            "openai", "gpt-5.5", 10_000, 40_000, 5_000, 400_000, "frontier",
+            "openai", "gpt-5.5", 5_000, 30_000, 5_000, 400_000, "frontier",
         ),
         m(
-            "openai", "gpt-5.4", 5_000, 15_000, 5_000, 400_000, "balanced",
+            "openai", "gpt-5.4", 2_500, 15_000, 5_000, 400_000, "balanced",
         ),
-        m("openai", "gpt-5-mini", 400, 1_600, 5_000, 400_000, "fast"),
+        m("openai", "gpt-5-mini", 250, 2_000, 5_000, 400_000, "fast"),
         m(
             "gemini",
             "gemini-3-pro",
@@ -677,6 +682,32 @@ mod tests {
 
         // Cached tokens are not double-counted as uncached.
         assert_eq!(model.cost_micros(2_000, 1_000, 0), 300 + 3_000);
+    }
+
+    #[test]
+    fn the_corrected_openai_rows_match_published_pricing() {
+        // Verified against https://developers.openai.com/api/docs/pricing on
+        // 2026-09-21: gpt-5.5 $5/$30, gpt-5.4 $2.50/$15, gpt-5-mini $0.25/$2,
+        // all per 1M tokens (so /1000 for the per-1k micros stored here).
+        let models = seed_models();
+        let rate = |id: &str| {
+            models
+                .iter()
+                .find(|m| m.provider == "openai" && m.model_id == id)
+                .unwrap()
+        };
+
+        let gpt_5_5 = rate("gpt-5.5");
+        assert_eq!(gpt_5_5.input_micros_per_1k, 5_000);
+        assert_eq!(gpt_5_5.output_micros_per_1k, 30_000);
+
+        let gpt_5_4 = rate("gpt-5.4");
+        assert_eq!(gpt_5_4.input_micros_per_1k, 2_500);
+        assert_eq!(gpt_5_4.output_micros_per_1k, 15_000);
+
+        let gpt_5_mini = rate("gpt-5-mini");
+        assert_eq!(gpt_5_mini.input_micros_per_1k, 250);
+        assert_eq!(gpt_5_mini.output_micros_per_1k, 2_000);
     }
 
     #[test]
