@@ -5,6 +5,7 @@ mod auth;
 pub mod billing;
 pub mod budget_enforcer;
 mod chat;
+mod chat_paid;
 pub mod clerk;
 mod context_api;
 // Public because tests/context_flow_integration_test.rs exercises it as a

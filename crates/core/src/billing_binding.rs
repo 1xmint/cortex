@@ -99,6 +99,15 @@ impl ChargeKey {
         Self(label.into())
     }
 
+    /// The charge for one Cortex-paid chat reply. Derived from the reply's
+    /// own id (`chat-reply:<uuid>`, minted once per reply) so a retried
+    /// settlement — the gateway reservation reconciling twice, a handler
+    /// re-entered after a crash — re-derives the same key and the ledger's
+    /// `UNIQUE` constraint turns it into a no-op rather than a second charge.
+    pub fn for_chat_reply(reply_id: &str) -> Self {
+        Self(format!("chat-reply:{reply_id}"))
+    }
+
     pub fn as_str(&self) -> &str {
         &self.0
     }

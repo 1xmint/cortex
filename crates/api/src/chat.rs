@@ -83,6 +83,10 @@ fn system_prompt_for_intent(intent: Option<cortex_core::routing::Intent>) -> &'s
 enum ProviderPath {
     /// Workspace: route to user's isolated Replit workspace
     Workspace { workspace_id: String },
+    /// Cortex-paid: no stored credential at all. Cortex calls Anthropic on
+    /// its own key through the private provider gateway and charges the
+    /// user's credits at observed cost. See `chat_paid.rs`.
+    Cortex { model: String },
     /// BYOS: authenticated subscription via CLI tool on the server
     Subscription {
         provider: Provider,
@@ -126,6 +130,18 @@ async fn resolve_provider(
     if let Some(workspace_id) = user_id.strip_prefix("workspace:") {
         return ProviderPath::Workspace {
             workspace_id: workspace_id.to_string(),
+        };
+    }
+
+    // 0.5. Cortex-paid: this is the path that survives once BYOK/BYOS are
+    // deleted, so it is tried before either — a stored credential is no
+    // longer required for chat to work at all, only for a user to route
+    // around their own credits. Off unless the gateway is actually usable
+    // (see `provider_gateway_http::gateway_usable`), which keeps this a
+    // no-op everywhere the gateway isn't configured.
+    if crate::provider_gateway_http::gateway_usable().is_some() {
+        return ProviderPath::Cortex {
+            model: crate::chat_paid::model_for_tier(model_tier).to_string(),
         };
     }
 
@@ -321,6 +337,33 @@ pub async fn chat(
                     db.add_message(cid, "assistant", &response, Some("replit"), None);
                 }
             });
+        }
+
+        ProviderPath::Cortex { model } => {
+            let system_prompt = system_prompt_for_intent(intent).to_string();
+            let user_message = req.message.clone();
+            let state_clone = state.clone();
+            let user_id = user.user_id.clone();
+            let conv_id = req.conversation_id.clone();
+
+            state.vera_tracker.record_conversation(&user.user_id);
+            if let Some(i) = intent {
+                state.vera_tracker.record_routed(&user.user_id, i);
+            }
+
+            if let (Some(db), Some(cid)) = (&state.db, &conv_id) {
+                db.add_message(cid, "user", &user_message, None, None);
+            }
+
+            tokio::spawn(crate::chat_paid::run(
+                state_clone,
+                user_id,
+                conv_id,
+                model,
+                system_prompt,
+                user_message,
+                tx,
+            ));
         }
 
         ProviderPath::Subscription {
