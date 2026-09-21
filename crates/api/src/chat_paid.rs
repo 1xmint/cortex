@@ -564,8 +564,10 @@ mod tests {
             max_micro_usd: 1000000000,
             funded_micro_usd: 1000000000,
         };
-        for _ in 0..2 {
-            send_paid_reply(
+        // The first call succeeds; the repeat is refused (its authorization
+        // already exists) — either way it must not charge a second time.
+        for attempt in 0..2 {
+            let result = send_paid_reply(
                 &db,
                 SIGNING_KEY,
                 SUPPLIER_KEY,
@@ -579,8 +581,12 @@ mod tests {
                 "reply-4",
                 NOW,
             )
-            .await
-            .expect("reply should succeed");
+            .await;
+            if attempt == 0 {
+                result.expect("first reply should succeed");
+            } else {
+                assert!(result.is_err(), "a replayed reply id must be refused");
+            }
         }
 
         let price_list = db.active_price_list().unwrap();
