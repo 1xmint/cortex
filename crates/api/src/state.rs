@@ -192,6 +192,23 @@ impl AppState {
         let db = Database::open(&db_path);
         tracing::info!("database opened at {}", db_path.display());
 
+        // Any live-voice reservation still `reserved` here was left
+        // mid-flight by a server restart — the billing task and the
+        // sideband-drop cleanup that would otherwise reconcile it both died
+        // with the old process. Sweep it to `unresolved` now rather than
+        // leaving it `reserved` (and its authorization exposure charged
+        // against) forever.
+        match db.sweep_stale_voice_reservations(chrono::Utc::now().timestamp_millis()) {
+            Ok(0) => {}
+            Ok(swept) => tracing::warn!(
+                swept,
+                "voice: marked stale reservation(s) unresolved after restart"
+            ),
+            Err(error) => {
+                tracing::error!(%error, "voice: startup sweep of stale reservations failed")
+            }
+        }
+
         // The anonymous worker path is off unless explicitly opened. Note it is
         // NOT tied to `CORTEX_AUTH_DISABLED`: losing a Clerk secret is an
         // accident, and this has to be a decision.
