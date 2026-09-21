@@ -465,6 +465,24 @@ pub fn seed_models() -> Vec<ModelPrice> {
             "openai", "gpt-5.4", 2_500, 15_000, 5_000, 400_000, "balanced",
         ),
         m("openai", "gpt-5-mini", 250, 2_000, 5_000, 400_000, "fast"),
+        // Voice rows are priced per SECOND, not per token: "input" is seconds
+        // of session, so `cost_micros(seconds, 0, 0)` is the cost. Reusing the
+        // token-shaped row avoids a schema change, and input is the one field
+        // the gateway already reserves against. `context_window` is the
+        // longest session Cortex allows, in seconds.
+        // gpt-live-1: $0.05/min billed per second = 833.33 micros/s, rounded
+        // up so a minute never costs less than the supplier charges us.
+        m("openai", "gpt-live-1", 833_334, 0, 0, 7_200, "voice"),
+        // gpt-4o-mini-transcribe: $0.003/min = 50 micros/s.
+        m(
+            "openai",
+            "gpt-4o-mini-transcribe",
+            50_000,
+            0,
+            0,
+            7_200,
+            "transcribe",
+        ),
         m(
             "gemini",
             "gemini-3-pro",
@@ -708,6 +726,22 @@ mod tests {
         let gpt_5_mini = rate("gpt-5-mini");
         assert_eq!(gpt_5_mini.input_micros_per_1k, 250);
         assert_eq!(gpt_5_mini.output_micros_per_1k, 2_000);
+    }
+
+    #[test]
+    fn voice_rows_charge_per_second_at_published_rates() {
+        let models = seed_models();
+        let rate = |id: &str| {
+            models
+                .iter()
+                .find(|m| m.provider == "openai" && m.model_id == id)
+                .unwrap()
+        };
+        // One minute of gpt-live-1 is $0.05 = 50_000 micros, rounded up by at
+        // most one micro.
+        let minute = rate("gpt-live-1").cost_micros(60, 0, 0);
+        assert!((50_000..=50_001).contains(&minute), "got {minute}");
+        assert_eq!(rate("gpt-4o-mini-transcribe").cost_micros(60, 0, 0), 3_000);
     }
 
     #[test]

@@ -5353,40 +5353,53 @@ impl Database {
         }
     }
 
-    /// Existing installations already have immutable price-list v1. Publish a
-    /// new version beside it when that historical seed predates the model ids
-    /// the router actually emits; never append to or rewrite the old list.
+    /// Existing installations already have an immutable price list. Publish a
+    /// new version beside it when the active list is missing a seeded model
+    /// (for example the routed Claude ids or the voice rows) or still carries
+    /// one of the corrected supplier rates below; never rewrite an old list.
     fn publish_gateway_model_revision_if_needed(&self) {
-        const ROUTED_CLAUDE_MODELS: &[&str] =
-            &["claude-haiku-4-5", "claude-sonnet-4-6", "claude-opus-4-6"];
+        // Rows whose earlier seed was wrong. Their current seed rate replaces
+        // whatever the active list says. Rows not named here are only ever
+        // added, never overwritten, so a measured rate is never clobbered.
+        const CORRECTED: &[(&str, &str)] = &[
+            ("openai", "gpt-5.5"),
+            ("openai", "gpt-5.4"),
+            ("openai", "gpt-5-mini"),
+        ];
         let Some(mut list) = self.active_price_list() else {
             return;
         };
-        let missing = ROUTED_CLAUDE_MODELS
-            .iter()
-            .filter(|model| list.model("claude", model).is_none())
-            .copied()
-            .collect::<Vec<_>>();
-        if missing.is_empty() {
-            return;
+        let mut changed = false;
+        for seed in crate::pricing::seed_models() {
+            let existing = list
+                .models
+                .iter_mut()
+                .find(|m| m.provider == seed.provider && m.model_id == seed.model_id);
+            match existing {
+                None => {
+                    list.models.push(seed);
+                    changed = true;
+                }
+                Some(row)
+                    if CORRECTED.contains(&(seed.provider.as_str(), seed.model_id.as_str()))
+                        && (row.input_micros_per_1k != seed.input_micros_per_1k
+                            || row.output_micros_per_1k != seed.output_micros_per_1k) =>
+                {
+                    *row = seed;
+                    changed = true;
+                }
+                Some(_) => {}
+            }
         }
-        let seed = crate::pricing::seed_models();
-        for model_id in missing {
-            let Some(model) = seed
-                .iter()
-                .find(|model| model.provider == "claude" && model.model_id == model_id)
-            else {
-                tracing::error!(model_id, "routed model has no provisional seed rate");
-                return;
-            };
-            list.models.push(model.clone());
+        if !changed {
+            return;
         }
         list.id = Uuid::new_v4().to_string();
         list.version += 1;
         list.published_at = Utc::now().timestamp();
         list.published_by = "cortex:gateway-model-revision".into();
         list.basis = format!(
-            "{}; adds provisional rows for routed Claude model ids without editing prior versions",
+            "{}; adds seeded model rows and corrects mispriced supplier rows without editing prior versions",
             list.basis
         );
         if let Err(error) = self.publish_price_list(&list) {
