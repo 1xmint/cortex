@@ -14,7 +14,6 @@ use tokio_stream::StreamExt;
 use cortex_engine::classifier::classify_intent;
 
 use crate::clerk::ClerkUser;
-use crate::llm_client::{self, ChatMessage, Provider};
 use crate::routes::ErrorResponse;
 use crate::state::{AppState, StepEvent};
 
@@ -48,7 +47,7 @@ pub struct RoutingPreferences {
     pub profile: Option<String>,
     #[serde(default)]
     pub budget_limit: Option<f64>,
-    /// BYOK model tier: "fast" (haiku/mini), "balanced" (sonnet/gpt-4.1), "powerful" (opus/gpt-5.5)
+    /// Model tier: "fast" (haiku/mini), "balanced" (sonnet/gpt-4.1), "powerful" (opus/gpt-5.5)
     #[serde(default)]
     pub model_tier: Option<String>,
 }
@@ -79,53 +78,23 @@ fn system_prompt_for_intent(intent: Option<cortex_core::routing::Intent>) -> &'s
 }
 
 /// Determine the best available provider path for a user.
-/// Priority: Workspace (isolated) > BYOS subscription (CLI) > BYOK API key > None
+/// Priority: Workspace (isolated) > Cortex-paid gateway > None
 enum ProviderPath {
     /// Workspace: route to user's isolated Replit workspace
     Workspace { workspace_id: String },
-    /// Cortex-paid: no stored credential at all. Cortex calls Anthropic on
-    /// its own key through the private provider gateway and charges the
-    /// user's credits at observed cost. See `chat_paid.rs`.
+    /// Cortex-paid: Cortex calls Anthropic on its own key through the
+    /// private provider gateway and charges the user's credits at observed
+    /// cost. See `chat_paid.rs`.
     Cortex { model: String },
-    /// BYOS: authenticated subscription via CLI tool on the server
-    Subscription {
-        provider: Provider,
-        model: String,
-        credential_data: String,
-    },
-    /// BYOK: raw API key (use cheap model by default)
-    ApiKey {
-        provider: Provider,
-        api_key: String,
-        model: String,
-    },
-    /// Stored key exists but decryption failed (key rotation or corruption)
-    DecryptFailed { provider: String },
     /// No provider available
     None,
 }
 
-fn byok_model(provider: &Provider, tier: Option<&str>) -> String {
-    match (provider, tier.unwrap_or("fast")) {
-        (Provider::Claude, "powerful") => "claude-opus-4-6".into(),
-        (Provider::Claude, "balanced") => "claude-sonnet-4-6".into(),
-        (Provider::Claude, _) => "claude-haiku-4-5".into(),
-        (Provider::Openai, "powerful") => "gpt-4.1".into(),
-        (Provider::Openai, "balanced") => "gpt-4.1".into(),
-        (Provider::Openai, _) => "gpt-4.1-mini".into(),
-        // Zen model IDs per opencode.ai/docs/zen; uncalibrated defaults.
-        (Provider::Zen, "powerful") => "kimi-k3".into(),
-        (Provider::Zen, "balanced") => "glm-5.2".into(),
-        (Provider::Zen, _) => "glm-5".into(),
-    }
-}
-
 async fn resolve_provider(
-    state: &AppState,
+    _state: &AppState,
     user_id: &str,
     model_tier: Option<&str>,
 ) -> ProviderPath {
-    // TODO: check credential_assignments when project context is available
     // 0. Workspace request (workspace:{workspace_id})
     if let Some(workspace_id) = user_id.strip_prefix("workspace:") {
         return ProviderPath::Workspace {
@@ -133,105 +102,13 @@ async fn resolve_provider(
         };
     }
 
-    // 0.5. Cortex-paid: this is the path that survives once BYOK/BYOS are
-    // deleted, so it is tried before either — a stored credential is no
-    // longer required for chat to work at all, only for a user to route
-    // around their own credits. Off unless the gateway is actually usable
-    // (see `provider_gateway_http::gateway_usable`), which keeps this a
-    // no-op everywhere the gateway isn't configured.
+    // 1. Cortex-paid: the only remaining chat path. Off unless the gateway
+    // is actually usable (see `provider_gateway_http::gateway_usable`),
+    // which keeps this a no-op everywhere the gateway isn't configured.
     if crate::provider_gateway_http::gateway_usable().is_some() {
         return ProviderPath::Cortex {
             model: crate::chat_paid::model_for_tier(model_tier).to_string(),
         };
-    }
-
-    // 1. Check user_credentials table (unified multi-credential system)
-    if let Some(db) = &state.db {
-        if let Some((cred, encrypted_data)) = db.get_any_credential(user_id) {
-            match crate::crypto::decrypt(&encrypted_data) {
-                Ok(decrypted) => {
-                    let provider = match Provider::from_str(&cred.provider) {
-                        Some(p) => p,
-                        None => return ProviderPath::None,
-                    };
-
-                    // Touch the credential (update last_used_at)
-                    db.touch_credential(&cred.id);
-
-                    match cred.credential_type.as_str() {
-                        "api_key" => {
-                            let model = byok_model(&provider, model_tier);
-                            return ProviderPath::ApiKey {
-                                provider,
-                                api_key: decrypted,
-                                model,
-                            };
-                        }
-                        "subscription" => {
-                            // Zen has no subscription auth — a "subscription"
-                            // credential for it is a data error; fall back to
-                            // treating the secret as an API key.
-                            if matches!(provider, Provider::Zen) {
-                                let model = byok_model(&provider, model_tier);
-                                return ProviderPath::ApiKey {
-                                    provider,
-                                    api_key: decrypted,
-                                    model,
-                                };
-                            }
-                            let model = match (&provider, model_tier.unwrap_or("fast")) {
-                                (Provider::Claude, "powerful") => "claude-sonnet-4-6".into(),
-                                (Provider::Claude, _) => "claude-sonnet-4-6".into(),
-                                (Provider::Openai, "powerful") => "gpt-4.1".into(),
-                                (Provider::Openai, _) => "gpt-4.1-mini".into(),
-                                (Provider::Zen, _) => unreachable!("handled above"),
-                            };
-                            return ProviderPath::Subscription {
-                                provider,
-                                model,
-                                credential_data: decrypted,
-                            };
-                        }
-                        _ => {
-                            let model = byok_model(&provider, model_tier);
-                            return ProviderPath::ApiKey {
-                                provider,
-                                api_key: decrypted,
-                                model,
-                            };
-                        }
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(user_id, provider = %cred.provider, "failed to decrypt credential: {e}");
-                    return ProviderPath::DecryptFailed {
-                        provider: cred.provider,
-                    };
-                }
-            }
-        }
-
-        // 2. Fallback: check legacy user_api_keys table
-        if let Some((provider_name, encrypted_key)) = db.get_any_api_key(user_id) {
-            match crate::crypto::decrypt(&encrypted_key) {
-                Ok(api_key) => {
-                    if let Some(provider) = Provider::from_str(&provider_name) {
-                        let model = byok_model(&provider, model_tier);
-                        return ProviderPath::ApiKey {
-                            provider,
-                            api_key,
-                            model,
-                        };
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(user_id, provider = %provider_name, "failed to decrypt legacy API key: {e}");
-                    return ProviderPath::DecryptFailed {
-                        provider: provider_name,
-                    };
-                }
-            }
-        }
     }
 
     ProviderPath::None
@@ -366,372 +243,6 @@ pub async fn chat(
             ));
         }
 
-        ProviderPath::Subscription {
-            provider,
-            model,
-            credential_data,
-        } => {
-            let system_prompt = system_prompt_for_intent(intent).to_string();
-            let user_message = req.message.clone();
-            let state_clone = state.clone();
-            let user_id = user.user_id.clone();
-            let conv_id = req.conversation_id.clone();
-            let provider_name = provider.name().to_string();
-
-            state.vera_tracker.record_conversation(&user.user_id);
-            if let Some(i) = intent {
-                state.vera_tracker.record_routed(&user.user_id, i);
-            }
-
-            if let (Some(db), Some(cid)) = (&state.db, &conv_id) {
-                db.add_message(cid, "user", &user_message, None, None);
-            }
-
-            tokio::spawn(async move {
-                let _ = tx
-                    .send(StepEvent::Started {
-                        step_id: "chat".into(),
-                        provider: provider_name.clone(),
-                        model: model.clone(),
-                    })
-                    .await;
-
-                let (chunk_tx, mut chunk_rx) = mpsc::channel::<String>(64);
-                let tx_clone = tx.clone();
-
-                // Resolve container or tmpfs path, then stream in a child task
-                let use_container = if let (Some(cm), Some(db)) =
-                    (&state_clone.container_manager, &state_clone.db)
-                {
-                    match cm.ensure_container(db, &user_id, provider.name()).await {
-                        Ok(container_id) => {
-                            db.touch_container_activity(&user_id);
-                            Some(container_id)
-                        }
-                        Err(e) => {
-                            tracing::warn!("container unavailable, falling back to tmpfs: {e}");
-                            None
-                        }
-                    }
-                } else {
-                    None
-                };
-
-                let stream_handle = if let Some(container_id) = use_container {
-                    let sc = state_clone.clone();
-                    tokio::spawn(async move {
-                        if let Some(cm) = &sc.container_manager {
-                            llm_client::stream_chat_via_container(
-                                &provider,
-                                &model,
-                                &system_prompt,
-                                &user_message,
-                                cm,
-                                &container_id,
-                                chunk_tx,
-                            )
-                            .await
-                        } else {
-                            Err("container manager disappeared".into())
-                        }
-                    })
-                } else {
-                    tokio::spawn(async move {
-                        llm_client::stream_chat_cli_isolated(
-                            &provider,
-                            Some(&model),
-                            &credential_data,
-                            &user_id,
-                            &system_prompt,
-                            &user_message,
-                            chunk_tx,
-                        )
-                        .await
-                    })
-                };
-
-                let mut full_response = String::new();
-                while let Some(chunk) = chunk_rx.recv().await {
-                    full_response.push_str(&chunk);
-                    let _ = tx_clone
-                        .send(StepEvent::Output {
-                            step_id: "chat".into(),
-                            line: chunk,
-                        })
-                        .await;
-                }
-
-                match stream_handle.await {
-                    Ok(Ok(())) => {
-                        let _ = tx_clone
-                            .send(StepEvent::Completed {
-                                step_id: "chat".into(),
-                                exit_code: 0,
-                            })
-                            .await;
-                    }
-                    Ok(Err(e)) => {
-                        let _ = tx_clone
-                            .send(StepEvent::Failed {
-                                step_id: "chat".into(),
-                                error: e,
-                            })
-                            .await;
-                    }
-                    Err(e) => {
-                        let _ = tx_clone
-                            .send(StepEvent::Failed {
-                                step_id: "chat".into(),
-                                error: format!("task panicked: {e}"),
-                            })
-                            .await;
-                    }
-                }
-
-                if let (Some(db), Some(cid)) = (&state_clone.db, &conv_id) {
-                    if !full_response.is_empty() {
-                        db.add_message(
-                            cid,
-                            "assistant",
-                            &full_response,
-                            Some(&provider_name),
-                            None,
-                        );
-                    }
-                }
-            });
-        }
-
-        ProviderPath::ApiKey {
-            provider,
-            api_key,
-            model,
-        } => {
-            let system_prompt = system_prompt_for_intent(intent).to_string();
-            let user_message = req.message.clone();
-            let state_clone = state.clone();
-            let conv_id = req.conversation_id.clone();
-            let provider_name = provider.name().to_string();
-
-            // Budget enforcement — check before spending user's money
-            if let Some(db) = &state.db {
-                let enforcer = crate::budget_enforcer::BudgetEnforcer::new(db);
-                let est_input =
-                    crate::cost_estimator::CostEstimator::estimate_tokens_from_text(&req.message);
-                let est_output =
-                    crate::cost_estimator::CostEstimator::estimate_output_tokens("chat", &model);
-                let (allowed, budget_result, warning) = enforcer.check_budget_before_request(
-                    &user.user_id,
-                    provider.name(),
-                    &model,
-                    est_input,
-                    est_output,
-                    true,
-                );
-
-                if let Some(w) = &warning {
-                    enforcer.record_warning(w);
-                }
-
-                if !allowed {
-                    let budget_total = budget_result.daily_spent + budget_result.daily_remaining;
-                    let reason = if budget_result.daily_remaining <= 0.0 {
-                        format!(
-                            "Daily budget limit reached (${:.2} / ${:.2}).",
-                            budget_result.daily_spent, budget_total
-                        )
-                    } else if budget_result.weekly_remaining <= 0.0 {
-                        format!(
-                            "Weekly budget limit reached (${:.2} spent this week).",
-                            budget_result.weekly_spent
-                        )
-                    } else {
-                        format!(
-                            "Monthly budget limit reached (${:.2} spent this month).",
-                            budget_result.monthly_spent
-                        )
-                    };
-                    let _ = tx
-                        .send(StepEvent::Failed {
-                            step_id: "chat".into(),
-                            error: format!(
-                                "{reason} Adjust your limits in Settings → Budget & Costs."
-                            ),
-                        })
-                        .await;
-                    let stream = ReceiverStream::new(rx).map(step_event_to_sse);
-                    return Ok(Sse::new(stream).keep_alive(KeepAlive::default()));
-                }
-            }
-
-            state.vera_tracker.record_conversation(&user.user_id);
-            if let Some(i) = intent {
-                state.vera_tracker.record_routed(&user.user_id, i);
-            }
-
-            if let (Some(db), Some(cid)) = (&state.db, &conv_id) {
-                db.add_message(cid, "user", &user_message, None, None);
-            }
-
-            // Start cost session
-            let session_id = state.db.as_ref().map(|db| {
-                let enforcer = crate::budget_enforcer::BudgetEnforcer::new(db);
-                let est_cost = {
-                    let est_in = crate::cost_estimator::CostEstimator::estimate_tokens_from_text(
-                        &user_message,
-                    );
-                    let est_out = crate::cost_estimator::CostEstimator::estimate_output_tokens(
-                        "chat", &model,
-                    );
-                    let (cost, _) = crate::cost_estimator::CostEstimator::estimate_request_cost(
-                        provider.name(),
-                        &model,
-                        est_in,
-                        est_out,
-                        None,
-                    );
-                    cost
-                };
-                enforcer.start_cost_session(
-                    &user.user_id,
-                    provider.name(),
-                    "byok",
-                    est_cost,
-                    0,
-                    Some(&model),
-                )
-            });
-
-            tokio::spawn(async move {
-                let _ = tx
-                    .send(StepEvent::Started {
-                        step_id: "chat".into(),
-                        provider: provider_name.clone(),
-                        model: model.clone(),
-                    })
-                    .await;
-
-                let (chunk_tx, mut chunk_rx) = mpsc::channel::<String>(64);
-                let tx_clone = tx.clone();
-
-                let messages = vec![ChatMessage {
-                    role: "user".into(),
-                    content: user_message,
-                }];
-
-                let model_for_cost = model.clone();
-                let stream_handle = tokio::spawn(async move {
-                    llm_client::stream_chat_api(
-                        &provider,
-                        &api_key,
-                        Some(&model),
-                        &system_prompt,
-                        &messages,
-                        chunk_tx,
-                    )
-                    .await
-                });
-
-                let mut full_response = String::new();
-                while let Some(chunk) = chunk_rx.recv().await {
-                    full_response.push_str(&chunk);
-                    let _ = tx_clone
-                        .send(StepEvent::Output {
-                            step_id: "chat".into(),
-                            line: chunk,
-                        })
-                        .await;
-                }
-
-                let _success = match stream_handle.await {
-                    Ok(Ok(())) => {
-                        let _ = tx_clone
-                            .send(StepEvent::Completed {
-                                step_id: "chat".into(),
-                                exit_code: 0,
-                            })
-                            .await;
-                        true
-                    }
-                    Ok(Err(e)) => {
-                        let _ = tx_clone
-                            .send(StepEvent::Failed {
-                                step_id: "chat".into(),
-                                error: e,
-                            })
-                            .await;
-                        false
-                    }
-                    Err(e) => {
-                        let _ = tx_clone
-                            .send(StepEvent::Failed {
-                                step_id: "chat".into(),
-                                error: format!("task panicked: {e}"),
-                            })
-                            .await;
-                        false
-                    }
-                };
-
-                // Finalize cost session
-                if let (Some(db), Some(sid)) = (&state_clone.db, &session_id) {
-                    let enforcer = crate::budget_enforcer::BudgetEnforcer::new(db);
-                    let tokens_out =
-                        crate::cost_estimator::CostEstimator::estimate_tokens_from_text(
-                            &full_response,
-                        );
-                    let (actual_cost, _) =
-                        crate::cost_estimator::CostEstimator::estimate_request_cost(
-                            &provider_name,
-                            &model_for_cost,
-                            0,
-                            tokens_out,
-                            None,
-                        );
-                    enforcer.finalize_cost_session(sid, actual_cost, tokens_out);
-                }
-
-                if let (Some(db), Some(cid)) = (&state_clone.db, &conv_id) {
-                    if !full_response.is_empty() {
-                        db.add_message(
-                            cid,
-                            "assistant",
-                            &full_response,
-                            Some(&provider_name),
-                            None,
-                        );
-                    }
-                }
-            });
-        }
-
-        ProviderPath::DecryptFailed { provider } => {
-            tokio::spawn(async move {
-                let _ = tx
-                    .send(StepEvent::Started {
-                        step_id: "chat".into(),
-                        provider: "cortex".into(),
-                        model: "system".into(),
-                    })
-                    .await;
-
-                let _ = tx.send(StepEvent::Output {
-                    step_id: "chat".into(),
-                    line: format!(
-                        "Your stored **{provider}** API key could not be decrypted. This can happen after a server update.\n\n\
-                         Please re-add your API key in **Settings → API Keys** to restore access."
-                    ),
-                }).await;
-
-                let _ = tx
-                    .send(StepEvent::Completed {
-                        step_id: "chat".into(),
-                        exit_code: 0,
-                    })
-                    .await;
-            });
-        }
-
         ProviderPath::None => {
             let state_conv = state.clone();
             let user_id = user.user_id.clone();
@@ -744,13 +255,13 @@ pub async fn chat(
                     })
                     .await;
 
-                let _ = tx.send(StepEvent::Output {
-                    step_id: "chat".into(),
-                    line: "To get started, connect your AI provider:\n\n\
-                           **Option 1 (Recommended):** Link your Claude or OpenAI subscription — your existing plan covers usage.\n\n\
-                           **Option 2:** Add an API key in **Settings → API Keys** — pay-per-use with your own key.\n\n\
-                           Once connected, I can help you build, debug, review, and ship code.".into(),
-                }).await;
+                let _ = tx
+                    .send(StepEvent::Output {
+                        step_id: "chat".into(),
+                        line: "Cortex chat is unavailable right now. Please try again shortly."
+                            .into(),
+                    })
+                    .await;
 
                 let _ = tx
                     .send(StepEvent::Completed {

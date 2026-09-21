@@ -63,7 +63,7 @@ pub fn db_ref(state: &crate::state::AppState) -> ApiResult<&crate::db::Database>
 /// Reports the status of each subsystem (database, docker, soma, scheduler,
 /// workers). The top-level `status` reflects only *critical* subsystems so the
 /// check stays stable across environments where optional subsystems (Docker
-/// BYOS, Soma) are intentionally absent:
+/// containers, Soma) are intentionally absent:
 ///   - `ok`        all critical subsystems healthy
 ///   - `unhealthy` a critical subsystem (database) is down
 ///
@@ -78,7 +78,7 @@ pub async fn health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let db_ok = state.db.as_ref().map(|d| d.health_check()).unwrap_or(false);
     crate::metrics::set_subsystem_up("database", db_ok);
 
-    // ── Docker / BYOS (non-critical: API still serves without it) ──────────
+    // ── Docker containers (non-critical: API still serves without it) ──────
     let docker_ok = state.container_manager.is_some();
     crate::metrics::set_subsystem_up("docker", docker_ok);
 
