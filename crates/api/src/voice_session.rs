@@ -541,6 +541,10 @@ async fn start_live_session(
                 "sideband attach failed after session start",
                 now_ms,
             );
+            // The OpenAI session started but we will never bill on it now;
+            // best effort, ask it to close rather than leave it running
+            // unmetered.
+            reattach_and_close(ws_base, &session_id, supplier_key).await;
             return Err(LiveSessionError::SupplierFailed);
         }
         Err(_elapsed) => {
@@ -555,6 +559,7 @@ async fn start_live_session(
                 "sideband attach timed out after session start",
                 now_ms,
             );
+            reattach_and_close(ws_base, &session_id, supplier_key).await;
             return Err(LiveSessionError::SupplierFailed);
         }
     };
@@ -639,6 +644,73 @@ struct Segment {
     reserved_micro: i64,
 }
 
+/// Guards `run_billing_loop`'s whole life against leaking the session on
+/// any exit that is not the loop's own normal cleanup — a panic in event
+/// handling, most concretely. On drop while still armed it removes
+/// `session_id` from `state.voice_sessions` and marks every segment still
+/// in `segments` `unresolved`, the same shape the sideband-drop path uses
+/// deliberately, so a panicked billing task cannot leave the user's
+/// placeholder stuck or a reservation silently `reserved` forever. The
+/// normal exit path disarms it right before doing this itself.
+struct BillingLoopGuard {
+    state: Arc<AppState>,
+    session_id: String,
+    local_id: String,
+    segments: Arc<std::sync::Mutex<std::collections::VecDeque<Segment>>>,
+    armed: bool,
+}
+
+impl BillingLoopGuard {
+    fn new(
+        state: Arc<AppState>,
+        session_id: String,
+        local_id: String,
+        segments: Arc<std::sync::Mutex<std::collections::VecDeque<Segment>>>,
+    ) -> Self {
+        Self {
+            state,
+            session_id,
+            local_id,
+            segments,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for BillingLoopGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        self.state
+            .voice_sessions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.session_id);
+        if let Some(db) = self.state.db.as_ref() {
+            let now_ms = chrono::Utc::now().timestamp_millis();
+            let mut segments = self.segments.lock().unwrap_or_else(|e| e.into_inner());
+            for seg in segments.drain(..) {
+                let key = format!("voice:{}:{}", self.local_id, seg.index);
+                let _ = db.mark_provider_request_unresolved(
+                    &key,
+                    None,
+                    "voice billing task exited abnormally without settling",
+                    now_ms,
+                );
+            }
+        }
+        tracing::error!(
+            session_id = %self.session_id,
+            "voice: billing loop task exited abnormally; session removed and open segments left unresolved"
+        );
+    }
+}
+
 /// Owns the sideband for one session's whole life: settles and renews
 /// credit segments off `session.usage.updated`, settles whatever is left
 /// off `session.closed`, and — if the socket disappears without a
@@ -669,11 +741,21 @@ async fn run_billing_loop(
         return;
     };
 
-    let mut segments: std::collections::VecDeque<Segment> = std::collections::VecDeque::new();
-    segments.push_back(Segment {
-        index: 0,
-        reserved_micro: segment0_micro,
-    });
+    let segments: Arc<std::sync::Mutex<std::collections::VecDeque<Segment>>> =
+        Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
+    segments
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push_back(Segment {
+            index: 0,
+            reserved_micro: segment0_micro,
+        });
+    let mut guard = BillingLoopGuard::new(
+        state.clone(),
+        session_id.clone(),
+        local_id.clone(),
+        segments.clone(),
+    );
     let mut next_segment_index: i64 = 0;
     let mut reserved_so_far_micro = segment0_micro;
     let mut settled_so_far_micro: i64 = 0;
@@ -723,7 +805,7 @@ async fn run_billing_loop(
                             &user_id,
                             &session_id,
                             &local_id,
-                            &mut segments,
+                            &mut segments.lock().unwrap_or_else(|e| e.into_inner()),
                             &mut settled_so_far_micro,
                             &mut charged_credits_so_far,
                             observed_total,
@@ -762,10 +844,13 @@ async fn run_billing_loop(
                                 ) {
                                     Ok(_) => {
                                         next_segment_index = candidate_index;
-                                        segments.push_back(Segment {
-                                            index: candidate_index,
-                                            reserved_micro: next_micro,
-                                        });
+                                        segments
+                                            .lock()
+                                            .unwrap_or_else(|e| e.into_inner())
+                                            .push_back(Segment {
+                                                index: candidate_index,
+                                                reserved_micro: next_micro,
+                                            });
                                         reserved_so_far_micro += next_micro;
                                     }
                                     Err(_) => {
@@ -820,7 +905,7 @@ async fn run_billing_loop(
                             &user_id,
                             &session_id,
                             &local_id,
-                            &mut segments,
+                            &mut segments.lock().unwrap_or_else(|e| e.into_inner()),
                             &mut settled_so_far_micro,
                             &mut charged_credits_so_far,
                             observed_total,
@@ -856,7 +941,7 @@ async fn run_billing_loop(
             &user_id,
             &session_id,
             &local_id,
-            &mut segments,
+            &mut segments.lock().unwrap_or_else(|e| e.into_inner()),
             &mut settled_so_far_micro,
             &mut charged_credits_so_far,
             last_observed_total_micro,
@@ -865,43 +950,45 @@ async fn run_billing_loop(
             now_ms(),
         );
 
-        // Usage already past every reservation this session ever made (an
-        // overrun that was never settled because the sideband dropped
-        // before the next `session.usage.updated` could report it) is
-        // still real spend — charge it directly, same cumulative rule as
-        // `settle_up_to`'s own overrun branch.
-        if last_observed_total_micro > reserved_so_far_micro
-            && last_observed_total_micro > settled_so_far_micro
-        {
-            let overrun_key = format!("voice:{local_id}:overrun");
-            let remaining = last_observed_total_micro - settled_so_far_micro;
+        // Usage observed but not yet reflected in charged credits is still
+        // real spend, whether it is a mid-segment drop (usage past what
+        // fully settled but not past every reservation, so the loop above
+        // left it `None`) or the debt from an earlier non-final charge
+        // that failed and was only ever recorded in
+        // `charged_credits_so_far` — with no further `session.usage.updated`
+        // coming, that debt would otherwise never be retried. Charge the
+        // whole outstanding remainder now, capped to balance since this is
+        // the last chance (`is_final = true`).
+        let basis_micro = last_observed_total_micro.max(settled_so_far_micro);
+        let credits_due = ceil_div(basis_micro, micros_per_credit);
+        let delta = credits_due - charged_credits_so_far;
+        if delta > 0 {
+            let drop_key = format!("voice:{local_id}:drop");
             tracing::error!(
                 user_id = %user_id,
                 session_id = %session_id,
-                remaining,
-                "voice: sideband dropped with usage beyond every reservation; charging the excess directly"
+                delta,
+                "voice: sideband dropped with usage not yet reflected in charged credits; charging the remainder directly"
             );
-            settled_so_far_micro = last_observed_total_micro;
-            let credits_due = ceil_div(settled_so_far_micro, micros_per_credit);
-            let delta = credits_due - charged_credits_so_far;
             let _ = charge_incremental(
                 db,
                 &user_id,
                 &session_id,
-                &overrun_key,
+                &drop_key,
                 "Cortex live voice overrun",
                 delta,
                 true,
             );
         }
 
-        let observed_note = last_observed_total_micro.to_string();
-        for seg in segments.drain(..) {
+        for seg in segments.lock().unwrap_or_else(|e| e.into_inner()).drain(..) {
             let key = format!("voice:{local_id}:{}", seg.index);
             let _ = db.mark_provider_request_unresolved(
                 &key,
-                Some(observed_note.as_str()),
-                "sideband dropped without session.closed",
+                Some(session_id.as_str()),
+                &format!(
+                    "sideband dropped without session.closed; last observed session total {last_observed_total_micro} micro-USD"
+                ),
                 now_ms(),
             );
         }
@@ -913,38 +1000,48 @@ async fn run_billing_loop(
         // Best effort: the sideband is gone, but the OpenAI session may
         // still be running and metering. Try once to re-attach and ask it
         // to close rather than leaving it running unmetered.
-        match tokio::time::timeout(
-            SIDEBAND_ATTACH_TIMEOUT,
-            WsSideband::attach(&ws_base, &session_id, &supplier_key),
-        )
-        .await
-        {
-            Ok(Ok(mut reattached)) => {
-                reattached
-                    .send(serde_json::json!({"type": "session.close"}))
-                    .await;
-            }
-            Ok(Err(detail)) => {
-                tracing::error!(
-                    session_id = %session_id,
-                    %detail,
-                    "voice: re-attach after sideband drop failed; could not send session.close"
-                );
-            }
-            Err(_elapsed) => {
-                tracing::error!(
-                    session_id = %session_id,
-                    "voice: re-attach after sideband drop timed out; could not send session.close"
-                );
-            }
-        }
+        reattach_and_close(&ws_base, &session_id, &supplier_key).await;
     }
 
+    guard.disarm();
     state
         .voice_sessions
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .remove(&session_id);
+}
+
+/// Best effort: re-attach the sideband once and immediately ask the session
+/// to close. Used both when the sideband drops mid-session (nothing left to
+/// bill on, but the OpenAI session may still be running and metering) and
+/// when the initial attach itself fails or times out after the OpenAI
+/// session already started (same problem, at the very start of the call).
+async fn reattach_and_close(ws_base: &str, session_id: &str, supplier_key: &str) {
+    match tokio::time::timeout(
+        SIDEBAND_ATTACH_TIMEOUT,
+        WsSideband::attach(ws_base, session_id, supplier_key),
+    )
+    .await
+    {
+        Ok(Ok(mut reattached)) => {
+            reattached
+                .send(serde_json::json!({"type": "session.close"}))
+                .await;
+        }
+        Ok(Err(detail)) => {
+            tracing::error!(
+                session_id,
+                %detail,
+                "voice: re-attach failed; could not send session.close"
+            );
+        }
+        Err(_elapsed) => {
+            tracing::error!(
+                session_id,
+                "voice: re-attach timed out; could not send session.close"
+            );
+        }
+    }
 }
 
 /// Deducts the next `delta_credits` credits owed under `key`, on top of
@@ -1111,6 +1208,31 @@ fn settle_up_to(
                 session_id,
                 &key,
                 "Cortex live voice overrun",
+                delta,
+                true,
+            );
+            *charged_credits_so_far += charged;
+        }
+
+        // A non-final charge earlier in this session can fail
+        // (`charge_incremental` returns `charged: 0` on a deduction
+        // error) while `settled_so_far_micro` already reflects the
+        // settle that triggered it — the debt then lives only in the gap
+        // between `ceil_div(settled_so_far_micro, micros_per_credit)` and
+        // `charged_credits_so_far`. If nothing above just charged it (the
+        // `remaining > 0` branch did not fire, because observed usage
+        // never grew past what was already settled), this is the last
+        // chance to retry it before the segment goes out of scope.
+        let credits_due = ceil_div(*settled_so_far_micro, micros_per_credit);
+        let delta = credits_due - *charged_credits_so_far;
+        if delta > 0 {
+            let key = format!("voice:{local_id}:final");
+            let (charged, _exhausted) = charge_incremental(
+                db,
+                user_id,
+                session_id,
+                &key,
+                "Cortex live voice",
                 delta,
                 true,
             );
