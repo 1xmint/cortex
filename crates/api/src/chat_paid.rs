@@ -50,10 +50,9 @@ fn ceil_div(numerator: i64, denominator: i64) -> i64 {
     (numerator + denominator - 1) / denominator
 }
 
-/// The BYOK model tiers, mapped to the same Claude model ids `chat.rs`
-/// already routes BYOK traffic to (see `byok_model`) — they are already
-/// priced on every seeded list, so picking them here never needs a second
-/// place to keep in sync with what the price list actually publishes.
+/// The chat model tiers, mapped to Claude model ids that are already priced
+/// on every seeded list, so picking them here never needs a second place to
+/// keep in sync with what the price list actually publishes.
 pub(crate) fn model_for_tier(tier: Option<&str>) -> &'static str {
     match tier.unwrap_or("fast") {
         "powerful" => "claude-opus-4-6",
@@ -265,9 +264,9 @@ fn extract_text(body: &Value) -> String {
 }
 
 /// The SSE-facing entry point: resolve whether the gateway is usable, run the
-/// paid-reply pipeline, and turn the outcome into the same `StepEvent`
-/// sequence the BYOK path sends — `Started`, then either `Output` +
-/// `Completed` or `Failed` — plus the conversation writes.
+/// paid-reply pipeline, and turn the outcome into the standard `StepEvent`
+/// sequence — `Started`, then either `Output` + `Completed` or `Failed` —
+/// plus the conversation writes.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run(
     state: Arc<AppState>,

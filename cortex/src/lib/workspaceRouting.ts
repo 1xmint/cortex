@@ -1,4 +1,4 @@
-// Workspace routing utilities for BYOS integration
+// Workspace routing utilities
 
 export interface WorkspaceContext {
   workspaceId?: string;

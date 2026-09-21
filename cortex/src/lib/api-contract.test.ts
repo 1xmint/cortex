@@ -38,31 +38,6 @@ const KNOWN_UNSERVED: Record<string, string> = {
   '/api/soma/spend': 'soma fence',
   '/api/soma/spend/{id}': 'soma fence',
 
-  // Never implemented. Gated by MEMORY_API_ENABLED, off by default.
-  '/api/memory/memories': 'memory not implemented',
-  '/api/memory/memories/search': 'memory not implemented',
-  '/api/memory/memories/{id}/effectiveness': 'memory not implemented',
-  '/api/memory/remove': 'memory not implemented',
-  '/api/memory/stats': 'memory not implemented',
-  '/api/memory/suggestions': 'memory not implemented',
-  '/api/memory/chat/auto-capture': 'memory not implemented',
-  '/api/memory/chat/process': 'memory not implemented',
-  '/api/memory/chat/suggestions/{id}/apply': 'memory not implemented',
-
-  // Never implemented. Gated by BUDGET_API_ENABLED, off by default.
-  '/api/budget/settings': 'budget not implemented',
-  '/api/budget/usage': 'budget not implemented',
-  '/api/budget/warnings': 'budget not implemented',
-  '/api/budget/warnings/{id}/acknowledge': 'budget not implemented',
-
-  // Never implemented. Gated by PROJECT_WORKSPACE_API_ENABLED, off by default.
-  '/api/projects/validate-name': 'project workspace not implemented',
-  '/api/projects/templates': 'project workspace not implemented',
-  '/api/projects/import/github': 'project workspace not implemented',
-  '/api/projects/{id}/files': 'project workspace not implemented',
-  '/api/projects/{id}/sync': 'project workspace not implemented',
-  '/api/projects/{id}/workspace': 'project workspace not implemented',
-
   // `/api/providers/status`, `/api/authority/delegate` and
   // `/api/groups/{id}/tasks/{id}/evidence` were unserved too, but each was a
   // lone endpoint inside a feature that otherwise works, so there was no

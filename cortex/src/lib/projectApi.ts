@@ -4,26 +4,6 @@
 const API_BASE = import.meta.env.VITE_CORTEX_API as string | undefined ??
   (import.meta.env.DEV ? 'http://localhost:3001' : '');
 
-/**
- * Six of the paths in this file have no backend behind them.
- *
- * The workspace serves exactly four project routes -- `GET|POST /api/projects`,
- * `DELETE|GET /api/projects/{id}`, `POST /api/projects/{id}/chat` and
- * `POST /api/projects/import` -- and has never served any of the rest in any
- * commit. So the file tree, the workspace link, repository sync, name
- * validation, templates and the GitHub import are switched off here rather
- * than deleted, and this is the switch to flip when those routes exist.
- *
- * Two of the six already degraded on their own: templates falls back to the
- * built-in list and name validation returns "cannot validate". Gating them
- * only spares the 404 on the way to the same answer.
- *
- * The paths are listed with this reason in `api-contract.test.ts`, which fails
- * if the frontend calls a path `crates/api/route-manifest.csv` does not serve.
- */
-export const PROJECT_WORKSPACE_API_ENABLED =
-  import.meta.env.VITE_CORTEX_PROJECT_WORKSPACE_ENABLED === 'true';
-
 async function fetchWithAuth(path: string, init?: RequestInit): Promise<Response> {
   // For now, use direct fetch - in production this should use auth tokens
   const url = `${API_BASE}${path}`;
@@ -80,49 +60,6 @@ export interface CreateProjectRequest {
   files?: FileList | null;
 }
 
-export interface ImportFromGitHubRequest {
-  name: string;
-  description: string;
-  repoUrl: string;
-  branch?: string;
-}
-
-export interface ProjectValidation {
-  valid: boolean;
-  error?: string;
-}
-
-/**
- * Validates a project name for uniqueness and format
- */
-export async function validateProjectName(name: string): Promise<ProjectValidation> {
-  if (!PROJECT_WORKSPACE_API_ENABLED) {
-    return { valid: true };
-  }
-  try {
-    const response = await fetchWithAuth('/api/projects/validate-name', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name }),
-    });
-
-    if (!response.ok) {
-      const errorData = await response.json().catch(() => ({}));
-      return {
-        valid: false,
-        error: errorData.error || 'Name validation failed'
-      };
-    }
-
-    return await response.json();
-  } catch {
-    return {
-      valid: false,
-      error: 'Unable to validate project name'
-    };
-  }
-}
-
 /**
  * Creates a new project from a template
  */
@@ -149,28 +86,6 @@ export async function createProject(request: CreateProjectRequest): Promise<stri
   if (!response.ok) {
     const errorData = await response.json().catch(() => ({}));
     throw new Error(errorData.error || 'Failed to create project');
-  }
-
-  const result = await response.json();
-  return result.projectId;
-}
-
-/**
- * Imports a project from GitHub
- */
-export async function importFromGitHub(request: ImportFromGitHubRequest): Promise<string> {
-  if (!PROJECT_WORKSPACE_API_ENABLED) {
-    throw new Error('Importing from GitHub is not available yet.');
-  }
-  const response = await fetchWithAuth('/api/projects/import/github', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(request),
-  });
-
-  if (!response.ok) {
-    const errorData = await response.json().catch(() => ({}));
-    throw new Error(errorData.error || 'Failed to import from GitHub');
   }
 
   const result = await response.json();
@@ -241,128 +156,5 @@ export async function deleteProject(projectId: string): Promise<void> {
   }
 }
 
-/**
- * Gets project file tree
- */
-export async function getProjectFiles(projectId: string): Promise<ProjectFileNode[]> {
-  if (!PROJECT_WORKSPACE_API_ENABLED) {
-    return [];
-  }
-  const response = await fetchWithAuth(`/api/projects/${projectId}/files`);
 
-  if (!response.ok) {
-    throw new Error('Failed to fetch project files');
-  }
 
-  return await response.json();
-}
-
-export interface ProjectFileNode {
-  name: string;
-  path: string;
-  type: 'file' | 'directory';
-  size?: number;
-  modifiedAt?: string;
-  children?: ProjectFileNode[];
-}
-
-/**
- * Gets project workspace URL for opening in external tools
- */
-export async function getProjectWorkspaceUrl(projectId: string): Promise<string> {
-  if (!PROJECT_WORKSPACE_API_ENABLED) {
-    throw new Error('Opening a project workspace is not available yet.');
-  }
-  const response = await fetchWithAuth(`/api/projects/${projectId}/workspace`);
-
-  if (!response.ok) {
-    throw new Error('Failed to get workspace URL');
-  }
-
-  const result = await response.json();
-  return result.workspaceUrl;
-}
-
-/**
- * Syncs project with remote repository
- */
-export async function syncProject(projectId: string): Promise<void> {
-  if (!PROJECT_WORKSPACE_API_ENABLED) {
-    throw new Error('Syncing a project is not available yet.');
-  }
-  const response = await fetchWithAuth(`/api/projects/${projectId}/sync`, {
-    method: 'POST',
-  });
-
-  if (!response.ok) {
-    const errorData = await response.json().catch(() => ({}));
-    throw new Error(errorData.error || 'Failed to sync project');
-  }
-}
-
-/**
- * Gets available project templates
- */
-export async function getProjectTemplates(): Promise<ProjectTemplate[]> {
-  if (!PROJECT_WORKSPACE_API_ENABLED) {
-    return getDefaultTemplates();
-  }
-  try {
-    const response = await fetchWithAuth('/api/projects/templates');
-
-    if (!response.ok) {
-      // Fall back to client-side templates if backend not available
-      return getDefaultTemplates();
-    }
-
-    return await response.json();
-  } catch {
-    // Return default templates as fallback
-    return getDefaultTemplates();
-  }
-}
-
-function getDefaultTemplates(): ProjectTemplate[] {
-  return [
-    {
-      id: 'web-app',
-      name: 'Web Application',
-      description: 'React/Next.js frontend with TypeScript',
-      icon: '🌐',
-      features: ['React/Next.js', 'TypeScript', 'Tailwind CSS', 'Vite'],
-      estimatedTime: '5 minutes'
-    },
-    {
-      id: 'api-service',
-      name: 'API Service',
-      description: 'REST API with Node.js/Express or Rust/Axum',
-      icon: '🔌',
-      features: ['REST endpoints', 'Database models', 'Authentication', 'OpenAPI docs'],
-      estimatedTime: '10 minutes'
-    },
-    {
-      id: 'full-stack',
-      name: 'Full-Stack App',
-      description: 'Complete web application with frontend and backend',
-      icon: '🏗️',
-      features: ['Frontend + Backend', 'Database', 'Auth system', 'Deployment ready'],
-      estimatedTime: '15 minutes'
-    },
-    {
-      id: 'mobile-app',
-      name: 'Mobile App',
-      description: 'React Native or Flutter mobile application',
-      icon: '📱',
-      features: ['Cross-platform', 'Navigation', 'State management', 'Native features'],
-      estimatedTime: '20 minutes'
-    },
-    {
-      id: 'blank',
-      name: 'Blank Project',
-      description: 'Start from scratch with basic structure',
-      icon: '📝',
-      features: ['Basic folder structure', 'Git repository', 'README template'],
-      estimatedTime: '2 minutes'
-    }
-  ];
-}

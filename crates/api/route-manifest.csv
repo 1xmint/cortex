@@ -8,12 +8,6 @@ cortex,GET,/api/admin/runs/{id}
 cortex,GET,/api/admin/usage
 cortex,GET,/api/admin/usage/users
 cortex,GET,/api/admin/workers
-cortex,POST,/api/auth/credential/default
-cortex,POST,/api/auth/credential/delete
-cortex,POST,/api/auth/refresh
-cortex,POST,/api/auth/start
-cortex,GET,/api/auth/status
-cortex,POST,/api/auth/submit
 cortex,GET|POST,/api/authority/delegations
 cortex,DELETE,/api/authority/delegations/{delegation_id}
 cortex,GET|POST,/api/authority/scopes
@@ -31,9 +25,6 @@ cortex,POST,/api/context/test
 cortex,GET|POST,/api/conversations
 cortex,DELETE|GET|PATCH,/api/conversations/{id}
 cortex,POST,/api/conversations/{id}/messages
-cortex,POST,/api/credentials/assign
-cortex,GET,/api/credentials/assignments
-cortex,DELETE,/api/credentials/assignments/{id}
 cortex,GET,/api/deploy-info
 cortex,GET,/api/deploy-metadata
 cortex,GET,/api/deploy-status
@@ -63,8 +54,6 @@ cortex,POST,/api/integrations/slack/import-channels
 cortex,GET,/api/integrations/slack/oauth/callback
 cortex,POST,/api/integrations/slack/oauth/start
 cortex,GET,/api/integrations/status
-cortex,GET,/api/keys
-cortex,DELETE|PUT,/api/keys/{provider}
 cortex,GET,/api/ledger
 cortex,GET,/api/mc
 cortex,GET,/api/mc/snapshot

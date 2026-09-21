@@ -1,24 +1,18 @@
 import { useCallback, useEffect, useState } from 'react';
 import {
   ArrowLeft,
-  ExternalLink,
   FileText,
   GitBranch,
   MessageSquare,
   Settings,
   Users,
   Activity,
-  Folder,
   Code2,
   CheckCircle
 } from 'lucide-react';
 import {
   getProject,
-  getProjectFiles,
-  getProjectWorkspaceUrl,
-  syncProject,
-  type Project,
-  type ProjectFileNode
+  type Project
 } from '../../lib/projectApi';
 
 interface ProjectDashboardProps {
@@ -72,78 +66,12 @@ function ProjectStats({ project }: { project: Project }) {
   );
 }
 
-function FileTree({ files }: { files: ProjectFileNode[] }) {
-  const [expandedFolders, setExpandedFolders] = useState<Set<string>>(new Set());
-
-  const toggleFolder = useCallback((path: string) => {
-    setExpandedFolders(prev => {
-      const next = new Set(prev);
-      if (next.has(path)) {
-        next.delete(path);
-      } else {
-        next.add(path);
-      }
-      return next;
-    });
-  }, []);
-
-  const renderNode = (node: ProjectFileNode, depth = 0) => {
-    const isExpanded = expandedFolders.has(node.path);
-
-    return (
-      <div key={node.path}>
-        <div
-          className="flex items-center gap-2 py-1 px-2 hover:bg-white/[0.03] rounded cursor-pointer"
-          style={{ paddingLeft: `${depth * 16 + 8}px` }}
-          onClick={() => node.type === 'directory' && toggleFolder(node.path)}
-        >
-          {node.type === 'directory' ? (
-            <Folder className="h-4 w-4 text-blue-400" />
-          ) : (
-            <FileText className="h-4 w-4 text-[var(--muted)]" />
-          )}
-          <span className="text-sm text-white truncate">{node.name}</span>
-          {node.size && (
-            <span className="text-xs text-[var(--muted)] ml-auto">
-              {(node.size / 1024).toFixed(1)}KB
-            </span>
-          )}
-        </div>
-
-        {node.type === 'directory' && isExpanded && node.children && (
-          <div>
-            {node.children.map(child => renderNode(child, depth + 1))}
-          </div>
-        )}
-      </div>
-    );
-  };
-
-  if (files.length === 0) {
-    return (
-      <div className="flex items-center justify-center h-32 text-[var(--muted)]">
-        No files found
-      </div>
-    );
-  }
-
-  return (
-    <div className="max-h-96 overflow-y-auto">
-      {files.map(node => renderNode(node))}
-    </div>
-  );
-}
-
 function QuickActions({
   project,
-  onOpenChat,
-  onOpenWorkspace,
-  onSync
+  onOpenChat
 }: {
   project: Project;
   onOpenChat: (projectId: string) => void;
-  onOpenWorkspace: () => void;
-  onSync: () => void;
 }) {
   const actions = [
     {
@@ -154,27 +82,12 @@ function QuickActions({
       primary: true
     },
     {
-      label: 'Open Workspace',
-      description: 'Edit code in external editor',
-      icon: ExternalLink,
-      onClick: onOpenWorkspace
-    },
-    {
       label: 'View Code',
       description: 'Browse files and folders',
       icon: Code2,
       onClick: () => {} // TODO: Implement file browser
     }
   ];
-
-  if (project.repoUrl) {
-    actions.push({
-      label: 'Sync Git',
-      description: 'Pull latest changes',
-      icon: GitBranch,
-      onClick: onSync
-    });
-  }
 
   return (
     <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
@@ -258,7 +171,6 @@ export default function ProjectDashboard({
   onOpenChat
 }: ProjectDashboardProps) {
   const [project, setProject] = useState<Project | null>(null);
-  const [files, setFiles] = useState<ProjectFileNode[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
@@ -267,13 +179,9 @@ export default function ProjectDashboard({
       setLoading(true);
       setError(null);
 
-      const [projectData, filesData] = await Promise.all([
-        getProject(projectId),
-        getProjectFiles(projectId).catch(() => []) // Files might not be available
-      ]);
+      const projectData = await getProject(projectId);
 
       setProject(projectData);
-      setFiles(filesData);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to load project');
     } finally {
@@ -284,29 +192,6 @@ export default function ProjectDashboard({
   useEffect(() => {
     loadProject();
   }, [loadProject]);
-
-  const handleOpenWorkspace = useCallback(async () => {
-    if (!project) return;
-
-    try {
-      const workspaceUrl = await getProjectWorkspaceUrl(project.id);
-      window.open(workspaceUrl, '_blank');
-    } catch (err) {
-      console.error('Failed to open workspace:', err);
-    }
-  }, [project]);
-
-  const handleSync = useCallback(async () => {
-    if (!project) return;
-
-    try {
-      await syncProject(project.id);
-      // Reload project data after sync
-      await loadProject();
-    } catch (err) {
-      console.error('Failed to sync project:', err);
-    }
-  }, [project, loadProject]);
 
   if (loading) {
     return (
@@ -387,8 +272,6 @@ export default function ProjectDashboard({
           <QuickActions
             project={project}
             onOpenChat={onOpenChat}
-            onOpenWorkspace={handleOpenWorkspace}
-            onSync={handleSync}
           />
         </div>
 
@@ -396,14 +279,6 @@ export default function ProjectDashboard({
         <div>
           <h2 className="text-lg font-semibold text-white mb-4">Recent Activity</h2>
           <RecentActivity />
-        </div>
-      </div>
-
-      {/* Project Files */}
-      <div>
-        <h2 className="text-lg font-semibold text-white mb-4">Project Files</h2>
-        <div className="bg-white/[0.02] border border-white/8 rounded-xl p-4">
-          <FileTree files={files} />
         </div>
       </div>
     </div>

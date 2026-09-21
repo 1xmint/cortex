@@ -1,6 +1,6 @@
 import { useState, useCallback } from 'react';
-import { ArrowLeft, ArrowRight, CheckCircle, FolderPlus, GitBranch, Upload, FileText, Loader2, X } from 'lucide-react';
-import { createProject, importFromGitHub, validateProjectName, type ProjectTemplate } from '../../lib/projectApi';
+import { ArrowLeft, ArrowRight, CheckCircle, FolderPlus, Upload, FileText, Loader2, X } from 'lucide-react';
+import { createProject, type ProjectTemplate } from '../../lib/projectApi';
 
 interface ProjectSetupWizardProps {
   onComplete: (projectId: string) => void;
@@ -14,9 +14,7 @@ interface ProjectConfig {
   name: string;
   description: string;
   template: ProjectTemplate | null;
-  importSource: 'new' | 'github' | 'upload';
-  githubRepo?: string;
-  githubBranch?: string;
+  importSource: 'new' | 'upload';
   localFiles?: FileList | null;
 }
 
@@ -178,32 +176,13 @@ function DetailsStep({
   onBack: () => void;
 }) {
   const [nameError, setNameError] = useState<string | null>(null);
-  const [validating, setValidating] = useState(false);
 
-  const handleNameChange = useCallback(async (name: string) => {
+  const handleNameChange = useCallback((name: string) => {
     onUpdate({ name });
-
-    if (name.length < 3) {
-      setNameError('Project name must be at least 3 characters');
-      return;
-    }
-
-    setValidating(true);
-    setNameError(null);
-
-    try {
-      const validation = await validateProjectName(name);
-      if (!validation.valid) {
-        setNameError(validation.error || 'Project name is not available');
-      }
-    } catch {
-      setNameError('Unable to validate project name');
-    } finally {
-      setValidating(false);
-    }
+    setNameError(name.length > 0 && name.length < 3 ? 'Project name must be at least 3 characters' : null);
   }, [onUpdate]);
 
-  const canProceed = config.name.length >= 3 && !nameError && !validating;
+  const canProceed = config.name.length >= 3 && !nameError;
 
   return (
     <div className="space-y-6">
@@ -227,9 +206,6 @@ function DetailsStep({
               placeholder="my-awesome-project"
               className="w-full px-3 py-2 bg-white/[0.03] border border-white/10 rounded-lg text-white placeholder-[var(--muted)] focus:border-[var(--accent)] focus:outline-none"
             />
-            {validating && (
-              <Loader2 className="absolute right-3 top-2.5 h-4 w-4 animate-spin text-[var(--muted)]" />
-            )}
           </div>
           {nameError && (
             <p className="mt-1 text-xs text-red-400">{nameError}</p>
@@ -302,12 +278,6 @@ function ImportStep({
       recommended: true
     },
     {
-      id: 'github' as const,
-      icon: GitBranch,
-      title: 'Import from GitHub',
-      description: 'Clone an existing repository'
-    },
-    {
       id: 'upload' as const,
       icon: Upload,
       title: 'Upload Files',
@@ -359,35 +329,6 @@ function ImportStep({
           );
         })}
       </div>
-
-      {config.importSource === 'github' && (
-        <div className="max-w-md mx-auto space-y-3 p-4 bg-white/[0.02] rounded-xl border border-white/8">
-          <div>
-            <label className="block text-sm font-medium text-white mb-2">
-              GitHub Repository URL
-            </label>
-            <input
-              type="url"
-              value={config.githubRepo || ''}
-              onChange={(e) => onUpdate({ githubRepo: e.target.value })}
-              placeholder="https://github.com/username/repo"
-              className="w-full px-3 py-2 bg-white/[0.03] border border-white/10 rounded-lg text-white placeholder-[var(--muted)] focus:border-[var(--accent)] focus:outline-none"
-            />
-          </div>
-          <div>
-            <label className="block text-sm font-medium text-white mb-2">
-              Branch (optional)
-            </label>
-            <input
-              type="text"
-              value={config.githubBranch || ''}
-              onChange={(e) => onUpdate({ githubBranch: e.target.value })}
-              placeholder="main"
-              className="w-full px-3 py-2 bg-white/[0.03] border border-white/10 rounded-lg text-white placeholder-[var(--muted)] focus:border-[var(--accent)] focus:outline-none"
-            />
-          </div>
-        </div>
-      )}
 
       {config.importSource === 'upload' && (
         <div className="max-w-md mx-auto">
@@ -450,23 +391,12 @@ function ReviewStep({
     setError(null);
 
     try {
-      let projectId: string;
-
-      if (config.importSource === 'github' && config.githubRepo) {
-        projectId = await importFromGitHub({
-          name: config.name,
-          description: config.description,
-          repoUrl: config.githubRepo,
-          branch: config.githubBranch
-        });
-      } else {
-        projectId = await createProject({
-          name: config.name,
-          description: config.description,
-          template: config.template,
-          files: config.localFiles
-        });
-      }
+      const projectId = await createProject({
+        name: config.name,
+        description: config.description,
+        template: config.template,
+        files: config.localFiles
+      });
 
       onComplete(projectId);
     } catch (err) {
@@ -512,12 +442,6 @@ function ReviewStep({
               </div>
             )}
 
-            {config.importSource === 'github' && config.githubRepo && (
-              <div>
-                <span className="text-[var(--muted)]">Repository:</span>
-                <p className="text-white mt-1 font-mono text-xs">{config.githubRepo}</p>
-              </div>
-            )}
           </div>
         </div>
 

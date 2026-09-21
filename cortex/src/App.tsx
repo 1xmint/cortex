@@ -90,7 +90,7 @@ const DEFAULT_SESSION_CONTROLS: ChatSessionControls = {
 const SESSION_CONTROLS_STORAGE_KEY = 'cortex:session-controls';
 const RUN_PROFILE_STORAGE_KEY = 'cortex:run-profile';
 const FREE_TIER_ACCESS_STATES = new Set<BillingAccessState>(['needs_checkout', 'needs_phone', 'cancelled']);
-type SettingsTab = 'providers' | 'integrations' | 'spend' | 'billing' | 'account';
+type SettingsTab = 'integrations' | 'spend' | 'billing' | 'account';
 
 function deploymentBadgeTitle(status: DeploymentStatus): string {
   const backend = status.commits.backend_commit_short ?? status.backend.commit_short ?? 'unknown';
@@ -268,7 +268,7 @@ function CortexShell() {
   // Auto-creates user's Soma identity + session-scoped delegation on sign-in
   useSomaSession(userId ?? 'anonymous', isSignedIn);
   const [settingsOpen, setSettingsOpen] = useState(false);
-  const [settingsInitialTab, setSettingsInitialTab] = useState<SettingsTab>('providers');
+  const [settingsInitialTab, setSettingsInitialTab] = useState<SettingsTab>('account');
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const activeConversationId = conversationByGroup[activeGroupId] ?? null;
   const [renamingTitle, setRenamingTitle] = useState(false);
@@ -522,7 +522,7 @@ function CortexShell() {
     setSidebarOpen(false);
   }, [addTeamGroup, groups, navigate]);
 
-  const handleOpenSettings = useCallback((tab: SettingsTab = 'providers') => {
+  const handleOpenSettings = useCallback((tab: SettingsTab = 'account') => {
     setSettingsInitialTab(tab);
     setSettingsOpen(true);
     setSidebarOpen(false);

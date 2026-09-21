@@ -63,7 +63,6 @@ async fn main() {
     // See the note in crates/api/src/main.rs: assert, reconcile, then serve.
     start_verification_dispatcher(&state);
 
-    cortex_api::token_refresh::spawn_token_refresh_job(state.clone());
     cortex_api::docker::spawn_idle_reaper(state.clone());
 
     let app = cortex_api::build_cortex_router(state.clone());

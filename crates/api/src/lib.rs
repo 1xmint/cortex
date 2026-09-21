@@ -1,9 +1,6 @@
 mod admin;
 pub mod api_error;
-mod api_keys;
-mod auth;
 pub mod billing;
-pub mod budget_enforcer;
 mod chat;
 mod chat_paid;
 pub mod clerk;
@@ -15,9 +12,6 @@ pub mod check_runner;
 pub mod context_flow;
 mod conversations;
 mod cortex_groups;
-pub mod cost_estimator;
-pub mod credentials;
-mod crypto;
 pub mod db;
 mod deploy_status;
 pub mod docker;
@@ -26,7 +20,6 @@ pub mod github;
 pub mod github_repos;
 mod integrations;
 pub mod key_material;
-pub mod llm_client;
 mod lock;
 pub mod metrics;
 pub mod mission_control;
@@ -66,7 +59,6 @@ pub fn build_gateway_cli_proof_router(
     provider_gateway_http::proof_router(db, signing_key, authorization_id)
 }
 pub mod stripe_client;
-pub mod token_refresh;
 mod usage_api;
 mod user;
 mod validate;
@@ -430,11 +422,6 @@ pub fn build_cortex_router(state: Arc<AppState>) -> Router {
             "/api/context/test",
             post(context_api::test_context_assembly),
         )
-        .route("/api/keys", get(api_keys::list_api_keys))
-        .route(
-            "/api/keys/{provider}",
-            put(api_keys::save_api_key).delete(api_keys::delete_api_key),
-        )
         .route("/api/github/repos", get(github_repos::list_repos))
         .route("/api/github/imports", get(github_repos::list_imports))
         .route("/api/github/import", post(github_repos::import_repo))
@@ -507,15 +494,6 @@ pub fn build_cortex_router(state: Arc<AppState>) -> Router {
         .route("/api/deployment/adapters", get(routes::get_deployment_adapters))
         .route("/api/providers", get(routes::get_providers))
         .route("/api/ledger", get(routes::get_ledger))
-        .route("/api/auth/status", get(auth::auth_status))
-        .route("/api/auth/start", post(auth::auth_start))
-        .route("/api/auth/submit", post(auth::auth_submit))
-        .route("/api/auth/refresh", post(auth::auth_refresh))
-        .route("/api/auth/credential/delete", post(auth::credential_delete))
-        .route("/api/auth/credential/default", post(auth::credential_set_default))
-        .route("/api/credentials/assign", post(credentials::assign_credential))
-        .route("/api/credentials/assignments", get(credentials::list_assignments))
-        .route("/api/credentials/assignments/{id}", delete(credentials::remove_assignment))
         .route("/api/conversations", get(conversations::list_conversations))
         .route("/api/conversations/{id}", get(conversations::get_conversation))
         .route("/api/conversations/{id}", patch(conversations::update_conversation))

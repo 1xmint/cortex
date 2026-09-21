@@ -1,8 +1,6 @@
-import { ArrowRight, ArrowUp, Square, Brain } from 'lucide-react';
+import { ArrowRight, ArrowUp, Square } from 'lucide-react';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type { FormEvent, KeyboardEvent } from 'react';
-import MemorySuggestions from './MemorySuggestions';
-import { MEMORY_API_ENABLED } from '../../lib/cortexApi';
 
 const BUILTIN_PHRASES = [
   'create task',
@@ -71,9 +69,6 @@ interface ChatComposerProps {
   onSend: () => void;
   onStop?: () => void;
   onSubscribe?: () => void;
-  showMemoryIndicator?: boolean;
-  currentFiles?: string[];
-  recentMessages?: string[];
 }
 
 export default function ChatComposer({
@@ -85,22 +80,14 @@ export default function ChatComposer({
   onSend,
   onStop,
   onSubscribe,
-  showMemoryIndicator = true,
-  currentFiles = [],
-  recentMessages = [],
 }: ChatComposerProps) {
   const canSend = draft.trim().length > 0 && !disabled && !locked;
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
-  const [showMemorySuggestions, setShowMemorySuggestions] = useState(false);
   const [ghostText, setGhostText] = useState('');
 
   const recomputeGhost = useCallback((value: string) => {
     setGhostText(computeGhostText(value));
   }, []);
-
-  // Check if the current draft looks like a memory command
-  const isMemoryCommand = MEMORY_API_ENABLED
-    && /\b(remember|recall|forget|store|save|what did|list memories)\b/.test(draft.toLowerCase());
 
   useEffect(() => {
     const textarea = textareaRef.current;
@@ -137,12 +124,6 @@ export default function ChatComposer({
     };
   }, []);
 
-  useEffect(() => {
-    // Show memory suggestions when user types memory-related keywords
-    const shouldShow = isMemoryCommand && draft.trim().length > 3 && !disabled && !locked;
-    setShowMemorySuggestions(shouldShow);
-  }, [draft, isMemoryCommand, disabled, locked]);
-
   function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (locked && onSubscribe) {
@@ -166,17 +147,12 @@ export default function ChatComposer({
     }
 
     if (event.key === 'Escape') {
-      setShowMemorySuggestions(false);
       setGhostText('');
       return;
     }
 
     if (event.key === 'Enter' && !event.shiftKey) {
       event.preventDefault();
-      if (showMemorySuggestions) {
-        // Let suggestions handle the enter key
-        return;
-      }
       if (locked && onSubscribe) {
         onSubscribe();
         return;
@@ -187,15 +163,6 @@ export default function ChatComposer({
         onSend();
       }
     }
-  }
-
-  function handleMemorySuggestionSelect(command: string) {
-    onDraftChange(command);
-    setShowMemorySuggestions(false);
-    // Auto-send memory commands
-    setTimeout(() => {
-      if (canSend) onSend();
-    }, 0);
   }
 
   if (locked) {
@@ -222,18 +189,6 @@ export default function ChatComposer({
 
   return (
     <form className="sticky bottom-0 relative border-t border-white/6 bg-[var(--panel)] p-3 shadow-[0_-18px_40px_rgba(0,0,0,0.26),inset_0_1px_0_rgba(156,199,184,0.12)] sm:p-4" onSubmit={handleSubmit} aria-label="Chat message composer">
-      {MEMORY_API_ENABLED && (
-        <MemorySuggestions
-          currentInput={draft}
-          context={{
-            files: currentFiles,
-            recentMessages,
-          }}
-          onSelect={handleMemorySuggestionSelect}
-          visible={showMemorySuggestions}
-        />
-      )}
-
       <div className="glass-strong rounded-[24px] p-2 shadow-[inset_0_1px_0_rgba(255,255,255,0.03)]">
         <div className="relative">
           <textarea
@@ -256,23 +211,7 @@ export default function ChatComposer({
             </div>
           )}
         </div>
-        <div className="flex items-center justify-between px-1 pb-1">
-          {/* Memory Indicator */}
-          {showMemoryIndicator && MEMORY_API_ENABLED && (
-            <div className="flex items-center gap-2">
-              {isMemoryCommand ? (
-                <div className="flex items-center gap-1 text-xs text-[var(--accent)]">
-                  <Brain className="h-3 w-3 animate-pulse" />
-                  <span>Memory command detected</span>
-                </div>
-              ) : (
-                <div className="text-xs text-[var(--muted)]">
-                  Type "remember" or "recall" for memory commands
-                </div>
-              )}
-            </div>
-          )}
-
+        <div className="flex items-center justify-end px-1 pb-1">
           {/* Action Buttons */}
           <div className="flex items-center gap-2">
             {disabled && onStop ? (

@@ -48,14 +48,6 @@ fn default_cortex_heart_id() -> cortex_core::vera::HeartId {
     cortex_core::vera::HeartId(id)
 }
 
-#[derive(Debug, Clone)]
-pub struct PendingAuthSession {
-    pub user_id: String,
-    pub provider: String,
-    pub session_code: String,
-    pub created_at: i64,
-}
-
 pub struct ConnectedWorker {
     pub worker_id: String,
     pub user_id: String,
@@ -147,12 +139,8 @@ pub struct AppState {
     pub vera_tracker: VeraTracker,
     /// Context-Flow Pipeline — enables AI models to feed each other.
     pub context_bus: ContextBus,
-    /// Docker container manager for BYOS credential isolation.
+    /// Docker container manager for workspace/task-run container isolation.
     pub container_manager: Option<crate::docker::ContainerManager>,
-    /// Pending interactive container auth sessions (user_id → session).
-    pub pending_container_auths: RwLock<HashMap<String, crate::docker::PendingContainerAuth>>,
-    /// Pending BYOS auth sessions for subscription flows (session_code → session).
-    pub pending_auth_sessions: Option<RwLock<HashMap<String, PendingAuthSession>>>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -388,8 +376,6 @@ impl AppState {
             vera_tracker,
             context_bus,
             container_manager,
-            pending_container_auths: RwLock::new(HashMap::new()),
-            pending_auth_sessions: Some(RwLock::new(HashMap::new())),
         })
     }
 
