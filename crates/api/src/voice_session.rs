@@ -1100,6 +1100,11 @@ mod tests {
         })
         .await;
 
+        // A real timestamp, not a fixed 0: `run_billing_loop`'s renewal
+        // reservations check the authorization's expiry against the real
+        // wall clock (`chrono::Utc::now()`), same as production does, so a
+        // multi-segment test needs the authorization's `now_ms` on the same
+        // clock or every renewal past segment 0 is rejected as "expired".
         let (session_id, _sdp, local_id) = start_session(
             &state,
             LiveVoiceMode::Live("sk-test-supplier-0123456789".into()),
@@ -1109,7 +1114,7 @@ mod tests {
             ample_limits(),
             USER,
             "offer-sdp",
-            0,
+            chrono::Utc::now().timestamp_millis(),
         )
         .await
         .expect("live start against the fake must succeed");
@@ -1405,15 +1410,25 @@ mod tests {
 
     #[tokio::test]
     async fn a_settle_that_cannot_charge_credits_closes_the_session() {
-        let (_dir, state) = test_state_with_balance(0).await;
-        let db = state.db.as_ref().unwrap();
-        let price_list = db.active_price_list().unwrap();
+        // Look up the segment cost against a throwaway state first, since
+        // the real state's balance must be initialized to exactly that
+        // amount in one `init_credit_balance` call — it only ever inserts,
+        // so a second call for the same user is a no-op.
+        let price_probe = test_state().await.1;
+        let price_list = price_probe
+            .db
+            .as_ref()
+            .unwrap()
+            .active_price_list()
+            .unwrap();
         let rate = price_list.model("openai", "gpt-live-1").cloned().unwrap();
         let segment_micro = rate.cost_micros(SEGMENT_SECONDS, 0, 0);
         let segment_credits = ceil_div(segment_micro, price_list.micros_per_credit);
+
         // Exactly enough to fund (and later settle) segment 0 — until the
         // test drains it mid-script.
-        db.init_credit_balance(USER, segment_credits).unwrap();
+        let (_dir, state) = test_state_with_balance(segment_credits).await;
+        let db = state.db.as_ref().unwrap();
 
         // A harmless first event (below the 80% renewal threshold), a real
         // pause for the test to drain the balance, then a second event that
