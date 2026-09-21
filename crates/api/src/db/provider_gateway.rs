@@ -335,6 +335,11 @@ impl Database {
     /// unresolved, both died with the old process) — mark it `unresolved`
     /// for reconciliation instead of leaving it `reserved` forever. Returns
     /// how many rows it swept, for a log line at startup.
+    ///
+    /// This assumes this process is the only server using this database
+    /// (`CORTEX_SINGLE_NODE`): it marks every `reserved` voice row
+    /// unresolved unconditionally, without checking whether some other
+    /// server process still has that session live.
     pub fn sweep_stale_voice_reservations(&self, now_ms: i64) -> Result<usize, String> {
         let conn = self.conn();
         let reason = "server restarted during live session";
