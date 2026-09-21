@@ -1,7 +1,7 @@
-use aes_gcm::aead::rand_core::RngCore;
-use aes_gcm::aead::{Aead, KeyInit, OsRng};
+use aes_gcm::aead::{Aead, KeyInit};
 use aes_gcm::{Aes256Gcm, Nonce};
 use base64::Engine;
+use rand::Rng;
 use sha2::{Digest, Sha256};
 
 const NONCE_LEN: usize = 12;
@@ -38,10 +38,10 @@ pub fn encrypt(plaintext: &str) -> Result<String, String> {
     let key = derive_key();
     let cipher = Aes256Gcm::new_from_slice(&key).map_err(|e| e.to_string())?;
     let mut nonce_bytes = [0u8; NONCE_LEN];
-    OsRng.fill_bytes(&mut nonce_bytes);
-    let nonce = Nonce::from_slice(&nonce_bytes);
+    rand::rng().fill_bytes(&mut nonce_bytes);
+    let nonce = Nonce::from(nonce_bytes);
     let ciphertext = cipher
-        .encrypt(nonce, plaintext.as_bytes())
+        .encrypt(&nonce, plaintext.as_bytes())
         .map_err(|e| e.to_string())?;
     let mut combined = nonce_bytes.to_vec();
     combined.extend_from_slice(&ciphertext);
@@ -58,9 +58,12 @@ pub fn decrypt(encoded: &str) -> Result<String, String> {
         return Err("ciphertext too short".into());
     }
     let (nonce_bytes, ciphertext) = combined.split_at(NONCE_LEN);
-    let nonce = Nonce::from_slice(nonce_bytes);
+    let nonce_bytes: [u8; NONCE_LEN] = nonce_bytes
+        .try_into()
+        .map_err(|_| "ciphertext too short".to_string())?;
+    let nonce = Nonce::from(nonce_bytes);
     let plaintext = cipher
-        .decrypt(nonce, ciphertext)
+        .decrypt(&nonce, ciphertext)
         .map_err(|_| "decryption failed — wrong key or corrupted data".to_string())?;
     String::from_utf8(plaintext).map_err(|e| e.to_string())
 }
