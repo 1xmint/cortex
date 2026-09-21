@@ -171,8 +171,8 @@ fn literal_manifest_exactly_matches_cortex_router() {
     let manifest = contracts();
     assert_eq!(
         manifest.len(),
-        106,
-        "cortex-standalone keeps 91 cortex + 15 duplicate routes"
+        95,
+        "cortex-standalone keeps 80 cortex + 15 duplicate routes"
     );
     assert_eq!(
         manifest
@@ -180,7 +180,7 @@ fn literal_manifest_exactly_matches_cortex_router() {
             .map(|contract| contract.path.as_str())
             .collect::<BTreeSet<_>>()
             .len(),
-        106,
+        95,
         "every path template must have exactly one owner"
     );
     assert_eq!(
@@ -188,7 +188,7 @@ fn literal_manifest_exactly_matches_cortex_router() {
             .iter()
             .filter(|contract| contract.owner == Owner::Cortex)
             .count(),
-        91
+        80
     );
     assert_eq!(
         manifest
@@ -309,8 +309,8 @@ async fn cortex_router_serves_only_the_manifest_and_no_socials_surface() {
         );
     }
 
-    let cortex_auth = send(cortex.clone(), "GET", "/api/auth/status").await;
-    assert_ne!(cortex_auth.status(), StatusCode::NOT_FOUND);
+    let cortex_admin = send(cortex.clone(), "GET", "/api/admin/containers").await;
+    assert_ne!(cortex_admin.status(), StatusCode::NOT_FOUND);
 
     let cortex_health = send(cortex.clone(), "GET", "/v1/health").await;
     assert_eq!(response_json(cortex_health).await["service"], "cortex");
