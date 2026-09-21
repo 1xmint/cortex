@@ -13,19 +13,28 @@ import ChatComposer from './ChatComposer';
  */
 let lastPeerConnection: FakePeerConnection | null = null;
 
+class FakeDataChannel {
+  readyState = 'open';
+  send = vi.fn();
+  close = vi.fn();
+  private listeners: Record<string, Array<(arg?: unknown) => void>> = {};
+  addEventListener(name: string, cb: (arg?: unknown) => void) {
+    this.listeners[name] ??= [];
+    this.listeners[name].push(cb);
+  }
+  emitMessage(data: unknown) {
+    for (const cb of this.listeners.message ?? []) cb({ data: JSON.stringify(data) });
+  }
+}
+
 class FakePeerConnection {
   connectionState = 'new';
   iceGatheringState = 'complete';
   private listeners: Record<string, Array<(arg?: unknown) => void>> = {};
   addTrack = vi.fn();
-  lastDataChannel: { readyState: string; send: ReturnType<typeof vi.fn>; addEventListener: ReturnType<typeof vi.fn>; close: ReturnType<typeof vi.fn> } | null = null;
+  lastDataChannel: FakeDataChannel | null = null;
   createDataChannel = vi.fn(() => {
-    const dc = {
-      readyState: 'open',
-      send: vi.fn(),
-      addEventListener: vi.fn(),
-      close: vi.fn(),
-    };
+    const dc = new FakeDataChannel();
     this.lastDataChannel = dc;
     return dc;
   });
@@ -461,6 +470,63 @@ describe('ChatComposer voice controls', () => {
     });
 
     expect(instances[0].srcObject).toBeNull();
+  });
+
+  it('a server-initiated session.closed (credits ran out) shows a message and sends one DELETE', async () => {
+    installFakeMediaDevices();
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
+      const url = String(input);
+      const method = init?.method ?? 'GET';
+      if (url.includes('/api/voice/live/sessions') && method === 'POST') {
+        return jsonResponse({ session_id: 'sess-8', sdp: 'fake-answer-sdp' });
+      }
+      if (url.includes('/api/voice/live/sessions/') && method === 'DELETE') {
+        return jsonResponse({});
+      }
+      return jsonResponse({}, 404);
+    });
+
+    render(<ChatComposer draft="" onDraftChange={noop} onSend={noop} />);
+    await act(async () => {
+      fireEvent.click(screen.getByLabelText('Start live voice'));
+    });
+    await waitFor(() => expect(screen.getByLabelText('End live voice')).toBeInTheDocument());
+
+    act(() => {
+      lastPeerConnection?.lastDataChannel?.emitMessage({ type: 'session.closed', reason: 'expired' });
+    });
+
+    expect(await screen.findByRole('alert')).toHaveTextContent(/credits ran out/i);
+    await waitFor(() => expect(screen.getByLabelText('Start live voice')).toBeInTheDocument());
+    const deleteCalls = fetchSpy.mock.calls.filter(([, init]) => (init?.method ?? 'GET') === 'DELETE');
+    expect(deleteCalls.length).toBe(1);
+  });
+
+  it('a user-requested toggle-off shows no error', async () => {
+    installFakeMediaDevices();
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
+      const url = String(input);
+      const method = init?.method ?? 'GET';
+      if (url.includes('/api/voice/live/sessions') && method === 'POST') {
+        return jsonResponse({ session_id: 'sess-9', sdp: 'fake-answer-sdp' });
+      }
+      if (url.includes('/api/voice/live/sessions/') && method === 'DELETE') {
+        return jsonResponse({});
+      }
+      return jsonResponse({}, 404);
+    });
+
+    render(<ChatComposer draft="" onDraftChange={noop} onSend={noop} />);
+    await act(async () => {
+      fireEvent.click(screen.getByLabelText('Start live voice'));
+    });
+    await waitFor(() => expect(screen.getByLabelText('End live voice')).toBeInTheDocument());
+
+    await act(async () => {
+      fireEvent.click(screen.getByLabelText('End live voice'));
+    });
+
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
   });
 
   it('shows the server refusal message for dictation (e.g. insufficient credits)', async () => {

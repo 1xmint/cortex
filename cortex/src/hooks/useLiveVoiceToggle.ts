@@ -5,6 +5,21 @@ import { routeLiveVoiceEvent } from './liveVoiceEvents';
 
 export type LiveVoiceStatus = 'idle' | 'connecting' | 'active';
 
+/**
+ * `session.closed`'s `reason` (per the GPT-Live WebRTC guide) is
+ * `close_requested` when *we* asked for the close (the toggle, an unmount,
+ * a tab close); anything else is the model or Cortex ending the call out
+ * from under the UI -- most commonly `expired`, which is what a session
+ * that ran out of the credits Cortex is willing to extend it looks like
+ * from the browser's side.
+ */
+function sessionClosedMessage(reason: unknown): string | null {
+  if (reason === 'close_requested') return null;
+  if (reason === 'expired') return 'Live voice ended: your credits ran out.';
+  const label = typeof reason === 'string' && reason ? reason.replace(/_/g, ' ') : 'the connection ended';
+  return `Live voice ended. ${label}.`;
+}
+
 function microphoneErrorMessage(error: unknown): string {
   if (error instanceof Error && error.name === 'NotAllowedError') {
     return 'Microphone access was denied. Allow microphone access to use live voice.';
@@ -161,11 +176,24 @@ export function useLiveVoiceToggle() {
       const dc = pc.createDataChannel('oai-events');
       dcRef.current = dc;
       dc.addEventListener('message', (event) => {
+        let payload: { type?: string; reason?: unknown };
         try {
-          routeLiveVoiceEvent(JSON.parse(event.data as string));
+          payload = JSON.parse(event.data as string);
         } catch {
-          // Not JSON -- nothing to route.
+          return; // Not JSON -- nothing to route.
         }
+        if (payload.type === 'session.closed') {
+          // The server can end this call on its own (credits ran out,
+          // OpenAI hung up, ...); a silent toggle-off would hide that from
+          // the user, so only a close *we* asked for stays quiet.
+          const message = sessionClosedMessage(payload.reason);
+          if (message) setError(message);
+          sendClose(false);
+          releaseLocal();
+          setStatus('idle');
+          return;
+        }
+        routeLiveVoiceEvent(payload);
       });
 
       const offer = await pc.createOffer();
@@ -181,14 +209,12 @@ export function useLiveVoiceToggle() {
       if (bailIfCancelled()) return;
 
       pc.addEventListener('connectionstatechange', () => {
-        if (
-          pc.connectionState === 'failed' ||
-          pc.connectionState === 'closed' ||
-          pc.connectionState === 'disconnected'
-        ) {
-          // Covers both a real failure and the server ending the call for
-          // us (credits ran out): either way the browser's connection to
-          // OpenAI has ended, so tear down and (best-effort) close our side.
+        // `connectionState` never reaches `closed` on its own here -- that
+        // only happens after this handler's own `pc.close()` (via
+        // `releaseLocal`) has already run -- so there is nothing for a
+        // `'closed'` branch to catch that isn't already handled below.
+        if (pc.connectionState === 'failed' || pc.connectionState === 'disconnected') {
+          setError('Live voice ended.');
           sendClose(false);
           releaseLocal();
           setStatus('idle');
