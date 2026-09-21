@@ -42,6 +42,11 @@ export function useLiveVoiceToggle() {
   // Synchronous re-entrancy guard against a fast double click -- see
   // useDictation's `startingRef` for why this cannot be state.
   const startingRef = useRef(false);
+  // Set by an unmount or a user-initiated stop while `start` is still
+  // in-flight. Checked after every await in `start` so a session that
+  // finishes connecting after the user has already left never gets
+  // stranded open and billed.
+  const cancelledRef = useRef(false);
 
   const releaseLocal = useCallback(() => {
     dcRef.current?.close();
@@ -90,6 +95,7 @@ export function useLiveVoiceToggle() {
   }, []);
 
   const stop = useCallback(() => {
+    cancelledRef.current = true;
     sendClose(false);
     releaseLocal();
     setStatus('idle');
@@ -98,8 +104,19 @@ export function useLiveVoiceToggle() {
   const start = useCallback(async () => {
     if (startingRef.current || status !== 'idle') return;
     startingRef.current = true;
+    cancelledRef.current = false;
     setError(null);
     setStatus('connecting');
+    // A cancellation (unmount or user stop) can land between any two awaits
+    // below. Bailing out here -- instead of pressing on to open a session
+    // nobody wants -- is what keeps a cancelled `start` from ever leaving a
+    // billed session running with no UI pointed at it.
+    const bailIfCancelled = () => {
+      if (!cancelledRef.current) return false;
+      sendClose(false);
+      releaseLocal();
+      return true;
+    };
     try {
       let stream: MediaStream;
       try {
@@ -113,7 +130,9 @@ export function useLiveVoiceToggle() {
         return;
       }
       streamRef.current = stream;
+      if (bailIfCancelled()) return;
       tokenRef.current = await getAuthToken();
+      if (bailIfCancelled()) return;
 
       const pc = new RTCPeerConnection();
       pcRef.current = pc;
@@ -131,12 +150,16 @@ export function useLiveVoiceToggle() {
       });
 
       const offer = await pc.createOffer();
+      if (bailIfCancelled()) return;
       await pc.setLocalDescription(offer);
+      if (bailIfCancelled()) return;
 
       const response = await startLiveVoiceSession(offer.sdp ?? '');
       sessionIdRef.current = response.session_id;
+      if (bailIfCancelled()) return;
 
       await pc.setRemoteDescription({ type: 'answer', sdp: response.sdp });
+      if (bailIfCancelled()) return;
 
       pc.addEventListener('connectionstatechange', () => {
         if (
@@ -189,6 +212,7 @@ export function useLiveVoiceToggle() {
       window.removeEventListener('beforeunload', handlePageHide);
       // A plain unmount (in-app navigation) keeps the tab alive, so the
       // regular DELETE path is reliable here -- no need for the beacon.
+      cancelledRef.current = true;
       sendClose(false);
       releaseLocal();
     };

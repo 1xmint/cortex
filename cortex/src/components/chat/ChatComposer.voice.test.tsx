@@ -196,6 +196,89 @@ describe('ChatComposer voice controls', () => {
     expect(await screen.findByRole('alert')).toHaveTextContent(/already have a live voice session open/i);
   });
 
+  it('unmounting while getUserMedia is pending never leaves a session open', async () => {
+    let resolveMedia: (stream: MediaStream) => void = () => {};
+    const mediaPromise = new Promise<MediaStream>((resolve) => {
+      resolveMedia = resolve;
+    });
+    const fakeTrack = { stop: vi.fn() };
+    const fakeStream = { getTracks: () => [fakeTrack] } as unknown as MediaStream;
+    Object.defineProperty(navigator, 'mediaDevices', {
+      value: { getUserMedia: vi.fn(() => mediaPromise) },
+      configurable: true,
+    });
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
+      const url = String(input);
+      const method = init?.method ?? 'GET';
+      if (url.includes('/api/voice/live/sessions') && method === 'POST') {
+        return jsonResponse({ session_id: 'sess-3', sdp: 'fake-answer-sdp' });
+      }
+      if (url.includes('/api/voice/live/sessions/') && method === 'DELETE') {
+        return jsonResponse({});
+      }
+      return jsonResponse({}, 404);
+    });
+
+    const { unmount } = render(<ChatComposer draft="" onDraftChange={noop} onSend={noop} />);
+    fireEvent.click(screen.getByLabelText('Start live voice'));
+
+    await act(async () => {
+      unmount();
+    });
+    await act(async () => {
+      resolveMedia(fakeStream);
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    const postCalls = fetchSpy.mock.calls.filter(
+      ([url, init]) => String(url).includes('/api/voice/live/sessions') && (init?.method ?? 'GET') === 'POST',
+    );
+    const deleteCalls = fetchSpy.mock.calls.filter(([, init]) => (init?.method ?? 'GET') === 'DELETE');
+    expect(postCalls.length).toBe(0);
+    expect(deleteCalls.length).toBeLessThanOrEqual(1);
+    expect(fakeTrack.stop).toHaveBeenCalled();
+  });
+
+  it('unmounting while the session POST is pending sends exactly one DELETE and tears down', async () => {
+    installFakeMediaDevices();
+    let resolvePost: (value: Response) => void = () => {};
+    const postPromise = new Promise<Response>((resolve) => {
+      resolvePost = resolve;
+    });
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
+      const url = String(input);
+      const method = init?.method ?? 'GET';
+      if (url.includes('/api/voice/live/sessions') && method === 'POST') {
+        return postPromise;
+      }
+      if (url.includes('/api/voice/live/sessions/') && method === 'DELETE') {
+        return jsonResponse({});
+      }
+      return jsonResponse({}, 404);
+    });
+
+    const { unmount } = render(<ChatComposer draft="" onDraftChange={noop} onSend={noop} />);
+    fireEvent.click(screen.getByLabelText('Start live voice'));
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    await act(async () => {
+      unmount();
+    });
+    await act(async () => {
+      resolvePost(jsonResponse({ session_id: 'sess-4', sdp: 'fake-answer-sdp' }));
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    const deleteCalls = fetchSpy.mock.calls.filter(([, init]) => (init?.method ?? 'GET') === 'DELETE');
+    expect(deleteCalls.length).toBe(1);
+  });
+
   it('shows the server refusal message for dictation (e.g. insufficient credits)', async () => {
     installFakeMediaDevices();
     vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
