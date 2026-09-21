@@ -356,6 +356,55 @@ describe('ChatComposer voice controls', () => {
     await waitFor(() => expect(screen.getByLabelText('Live voice')).toHaveAttribute('aria-pressed', 'true'));
   });
 
+  it('stopping while setRemoteDescription is still pending (and it later rejects) shows no error, sends one DELETE', async () => {
+    installFakeMediaDevices();
+    let rejectSetRemoteDescription: (err: unknown) => void = () => {};
+    const setRemoteDescriptionPromise = new Promise<undefined>((_resolve, reject) => {
+      rejectSetRemoteDescription = reject;
+    });
+    (
+      globalThis as unknown as { RTCPeerConnection: new () => FakePeerConnection }
+    ).RTCPeerConnection = class extends FakePeerConnection {
+      setRemoteDescription = vi.fn(() => setRemoteDescriptionPromise);
+    };
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
+      const url = String(input);
+      const method = init?.method ?? 'GET';
+      if (url.includes('/api/voice/live/sessions') && method === 'POST') {
+        return jsonResponse({ session_id: 'sess-cancel', sdp: 'fake-answer-sdp' });
+      }
+      if (url.includes('/api/voice/live/sessions/') && method === 'DELETE') {
+        return jsonResponse({});
+      }
+      return jsonResponse({}, 404);
+    });
+
+    render(<ChatComposer draft="" onDraftChange={noop} onSend={noop} />);
+    fireEvent.click(screen.getByLabelText('Live voice'));
+    // Let the POST resolve so setRemoteDescription is called and pending.
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    // The user cancels before setRemoteDescription settles.
+    await act(async () => {
+      fireEvent.click(screen.getByLabelText('Live voice'));
+    });
+
+    await act(async () => {
+      rejectSetRemoteDescription(new Error('boom'));
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+    const deleteCalls = fetchSpy.mock.calls.filter(([, init]) => (init?.method ?? 'GET') === 'DELETE');
+    expect(deleteCalls.length).toBe(1);
+  });
+
   it('pagehide sends session.close on the data channel then one keepalive DELETE', async () => {
     installFakeMediaDevices();
     const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
@@ -385,6 +434,37 @@ describe('ChatComposer voice controls', () => {
     );
     const deleteCalls = fetchSpy.mock.calls.filter(([, init]) => (init?.method ?? 'GET') === 'DELETE');
     expect(deleteCalls.length).toBe(1);
+    expect(deleteCalls[0][1]?.keepalive).toBe(true);
+  });
+
+  it('does not end the call on beforeunload (a cancelled "Leave site?" prompt should not hang up)', async () => {
+    installFakeMediaDevices();
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
+      const url = String(input);
+      const method = init?.method ?? 'GET';
+      if (url.includes('/api/voice/live/sessions') && method === 'POST') {
+        return jsonResponse({ session_id: 'sess-5b', sdp: 'fake-answer-sdp' });
+      }
+      if (url.includes('/api/voice/live/sessions/') && method === 'DELETE') {
+        return jsonResponse({});
+      }
+      return jsonResponse({}, 404);
+    });
+
+    render(<ChatComposer draft="" onDraftChange={noop} onSend={noop} />);
+    await act(async () => {
+      fireEvent.click(screen.getByLabelText('Live voice'));
+    });
+    await waitFor(() => expect(screen.getByLabelText('Live voice')).toHaveAttribute('aria-pressed', 'true'));
+
+    await act(async () => {
+      window.dispatchEvent(new Event('beforeunload'));
+    });
+
+    expect(lastPeerConnection?.lastDataChannel?.send).not.toHaveBeenCalled();
+    const deleteCalls = fetchSpy.mock.calls.filter(([, init]) => (init?.method ?? 'GET') === 'DELETE');
+    expect(deleteCalls.length).toBe(0);
+    expect(screen.getByLabelText('Live voice')).toHaveAttribute('aria-pressed', 'true');
   });
 
   it('refreshes the auth token every ~30s so the pagehide DELETE carries a fresh one', async () => {
