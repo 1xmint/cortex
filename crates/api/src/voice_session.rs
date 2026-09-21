@@ -1856,6 +1856,113 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_client_disconnect_during_a_hung_attach_frees_the_placeholder_and_does_not_wedge_later_starts(
+    ) {
+        let (_dir, state) = test_state().await;
+        let (http_base, ws_base) = spawn(FakeLiveScript {
+            usage_events: vec![],
+            send_closed_after_script: false,
+            respond_to_client_close: false,
+            refuse_attach: false,
+            pause_after_first_event: None,
+            hang_attach_for: Some(StdDuration::from_secs(20)),
+            ..Default::default()
+        })
+        .await;
+
+        // Simulate a real client disconnect while the sideband attach is
+        // still hung: await `start_session` itself only briefly, then
+        // drop that future. Per `start_session`'s own doc comment, the
+        // pipeline runs on its own spawned task and is NOT cancelled by
+        // this — it keeps running to its own internal
+        // `SIDEBAND_ATTACH_TIMEOUT` and must clean up the per-user
+        // placeholder and mark the reservation unresolved on its own,
+        // with nothing left awaiting its result at all.
+        let disconnected = tokio::time::timeout(
+            StdDuration::from_millis(100),
+            start_session(
+                &state,
+                LiveVoiceMode::Live("sk-test-supplier-0123456789".into()),
+                &http_base,
+                &ws_base,
+                SIGNING_KEY,
+                ample_limits(),
+                USER,
+                "offer-sdp",
+                0,
+            ),
+        )
+        .await;
+        assert!(
+            disconnected.is_err(),
+            "the 100ms wrapper must itself time out before the ~15s internal attach timeout — \
+             otherwise this test is not exercising a disconnect at all"
+        );
+
+        // Poll (bounded) for the background pipeline to finish cleaning
+        // up on its own: the per-user placeholder gone from
+        // `state.voice_sessions`.
+        let deadline = tokio::time::Instant::now() + StdDuration::from_secs(30);
+        loop {
+            if state.voice_sessions.lock().unwrap().is_empty() {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "placeholder was never freed after the client disconnected during a hung attach"
+            );
+            tokio::time::sleep(StdDuration::from_millis(50)).await;
+        }
+
+        let db = state.db.as_ref().unwrap();
+        let request_key: String = db
+            .conn()
+            .query_row(
+                "SELECT request_key FROM provider_request_reservations \
+                 ORDER BY created_at DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("the pre-start reservation was persisted");
+        assert!(
+            request_key.ends_with(":0"),
+            "segment 0's own reservation must be the one left unresolved"
+        );
+        let reservation = db
+            .get_provider_reservation(&request_key)
+            .expect("reservation exists");
+        assert_eq!(reservation.status, "unresolved");
+
+        // A later start for the same user must not be refused with 409 —
+        // the placeholder must already be gone even though nothing ever
+        // awaited the disconnected pipeline's own result.
+        let (http_base2, ws_base2) = spawn(FakeLiveScript {
+            usage_events: vec![],
+            send_closed_after_script: false,
+            respond_to_client_close: true,
+            refuse_attach: false,
+            pause_after_first_event: None,
+            ..Default::default()
+        })
+        .await;
+        let (session_id, _sdp, _local_id) = start_session(
+            &state,
+            LiveVoiceMode::Live("sk-test-supplier-0123456789".into()),
+            &http_base2,
+            &ws_base2,
+            SIGNING_KEY,
+            ample_limits(),
+            USER,
+            "offer-sdp",
+            0,
+        )
+        .await
+        .expect("a later start for the same user must not be 409'd by the disconnected attempt");
+
+        close_session(&state, USER, &session_id).await.unwrap();
+    }
+
+    #[tokio::test]
     async fn a_dropped_sideband_with_usage_past_every_reservation_charges_the_overrun_and_reattaches_to_close(
     ) {
         // A tight max_micro_usd budget of exactly one segment: the second
