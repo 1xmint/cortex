@@ -92,6 +92,11 @@ jobs:
       # check `crates/api/tests/route_ownership.rs` makes inside the backend,
       # carried across the boundary, and it found fourteen paths being called
       # against routes that had never existed.
+      #
+      # 17 -> 20 with the three in `src/lib/reachability.test.ts`, which walks
+      # the import graph from `App.tsx` and fails on a file nothing can reach.
+      # Same rot, other shape: not a call to a route that isn't there, but a
+      # finished screen wired to nothing. It found seven.
       - name: Test Cortex
         run: |
           set -euo pipefail
@@ -101,8 +106,8 @@ jobs:
           echo "$output"
           passed=$(echo "$output" | grep -oE "Tests +[0-9]+ passed" | grep -oE "[0-9]+" | tail -1)
           echo "cortex tests passed: ${passed:-0}"
-          if [ "${passed:-0}" -lt 17 ]; then
-            echo "::error::expected at least 17 Cortex tests to run, saw ${passed:-0}"
+          if [ "${passed:-0}" -lt 20 ]; then
+            echo "::error::expected at least 20 Cortex tests to run, saw ${passed:-0}"
             exit 1
           fi
 
