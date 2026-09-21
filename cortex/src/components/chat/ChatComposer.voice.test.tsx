@@ -16,7 +16,7 @@ let lastPeerConnection: FakePeerConnection | null = null;
 class FakePeerConnection {
   connectionState = 'new';
   iceGatheringState = 'complete';
-  private listeners: Record<string, Array<() => void>> = {};
+  private listeners: Record<string, Array<(arg?: unknown) => void>> = {};
   addTrack = vi.fn();
   lastDataChannel: { readyState: string; send: ReturnType<typeof vi.fn>; addEventListener: ReturnType<typeof vi.fn>; close: ReturnType<typeof vi.fn> } | null = null;
   createDataChannel = vi.fn(() => {
@@ -36,12 +36,12 @@ class FakePeerConnection {
   setLocalDescription = vi.fn(async () => undefined);
   setRemoteDescription = vi.fn(async () => undefined);
   close = vi.fn();
-  addEventListener(name: string, cb: () => void) {
+  addEventListener(name: string, cb: (arg?: unknown) => void) {
     this.listeners[name] ??= [];
     this.listeners[name].push(cb);
   }
-  emit(name: string) {
-    for (const cb of this.listeners[name] ?? []) cb();
+  emit(name: string, arg?: unknown) {
+    for (const cb of this.listeners[name] ?? []) cb(arg);
   }
 }
 
@@ -409,6 +409,58 @@ describe('ChatComposer voice controls', () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it('plays a remote track and clears it on teardown', async () => {
+    installFakeMediaDevices();
+    class FakeMediaStream {
+      tracks: unknown[];
+      constructor(tracks: unknown[] = []) {
+        this.tracks = tracks;
+      }
+    }
+    const instances: FakeAudioInstance[] = [];
+    class FakeAudioInstance {
+      autoplay = false;
+      srcObject: unknown = null;
+      constructor() {
+        instances.push(this);
+      }
+    }
+    (globalThis as unknown as { MediaStream: typeof FakeMediaStream }).MediaStream = FakeMediaStream;
+    (globalThis as unknown as { Audio: typeof FakeAudioInstance }).Audio = FakeAudioInstance;
+
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
+      const url = String(input);
+      const method = init?.method ?? 'GET';
+      if (url.includes('/api/voice/live/sessions') && method === 'POST') {
+        return jsonResponse({ session_id: 'sess-7', sdp: 'fake-answer-sdp' });
+      }
+      if (url.includes('/api/voice/live/sessions/') && method === 'DELETE') {
+        return jsonResponse({});
+      }
+      return jsonResponse({}, 404);
+    });
+
+    const { unmount } = render(<ChatComposer draft="" onDraftChange={noop} onSend={noop} />);
+    await act(async () => {
+      fireEvent.click(screen.getByLabelText('Start live voice'));
+    });
+    await waitFor(() => expect(screen.getByLabelText('End live voice')).toBeInTheDocument());
+
+    const remoteTrack = { id: 'remote-track' };
+    act(() => {
+      lastPeerConnection?.emit('track', { track: remoteTrack });
+    });
+
+    expect(instances.length).toBe(1);
+    expect(instances[0].srcObject).toBeInstanceOf(FakeMediaStream);
+
+    await act(async () => {
+      unmount();
+    });
+
+    expect(instances[0].srcObject).toBeNull();
   });
 
   it('shows the server refusal message for dictation (e.g. insufficient credits)', async () => {

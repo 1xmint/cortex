@@ -37,6 +37,10 @@ export function useLiveVoiceToggle() {
   const pcRef = useRef<RTCPeerConnection | null>(null);
   const dcRef = useRef<RTCDataChannel | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
+  // The model's audio, played out through an autoplay <audio> element that
+  // is never attached to the DOM -- WebRTC only hands us the remote track,
+  // it doesn't play it for us.
+  const audioRef = useRef<HTMLAudioElement | null>(null);
   const sessionIdRef = useRef<string | null>(null);
   const tokenRef = useRef<string | null>(null);
   // Synchronous re-entrancy guard against a fast double click -- see
@@ -55,6 +59,10 @@ export function useLiveVoiceToggle() {
     pcRef.current = null;
     streamRef.current?.getTracks().forEach((track) => track.stop());
     streamRef.current = null;
+    if (audioRef.current) {
+      audioRef.current.srcObject = null;
+      audioRef.current = null;
+    }
   }, []);
 
   /**
@@ -142,6 +150,13 @@ export function useLiveVoiceToggle() {
       pcRef.current = pc;
       const [track] = stream.getTracks();
       if (track) pc.addTrack(track, stream);
+
+      pc.addEventListener('track', (event: RTCTrackEvent) => {
+        const audio = audioRef.current ?? new Audio();
+        audio.autoplay = true;
+        audio.srcObject = new MediaStream([event.track]);
+        audioRef.current = audio;
+      });
 
       const dc = pc.createDataChannel('oai-events');
       dcRef.current = dc;
