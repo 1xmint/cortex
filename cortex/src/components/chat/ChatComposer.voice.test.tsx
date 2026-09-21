@@ -29,7 +29,15 @@ class FakeDataChannel {
 
 class FakePeerConnection {
   connectionState = 'new';
-  iceGatheringState = 'complete';
+  // Real ICE gathering starts out incomplete; `localDescription` only picks
+  // up every candidate once it reaches 'complete'. Starting here the same
+  // way catches a hook that reads the offer's `sdp` instead of waiting for
+  // `pc.localDescription`.
+  iceGatheringState = 'gathering';
+  localDescription: { sdp: string } | null = null;
+  // A subclass can set this to false before construction finishes gathering
+  // on its own timeline instead of the default next-microtask auto-complete.
+  autoCompleteIceGathering = true;
   private listeners: Record<string, Array<(arg?: unknown) => void>> = {};
   addTrack = vi.fn();
   lastDataChannel: FakeDataChannel | null = null;
@@ -42,17 +50,35 @@ class FakePeerConnection {
     // Test fake exposes the most recently constructed instance so assertions can reach into it.
     // eslint-disable-next-line @typescript-eslint/no-this-alias
     lastPeerConnection = this;
+    // Tests that don't care about ICE gathering timing shouldn't have to
+    // drive it themselves -- complete it on the next microtask by default.
+    // A test that does care (e.g. asserting the gathered SDP) can call
+    // `completeIceGathering()` itself before that microtask runs.
+    queueMicrotask(() => {
+      if (this.autoCompleteIceGathering && this.iceGatheringState !== 'complete') {
+        this.completeIceGathering();
+      }
+    });
   }
   createOffer = vi.fn(async () => ({ type: 'offer', sdp: 'fake-offer-sdp' }));
-  setLocalDescription = vi.fn(async () => undefined);
+  setLocalDescription = vi.fn(async () => {
+    this.localDescription = { sdp: 'gathered-sdp' };
+  });
   setRemoteDescription = vi.fn(async () => undefined);
   close = vi.fn();
   addEventListener(name: string, cb: (arg?: unknown) => void) {
     this.listeners[name] ??= [];
     this.listeners[name].push(cb);
   }
+  removeEventListener(name: string, cb: (arg?: unknown) => void) {
+    this.listeners[name] = (this.listeners[name] ?? []).filter((listener) => listener !== cb);
+  }
   emit(name: string, arg?: unknown) {
     for (const cb of this.listeners[name] ?? []) cb(arg);
+  }
+  completeIceGathering() {
+    this.iceGatheringState = 'complete';
+    this.emit('icegatheringstatechange');
   }
 }
 
@@ -136,6 +162,53 @@ describe('ChatComposer voice controls', () => {
 
     expect(await screen.findByRole('alert')).toHaveTextContent(/microphone access was denied/i);
     expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it('waits for ICE gathering to complete and sends the gathered SDP, not the raw offer', async () => {
+    installFakeMediaDevices();
+    class ManualIceFakePeerConnection extends FakePeerConnection {
+      autoCompleteIceGathering = false;
+    }
+    (
+      globalThis as unknown as { RTCPeerConnection: new () => FakePeerConnection }
+    ).RTCPeerConnection = ManualIceFakePeerConnection;
+    let postBody = '';
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
+      const url = String(input);
+      const method = init?.method ?? 'GET';
+      if (url.includes('/api/voice/live/sessions') && method === 'POST') {
+        postBody = String(init?.body ?? '');
+        return jsonResponse({ session_id: 'sess-ice', sdp: 'fake-answer-sdp' });
+      }
+      if (url.includes('/api/voice/live/sessions/') && method === 'DELETE') {
+        return jsonResponse({});
+      }
+      return jsonResponse({}, 404);
+    });
+
+    render(<ChatComposer draft="" onDraftChange={noop} onSend={noop} />);
+    fireEvent.click(screen.getByLabelText('Live voice'));
+
+    // Let getUserMedia/getAuthToken/createOffer/setLocalDescription settle
+    // so the peer connection is sitting at iceGatheringState 'gathering'.
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(lastPeerConnection?.iceGatheringState).toBe('gathering');
+    expect(screen.getByLabelText('Live voice')).toHaveAttribute('aria-pressed', 'false');
+
+    await act(async () => {
+      lastPeerConnection?.completeIceGathering();
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    await waitFor(() => expect(screen.getByLabelText('Live voice')).toHaveAttribute('aria-pressed', 'true'));
+    expect(postBody).toContain('gathered-sdp');
   });
 
   it('starting live voice twice fast sends exactly one POST, and toggling off sends exactly one DELETE', async () => {
