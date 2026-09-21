@@ -19,7 +19,10 @@ import SignInScreen from '../auth/SignInScreen';
 const PANES = [
   { to: '/runs', label: 'Runs', icon: Activity, hint: 'live steps and state' },
   { to: '/receipts', label: 'Receipts', icon: BadgeCheck, hint: 'proof the checks ran' },
-  { to: '/ledger', label: 'Ledger', icon: Coins, hint: 'credits, spend, refunds' },
+  // Was "credits, spend, refunds", which the pane did not show and still
+  // does not show two thirds of. It shows what was spent and which model was
+  // picked, so that is what it says.
+  { to: '/ledger', label: 'Ledger', icon: Coins, hint: 'what it cost and why' },
   { to: '/leases', label: 'Leases', icon: GitBranch, hint: 'who holds what surface' },
   { to: '/admin', label: 'Admin', icon: Shield, hint: 'members, policy, keys' },
   { to: '/', label: 'Chat', icon: MessageSquare, hint: 'a doorway, not the product' },

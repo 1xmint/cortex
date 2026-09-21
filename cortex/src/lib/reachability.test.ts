@@ -30,12 +30,7 @@ const SRC = resolve(process.cwd(), 'src');
  * the test, and so does an entry here that got wired up or deleted.
  */
 const KNOWN_UNREACHABLE: Record<string, string> = {
-  // Finished, and every route it needs is in route-manifest.csv: GET
-  // /api/usage and GET /api/usage/daily. It shows real spend and needs no
-  // backend work at all -- only a route and a way in. Wire it or delete it.
-  'components/usage/UsageView.tsx': 'built, backend served, never wired',
-
-  // Same: GET /api/github/repos, POST /api/github/import and GET
+  // GET /api/github/repos, POST /api/github/import and GET
   // /api/github/status/{import_id} are all served. Importing a repo is
   // reachable nowhere in the running app.
   'components/onboarding/RepoImport.tsx': 'built, backend served, never wired',
