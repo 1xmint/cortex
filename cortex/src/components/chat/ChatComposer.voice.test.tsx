@@ -606,6 +606,95 @@ describe('ChatComposer voice controls', () => {
     expect(screen.queryByRole('alert')).not.toBeInTheDocument();
   });
 
+  it('shows a generic message and sends one DELETE when the connection fails', async () => {
+    installFakeMediaDevices();
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
+      const url = String(input);
+      const method = init?.method ?? 'GET';
+      if (url.includes('/api/voice/live/sessions') && method === 'POST') {
+        return jsonResponse({ session_id: 'sess-fail-1', sdp: 'fake-answer-sdp' });
+      }
+      if (url.includes('/api/voice/live/sessions/') && method === 'DELETE') {
+        return jsonResponse({});
+      }
+      return jsonResponse({}, 404);
+    });
+
+    render(<ChatComposer draft="" onDraftChange={noop} onSend={noop} />);
+    await act(async () => {
+      fireEvent.click(screen.getByLabelText('Live voice'));
+    });
+    await waitFor(() => expect(screen.getByLabelText('Live voice')).toHaveAttribute('aria-pressed', 'true'));
+
+    act(() => {
+      if (lastPeerConnection) lastPeerConnection.connectionState = 'failed';
+      lastPeerConnection?.emit('connectionstatechange');
+    });
+
+    expect(await screen.findByRole('alert')).toHaveTextContent(/live voice ended\./i);
+    await waitFor(() => expect(screen.getByLabelText('Live voice')).toHaveAttribute('aria-pressed', 'false'));
+    const deleteCalls = fetchSpy.mock.calls.filter(([, init]) => (init?.method ?? 'GET') === 'DELETE');
+    expect(deleteCalls.length).toBe(1);
+  });
+
+  it('debounces a disconnected state -- a recovery within the window keeps the session alive, only a sustained drop ends it', async () => {
+    vi.useFakeTimers();
+    try {
+      installFakeMediaDevices();
+      const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
+        const url = String(input);
+        const method = init?.method ?? 'GET';
+        if (url.includes('/api/voice/live/sessions') && method === 'POST') {
+          return jsonResponse({ session_id: 'sess-fail-2', sdp: 'fake-answer-sdp' });
+        }
+        if (url.includes('/api/voice/live/sessions/') && method === 'DELETE') {
+          return jsonResponse({});
+        }
+        return jsonResponse({}, 404);
+      });
+
+      render(<ChatComposer draft="" onDraftChange={noop} onSend={noop} />);
+      await act(async () => {
+        fireEvent.click(screen.getByLabelText('Live voice'));
+        await vi.runOnlyPendingTimersAsync();
+      });
+      expect(screen.getByLabelText('Live voice')).toHaveAttribute('aria-pressed', 'true');
+
+      act(() => {
+        if (lastPeerConnection) lastPeerConnection.connectionState = 'disconnected';
+        lastPeerConnection?.emit('connectionstatechange');
+      });
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(4000);
+      });
+      expect(screen.getByLabelText('Live voice')).toHaveAttribute('aria-pressed', 'true');
+
+      act(() => {
+        if (lastPeerConnection) lastPeerConnection.connectionState = 'connected';
+        lastPeerConnection?.emit('connectionstatechange');
+      });
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(2000);
+      });
+      expect(screen.getByLabelText('Live voice')).toHaveAttribute('aria-pressed', 'true');
+      let deleteCalls = fetchSpy.mock.calls.filter(([, init]) => (init?.method ?? 'GET') === 'DELETE');
+      expect(deleteCalls.length).toBe(0);
+
+      act(() => {
+        if (lastPeerConnection) lastPeerConnection.connectionState = 'disconnected';
+        lastPeerConnection?.emit('connectionstatechange');
+      });
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(5000);
+      });
+      expect(screen.getByLabelText('Live voice')).toHaveAttribute('aria-pressed', 'false');
+      deleteCalls = fetchSpy.mock.calls.filter(([, init]) => (init?.method ?? 'GET') === 'DELETE');
+      expect(deleteCalls.length).toBe(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('ends the session when the mic track ends on its own', async () => {
     const { fakeTrack } = installFakeMediaDevices();
     const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
