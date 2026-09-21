@@ -119,6 +119,14 @@ impl RefundKey {
         Self(format!("refund:{verification_id}"))
     }
 
+    /// A refund for one unit of work charged with [`ChargeKey::per_unit`].
+    /// The caller supplies a label distinct from the charge's own label, so
+    /// the refund lands in its own idempotency namespace rather than
+    /// colliding with the charge it reverses.
+    pub fn per_unit(label: impl Into<String>) -> Self {
+        Self(label.into())
+    }
+
     pub fn as_str(&self) -> &str {
         &self.0
     }
