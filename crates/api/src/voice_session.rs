@@ -982,7 +982,7 @@ async fn run_billing_loop(
                 &user_id,
                 &session_id,
                 &drop_key,
-                "Cortex live voice overrun",
+                "Cortex live voice (dropped session)",
                 delta,
                 true,
             );
@@ -1744,6 +1744,87 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_dropped_sideband_after_850_seconds_settles_two_segments_and_charges_the_rest() {
+        // Crosses the 80% renewal threshold enough times to reserve four
+        // 300s segments, but only ever reports usage through 850s: segments
+        // 0 (0-300s) and 1 (300-600s) are fully consumed and settle inline;
+        // segment 2 (600-900s) is only partially observed (250s of its
+        // 300s) so it never settles, and segment 3 (900-1200s) is reserved
+        // with no usage at all. The drop then charges the remainder beyond
+        // what settled and leaves both open segments unresolved.
+        let (_dir, state) = test_state().await;
+        let (http_base, ws_base) = spawn(FakeLiveScript {
+            usage_events: vec![240, 480, 720, 850],
+            send_closed_after_script: false,
+            respond_to_client_close: false,
+            refuse_attach: false,
+            pause_after_first_event: None,
+            ..Default::default()
+        })
+        .await;
+
+        let (session_id, _sdp, local_id) = start_session(
+            &state,
+            LiveVoiceMode::Live("sk-test-supplier-0123456789".into()),
+            &http_base,
+            &ws_base,
+            SIGNING_KEY,
+            ample_limits(),
+            USER,
+            "offer-sdp",
+            chrono::Utc::now().timestamp_millis(),
+        )
+        .await
+        .expect("live start must succeed");
+
+        wait_until_session_gone(&state, &session_id).await;
+
+        let db = state.db.as_ref().unwrap();
+        let price_list = db.active_price_list().unwrap();
+        let rate = price_list.model("openai", "gpt-live-1").cloned().unwrap();
+
+        for n in 0..2 {
+            let reservation = db
+                .get_provider_reservation(&format!("voice:{local_id}:{n}"))
+                .expect("reservation exists");
+            assert_eq!(reservation.status, "settled", "segment {n} must be settled");
+        }
+        for n in 2..4 {
+            let reservation = db
+                .get_provider_reservation(&format!("voice:{local_id}:{n}"))
+                .expect("reservation exists");
+            assert_eq!(
+                reservation.status, "unresolved",
+                "segment {n} must be left unresolved by the drop"
+            );
+        }
+
+        let expected_credits = ceil_div(rate.cost_micros(850, 0, 0), price_list.micros_per_credit);
+        // 850s = 708_333 micro-USD at this test's rate, ceil-divided by
+        // 100_000 micros/credit = 8 credits; pinned literally so a change to
+        // `rate` or `ceil_div` that silently under-charges cannot make this
+        // test pass by agreeing with itself.
+        assert_eq!(expected_credits, 8);
+        let balance = db.get_credit_balance_row(USER).unwrap();
+        let spent_credits = 1_000_000_000 - balance.subscription_remaining;
+        assert_eq!(spent_credits, expected_credits);
+
+        let drop_key_prefix = format!("voice:{local_id}:drop%");
+        let ledger_rows: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM credit_transactions WHERE idempotency_key LIKE ?1",
+                [&drop_key_prefix],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            ledger_rows >= 1,
+            "the observed remainder beyond the settled segments must be charged on drop"
+        );
+    }
+
+    #[tokio::test]
     async fn cumulative_rounding_charges_exactly_the_ceiling_and_settles_the_last_segment() {
         // Same scripted session as the 650s multi-segment test, but the
         // balance is funded for *exactly* the session's real cost instead
@@ -2052,7 +2133,7 @@ mod tests {
         wait_until_session_gone_with_timeout(&state, &session_id, StdDuration::from_secs(30)).await;
 
         // Segment 0 (the only reservation this cap could ever fund) settles
-        // for its full reserved amount; the extra 30s reported on top of it
+        // for its full reserved amount; the extra 150s reported on top of it
         // is charged directly as an overrun.
         let reservation = db
             .get_provider_reservation(&format!("voice:{local_id}:0"))
@@ -2285,7 +2366,7 @@ mod tests {
         })
         .await;
 
-        let (session_id, _sdp, _local_id) = start_session(
+        let (session_id, _sdp, local_id) = start_session(
             &state,
             LiveVoiceMode::Live("sk-test-supplier-0123456789".into()),
             &http_base,
@@ -2312,9 +2393,48 @@ mod tests {
         )
         .expect("draining the balance directly must succeed");
 
+        // Give the segment-crossing event time to arrive and the settle it
+        // triggers time to fail against the drained balance (entering the
+        // warning-grace/goodbye path), then top the balance back up — still
+        // well inside the 20s `WARNING_GRACE` window — the same way the
+        // ledger's own tests fund a balance (`add_pack_credits`). This
+        // proves the goodbye path's `session.closed` retry (the `:final`
+        // charge in `settle_up_to`) actually recovers a settle that failed
+        // only because credits were briefly unavailable, not because the
+        // session was over budget.
+        tokio::time::sleep(StdDuration::from_millis(500)).await;
+        db.add_pack_credits(USER, segment_credits)
+            .expect("topping the balance back up must succeed");
+
         // The failed deduction stops renewal and heads for the goodbye
         // path, which needs the full warning grace before it closes.
         wait_until_session_gone_with_timeout(&state, &session_id, StdDuration::from_secs(40)).await;
+
+        let final_key_prefix = format!("voice:{local_id}:final%");
+        let final_rows: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM credit_transactions WHERE idempotency_key LIKE ?1",
+                [&final_key_prefix],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            final_rows >= 1,
+            "the retried settle must charge under the :final key once credits are available again"
+        );
+
+        // Total spent, excluding the test's own direct drain, must be
+        // exactly the one segment's cost — the retried settle must not
+        // double-charge on top of what `charged_credits_so_far` already
+        // tracked as owed.
+        let balance = db.get_credit_balance_row(USER).unwrap();
+        let remaining = balance.subscription_remaining + balance.pack_remaining;
+        // Funded in total: `segment_credits` at `test_state_with_balance`,
+        // plus `segment_credits` from the top-up above.
+        let funded = segment_credits + segment_credits;
+        let spent_excluding_drain = funded - remaining - drainable;
+        assert_eq!(spent_excluding_drain, segment_credits);
     }
 
     #[test]
