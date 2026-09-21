@@ -92,6 +92,7 @@ export function useLiveVoiceToggle() {
   // finishes connecting after the user has already left never gets
   // stranded open and billed.
   const cancelledRef = useRef(false);
+  const disconnectTimerRef = useRef<number | null>(null);
 
   const releaseLocal = useCallback(() => {
     dcRef.current?.close();
@@ -103,6 +104,10 @@ export function useLiveVoiceToggle() {
     if (audioRef.current) {
       audioRef.current.srcObject = null;
       audioRef.current = null;
+    }
+    if (disconnectTimerRef.current !== null) {
+      window.clearTimeout(disconnectTimerRef.current);
+      disconnectTimerRef.current = null;
     }
   }, []);
 
@@ -242,16 +247,40 @@ export function useLiveVoiceToggle() {
       await pc.setRemoteDescription({ type: 'answer', sdp: response.sdp });
       if (bailIfCancelled()) return;
 
+      const endForConnectionFailure = () => {
+        setError('Live voice ended.');
+        sendClose(false);
+        releaseLocal();
+        setStatus('idle');
+      };
       pc.addEventListener('connectionstatechange', () => {
         // `connectionState` never reaches `closed` on its own here -- that
         // only happens after this handler's own `pc.close()` (via
         // `releaseLocal`) has already run -- so there is nothing for a
         // `'closed'` branch to catch that isn't already handled below.
-        if (pc.connectionState === 'failed' || pc.connectionState === 'disconnected') {
-          setError('Live voice ended.');
-          sendClose(false);
-          releaseLocal();
-          setStatus('idle');
+        if (pc.connectionState === 'failed') {
+          if (disconnectTimerRef.current !== null) {
+            window.clearTimeout(disconnectTimerRef.current);
+            disconnectTimerRef.current = null;
+          }
+          endForConnectionFailure();
+          return;
+        }
+        if (pc.connectionState === 'disconnected') {
+          // A brief blip (network handoff, momentary ICE hiccup) recovers
+          // on its own; only treat it as final once it has held for a few
+          // seconds.
+          if (disconnectTimerRef.current === null) {
+            disconnectTimerRef.current = window.setTimeout(() => {
+              disconnectTimerRef.current = null;
+              if (pc.connectionState === 'disconnected') endForConnectionFailure();
+            }, 5000);
+          }
+          return;
+        }
+        if (disconnectTimerRef.current !== null) {
+          window.clearTimeout(disconnectTimerRef.current);
+          disconnectTimerRef.current = null;
         }
       });
 
