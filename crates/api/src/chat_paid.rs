@@ -29,8 +29,8 @@ use serde_json::Value;
 use tokio::sync::mpsc;
 
 use crate::db::Database;
-use crate::provider_gateway::{GatewayRequest, ProviderGateway, ProviderTransport};
-use crate::provider_gateway_http::{self, GatewayUsable};
+use crate::provider_gateway::{GatewayError, GatewayRequest, ProviderGateway, ProviderTransport};
+use crate::provider_gateway_http::{self, GatewayUsable, SpendLimits};
 use crate::state::{AppState, StepEvent};
 
 /// Anthropic's cap on one reply. Fixed rather than user-supplied: chat has no
@@ -72,6 +72,9 @@ pub(crate) enum PaidReplyError {
     Unavailable,
     /// The user has nothing left to spend.
     NoCredits,
+    /// The user has some credits, but not enough to cover the longest reply
+    /// this model could send.
+    NotEnoughCredits,
     /// The supplier call itself failed after a reservation was attempted.
     Provider(String),
 }
@@ -85,8 +88,11 @@ impl PaidReplyError {
             PaidReplyError::NoCredits => {
                 "You're out of credits. Go to Settings → Billing to buy more or subscribe.".into()
             }
-            PaidReplyError::Provider(detail) => {
-                format!("The model provider could not complete this reply: {detail}")
+            PaidReplyError::NotEnoughCredits => {
+                "You don't have enough credits left for a reply this long. Go to Settings → Billing to buy more or subscribe.".into()
+            }
+            PaidReplyError::Provider(_) => {
+                "The model provider could not complete this reply. Please try again in a moment.".into()
             }
         }
     }
@@ -115,6 +121,7 @@ pub(crate) async fn send_paid_reply<T: ProviderTransport>(
     signing_key: &str,
     supplier_key: &str,
     transport: T,
+    limits: SpendLimits,
     user_id: &str,
     conversation_id: Option<&str>,
     model: &str,
@@ -136,10 +143,7 @@ pub(crate) async fn send_paid_reply<T: ProviderTransport>(
     let balance_micro_usd = (balance.subscription_remaining + balance.pack_remaining)
         .saturating_mul(price_list.micros_per_credit);
 
-    let env_max_micro_usd =
-        provider_gateway_http::positive_env("CORTEX_PROVIDER_GATEWAY_MAX_MICRO_USD")
-            .ok_or(PaidReplyError::Unavailable)?;
-    let max_micro_usd = env_max_micro_usd.min(balance_micro_usd);
+    let max_micro_usd = limits.max_micro_usd.min(balance_micro_usd);
     if max_micro_usd <= 0 {
         return Err(PaidReplyError::NoCredits);
     }
@@ -158,6 +162,7 @@ pub(crate) async fn send_paid_reply<T: ProviderTransport>(
         &attempt_id,
         model,
         max_micro_usd,
+        limits.funded_micro_usd,
         expires_at_ms,
         now_ms,
     )
@@ -185,7 +190,18 @@ pub(crate) async fn send_paid_reply<T: ProviderTransport>(
     let outcome = gateway
         .forward(request, now_ms)
         .await
-        .map_err(|e| PaidReplyError::Provider(e.to_string()))?;
+        .map_err(|e| match e {
+            // The reservation is refused when the cap (at most the user's
+            // balance) cannot cover the worst-case cost of this reply.
+            GatewayError::Reservation(detail) => {
+                tracing::info!(user_id, %detail, "chat: spend reservation refused");
+                PaidReplyError::NotEnoughCredits
+            }
+            other => {
+                tracing::error!(user_id, error = %other, "chat: gateway call failed");
+                PaidReplyError::Provider(other.to_string())
+            }
+        })?;
 
     let Some(body) = outcome.body else {
         // A replay of a reply id that already resolved. `reply_id` is minted
@@ -294,6 +310,16 @@ pub(crate) async fn run(
         return;
     };
 
+    let Some(limits) = SpendLimits::from_env() else {
+        let _ = tx
+            .send(StepEvent::Failed {
+                step_id: "chat".into(),
+                error: PaidReplyError::Unavailable.user_message(),
+            })
+            .await;
+        return;
+    };
+
     let reply_id = uuid::Uuid::new_v4().to_string();
     let now_ms = chrono::Utc::now().timestamp_millis();
 
@@ -302,6 +328,7 @@ pub(crate) async fn run(
         &signing_key,
         &supplier_key,
         transport,
+        limits,
         &user_id,
         conversation_id.as_deref(),
         &model,
@@ -370,20 +397,6 @@ mod tests {
         (dir, db)
     }
 
-    /// The two env vars this module reads, set for the duration of one test.
-    /// `cargo test` runs this crate's tests on one process, so a test that
-    /// forgets to clean up would leak into the next; every caller below
-    /// removes both vars again immediately after its single `.await`.
-    fn set_test_env(max_micro_usd: &str, funded_micro_usd: &str) {
-        std::env::set_var("CORTEX_PROVIDER_GATEWAY_MAX_MICRO_USD", max_micro_usd);
-        std::env::set_var("CORTEX_PROVIDER_GATEWAY_FUNDED_MICRO_USD", funded_micro_usd);
-    }
-
-    fn clear_test_env() {
-        std::env::remove_var("CORTEX_PROVIDER_GATEWAY_MAX_MICRO_USD");
-        std::env::remove_var("CORTEX_PROVIDER_GATEWAY_FUNDED_MICRO_USD");
-    }
-
     #[derive(Clone)]
     struct FixedTransport {
         calls: Arc<AtomicUsize>,
@@ -450,12 +463,16 @@ mod tests {
         assert!(observed_micros > 0, "fixture must actually cost something");
         let expected_credits = ceil_div(observed_micros, price_list.micros_per_credit);
 
-        set_test_env("1000000000", "1000000000");
+        let limits = SpendLimits {
+            max_micro_usd: 1000000000,
+            funded_micro_usd: 1000000000,
+        };
         let reply = send_paid_reply(
             &db,
             SIGNING_KEY,
             SUPPLIER_KEY,
             FixedTransport::ok(10, 10, "hello there"),
+            limits,
             "user-1",
             Some("conv-1"),
             MODEL,
@@ -466,7 +483,6 @@ mod tests {
         )
         .await
         .expect("reply should succeed");
-        clear_test_env();
 
         assert_eq!(reply.text, "hello there");
         assert_eq!(reply.charged_credits, expected_credits);
@@ -479,12 +495,16 @@ mod tests {
         let (_dir, db) = test_db();
         db.init_credit_balance("user-1", 100).unwrap();
 
-        set_test_env("1000000000", "1000000000");
+        let limits = SpendLimits {
+            max_micro_usd: 1000000000,
+            funded_micro_usd: 1000000000,
+        };
         let error = send_paid_reply(
             &db,
             SIGNING_KEY,
             SUPPLIER_KEY,
             FixedTransport::failing(),
+            limits,
             "user-1",
             Some("conv-1"),
             MODEL,
@@ -495,7 +515,6 @@ mod tests {
         )
         .await
         .expect_err("supplier failure must not succeed");
-        clear_test_env();
 
         assert!(matches!(error, PaidReplyError::Provider(_)));
         let balance = db.get_credit_balance_row("user-1").unwrap();
@@ -507,12 +526,16 @@ mod tests {
         let (_dir, db) = test_db();
         db.init_credit_balance("user-1", 0).unwrap();
 
-        set_test_env("1000000000", "1000000000");
+        let limits = SpendLimits {
+            max_micro_usd: 1000000000,
+            funded_micro_usd: 1000000000,
+        };
         let error = send_paid_reply(
             &db,
             SIGNING_KEY,
             SUPPLIER_KEY,
             FixedTransport::ok(10, 10, "should not be called"),
+            limits,
             "user-1",
             Some("conv-1"),
             MODEL,
@@ -523,7 +546,6 @@ mod tests {
         )
         .await
         .expect_err("zero balance must refuse");
-        clear_test_env();
 
         assert_eq!(error, PaidReplyError::NoCredits);
         assert!(
@@ -538,13 +560,17 @@ mod tests {
         let (_dir, db) = test_db();
         db.init_credit_balance("user-1", 100).unwrap();
 
-        set_test_env("1000000000", "1000000000");
+        let limits = SpendLimits {
+            max_micro_usd: 1000000000,
+            funded_micro_usd: 1000000000,
+        };
         for _ in 0..2 {
             send_paid_reply(
                 &db,
                 SIGNING_KEY,
                 SUPPLIER_KEY,
                 FixedTransport::ok(10, 10, "hello there"),
+                limits,
                 "user-1",
                 Some("conv-1"),
                 MODEL,
@@ -556,7 +582,6 @@ mod tests {
             .await
             .expect("reply should succeed");
         }
-        clear_test_env();
 
         let price_list = db.active_price_list().unwrap();
         let rate = price_list.model("claude", MODEL).unwrap();
@@ -574,13 +599,17 @@ mod tests {
         let (_dir, db) = test_db();
         db.init_credit_balance("user-1", 1).unwrap();
         // A deliberately huge env cap: the user's own balance must still win.
-        set_test_env("1000000000000", "1000000000000");
+        let limits = SpendLimits {
+            max_micro_usd: 1000000000000,
+            funded_micro_usd: 1000000000000,
+        };
 
         let reply = send_paid_reply(
             &db,
             SIGNING_KEY,
             SUPPLIER_KEY,
             FixedTransport::ok(1, 1, "tiny reply"),
+            limits,
             "user-1",
             Some("conv-1"),
             MODEL,
@@ -591,7 +620,6 @@ mod tests {
         )
         .await
         .expect("reply should succeed");
-        clear_test_env();
 
         let price_list = db.active_price_list().unwrap();
         let authorization_id = "gateway-auth:chat-reply:reply-5";

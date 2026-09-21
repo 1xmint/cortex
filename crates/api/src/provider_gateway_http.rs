@@ -69,7 +69,7 @@ pub(crate) fn issue_access(
         return None;
     }
     let signing_key = std::env::var("CORTEX_PROVIDER_GATEWAY_SIGNING_KEY").ok()?;
-    let max_micro_usd = positive_env("CORTEX_PROVIDER_GATEWAY_MAX_MICRO_USD")?;
+    let limits = SpendLimits::from_env()?;
     let expires_at_ms = lease_deadline_ms;
     let (authorization_id, signed) = create_authorization_and_capability(
         db,
@@ -78,7 +78,8 @@ pub(crate) fn issue_access(
         run_id,
         attempt_id,
         model,
-        max_micro_usd,
+        limits.max_micro_usd,
+        limits.funded_micro_usd,
         expires_at_ms,
         now_ms,
     )?;
@@ -110,6 +111,7 @@ pub(crate) fn create_authorization_and_capability(
     attempt_id: &str,
     model: &str,
     max_micro_usd: i64,
+    funded_micro_usd: i64,
     expires_at_ms: i64,
     now_ms: i64,
 ) -> Option<(String, SignedCapability)> {
@@ -117,7 +119,6 @@ pub(crate) fn create_authorization_and_capability(
         tracing::error!("gateway signing key must contain at least 32 bytes");
         return None;
     }
-    let funded_micro_usd = positive_env("CORTEX_PROVIDER_GATEWAY_FUNDED_MICRO_USD")?;
     let price_list = db.active_price_list()?;
     if price_list.model("claude", model).is_none() {
         tracing::error!(model, "gateway has no immutable model rate");
@@ -154,6 +155,25 @@ pub(crate) fn create_authorization_and_capability(
     );
     let signed = sign_capability(signing_key.as_bytes(), &claims).ok()?;
     Some((authorization_id, signed))
+}
+
+/// The operator's two spending numbers: the most one authorization may spend,
+/// and how much Cortex has funded the supplier with. Read once from the
+/// environment by the caller and passed down, so nothing below reads process
+/// state that a test running alongside could change.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SpendLimits {
+    pub max_micro_usd: i64,
+    pub funded_micro_usd: i64,
+}
+
+impl SpendLimits {
+    pub(crate) fn from_env() -> Option<Self> {
+        Some(Self {
+            max_micro_usd: positive_env("CORTEX_PROVIDER_GATEWAY_MAX_MICRO_USD")?,
+            funded_micro_usd: positive_env("CORTEX_PROVIDER_GATEWAY_FUNDED_MICRO_USD")?,
+        })
+    }
 }
 
 pub(crate) fn positive_env(name: &str) -> Option<i64> {
