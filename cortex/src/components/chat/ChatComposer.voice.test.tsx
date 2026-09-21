@@ -599,6 +599,36 @@ describe('ChatComposer voice controls', () => {
     await waitFor(() => expect(screen.getByLabelText('Start live voice')).toBeInTheDocument());
   });
 
+  it('unmounting while the mic prompt is pending never requests a dictation token', async () => {
+    let resolveMedia: (stream: MediaStream) => void = () => {};
+    const mediaPromise = new Promise<MediaStream>((resolve) => {
+      resolveMedia = resolve;
+    });
+    const fakeTrack = { stop: vi.fn() };
+    const fakeStream = { getTracks: () => [fakeTrack] } as unknown as MediaStream;
+    Object.defineProperty(navigator, 'mediaDevices', {
+      value: { getUserMedia: vi.fn(() => mediaPromise) },
+      configurable: true,
+    });
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async () => jsonResponse({}, 404));
+
+    const { unmount } = render(<ChatComposer draft="" onDraftChange={noop} onSend={noop} />);
+    fireEvent.click(screen.getByLabelText('Start dictation'));
+
+    await act(async () => {
+      unmount();
+    });
+    await act(async () => {
+      resolveMedia(fakeStream);
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    const tokenCalls = fetchSpy.mock.calls.filter(([url]) => String(url).includes('/api/voice/dictation/token'));
+    expect(tokenCalls.length).toBe(0);
+    expect(fakeTrack.stop).toHaveBeenCalled();
+  });
+
   it('shows the server refusal message for dictation (e.g. insufficient credits)', async () => {
     installFakeMediaDevices();
     vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {

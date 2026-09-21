@@ -48,6 +48,11 @@ export function useDictation({ onTranscript }: UseDictationOptions) {
   // within the same tick, so a second press before the first `start()` has
   // had a chance to re-render must still be caught here.
   const startingRef = useRef(false);
+  // Set by an unmount or a user-initiated stop while `start` is still
+  // in-flight -- see `useLiveVoiceToggle`'s `cancelledRef` for the same
+  // pattern and why it matters here too (a stray token request after the
+  // user has already left).
+  const cancelledRef = useRef(false);
   const onTranscriptRef = useRef(onTranscript);
   useEffect(() => {
     onTranscriptRef.current = onTranscript;
@@ -71,6 +76,7 @@ export function useDictation({ onTranscript }: UseDictationOptions) {
   }, [releaseMic]);
 
   const stop = useCallback(() => {
+    cancelledRef.current = true;
     teardown();
     setStatus('idle');
   }, [teardown]);
@@ -78,6 +84,7 @@ export function useDictation({ onTranscript }: UseDictationOptions) {
   const start = useCallback(async () => {
     if (startingRef.current || status === 'listening' || status === 'requesting') return;
     startingRef.current = true;
+    cancelledRef.current = false;
     setError(null);
     setStatus('requesting');
     try {
@@ -95,9 +102,17 @@ export function useDictation({ onTranscript }: UseDictationOptions) {
         return;
       }
       streamRef.current = stream;
+      if (cancelledRef.current) {
+        releaseMic();
+        return;
+      }
 
       const idempotencyKey = crypto.randomUUID();
       const tokenResponse = await requestDictationToken(idempotencyKey);
+      if (cancelledRef.current) {
+        releaseMic();
+        return;
+      }
 
       const pc = new RTCPeerConnection();
       pcRef.current = pc;
@@ -124,7 +139,15 @@ export function useDictation({ onTranscript }: UseDictationOptions) {
       });
 
       const offer = await pc.createOffer();
+      if (cancelledRef.current) {
+        teardown();
+        return;
+      }
       await pc.setLocalDescription(offer);
+      if (cancelledRef.current) {
+        teardown();
+        return;
+      }
 
       const sdpResponse = await fetch(REALTIME_CALLS_URL, {
         method: 'POST',
@@ -134,11 +157,23 @@ export function useDictation({ onTranscript }: UseDictationOptions) {
           'Content-Type': 'application/sdp',
         },
       });
+      if (cancelledRef.current) {
+        teardown();
+        return;
+      }
       if (!sdpResponse.ok) {
         throw new Error('Dictation is temporarily unavailable. Please try again in a moment.');
       }
       const answerSdp = await sdpResponse.text();
+      if (cancelledRef.current) {
+        teardown();
+        return;
+      }
       await pc.setRemoteDescription({ type: 'answer', sdp: answerSdp });
+      if (cancelledRef.current) {
+        teardown();
+        return;
+      }
 
       pc.addEventListener('connectionstatechange', () => {
         if (
@@ -185,7 +220,13 @@ export function useDictation({ onTranscript }: UseDictationOptions) {
 
   // Release the mic and close the connection on unmount, no matter what
   // state dictation was in.
-  useEffect(() => () => teardown(), [teardown]);
+  useEffect(
+    () => () => {
+      cancelledRef.current = true;
+      teardown();
+    },
+    [teardown],
+  );
 
   return { status, error, toggle };
 }
