@@ -39,6 +39,8 @@ class FakePeerConnection {
     return dc;
   });
   constructor() {
+    // Test fake exposes the most recently constructed instance so assertions can reach into it.
+    // eslint-disable-next-line @typescript-eslint/no-this-alias
     lastPeerConnection = this;
   }
   createOffer = vi.fn(async () => ({ type: 'offer', sdp: 'fake-offer-sdp' }));
@@ -320,9 +322,10 @@ describe('ChatComposer voice controls', () => {
         RTCPeerConnection: new () => FakePeerConnection;
       }
     ).RTCPeerConnection = class extends FakePeerConnection {
-      setRemoteDescription = vi.fn(async () => {
+      setRemoteDescription = vi.fn(async (): Promise<undefined> => {
         call += 1;
         if (call === 1) throw new Error('boom');
+        return undefined;
       });
     };
     const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
