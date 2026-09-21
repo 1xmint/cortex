@@ -141,6 +141,11 @@ pub struct AppState {
     pub context_bus: ContextBus,
     /// Docker container manager for workspace/task-run container isolation.
     pub container_manager: Option<crate::docker::ContainerManager>,
+    /// Live voice sessions this server is currently brokering, keyed by the
+    /// OpenAI session id. Lets `DELETE /api/voice/live/sessions/{id}` find the
+    /// owning user (so only they may close it) and the handle used to ask the
+    /// billing task to send `session.close` on the sideband.
+    pub voice_sessions: Mutex<HashMap<String, crate::voice_session::VoiceSessionHandle>>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -376,6 +381,7 @@ impl AppState {
             vera_tracker,
             context_bus,
             container_manager,
+            voice_sessions: Mutex::new(HashMap::new()),
         })
     }
 
