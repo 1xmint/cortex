@@ -228,3 +228,54 @@ fn an_unquoted_step_reads_as_none_rather_than_zero() {
     let (_dir, db) = db();
     assert!(db.get_step_quote("nope", "nope").is_none());
 }
+
+#[test]
+fn startup_republishes_corrected_supplier_rates_once_and_leaves_other_rows_alone() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("cortex.db");
+
+    // A fresh database seeds v1 from the current seed and needs no revision.
+    let db = Database::open(&path);
+    assert_eq!(db.active_price_list().expect("published").version, 1);
+
+    // Simulate an install published before the fix: gpt-5.5 at the old
+    // over-priced rate, a voice row missing, and gemini carrying a rate that
+    // differs from the seed (standing in for a measured price).
+    let mut old = pricing::seed_provisional(2, "test", 1_700_000_000, pricing::seed_models());
+    for row in &mut old.models {
+        if row.provider == "openai" && row.model_id == "gpt-5.5" {
+            row.input_micros_per_1k = 10_000;
+            row.output_micros_per_1k = 40_000;
+        }
+        if row.provider == "gemini" && row.model_id == "gemini-3-pro" {
+            row.input_micros_per_1k = 9_999;
+        }
+    }
+    old.models.retain(|m| m.model_id != "gpt-live-1");
+    db.publish_price_list(&old).expect("old list publishes");
+    drop(db);
+
+    // Next startup publishes exactly one corrected version beside it.
+    let db = Database::open(&path);
+    let active = db.active_price_list().expect("published");
+    assert_eq!(active.version, 3);
+    let gpt_5_5 = active.model("openai", "gpt-5.5").expect("row");
+    assert_eq!(
+        (gpt_5_5.input_micros_per_1k, gpt_5_5.output_micros_per_1k),
+        (5_000, 30_000)
+    );
+    assert!(active.model("openai", "gpt-live-1").is_some());
+    assert_eq!(
+        active
+            .model("gemini", "gemini-3-pro")
+            .expect("row")
+            .input_micros_per_1k,
+        9_999,
+        "a row not named as corrected was overwritten"
+    );
+    drop(db);
+
+    // And the startup after that publishes nothing new.
+    let db = Database::open(&path);
+    assert_eq!(db.active_price_list().expect("published").version, 3);
+}
