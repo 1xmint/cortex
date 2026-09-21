@@ -329,6 +329,26 @@ impl Database {
         read_reservation(&conn, request_key).ok_or_else(|| "reservation does not exist".to_string())
     }
 
+    /// Startup sweep: any `voice:*` reservation still `reserved` at process
+    /// start was left mid-flight by a server restart (the billing task that
+    /// owned it, and the sideband drop cleanup that would otherwise mark it
+    /// unresolved, both died with the old process) — mark it `unresolved`
+    /// for reconciliation instead of leaving it `reserved` forever. Returns
+    /// how many rows it swept, for a log line at startup.
+    pub fn sweep_stale_voice_reservations(&self, now_ms: i64) -> Result<usize, String> {
+        let conn = self.conn();
+        let reason = "server restarted during live session";
+        let swept = conn
+            .execute(
+                "UPDATE provider_request_reservations
+                 SET status = 'unresolved', terminal_reason = ?1, reconciled_at = ?2
+                 WHERE status = 'reserved' AND request_key LIKE 'voice:%'",
+                params![reason, now_ms],
+            )
+            .map_err(|e| format!("failed to sweep stale voice reservations: {e}"))?;
+        Ok(swept)
+    }
+
     pub fn release_provider_request(
         &self,
         request_key: &str,
