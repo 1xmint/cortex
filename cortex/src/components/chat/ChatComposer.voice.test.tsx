@@ -568,6 +568,37 @@ describe('ChatComposer voice controls', () => {
     expect(deleteCalls.length).toBe(1);
   });
 
+  it('stays enabled while disabled=true and an active session runs, so it can still be switched off', async () => {
+    installFakeMediaDevices();
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
+      const url = String(input);
+      const method = init?.method ?? 'GET';
+      if (url.includes('/api/voice/live/sessions') && method === 'POST') {
+        return jsonResponse({ session_id: 'sess-11', sdp: 'fake-answer-sdp' });
+      }
+      if (url.includes('/api/voice/live/sessions/') && method === 'DELETE') {
+        return jsonResponse({});
+      }
+      return jsonResponse({}, 404);
+    });
+
+    const { rerender } = render(<ChatComposer draft="" onDraftChange={noop} onSend={noop} />);
+    await act(async () => {
+      fireEvent.click(screen.getByLabelText('Start live voice'));
+    });
+    await waitFor(() => expect(screen.getByLabelText('End live voice')).toBeInTheDocument());
+
+    rerender(<ChatComposer draft="" disabled onDraftChange={noop} onSend={noop} />);
+    const button = screen.getByLabelText('End live voice');
+    expect(button).not.toBeDisabled();
+
+    await act(async () => {
+      fireEvent.click(button);
+    });
+
+    await waitFor(() => expect(screen.getByLabelText('Start live voice')).toBeInTheDocument());
+  });
+
   it('shows the server refusal message for dictation (e.g. insufficient credits)', async () => {
     installFakeMediaDevices();
     vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {

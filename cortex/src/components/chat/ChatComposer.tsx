@@ -253,7 +253,7 @@ export default function ChatComposer({
             </button>
             <button
               type="button"
-              disabled={disabled || dictation.status !== 'idle' || liveVoice.status === 'connecting'}
+              disabled={(disabled && liveVoice.status === 'idle') || dictation.status !== 'idle'}
               aria-label={liveVoice.status === 'active' ? 'End live voice' : 'Start live voice'}
               aria-pressed={liveVoice.status === 'active'}
               onClick={liveVoice.toggle}
