@@ -555,8 +555,6 @@ pub fn seed_models() -> Vec<ModelPrice> {
         ),
         m("zen", "glm-5.3-flash", 150, 500, 2_000, 128_000, "fast"),
         m("zen", "glm-5.3", 1_400, 4_400, 1_857, 128_000, "balanced"),
-        m("zen", "glm-5.2", 1_400, 4_400, 1_857, 128_000, "balanced"),
-        m("zen", "glm-5.1", 1_400, 4_400, 1_857, 128_000, "balanced"),
         m("zen", "glm-5", 1_000, 3_200, 2_000, 128_000, "balanced"),
         m("zen", "minimax-m3", 300, 1_200, 2_000, 200_000, "balanced"),
         m(

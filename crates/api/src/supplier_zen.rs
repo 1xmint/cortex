@@ -11,10 +11,13 @@
 //! `/v1/messages` and `/v1/responses`, in different wire shapes; those are
 //! out of scope here and are refused the same as any other unlisted model.
 //!
-//! Every call goes upstream with `stream: false`, whatever the caller asked
-//! for, the same reason `supplier_openai.rs` does: the full answer carries
-//! the one usage figure the gateway settles against, so spend is known
-//! exactly before a single byte reaches the caller.
+//! A streamed request is refused before it is sent: the gateway's SSE replay
+//! reads Anthropic's `content` array, not chat-completions' `choices`, so a
+//! streamed Zen reply would bill the caller for an answer they would never
+//! see. `n` and `max_completion_tokens` are pinned to `1` and the reserved
+//! `max_output_tokens` respectively, and a request that asked for anything
+//! else there is refused rather than silently downgraded, so nothing can
+//! spend past what the gateway reserved.
 
 use std::future::Future;
 use std::time::Duration;
@@ -50,8 +53,6 @@ const ALLOWED_MODELS: &[&str] = &[
     "deepseek-v4-flash-vision-exp",
     "glm-5.3-flash",
     "glm-5.3",
-    "glm-5.2",
-    "glm-5.1",
     "glm-5",
     "minimax-m3",
     "minimax-m2.7",
@@ -96,9 +97,21 @@ impl ProviderTransport for ZenTransport {
         let key = supplier_key.to_string();
         let allowed = ALLOWED_MODELS.contains(&request.model.as_str());
         let model = request.model.clone();
+        let max_output_tokens = request.max_output_tokens;
         let mut body = request.body.clone();
+        let requests_stream = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
+        let n = body.get("n").and_then(Value::as_i64);
+        let max_completion_tokens = body.get("max_completion_tokens").and_then(Value::as_i64);
+        let n_bypassed = matches!(n, Some(value) if value != 1);
+        let max_tokens_bypassed =
+            matches!(max_completion_tokens, Some(value) if value != max_output_tokens);
+        let bound_bypassed = n_bypassed || max_tokens_bypassed;
         if let Some(fields) = body.as_object_mut() {
-            fields.insert("stream".into(), Value::Bool(false));
+            fields.insert("n".into(), Value::from(1));
+            fields.insert(
+                "max_completion_tokens".into(),
+                Value::from(max_output_tokens),
+            );
         }
 
         async move {
@@ -111,6 +124,34 @@ impl ProviderTransport for ZenTransport {
                     kind: TransportFailureKind::NotSent,
                     upstream_request_id: None,
                     message: format!("zen model {model:?} is not on the allowlist"),
+                });
+            }
+            if requests_stream {
+                // The gateway's SSE replay (`message_as_sse`) reads
+                // Anthropic's `content` array, not chat-completions'
+                // `choices`; a streamed Zen reply would bill the caller for
+                // an answer they never see. Refused before a byte is sent,
+                // same as an unlisted model.
+                return Err(TransportFailure {
+                    kind: TransportFailureKind::NotSent,
+                    upstream_request_id: None,
+                    message: "zen does not support streamed replay".into(),
+                });
+            }
+            if bound_bypassed {
+                // `n` multiplies the output `max_completion_tokens` extends
+                // it: both can spend past what the gateway reserved. Refused
+                // before a byte is sent rather than silently overridden, so
+                // a caller that actually wanted more than one completion (or
+                // a different cap) gets a clear refusal instead of a quiet
+                // downgrade.
+                return Err(TransportFailure {
+                    kind: TransportFailureKind::NotSent,
+                    upstream_request_id: None,
+                    message: format!(
+                        "zen request asked for n={n:?} max_completion_tokens={max_completion_tokens:?}, \
+                         which would bypass the reservation bound of {max_output_tokens} tokens"
+                    ),
                 });
             }
 
@@ -177,12 +218,17 @@ fn send_failure_kind(error: &reqwest::Error) -> TransportFailureKind {
     }
 }
 
-/// Zen's error codes are not documented. Treated the same way
-/// `supplier_openai.rs` treats OpenAI's: a 4xx is a refusal it does not
-/// bill, a 5xx is Zen's own fault and says nothing certain about what ran,
-/// so it stays unknown rather than free.
+/// Zen documents no billing on errors, but it also proxies straight through
+/// to the underlying model provider, so a 4xx that could mean "the upstream
+/// model provider did something and Zen doesn't know" must not be treated as
+/// a free refusal. Only the codes that are unambiguously "never reached a
+/// model" release the reservation: bad request, auth, forbidden, not found,
+/// payload too large, and unprocessable. Everything else — including 402
+/// (payment/balance), 408 (request timeout), 409 (conflict), 429 (rate
+/// limit), and every 5xx — stays unknown and held, the same as a timeout.
 fn status_failure_kind(status: u16) -> TransportFailureKind {
-    if (400..500).contains(&status) {
+    const RELEASED: &[u16] = &[400, 401, 403, 404, 413, 422];
+    if RELEASED.contains(&status) {
         TransportFailureKind::Rejected
     } else {
         TransportFailureKind::Unknown
@@ -303,7 +349,7 @@ mod tests {
         )
         .await;
         let response = ZenTransport::with_base_url(url)
-            .forward("zen-test-supplier", &request("deepseek-v4-flash", true))
+            .forward("zen-test-supplier", &request("deepseek-v4-flash", false))
             .await
             .unwrap();
 
@@ -311,6 +357,8 @@ mod tests {
         let (headers, body) = &seen[0];
         assert_eq!(headers["authorization"], "Bearer zen-test-supplier");
         assert_eq!(body["stream"], false);
+        assert_eq!(body["n"], 1);
+        assert_eq!(body["max_completion_tokens"], 100);
         assert_eq!(response.upstream_request_id.as_deref(), Some("req_fake_1"));
         assert_eq!(
             response.usage,
@@ -339,6 +387,26 @@ mod tests {
     #[tokio::test]
     async fn a_refusal_is_rejected_so_the_reservation_is_released() {
         let (url, _) = fake_zen(
+            StatusCode::UNAUTHORIZED,
+            serde_json::json!({"error": {"type": "invalid_auth", "message": "bad key"}}),
+        )
+        .await;
+        let failure = ZenTransport::with_base_url(url)
+            .forward("zen-test-supplier", &request("deepseek-v4-flash", false))
+            .await
+            .unwrap_err();
+        assert_eq!(failure.kind, TransportFailureKind::Rejected);
+        assert!(failure.message.contains("bad key"));
+        assert_eq!(failure.upstream_request_id.as_deref(), Some("req_fake_1"));
+    }
+
+    #[tokio::test]
+    async fn a_rate_limit_stays_unknown_so_the_reservation_is_kept() {
+        // Zen proxies to the underlying model provider and documents no
+        // billing on errors; a 429 could mean the upstream provider was
+        // reached and rate-limited *after* doing work, so it must not be
+        // treated as a free refusal.
+        let (url, _) = fake_zen(
             StatusCode::TOO_MANY_REQUESTS,
             serde_json::json!({"error": {"type": "rate_limit_error", "message": "slow down"}}),
         )
@@ -347,9 +415,21 @@ mod tests {
             .forward("zen-test-supplier", &request("deepseek-v4-flash", false))
             .await
             .unwrap_err();
-        assert_eq!(failure.kind, TransportFailureKind::Rejected);
-        assert!(failure.message.contains("slow down"));
-        assert_eq!(failure.upstream_request_id.as_deref(), Some("req_fake_1"));
+        assert_eq!(failure.kind, TransportFailureKind::Unknown);
+    }
+
+    #[tokio::test]
+    async fn a_request_timeout_stays_unknown_so_the_reservation_is_kept() {
+        let (url, _) = fake_zen(
+            StatusCode::REQUEST_TIMEOUT,
+            serde_json::json!({"error": {"type": "timeout", "message": "too slow"}}),
+        )
+        .await;
+        let failure = ZenTransport::with_base_url(url)
+            .forward("zen-test-supplier", &request("deepseek-v4-flash", false))
+            .await
+            .unwrap_err();
+        assert_eq!(failure.kind, TransportFailureKind::Unknown);
     }
 
     #[tokio::test]
@@ -401,6 +481,77 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(failure.kind, TransportFailureKind::NotSent);
+        assert!(failure.message.contains("not on the allowlist"));
+        assert!(failure.message.contains("deepseek-v4-flash-free"));
+    }
+
+    #[test]
+    fn allowlist_matches_exactly_the_zen_rows_priced_in_seed_models() {
+        let list = crate::pricing::seed_provisional(
+            1,
+            "test",
+            1_700_000_000,
+            crate::pricing::seed_models(),
+        );
+        let mut priced: Vec<&str> = list
+            .models
+            .iter()
+            .filter(|model| model.provider == "zen")
+            .map(|model| model.model_id.as_str())
+            .collect();
+        priced.sort_unstable();
+        let mut allowed: Vec<&str> = ALLOWED_MODELS.to_vec();
+        allowed.sort_unstable();
+        assert_eq!(priced, allowed);
+    }
+
+    #[tokio::test]
+    async fn a_streamed_request_is_refused_before_a_byte_is_sent() {
+        let failure = ZenTransport::with_base_url("http://127.0.0.1:1")
+            .forward("zen-test-supplier", &request("deepseek-v4-flash", true))
+            .await
+            .unwrap_err();
+        assert_eq!(failure.kind, TransportFailureKind::NotSent);
+        assert!(failure.message.contains("stream"));
+    }
+
+    #[tokio::test]
+    async fn n_greater_than_one_is_refused_before_a_byte_is_sent() {
+        let mut req = request("deepseek-v4-flash", false);
+        req.body["n"] = serde_json::json!(8);
+        let failure = ZenTransport::with_base_url("http://127.0.0.1:1")
+            .forward("zen-test-supplier", &req)
+            .await
+            .unwrap_err();
+        assert_eq!(failure.kind, TransportFailureKind::NotSent);
+    }
+
+    #[tokio::test]
+    async fn max_completion_tokens_above_the_bound_is_refused_before_a_byte_is_sent() {
+        let mut req = request("deepseek-v4-flash", false);
+        req.body["max_completion_tokens"] = serde_json::json!(99_999);
+        let failure = ZenTransport::with_base_url("http://127.0.0.1:1")
+            .forward("zen-test-supplier", &req)
+            .await
+            .unwrap_err();
+        assert_eq!(failure.kind, TransportFailureKind::NotSent);
+    }
+
+    #[tokio::test]
+    async fn n_and_max_completion_tokens_are_pinned_on_the_wire() {
+        let (url, seen) = fake_zen(
+            StatusCode::OK,
+            serde_json::json!({"id": "chatcmpl-1", "choices": []}),
+        )
+        .await;
+        ZenTransport::with_base_url(url)
+            .forward("zen-test-supplier", &request("deepseek-v4-flash", false))
+            .await
+            .unwrap();
+        let seen = seen.lock().unwrap();
+        let (_, body) = &seen[0];
+        assert_eq!(body["n"], 1);
+        assert_eq!(body["max_completion_tokens"], 100);
     }
 
     #[test]

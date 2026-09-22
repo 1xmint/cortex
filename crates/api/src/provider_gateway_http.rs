@@ -89,14 +89,23 @@ pub(crate) fn issue_access(
     lease_deadline_ms: i64,
     now_ms: i64,
 ) -> Option<cortex_core::protocol::ProviderGatewayAccess> {
-    if gateway_mode().is_none()
-        || !matches!(
-            provider,
-            cortex_core::provider::ProviderId::Claude
-                | cortex_core::provider::ProviderId::Openai
-                | cortex_core::provider::ProviderId::Zen
-        )
-    {
+    let mode = gateway_mode()?;
+    let zen_configured = matches!(
+        &mode,
+        GatewayMode::Live { supplier_keys } if supplier_keys.contains_key("zen")
+    );
+    let allowed = match provider {
+        cortex_core::provider::ProviderId::Claude | cortex_core::provider::ProviderId::Openai => {
+            true
+        }
+        // Zen only joins the gateway once it is actually funded and live:
+        // in stub mode, or live mode without a Zen key, a Zen request keeps
+        // whatever path it used before this supplier existed, the same as
+        // an unconfigured supplier is refused elsewhere in this module.
+        cortex_core::provider::ProviderId::Zen => zen_configured,
+        _ => false,
+    };
+    if !allowed {
         return None;
     }
     let provider_label = cortex_core::egress::provider_grant_name(provider);
