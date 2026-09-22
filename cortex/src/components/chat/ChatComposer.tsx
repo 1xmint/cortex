@@ -82,9 +82,9 @@ interface ChatComposerProps {
   /** A `voice_message` event from the open live voice session. */
   onVoiceMessage?: (role: 'user' | 'assistant', content: string) => void;
   /** A voice session's `confirm_required` event -- same card as a typed one. */
-  onVoiceConfirmRequired?: (event: { action_id: string; nonce: string; summary: string; expires_at: string }) => void;
+  onVoiceConfirmRequired?: (event: { action_id: string; nonce: string; summary: string; expires_at: number }) => void;
   /** A voice session's `spoken_window` event: the say-yes countdown opened. */
-  onVoiceSpokenWindow?: (event: { action_id: string; deadline: string }) => void;
+  onVoiceSpokenWindow?: (event: { action_id: string; deadline: number }) => void;
   /** A voice session's `confirm_resolved` event: the action reached a final status. */
   onVoiceConfirmResolved?: (event: { action_id: string; status: string }) => void;
 }

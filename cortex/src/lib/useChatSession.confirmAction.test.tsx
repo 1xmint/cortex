@@ -77,7 +77,7 @@ describe('useChatSession confirm_required handling', () => {
         action_id: 'action-1',
         nonce: 'nonce-1',
         summary: 'Delete 3 stale branches',
-        expires_at: new Date(Date.now() + 60_000).toISOString(),
+        expires_at: Math.floor(Date.now() / 1000) + 60,
       });
     });
 
@@ -111,7 +111,7 @@ describe('useChatSession confirm_required handling', () => {
         action_id: 'action-1',
         nonce: 'nonce-1',
         summary: 'First risky action',
-        expires_at: new Date(Date.now() + 60_000).toISOString(),
+        expires_at: Math.floor(Date.now() / 1000) + 60,
       });
     });
     await waitFor(() =>
@@ -124,7 +124,7 @@ describe('useChatSession confirm_required handling', () => {
         action_id: 'action-2',
         nonce: 'nonce-2',
         summary: 'Second risky action',
-        expires_at: new Date(Date.now() + 60_000).toISOString(),
+        expires_at: Math.floor(Date.now() / 1000) + 60,
       });
     });
 

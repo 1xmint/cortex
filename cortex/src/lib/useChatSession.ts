@@ -41,7 +41,13 @@ interface ConfirmRequiredFields {
   action_id: string;
   nonce: string;
   summary: string;
-  expires_at: string;
+  /** Unix seconds, as the server sends it. */
+  expires_at: number;
+}
+
+/** The server sends times as Unix seconds; the cards keep ISO strings. */
+export function unixSecondsToIso(seconds: number): string {
+  return new Date(seconds * 1000).toISOString();
 }
 
 /**
@@ -64,7 +70,7 @@ function buildConfirmMessage(event: ConfirmRequiredFields, provider?: string): C
       actionId: event.action_id,
       nonce: event.nonce,
       summary: event.summary,
-      expiresAt: event.expires_at,
+      expiresAt: unixSecondsToIso(event.expires_at),
       status: 'pending',
     },
   };
@@ -437,12 +443,12 @@ export function useChatSession({
    * card (if still pending) shows a countdown to `deadline` alongside its
    * regular controls.
    */
-  const handleVoiceSpokenWindow = useCallback((event: { action_id: string; deadline: string }) => {
+  const handleVoiceSpokenWindow = useCallback((event: { action_id: string; deadline: number }) => {
     setMessages((cur) =>
       cur.map((m) => {
         if (!m.confirmAction || m.confirmAction.actionId !== event.action_id) return m;
         if (m.confirmAction.status !== 'pending') return m;
-        return { ...m, confirmAction: { ...m.confirmAction, spokenWindowDeadline: event.deadline } };
+        return { ...m, confirmAction: { ...m.confirmAction, spokenWindowDeadline: unixSecondsToIso(event.deadline) } };
       }),
     );
   }, []);
@@ -792,7 +798,7 @@ export function useChatSession({
               }
 
               case 'confirm_required': {
-                if (!event.action_id || !event.nonce || !event.summary || !event.expires_at) break;
+                if (!event.action_id || !event.nonce || !event.summary || typeof event.expires_at !== 'number') break;
                 const confirmMessage = buildConfirmMessage(
                   {
                     action_id: event.action_id,

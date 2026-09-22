@@ -26,8 +26,8 @@ interface ProjectChatProps {
   onConfirmActionStatusChange?: (messageId: string, status: ConfirmActionStatus) => void;
   onLiveVoiceStart?: () => Promise<string | null | undefined>;
   onVoiceMessage?: (role: 'user' | 'assistant', content: string) => void;
-  onVoiceConfirmRequired?: (event: { action_id: string; nonce: string; summary: string; expires_at: string }) => void;
-  onVoiceSpokenWindow?: (event: { action_id: string; deadline: string }) => void;
+  onVoiceConfirmRequired?: (event: { action_id: string; nonce: string; summary: string; expires_at: number }) => void;
+  onVoiceSpokenWindow?: (event: { action_id: string; deadline: number }) => void;
   onVoiceConfirmResolved?: (event: { action_id: string; status: string }) => void;
 }
 

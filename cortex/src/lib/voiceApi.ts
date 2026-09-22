@@ -129,14 +129,16 @@ export interface VoiceConfirmRequiredEvent {
   action_id: string;
   nonce: string;
   summary: string;
-  expires_at: string;
+  /** Unix seconds. */
+  expires_at: number;
 }
 
 /** Accepted and typed now; the server does not emit these yet. */
 export interface VoiceSpokenWindowEvent {
   type: 'spoken_window';
   action_id: string;
-  deadline: string;
+  /** Unix seconds. */
+  deadline: number;
 }
 
 /** Accepted and typed now; the server does not emit these yet. */
