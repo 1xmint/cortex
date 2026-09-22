@@ -1,10 +1,11 @@
-//! The real wire to OpenCode Zen, on Cortex's own key.
+//! The wire to OpenCode Zen, on the customer's own key.
 //!
-//! One supplier per file. The gateway in `provider_gateway.rs` decides
-//! whether a call may happen and what it is allowed to cost; this file only
-//! makes the call and reports honestly what came back. Mirrors
-//! `supplier_openai.rs`, since Zen's `/chat/completions` family speaks the
-//! same OpenAI-compatible chat-completions shape.
+//! Zen is bring-your-own-key only: Cortex never holds a Zen key of its own,
+//! and this transport never runs behind the Cortex-funded provider gateway
+//! in `provider_gateway.rs`. It is called directly, with a customer's own
+//! key, from the chat BYOK path. Mirrors `supplier_openai.rs`, since Zen's
+//! `/chat/completions` family speaks the same OpenAI-compatible
+//! chat-completions shape.
 //!
 //! This slice covers only Zen's `/chat/completions` models: DeepSeek, GLM,
 //! Kimi, MiniMax. Zen also serves Claude/GPT/Gemini/Grok aliases behind
@@ -18,6 +19,12 @@
 //! `max_output_tokens` respectively, and a request that asked for anything
 //! else there is refused rather than silently downgraded, so nothing can
 //! spend past what the gateway reserved.
+
+// This module has no caller yet: the Cortex-funded gateway path that used to
+// call it was removed (Zen is BYOK-only, never Cortex-funded), and the BYOK
+// chat path that will call it directly is `chat_zen.rs`, a later step
+// (M-D-0003). Dead on purpose in between; not a leftover.
+#![allow(dead_code)]
 
 use std::future::Future;
 use std::time::Duration;

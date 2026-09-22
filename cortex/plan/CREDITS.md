@@ -221,10 +221,37 @@ tokens consumed, the customer is buying tokens again and §D.4 is back in play.
 It is also the only way to see margin per task class, which is the number that
 tells you whether the pricing works.
 
-`cost_type` gains `'platform'`, which does not exist today —
-`CostEstimator::get_cost_type` (`crates/api/src/cost_estimator.rs:96`) returns only
-`"byok"` or `"byos"`, which is why operator-funded spend currently has nowhere to
-be recorded. See PR #415.
+`cost_type` gains `'platform'`, which does not exist today. `cost_estimator.rs`
+was deleted in #17; the provider gateway now writes `provider_spend` rows
+itself, with `cost_type = 'gateway_observed'`
+(`crates/api/src/db/provider_gateway.rs:185`), which is why operator-funded
+spend currently has nowhere clearly named to be recorded. See PR #415.
+
+---
+
+## Suppliers Cortex pays for vs. BYOK
+
+Anthropic and OpenAI are Cortex-paid: every call to them goes through the
+provider gateway (`crates/api/src/provider_gateway.rs`,
+`provider_gateway_http.rs`), reserved and settled against Cortex's own
+supplier keys, and charged to the customer in credits.
+
+OpenCode Zen is **BYOK only**. The customer supplies their own Zen key; Zen
+bills the customer directly, at 0 Cortex credits; a Cortex subscription is
+still required to reach Zen at all; and Cortex never holds a Zen key of its
+own. `KNOWN_PROVIDERS` in `provider_gateway.rs` does not include `"zen"`, so
+a Zen authorization against Cortex's own money can never be created, and
+`issue_access` in `provider_gateway_http.rs` refuses a Zen capability for a
+run unconditionally. This means Cortex does not resell Zen: it is a pass-through
+account, not a product Cortex buys wholesale and marks up. See
+`plan-zen-byok.md`, decision D1, for why BYOK spend is not routed through the
+gateway's reservation machinery at all — that machinery exists to cap
+Cortex's *own* spend, and a BYOK call spends the customer's money, not
+Cortex's.
+
+BYOK usage is still recorded for analytics, as one `provider_spend` row per
+call with `cost_type = 'byok'` and `cost_micro_usd = 0`: real token counts,
+zero cost, because Cortex paid nothing.
 
 ---
 
