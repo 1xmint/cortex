@@ -2902,6 +2902,103 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn foreign_conversation_id_is_404_and_reserves_nothing() {
+        let (_dir, state) = test_state().await;
+        let db = state.db.as_ref().unwrap();
+        let owner_conversation = db.create_conversation("someone-else", None);
+        let balance_before = db.get_credit_balance_row(USER);
+
+        let result = live_session_start(
+            State(state.clone()),
+            ClerkUser {
+                user_id: USER.to_string(),
+            },
+            HeaderMap::new(),
+            Json(LiveSessionStartRequest {
+                sdp: "offer-sdp".to_string(),
+                conversation_id: Some(owner_conversation.id.clone()),
+            }),
+        )
+        .await;
+
+        let Err((status, _)) = result else {
+            panic!("a foreign conversation id must be refused");
+        };
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(
+            db.get_credit_balance_row(USER),
+            balance_before,
+            "nothing must be reserved for a refused start"
+        );
+        assert!(
+            state.voice_sessions.lock().unwrap().is_empty(),
+            "no placeholder may be left behind"
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_conversation_id_is_404_and_reserves_nothing() {
+        let (_dir, state) = test_state().await;
+        let db = state.db.as_ref().unwrap();
+        let balance_before = db.get_credit_balance_row(USER);
+
+        let result = live_session_start(
+            State(state.clone()),
+            ClerkUser {
+                user_id: USER.to_string(),
+            },
+            HeaderMap::new(),
+            Json(LiveSessionStartRequest {
+                sdp: "offer-sdp".to_string(),
+                conversation_id: Some("no-such-conversation".to_string()),
+            }),
+        )
+        .await;
+
+        let Err((status, _)) = result else {
+            panic!("a conversation id that does not exist must be refused");
+        };
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(db.get_credit_balance_row(USER), balance_before);
+        assert!(state.voice_sessions.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn no_conversation_id_keeps_todays_behavior() {
+        let (_dir, state) = test_state().await;
+
+        // Stub mode, so this exercises only the handler's ownership gate
+        // (skipped entirely with no id) and not the rest of the pipeline,
+        // which the other `start_session` tests already cover directly.
+        std::env::set_var("CORTEX_PROVIDER_GATEWAY_MODE", "stub");
+        std::env::set_var("CORTEX_PROVIDER_GATEWAY_SIGNING_KEY", SIGNING_KEY);
+        std::env::set_var("CORTEX_PROVIDER_GATEWAY_MAX_MICRO_USD", "1000000000");
+        std::env::set_var("CORTEX_PROVIDER_GATEWAY_FUNDED_MICRO_USD", "1000000000");
+        let result = live_session_start(
+            State(state.clone()),
+            ClerkUser {
+                user_id: USER.to_string(),
+            },
+            HeaderMap::new(),
+            Json(LiveSessionStartRequest {
+                sdp: "offer-sdp".to_string(),
+                conversation_id: None,
+            }),
+        )
+        .await;
+        std::env::remove_var("CORTEX_PROVIDER_GATEWAY_MODE");
+        std::env::remove_var("CORTEX_PROVIDER_GATEWAY_SIGNING_KEY");
+        std::env::remove_var("CORTEX_PROVIDER_GATEWAY_MAX_MICRO_USD");
+        std::env::remove_var("CORTEX_PROVIDER_GATEWAY_FUNDED_MICRO_USD");
+
+        assert!(
+            result.is_ok(),
+            "no conversation id must not be refused: {:?}",
+            result.err().map(|(status, _)| status)
+        );
+    }
+
     mod delegation {
         use std::future::Future;
         use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
@@ -3071,6 +3168,75 @@ mod tests {
                 before.subscription_remaining - after.subscription_remaining,
                 expected_credits,
                 "the delegation must charge exactly the observed 10-in/10-out token cost"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_delegation_in_a_linked_session_saves_user_text_and_answer() {
+            let (_dir, state) = test_state_with_balance(1_000_000_000).await;
+            let db = state.db.as_ref().unwrap();
+            let conversation = db.create_conversation(USER, None);
+
+            let transport = CountingTransport::ok("the answer is four");
+            let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let answer = run_voice_delegation_with(
+                db,
+                SIGNING_KEY,
+                SUPPLIER_KEY,
+                transport.clone(),
+                ample_limits(),
+                USER,
+                Some(conversation.id.as_str()),
+                "what is two plus two",
+                &cancel,
+            )
+            .await;
+
+            assert_eq!(answer, "the answer is four");
+            let messages = db
+                .get_conversation(&conversation.id, USER)
+                .unwrap()
+                .messages;
+            assert_eq!(
+                messages.len(),
+                2,
+                "a delegation must save exactly the user's text and the answer"
+            );
+            assert_eq!(messages[0].role, "user");
+            assert_eq!(messages[0].content, "what is two plus two");
+            assert_eq!(messages[1].role, "assistant");
+            assert_eq!(messages[1].content, "the answer is four");
+        }
+
+        #[tokio::test]
+        async fn a_delegation_in_an_unlinked_session_saves_nothing() {
+            let (_dir, state) = test_state_with_balance(1_000_000_000).await;
+            let db = state.db.as_ref().unwrap();
+            let conversation = db.create_conversation(USER, None);
+
+            let transport = CountingTransport::ok("the answer is four");
+            let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let answer = run_voice_delegation_with(
+                db,
+                SIGNING_KEY,
+                SUPPLIER_KEY,
+                transport.clone(),
+                ample_limits(),
+                USER,
+                None,
+                "what is two plus two",
+                &cancel,
+            )
+            .await;
+
+            assert_eq!(answer, "the answer is four");
+            assert_eq!(
+                db.get_conversation(&conversation.id, USER)
+                    .unwrap()
+                    .messages
+                    .len(),
+                0,
+                "a session with no linked conversation must save nothing anywhere"
             );
         }
 
