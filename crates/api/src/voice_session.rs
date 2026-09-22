@@ -2961,6 +2961,7 @@ mod tests {
         async fn a_delegation_runs_the_agent_and_returns_its_answer() {
             let (_dir, state) = test_state_with_balance(1_000_000_000).await;
             let db = state.db.as_ref().unwrap();
+            let before = db.get_credit_balance_row(USER).unwrap();
 
             let transport = CountingTransport::ok("the answer is four");
             let answer = run_voice_delegation_with(
@@ -2976,6 +2977,17 @@ mod tests {
 
             assert_eq!(answer, "the answer is four");
             assert_eq!(transport.call_count(), 1);
+
+            let price_list = db.active_price_list().unwrap();
+            let rate = price_list.model("claude", DELEGATION_MODEL).unwrap();
+            let expected_credits =
+                ceil_div(rate.cost_micros(10, 0, 10), price_list.micros_per_credit);
+            let after = db.get_credit_balance_row(USER).unwrap();
+            assert_eq!(
+                before.subscription_remaining - after.subscription_remaining,
+                expected_credits,
+                "the delegation must charge exactly the observed 10-in/10-out token cost"
+            );
         }
 
         #[tokio::test]
