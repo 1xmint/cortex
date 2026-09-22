@@ -57,6 +57,160 @@ fn db_from_state(state: &AppState) -> Result<&Database, (StatusCode, Json<ErrorR
     })
 }
 
+/// Why [`confirm_and_execute`]/[`confirm_and_execute_spoken`] refused, or the
+/// tool itself failed once run. A superset of [`ConfirmActionError`] plus the
+/// one failure mode that can only happen after the status flip: the tool's
+/// own execution.
+pub enum ConfirmAndExecuteError {
+    /// No such row, another user's row, or (for the tap route) a wrong
+    /// nonce — all indistinguishable from "never existed" per this module's
+    /// doc comment.
+    NotFound,
+    Expired,
+    AlreadyResolved,
+    ArgsTampered,
+    /// The row's stored `args_json` failed to parse. Should be unreachable
+    /// in practice (the row is only ever written from already-serialized
+    /// JSON), but if it ever happens this is a server bug, not a client
+    /// error — 500, not 422.
+    InvalidStoredArgs(String),
+    /// `execute_confirmed` itself refused or failed.
+    ToolFailed(String),
+}
+
+impl From<ConfirmActionError> for ConfirmAndExecuteError {
+    fn from(err: ConfirmActionError) -> Self {
+        match err {
+            ConfirmActionError::NotFound | ConfirmActionError::WrongNonce => Self::NotFound,
+            ConfirmActionError::Expired => Self::Expired,
+            ConfirmActionError::AlreadyResolved => Self::AlreadyResolved,
+            ConfirmActionError::ArgsTampered => Self::ArgsTampered,
+        }
+    }
+}
+
+impl ConfirmAndExecuteError {
+    fn into_response(self) -> (StatusCode, Json<ErrorResponse>) {
+        match self {
+            Self::NotFound => not_found(),
+            Self::Expired => (
+                StatusCode::CONFLICT,
+                Json(ErrorResponse {
+                    error: "this action has expired; ask again".into(),
+                }),
+            ),
+            Self::AlreadyResolved => (
+                StatusCode::CONFLICT,
+                Json(ErrorResponse {
+                    error: "this action was already confirmed or cancelled".into(),
+                }),
+            ),
+            Self::ArgsTampered => (
+                StatusCode::CONFLICT,
+                Json(ErrorResponse {
+                    error:
+                        "this action's arguments changed since it was proposed; refusing to run it"
+                            .into(),
+                }),
+            ),
+            Self::InvalidStoredArgs(message) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse { error: message }),
+            ),
+            Self::ToolFailed(message) => (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(ErrorResponse { error: message }),
+            ),
+        }
+    }
+}
+
+/// The shared core of both `POST /api/agent/actions/{id}/confirm` (tap,
+/// nonce supplied by the caller) and the spoken path (nonce looked up
+/// server-side — see [`confirm_and_execute_spoken`]): run every check
+/// `Database::confirm_pending_action` enforces (ownership, nonce match, not
+/// expired, not voided, single-use atomic claim), then run the tool with
+/// exactly the row's stored, hash-verified arguments, and best-effort save
+/// the result to the conversation. Never trusts anything about the row
+/// except what this DB round trip just read back.
+async fn confirm_and_execute(
+    state: &Arc<AppState>,
+    db: &Database,
+    user_id: &str,
+    action_id: &str,
+    nonce: &str,
+) -> Result<serde_json::Value, ConfirmAndExecuteError> {
+    let now = chrono::Utc::now().timestamp();
+    let action = db.confirm_pending_action(action_id, user_id, nonce, now)?;
+
+    let input: serde_json::Value = serde_json::from_str(&action.args_json).map_err(|e| {
+        ConfirmAndExecuteError::InvalidStoredArgs(format!(
+            "stored action arguments are not valid JSON: {e}"
+        ))
+    })?;
+
+    let result =
+        crate::agent_tools::execute_confirmed(state, db, user_id, &action.tool_name, &input)
+            .await
+            .map_err(|e| ConfirmAndExecuteError::ToolFailed(e.message()))?;
+
+    // The tool has already run by this point — its result must reach the
+    // caller either way. `messages.conversation_id` is a `NOT NULL` foreign
+    // key (`Database::add_message` panics on a violation), and the
+    // conversation the row was proposed against can in principle be gone by
+    // now (deleted, or — before the chat_paid.rs fix that refuses a
+    // proposal with no owned conversation — never valid at all), so this is
+    // best-effort: save the message when the conversation still exists for
+    // this user, but never let a missing conversation turn a successful
+    // confirm into a 500 or a panic.
+    if db
+        .get_conversation(&action.conversation_id, user_id)
+        .is_some()
+    {
+        db.add_message(
+            &action.conversation_id,
+            "assistant",
+            &result.to_string(),
+            None,
+            None,
+        );
+    }
+
+    Ok(result)
+}
+
+/// The spoken-confirm entry point: same checks and execution as
+/// [`confirm_and_execute`], but the caller (a voice session) never has the
+/// row's nonce — the client-side "yes" carries only the `action_id` a
+/// `VoiceEvent::ConfirmRequired` already scoped to this session's owner, so
+/// the nonce is looked up here, server-side, from the DB row itself.
+/// Ownership is still enforced by `confirm_pending_action`'s own `user_id`
+/// scoping, and the row's live `status`/`expires_at` are re-checked there
+/// too — the in-memory pending slot in `voice_session.rs` is never trusted
+/// for this, since it is never cleared on tap, cancel, expiry, or void.
+///
+/// Not called from any route yet — the transcript-driven wiring lands in
+/// part 2b of the spoken-confirm plan. Exercised directly by the tests
+/// below in the meantime.
+///
+/// This function does not itself gate on premium: the tap route
+/// (`confirm_action`) gets that for free from the `PremiumUser` extractor.
+/// Whatever caller wires this in for part 2b must enforce that same premium
+/// check before reaching here.
+#[allow(dead_code)] // Wired to the transcript matcher in part 2b.
+async fn confirm_and_execute_spoken(
+    state: &Arc<AppState>,
+    db: &Database,
+    user_id: &str,
+    action_id: &str,
+) -> Result<serde_json::Value, ConfirmAndExecuteError> {
+    let nonce = db
+        .get_pending_action(action_id, user_id)
+        .ok_or(ConfirmAndExecuteError::NotFound)?
+        .nonce;
+    confirm_and_execute(state, db, user_id, action_id, &nonce).await
+}
+
 /// `POST /api/agent/actions/{id}/confirm` — run the `Risk::Confirm` tool
 /// this pending row proposed, using only its stored, hash-verified
 /// arguments (never anything in this request), and save the tool's result
@@ -75,78 +229,9 @@ pub async fn confirm_action(
         return Err(not_found());
     }
 
-    let now = chrono::Utc::now().timestamp();
-    let action =
-        match db.confirm_pending_action(&id, &user.user_id, &req.nonce, now) {
-            Ok(action) => action,
-            Err(ConfirmActionError::NotFound) => return Err(not_found()),
-            Err(ConfirmActionError::WrongNonce) => return Err(not_found()),
-            Err(ConfirmActionError::Expired) => {
-                return Err((
-                    StatusCode::CONFLICT,
-                    Json(ErrorResponse {
-                        error: "this action has expired; ask again".into(),
-                    }),
-                ))
-            }
-            Err(ConfirmActionError::AlreadyResolved) => {
-                return Err((
-                    StatusCode::CONFLICT,
-                    Json(ErrorResponse {
-                        error: "this action was already confirmed or cancelled".into(),
-                    }),
-                ))
-            }
-            Err(ConfirmActionError::ArgsTampered) => return Err((
-                StatusCode::CONFLICT,
-                Json(ErrorResponse {
-                    error:
-                        "this action's arguments changed since it was proposed; refusing to run it"
-                            .into(),
-                }),
-            )),
-        };
-
-    let input: serde_json::Value = serde_json::from_str(&action.args_json).map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: format!("stored action arguments are not valid JSON: {e}"),
-            }),
-        )
-    })?;
-
-    let result =
-        crate::agent_tools::execute_confirmed(&state, db, &user.user_id, &action.tool_name, &input)
-            .await
-            .map_err(|e| {
-                (
-                    StatusCode::UNPROCESSABLE_ENTITY,
-                    Json(ErrorResponse { error: e.message() }),
-                )
-            })?;
-
-    // The tool has already run by this point — its result must reach the
-    // caller either way. `messages.conversation_id` is a `NOT NULL` foreign
-    // key (`Database::add_message` panics on a violation), and the
-    // conversation the row was proposed against can in principle be gone by
-    // now (deleted, or — before the chat_paid.rs fix that refuses a
-    // proposal with no owned conversation — never valid at all), so this is
-    // best-effort: save the message when the conversation still exists for
-    // this user, but never let a missing conversation turn a successful
-    // confirm into a 500 or a panic.
-    if db
-        .get_conversation(&action.conversation_id, &user.user_id)
-        .is_some()
-    {
-        db.add_message(
-            &action.conversation_id,
-            "assistant",
-            &result.to_string(),
-            None,
-            None,
-        );
-    }
+    let result = confirm_and_execute(&state, db, &user.user_id, &id, &req.nonce)
+        .await
+        .map_err(ConfirmAndExecuteError::into_response)?;
 
     Ok(Json(ConfirmActionResponse {
         status: "confirmed".into(),
@@ -252,5 +337,145 @@ mod tests {
             .expect("the owner can still see their own row");
         assert_eq!(reread.status, "pending");
         drop(state);
+    }
+
+    /// `confirm_and_execute_spoken` exercised directly — it is not wired to
+    /// any route yet (see its own doc comment), so these are the only tests
+    /// that can fail if it regresses before part 2b lands.
+    mod spoken {
+        use super::*;
+
+        /// `execute_confirmed("open_pr", ...)` does a real `git push`/`gh pr
+        /// create`, so a genuinely successful run is not something a unit
+        /// test can trigger. A run id that does not exist fails inside
+        /// `create_pr_core`'s own validation, before any process spawns —
+        /// which is exactly the boundary this test needs: proof that every
+        /// confirm-gate check (ownership, nonce lookup, not expired, not
+        /// voided, atomic single-use claim) passed, leaving only the tool's
+        /// own failure. The status flip is unconditional once the gate
+        /// passes, so re-reading it here is what actually proves the row
+        /// went from pending to confirmed.
+        #[tokio::test]
+        async fn succeeds_through_the_gate_on_a_pending_unexpired_owned_row() {
+            let (_dir, state) = test_state().await;
+            let db = state.db.as_ref().expect("db configured");
+            let now = chrono::Utc::now().timestamp();
+            let action = db.insert_pending_action(
+                "user-1",
+                "conv-1",
+                "open_pr",
+                &serde_json::json!({"run_id": "no-such-run"}),
+                "s",
+                now,
+            );
+
+            let err = confirm_and_execute_spoken(&state, db, "user-1", &action.id)
+                .await
+                .expect_err("no such run: the tool itself fails, not the confirm gate");
+            assert!(
+                matches!(err, ConfirmAndExecuteError::ToolFailed(_)),
+                "the gate must have passed for the tool to run at all"
+            );
+
+            let reread = db.get_pending_action(&action.id, "user-1").unwrap();
+            assert_eq!(reread.status, "confirmed");
+        }
+
+        #[tokio::test]
+        async fn refuses_an_expired_row() {
+            let (_dir, state) = test_state().await;
+            let db = state.db.as_ref().expect("db configured");
+            let real_now = chrono::Utc::now().timestamp();
+            // Inserted far enough in the "past" that its expires_at is
+            // already behind the real wall clock `confirm_and_execute`
+            // reads internally.
+            let insert_now = real_now - crate::db::PENDING_ACTION_TTL_SECS - 10;
+            let action = db.insert_pending_action(
+                "user-1",
+                "conv-1",
+                "open_pr",
+                &serde_json::json!({"run_id": "r1"}),
+                "s",
+                insert_now,
+            );
+
+            let err = confirm_and_execute_spoken(&state, db, "user-1", &action.id)
+                .await
+                .expect_err("an expired row must not confirm");
+            assert!(matches!(err, ConfirmAndExecuteError::Expired));
+        }
+
+        #[tokio::test]
+        async fn refuses_a_voided_row() {
+            let (_dir, state) = test_state().await;
+            let db = state.db.as_ref().expect("db configured");
+            let now = chrono::Utc::now().timestamp();
+            let first = db.insert_pending_action(
+                "user-1",
+                "conv-1",
+                "open_pr",
+                &serde_json::json!({"run_id": "r1"}),
+                "first",
+                now,
+            );
+            // A second proposal on the same conversation voids the first.
+            let _second = db.insert_pending_action(
+                "user-1",
+                "conv-1",
+                "open_pr",
+                &serde_json::json!({"run_id": "r2"}),
+                "second",
+                now,
+            );
+
+            let err = confirm_and_execute_spoken(&state, db, "user-1", &first.id)
+                .await
+                .expect_err("a voided row must not confirm");
+            assert!(matches!(err, ConfirmAndExecuteError::AlreadyResolved));
+        }
+
+        #[tokio::test]
+        async fn refuses_another_users_row() {
+            let (_dir, state) = test_state().await;
+            let db = state.db.as_ref().expect("db configured");
+            let now = chrono::Utc::now().timestamp();
+            let action = db.insert_pending_action(
+                "user-1",
+                "conv-1",
+                "open_pr",
+                &serde_json::json!({"run_id": "r1"}),
+                "s",
+                now,
+            );
+
+            let err = confirm_and_execute_spoken(&state, db, "user-2", &action.id)
+                .await
+                .expect_err("another user's row must not confirm");
+            assert!(matches!(err, ConfirmAndExecuteError::NotFound));
+        }
+
+        #[tokio::test]
+        async fn refuses_a_second_call() {
+            let (_dir, state) = test_state().await;
+            let db = state.db.as_ref().expect("db configured");
+            let now = chrono::Utc::now().timestamp();
+            let action = db.insert_pending_action(
+                "user-1",
+                "conv-1",
+                "open_pr",
+                &serde_json::json!({"run_id": "no-such-run"}),
+                "s",
+                now,
+            );
+
+            confirm_and_execute_spoken(&state, db, "user-1", &action.id)
+                .await
+                .expect_err("the tool itself still fails (no such run)");
+
+            let err = confirm_and_execute_spoken(&state, db, "user-1", &action.id)
+                .await
+                .expect_err("a second call on the same row must not confirm again");
+            assert!(matches!(err, ConfirmAndExecuteError::AlreadyResolved));
+        }
     }
 }

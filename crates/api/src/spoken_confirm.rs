@@ -123,8 +123,10 @@ impl Matcher {
 
     /// Opens the matching window: the currently-armed action now has 45s
     /// for a matching utterance to *start*. A no-op if nothing is armed
-    /// (e.g. a stale report after a re-arm or resolution).
-    pub fn prompt_ended(&mut self, now: Instant) {
+    /// (e.g. a stale report after a re-arm or resolution) — returns `false`
+    /// in that case (window already open, or the matcher isn't waiting on a
+    /// report), `true` only when it actually opened the window.
+    pub fn prompt_ended(&mut self, now: Instant) -> bool {
         if let Phase::AwaitingReport { action_id } = &self.phase {
             self.phase = Phase::Open {
                 action_id: action_id.clone(),
@@ -132,7 +134,19 @@ impl Matcher {
                 deadline: now + WINDOW,
                 utterance: None,
             };
+            true
+        } else {
+            false
         }
+    }
+
+    /// Test-only: whether the window is currently open (`Phase::Open`).
+    /// Lets a test confirm a rejected `prompt_ended` did not open the
+    /// window, and that a re-arm after resolution put the matcher back into
+    /// a state where the window is not open.
+    #[cfg(test)]
+    pub(crate) fn is_window_open(&self) -> bool {
+        matches!(self.phase, Phase::Open { .. })
     }
 
     /// Feeds a transcript delta. Text before the window opens, or once the

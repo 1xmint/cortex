@@ -83,6 +83,7 @@ cortex,POST,/api/voice/dictation/token
 cortex,POST,/api/voice/live/sessions
 cortex,DELETE,/api/voice/live/sessions/{id}
 cortex,GET,/api/voice/live/sessions/{id}/events
+cortex,POST,/api/voice/live/sessions/{id}/prompt-ended
 cortex,GET,/api/ws
 cortex,POST,/internal/provider/v1/messages
 duplicate,GET,/api/admin/audit-log
