@@ -150,6 +150,7 @@ pub(crate) async fn chat(
         user_message,
         key,
         tx,
+        ZenTransport::new(),
     ));
 
     let stream = ReceiverStream::new(rx).map(step_event_to_sse);
@@ -279,8 +280,12 @@ fn reply_text(body: &serde_json::Value) -> String {
         .to_string()
 }
 
+/// Generic over `T: ProviderTransport` purely so tests can substitute a
+/// mock Zen server (see `tests::run` below, mirroring `chat_paid::run`'s own
+/// `send_paid_reply<T: ProviderTransport>`); the only production caller
+/// (`chat` above) always passes a real `ZenTransport`.
 #[allow(clippy::too_many_arguments)]
-async fn run(
+async fn run<T: ProviderTransport + Clone>(
     state: Arc<AppState>,
     user_id: String,
     conversation_id: Option<String>,
@@ -289,6 +294,7 @@ async fn run(
     user_message: String,
     key: ZenApiKey,
     tx: mpsc::Sender<StepEvent>,
+    transport: T,
 ) {
     let _ = tx
         .send(StepEvent::Started {
@@ -347,7 +353,6 @@ async fn run(
         capability: SignedCapability::from_exposed("zen-byok"),
     };
 
-    let transport = ZenTransport::new();
     match transport.forward(key.expose_secret(), &request).await {
         Ok(response) => {
             let text = reply_text(&response.body);
@@ -416,6 +421,510 @@ async fn run(
                     error: user_text,
                 })
                 .await;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::byok::BYOK_ENV_LOCK;
+    use axum::http::HeaderMap;
+    use axum::routing::post;
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    use std::sync::Mutex as StdMutex;
+
+    const MODEL: &str = "deepseek-v4-flash";
+
+    async fn test_state() -> (tempfile::TempDir, Arc<AppState>) {
+        test_state_with_clerk_secret(None).await
+    }
+
+    async fn test_state_with_clerk_secret(
+        clerk_secret_key: Option<String>,
+    ) -> (tempfile::TempDir, Arc<AppState>) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".cortex")).unwrap();
+        let state = AppState::new(
+            dir.path().join(".cortex/ledger.jsonl"),
+            dir.path().to_path_buf(),
+            clerk_secret_key,
+        )
+        .await;
+        (dir, state)
+    }
+
+    /// A stub key row good enough to exercise `get_provider_key_row` /
+    /// `mark_provider_key_rejected` -- these tests never decrypt it, so the
+    /// ciphertext does not need to be real.
+    fn stub_encrypted_key() -> EncryptedKey {
+        EncryptedKey {
+            key_version: 1,
+            nonce: vec![0u8; 12],
+            ciphertext: vec![1, 2, 3, 4],
+        }
+    }
+
+    type Seen = Arc<StdMutex<Vec<(HeaderMap, serde_json::Value)>>>;
+
+    /// A stand-in Zen on a local port, mirroring `supplier_zen::tests::fake_zen`.
+    async fn fake_zen(status: StatusCode, reply: serde_json::Value) -> (String, Seen) {
+        let seen: Seen = Arc::default();
+        let log = seen.clone();
+        let app = axum::Router::new().route(
+            "/chat/completions",
+            post(
+                move |headers: HeaderMap, Json(body): Json<serde_json::Value>| {
+                    let log = log.clone();
+                    let reply = reply.clone();
+                    async move {
+                        log.lock().unwrap().push((headers, body));
+                        (status, [("x-request-id", "req_fake_1")], Json(reply))
+                    }
+                },
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{address}"), seen)
+    }
+
+    async fn collect(mut rx: mpsc::Receiver<StepEvent>) -> Vec<StepEvent> {
+        let mut events = Vec::new();
+        while let Some(event) = rx.recv().await {
+            events.push(event);
+        }
+        events
+    }
+
+    fn output_text(events: &[StepEvent]) -> Option<String> {
+        events.iter().find_map(|e| match e {
+            StepEvent::Output { line, .. } => Some(line.clone()),
+            _ => None,
+        })
+    }
+
+    fn failed_text(events: &[StepEvent]) -> Option<String> {
+        events.iter().find_map(|e| match e {
+            StepEvent::Failed { error, .. } => Some(error.clone()),
+            _ => None,
+        })
+    }
+
+    fn table_row_count(db: &crate::db::Database, table: &str) -> i64 {
+        db.conn()
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
+            .unwrap()
+    }
+
+    // --- 1/2: a saved key reaches Zen with the customer's own key, and
+    // settles as an unbilled `provider_spend` row only. ---
+
+    #[tokio::test]
+    async fn a_saved_key_reaches_zen_with_bearer_auth_and_the_reply_streams() {
+        let (url, seen) = fake_zen(
+            StatusCode::OK,
+            serde_json::json!({
+                "id": "chatcmpl-1",
+                "choices": [{"message": {"role": "assistant", "content": "hello from zen"}}],
+                "usage": {
+                    "prompt_tokens": 5,
+                    "completion_tokens": 3,
+                    "prompt_tokens_details": {"cached_tokens": 0}
+                }
+            }),
+        )
+        .await;
+        let (_dir, state) = test_state().await;
+        let (tx, rx) = mpsc::channel::<StepEvent>(64);
+        let key = ZenApiKey::new("zen-secret-CUSTKEY1234".into());
+
+        run(
+            state.clone(),
+            "user-1".into(),
+            Some("conv-1".into()),
+            MODEL.into(),
+            "system".into(),
+            "hi".into(),
+            key,
+            tx,
+            ZenTransport::with_base_url(url),
+        )
+        .await;
+
+        let events = collect(rx).await;
+        assert_eq!(output_text(&events).as_deref(), Some("hello from zen"));
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1, "zen must be called exactly once");
+        assert_eq!(
+            seen[0].0["authorization"], "Bearer zen-secret-CUSTKEY1234",
+            "the mock must receive the customer's own key as a bearer token"
+        );
+
+        // #2: nothing billed to Cortex -- no reservation, no authorization,
+        // no credit transaction, no balance row at all; exactly one
+        // `provider_spend` row, tagged `byok` at zero cost, for analytics
+        // only. NOTE (reasoned, not run): if `chat_zen::run` ever grew a
+        // `db.deduct_credits_up_to(...)` call on this path, this test would
+        // still pass unless that call also wrote a `credit_transactions`
+        // row and moved `credit_balances` -- which `deduct_credits_up_to`
+        // always does on success (see `db/ledger.rs`). So a stray deduct
+        // call here would flip the `credit_transactions` and
+        // `credit_balances` assertions below and fail this test.
+        let db = state.db.as_ref().unwrap();
+        assert_eq!(table_row_count(db, "credit_transactions"), 0);
+        assert_eq!(table_row_count(db, "provider_request_reservations"), 0);
+        assert_eq!(table_row_count(db, "provider_spend_authorizations"), 0);
+        assert_eq!(table_row_count(db, "provider_spend"), 1);
+        assert!(
+            db.get_credit_balance_row("user-1").is_none(),
+            "byok never touches credit_balances"
+        );
+        let (cost_type, cost_micro_usd): (String, i64) = db
+            .conn()
+            .query_row(
+                "SELECT cost_type, cost_micro_usd FROM provider_spend",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(cost_type, "byok");
+        assert_eq!(cost_micro_usd, 0);
+    }
+
+    // --- 3: no key -> 409 zen_key_required, before any transport call. ---
+
+    #[tokio::test]
+    async fn no_key_refuses_with_409_before_any_call() {
+        let _guard = BYOK_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("CORTEX_BYOK_KEK_V1", STANDARD.encode([11u8; 32]));
+        std::env::set_var("CORTEX_BYOK_KEK_CURRENT", "1");
+
+        let (_dir, state) = test_state().await;
+        let user = ClerkUser {
+            user_id: "user-3".into(),
+        };
+        let req = ChatRequest {
+            message: "hi".into(),
+            file_paths: vec![],
+            user_id: None,
+            conversation_id: None,
+            routing_preferences: None,
+            model: Some(format!("zen:{MODEL}")),
+        };
+
+        let result = chat(
+            State(state.clone()),
+            user,
+            req,
+            MODEL.into(),
+            "system".into(),
+        )
+        .await;
+
+        std::env::remove_var("CORTEX_BYOK_KEK_V1");
+        std::env::remove_var("CORTEX_BYOK_KEK_CURRENT");
+
+        let response = result.expect_err("no key must refuse, not stream");
+        assert_eq!(response.status(), axum::http::StatusCode::CONFLICT);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"], "zen_key_required");
+    }
+
+    // --- 4: a rejected key -> the same 409, never falls through. ---
+
+    #[tokio::test]
+    async fn rejected_key_refuses_with_409() {
+        let _guard = BYOK_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("CORTEX_BYOK_KEK_V1", STANDARD.encode([11u8; 32]));
+        std::env::set_var("CORTEX_BYOK_KEK_CURRENT", "1");
+
+        let (_dir, state) = test_state().await;
+        state.db.as_ref().unwrap().upsert_provider_key(
+            "user-4",
+            "zen",
+            &stub_encrypted_key(),
+            "1234",
+            1_800_000_000_000,
+        );
+        state
+            .db
+            .as_ref()
+            .unwrap()
+            .mark_provider_key_rejected("user-4", "zen", 1_800_000_000_000);
+
+        let user = ClerkUser {
+            user_id: "user-4".into(),
+        };
+        let req = ChatRequest {
+            message: "hi".into(),
+            file_paths: vec![],
+            user_id: None,
+            conversation_id: None,
+            routing_preferences: None,
+            model: Some(format!("zen:{MODEL}")),
+        };
+
+        let result = chat(
+            State(state.clone()),
+            user,
+            req,
+            MODEL.into(),
+            "system".into(),
+        )
+        .await;
+
+        std::env::remove_var("CORTEX_BYOK_KEK_V1");
+        std::env::remove_var("CORTEX_BYOK_KEK_CURRENT");
+
+        let response = result.expect_err("a rejected key must refuse, not stream");
+        assert_eq!(response.status(), axum::http::StatusCode::CONFLICT);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"], "zen_key_required");
+    }
+
+    // --- 5: no subscription -> 402, before this module (and its decrypt
+    // call) ever runs -- the check lives in `chat::chat`, not here. ---
+
+    #[tokio::test]
+    async fn no_subscription_refuses_with_402_before_chat_zen_runs() {
+        let (_dir, state) = test_state_with_clerk_secret(Some("test-clerk-secret".into())).await;
+        state
+            .db
+            .as_ref()
+            .unwrap()
+            .upsert_subscription(&crate::db::SubscriptionRecord {
+                clerk_user_id: "user-5".into(),
+                stripe_customer_id: "cus_test".into(),
+                stripe_subscription_id: None,
+                plan_type: "pro".into(),
+                status: "past_due".into(),
+                trial_end: None,
+                current_period_start: None,
+                current_period_end: None,
+            });
+
+        let user = ClerkUser {
+            user_id: "user-5".into(),
+        };
+        let req = ChatRequest {
+            message: "hi".into(),
+            file_paths: vec![],
+            user_id: None,
+            conversation_id: None,
+            routing_preferences: None,
+            model: Some(format!("zen:{MODEL}")),
+        };
+
+        let result = crate::chat::chat(State(state.clone()), user, Json(req)).await;
+
+        let response = result.expect_err("no active subscription must refuse before zen runs");
+        assert_eq!(response.status(), axum::http::StatusCode::PAYMENT_REQUIRED);
+        // Never touched a provider key: no row exists, and none was created.
+        assert!(state
+            .db
+            .as_ref()
+            .unwrap()
+            .get_provider_key_row("user-5", "zen")
+            .is_none());
+    }
+
+    // --- 6: a 401 from Zen marks the key rejected, and never shows the
+    // customer their key or the raw upstream body. ---
+
+    #[tokio::test]
+    async fn a_401_from_zen_marks_the_key_rejected_and_hides_the_body() {
+        let (url, _seen) = fake_zen(
+            StatusCode::UNAUTHORIZED,
+            serde_json::json!({"error": {"message": "raw-upstream-body-marker-should-not-leak"}}),
+        )
+        .await;
+        let (_dir, state) = test_state().await;
+        state.db.as_ref().unwrap().upsert_provider_key(
+            "user-6",
+            "zen",
+            &stub_encrypted_key(),
+            "1234",
+            1_800_000_000_000,
+        );
+
+        let (tx, rx) = mpsc::channel::<StepEvent>(64);
+        let key = ZenApiKey::new("zen-secret-CUSTKEY1234".into());
+        run(
+            state.clone(),
+            "user-6".into(),
+            None,
+            MODEL.into(),
+            "system".into(),
+            "hi".into(),
+            key,
+            tx,
+            ZenTransport::with_base_url(url),
+        )
+        .await;
+
+        let events = collect(rx).await;
+        let failed = failed_text(&events).expect("a 401 must fail the turn");
+        assert!(!failed.contains("zen-secret-CUSTKEY1234"));
+        assert!(!failed.contains("raw-upstream-body-marker-should-not-leak"));
+
+        let row = state
+            .db
+            .as_ref()
+            .unwrap()
+            .get_provider_key_row("user-6", "zen")
+            .unwrap();
+        assert_eq!(row.status, "rejected");
+    }
+
+    // --- 7: a model outside the allowlist -> 400, before any KEK/db work. ---
+
+    #[tokio::test]
+    async fn a_model_outside_the_allowlist_refuses_with_400() {
+        let (_dir, state) = test_state().await;
+        let user = ClerkUser {
+            user_id: "user-7".into(),
+        };
+        let req = ChatRequest {
+            message: "hi".into(),
+            file_paths: vec![],
+            user_id: None,
+            conversation_id: None,
+            routing_preferences: None,
+            model: Some("zen:big-pickle".into()),
+        };
+
+        let result = chat(
+            State(state),
+            user,
+            req,
+            "big-pickle".into(),
+            "system".into(),
+        )
+        .await;
+
+        let response = result.expect_err("an unlisted model must refuse, not stream");
+        assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"], "zen_model_not_allowed");
+    }
+
+    // --- 8: GET /api/chat/models reflects real key state for Zen entries,
+    // and never changes the Claude entries. ---
+
+    #[tokio::test]
+    async fn chat_models_reflects_zen_key_state_and_leaves_claude_unchanged() {
+        let _guard = BYOK_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("CORTEX_BYOK_KEK_V1", STANDARD.encode([11u8; 32]));
+        std::env::set_var("CORTEX_BYOK_KEK_CURRENT", "1");
+
+        let (_dir, state) = test_state().await;
+        let user = ClerkUser {
+            user_id: "user-8".into(),
+        };
+
+        let before = crate::chat::chat_models(State(state.clone()), user.clone())
+            .await
+            .0;
+        let claude_before: Vec<serde_json::Value> = before
+            .models
+            .iter()
+            .filter(|m| m.provider == "claude")
+            .map(|m| serde_json::to_value(m).unwrap())
+            .collect();
+        let zen_before: Vec<_> = before
+            .models
+            .iter()
+            .filter(|m| m.provider == "zen")
+            .collect();
+        assert!(zen_before
+            .iter()
+            .all(|m| !m.available && m.unavailable_reason.as_deref() == Some("needs_key")));
+
+        state.db.as_ref().unwrap().upsert_provider_key(
+            "user-8",
+            "zen",
+            &stub_encrypted_key(),
+            "1234",
+            1_800_000_000_000,
+        );
+
+        let after = crate::chat::chat_models(State(state.clone()), user).await.0;
+        let zen_after: Vec<_> = after
+            .models
+            .iter()
+            .filter(|m| m.provider == "zen")
+            .collect();
+        assert!(zen_after
+            .iter()
+            .all(|m| m.available && m.unavailable_reason.is_none()));
+
+        let claude_after: Vec<serde_json::Value> = after
+            .models
+            .iter()
+            .filter(|m| m.provider == "claude")
+            .map(|m| serde_json::to_value(m).unwrap())
+            .collect();
+        assert_eq!(claude_before, claude_after, "claude entries never change");
+
+        std::env::remove_var("CORTEX_BYOK_KEK_V1");
+        std::env::remove_var("CORTEX_BYOK_KEK_CURRENT");
+    }
+
+    // --- 9: no `model` field behaves exactly as before -- it never reaches
+    // chat_zen at all. ---
+
+    #[tokio::test]
+    async fn no_model_field_takes_the_pre_existing_path_not_zen() {
+        let (_dir, state) = test_state().await;
+        let user = ClerkUser {
+            user_id: "user-9".into(),
+        };
+        let req = ChatRequest {
+            message: "hi".into(),
+            file_paths: vec![],
+            user_id: None,
+            conversation_id: None,
+            routing_preferences: None,
+            model: None,
+        };
+
+        let result = crate::chat::chat(State(state.clone()), user, Json(req)).await;
+        // `chat_zen::chat` only ever returns `zen_key_required`,
+        // `zen_model_not_allowed`, or `database_unavailable` -- with no
+        // `model` field, `chat::chat`'s own guard never calls into this
+        // module at all, so the only possible outcomes are the pre-existing
+        // ones: a normal SSE stream (no provider gateway configured here,
+        // so `ProviderPath::None`) or one of `chat::chat`'s own pre-routing
+        // refusals, never a zen-tagged error body.
+        if let Err(response) = result {
+            let status = response.status();
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
+            assert_ne!(
+                body.get("error").and_then(|v| v.as_str()),
+                Some("zen_key_required")
+            );
+            assert_ne!(
+                body.get("error").and_then(|v| v.as_str()),
+                Some("zen_model_not_allowed")
+            );
+            let _ = status;
         }
     }
 }
