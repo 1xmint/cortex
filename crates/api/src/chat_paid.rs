@@ -1758,9 +1758,17 @@ mod tests {
         let db = Database::open(&db_path);
         db.init_credit_balance("user-1", 100).unwrap();
 
+        // Usage must stay inside the per-turn reservation (MAX_OUTPUT_TOKENS
+        // of output) or the gateway refuses it before the loop sees it. A
+        // haiku turn that size costs under one credit, so this test uses a
+        // pricier model to make one in-bounds turn cost more than the 1
+        // credit left after the concurrent drain.
+        const PRICEY_MODEL: &str = "claude-opus-5";
+        let input_tokens = 10;
+        let output_tokens = MAX_OUTPUT_TOKENS - 96;
         let price_list = db.active_price_list().unwrap();
-        let rate = price_list.model("claude", MODEL).unwrap();
-        let observed_micros = rate.cost_micros(100_000, 0, 100_000);
+        let rate = price_list.model("claude", PRICEY_MODEL).unwrap();
+        let observed_micros = rate.cost_micros(input_tokens, 0, output_tokens);
         let expected_credits = ceil_div(observed_micros, price_list.micros_per_credit);
         assert!(
             expected_credits > 1,
@@ -1772,8 +1780,8 @@ mod tests {
             user_id: "user-1",
             leave_remaining: 1,
             response_text: "hello there",
-            input_tokens: 100_000,
-            output_tokens: 100_000,
+            input_tokens,
+            output_tokens,
         };
 
         // The turn-1 reservation cap is based on the balance at loop start
@@ -1793,7 +1801,7 @@ mod tests {
             limits,
             "user-1",
             Some("conv-1"),
-            MODEL,
+            PRICEY_MODEL,
             "system",
             "hi",
             "reply-shortfall",
