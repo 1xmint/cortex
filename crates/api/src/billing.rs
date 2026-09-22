@@ -38,32 +38,7 @@ where
         // First, extract the authenticated user via ClerkUser
         let clerk_user = ClerkUser::from_request_parts(parts, state).await?;
 
-        // Dev/local mode: no Clerk configured, allow through
-        if app_state.clerk_secret_key.is_none() {
-            return Ok(PremiumUser {
-                user_id: clerk_user.user_id,
-            });
-        }
-
-        // Admin bypass
-        if crate::admin::authorize_admin(&app_state, &clerk_user)
-            .await
-            .is_ok()
-        {
-            return Ok(PremiumUser {
-                user_id: clerk_user.user_id,
-            });
-        }
-
-        // Check premium status using same logic as is_premium()
-        let is_premium = app_state
-            .db
-            .as_ref()
-            .and_then(|db| db.get_subscription(&clerk_user.user_id))
-            .map(|sub| matches!(sub.status.as_str(), "active" | "trialing"))
-            .unwrap_or(false);
-
-        if is_premium {
+        if premium_user_check(&app_state, &clerk_user).await {
             Ok(PremiumUser {
                 user_id: clerk_user.user_id,
             })
@@ -76,6 +51,29 @@ where
             ))
         }
     }
+}
+
+/// The same dev-bypass / admin-bypass / active-or-trialing-subscription logic
+/// [`PremiumUser`]'s extractor gates a route with, factored out so a caller
+/// that already has an authenticated `user_id` and no request parts (the
+/// live voice session's event loop, which is not behind axum extraction) can
+/// run the identical check instead of trusting that voice session start
+/// already verified it.
+pub async fn premium_user_check(app_state: &AppState, clerk_user: &ClerkUser) -> bool {
+    // Dev/local mode: no Clerk configured, allow through
+    if app_state.clerk_secret_key.is_none() {
+        return true;
+    }
+
+    // Admin bypass
+    if crate::admin::authorize_admin(app_state, clerk_user)
+        .await
+        .is_ok()
+    {
+        return true;
+    }
+
+    is_premium(app_state, &clerk_user.user_id)
 }
 
 /// Billing gate errors. Each variant carries current and limit values for diagnostics.
