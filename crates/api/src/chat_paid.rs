@@ -617,17 +617,24 @@ pub(crate) async fn send_paid_reply<T: ProviderTransport + Clone>(
     // run are never given away for free.
     let charged_credits_total = if total_observed_micro_usd > 0 {
         let credits = ceil_div(total_observed_micro_usd, price_list.micros_per_credit);
-        db.deduct_credits(
+        // Never discard the reply over the final charge: `?` here would turn
+        // a billing hiccup (or a balance that shrank mid-loop, e.g. another
+        // reply spending concurrently) into a lost answer the user already
+        // paid the supplier for. `deduct_credits_up_to` clamps to whatever is
+        // actually left instead of erroring, so this only fails on a real
+        // database error, which we log and still answer past.
+        match db.deduct_credits_up_to(
             user_id,
             credits,
             "Cortex-paid chat reply",
             &ChargeKey::for_chat_reply(reply_id),
-        )
-        .map_err(|e| {
-            tracing::error!(user_id, reply_id, error = %e, "chat: failed to charge for reply");
-            PaidReplyError::Unavailable
-        })?;
-        credits
+        ) {
+            Ok(charged) => charged,
+            Err(e) => {
+                tracing::error!(user_id, reply_id, error = %e, "chat: failed to charge for reply");
+                0
+            }
+        }
     } else {
         0
     };
@@ -1464,6 +1471,129 @@ mod tests {
             reply.text.contains("too quickly"),
             "partial answer must explain the rate limit: {}",
             reply.text
+        );
+    }
+
+    /// A transport that, on its first call, opens a second connection to the
+    /// same sqlite file and spends most of the user's balance out from under
+    /// the reply in progress — standing in for a concurrent charge (another
+    /// reply, another device) between when this loop reserved its spend and
+    /// when it settles the final charge.
+    #[derive(Clone)]
+    struct ShrinkingBalanceTransport {
+        db_path: std::path::PathBuf,
+        user_id: &'static str,
+        leave_remaining: i64,
+        response_text: &'static str,
+        input_tokens: i64,
+        output_tokens: i64,
+    }
+
+    impl ProviderTransport for ShrinkingBalanceTransport {
+        fn forward(
+            &self,
+            _supplier_key: &str,
+            _request: &GatewayRequest,
+        ) -> impl Future<Output = Result<TransportResponse, TransportFailure>> + Send {
+            let concurrent_db = Database::open(&self.db_path);
+            let balance = concurrent_db
+                .get_credit_balance_row(self.user_id)
+                .expect("balance row");
+            let available = balance.subscription_remaining + balance.pack_remaining;
+            let drain = (available - self.leave_remaining).max(0);
+            if drain > 0 {
+                concurrent_db
+                    .deduct_credits(
+                        self.user_id,
+                        drain,
+                        "concurrent spend",
+                        &ChargeKey::for_verification("concurrent-drain"),
+                    )
+                    .expect("concurrent deduction should succeed");
+            }
+            let input_tokens = self.input_tokens;
+            let output_tokens = self.output_tokens;
+            let text = self.response_text;
+            std::future::ready(Ok(TransportResponse {
+                body: serde_json::json!({
+                    "id": "msg_test",
+                    "type": "message",
+                    "role": "assistant",
+                    "model": MODEL,
+                    "content": [{"type": "text", "text": text}],
+                    "stop_reason": "end_turn",
+                    "stop_sequence": null,
+                    "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens}
+                }),
+                upstream_request_id: Some("upstream-1".into()),
+                usage: Some(ObservedUsage {
+                    input_tokens,
+                    cached_input_tokens: 0,
+                    output_tokens,
+                }),
+            }))
+        }
+    }
+
+    #[tokio::test]
+    async fn final_charge_shortfall_still_returns_reply() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("chat-paid.sqlite");
+        let db = Database::open(&db_path);
+        db.init_credit_balance("user-1", 100).unwrap();
+
+        let price_list = db.active_price_list().unwrap();
+        let rate = price_list.model("claude", MODEL).unwrap();
+        let observed_micros = rate.cost_micros(500, 0, 500);
+        let expected_credits = ceil_div(observed_micros, price_list.micros_per_credit);
+        assert!(
+            expected_credits > 1,
+            "fixture must cost more than the 1 credit left after the concurrent drain"
+        );
+
+        let transport = ShrinkingBalanceTransport {
+            db_path: db_path.clone(),
+            user_id: "user-1",
+            leave_remaining: 1,
+            response_text: "hello there",
+            input_tokens: 500,
+            output_tokens: 500,
+        };
+
+        // The turn-1 reservation cap is based on the balance at loop start
+        // (100 credits), so it is happy to authorize a turn that ends up
+        // costing more than what's left once the concurrent drain (inside
+        // the transport call) has run.
+        let limits = SpendLimits {
+            max_micro_usd: 1_000_000_000_000,
+            funded_micro_usd: 1_000_000_000_000,
+        };
+
+        let reply = send_paid_reply(
+            &db,
+            SIGNING_KEY,
+            SUPPLIER_KEY,
+            transport,
+            limits,
+            "user-1",
+            Some("conv-1"),
+            MODEL,
+            "system",
+            "hi",
+            "reply-shortfall",
+            NOW,
+            20,
+            None,
+        )
+        .await
+        .expect("a shortfall at final-charge time must not discard the reply");
+
+        assert_eq!(reply.text, "hello there");
+        let balance = db.get_credit_balance_row("user-1").unwrap();
+        assert_eq!(
+            balance.subscription_remaining + balance.pack_remaining,
+            0,
+            "the clamped charge must take exactly what was left, not go negative"
         );
     }
 }
