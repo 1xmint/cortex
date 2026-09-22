@@ -370,12 +370,6 @@ async fn run<T: ProviderTransport + Clone>(
                 })
                 .await;
 
-            if let Some(cid) = &conversation_id {
-                if !text.is_empty() {
-                    db.add_message(cid, "assistant", &text, Some("zen"), Some(&model));
-                }
-            }
-
             db.touch_provider_key_last_used(&user_id, "zen", now_ms);
             let ObservedUsage {
                 input_tokens,
@@ -396,6 +390,24 @@ async fn run<T: ProviderTransport + Clone>(
                 cached_input_tokens,
                 now_ms,
             );
+
+            if let Some(cid) = &conversation_id {
+                if !text.is_empty() {
+                    if let Err(error) =
+                        db.try_add_message(cid, "assistant", &text, Some("zen"), Some(&model))
+                    {
+                        // The conversation may have been deleted mid-reply;
+                        // usage is already recorded above, so this is only
+                        // a lost transcript entry, never a panicked task.
+                        tracing::error!(
+                            %error,
+                            %reply_id,
+                            conversation_id = %cid,
+                            "failed to store zen byok assistant reply"
+                        );
+                    }
+                }
+            }
         }
         Err(failure) => {
             // The raw upstream body/message is sanitized by
@@ -433,6 +445,7 @@ mod tests {
     use axum::http::HeaderMap;
     use axum::routing::post;
     use base64::{engine::general_purpose::STANDARD, Engine};
+    use rusqlite::params;
     use std::sync::Mutex as StdMutex;
 
     const MODEL: &str = "deepseek-v4-flash";
@@ -540,13 +553,15 @@ mod tests {
         )
         .await;
         let (_dir, state) = test_state().await;
+        let db = state.db.as_ref().unwrap();
+        let conversation = db.create_conversation("user-1", None);
         let (tx, rx) = mpsc::channel::<StepEvent>(64);
         let key = ZenApiKey::new("zen-secret-CUSTKEY1234".into());
 
         run(
             state.clone(),
             "user-1".into(),
-            Some("conv-1".into()),
+            Some(conversation.id.clone()),
             MODEL.into(),
             "system".into(),
             "hi".into(),
@@ -595,6 +610,16 @@ mod tests {
             .unwrap();
         assert_eq!(cost_type, "byok");
         assert_eq!(cost_micro_usd, 0);
+
+        let stored: String = db
+            .conn()
+            .query_row(
+                "SELECT content FROM messages WHERE conversation_id = ?1 AND role = 'assistant'",
+                params![conversation.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, "hello from zen");
     }
 
     // --- 3: no key -> 409 zen_key_required, before any transport call. ---
