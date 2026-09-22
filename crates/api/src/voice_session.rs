@@ -958,6 +958,16 @@ async fn run_billing_loop(
     // carries no request text or tool arguments (confirmed against
     // https://developers.openai.com/api/docs/guides/live-migration).
     let mut pending_transcript = String::new();
+    // Set whenever `spoken_tick`'s own tick (not a `session.delegation.created`
+    // event) resolves a spoken Confirm/Cancel. GPT-Live can still turn that
+    // same spoken utterance into a `session.delegation.created` event shortly
+    // after the tick already resolved it — the matcher has moved on to
+    // `Resolved` by then, so `route_delegation` alone can no longer catch it
+    // and would delegate it as a brand-new (paid) request. This marker gives
+    // that late-arriving delegation a short grace window to be swallowed
+    // instead, with no `send_paid_reply` and no reservation.
+    let mut swallow_delegation_until: Option<Instant> = None;
+    const SWALLOW_DELEGATION_WINDOW: Duration = Duration::from_secs(3);
     let delegation_busy = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     // Told to a still-running delegation once this loop exits, so its agent
     // loop stops cooperatively at its next turn boundary — see
@@ -992,7 +1002,25 @@ async fn run_billing_loop(
             }
             _ = spoken_tick.tick() => {
                 if let Some(outcome) = lock_spoken_matcher(&state, &session_id, |m| m.tick(Instant::now())) {
-                    spawn_resolve_spoken_outcome(&state, &session_id, &user_id, &commentary_tx, outcome);
+                    if matches!(
+                        outcome.kind,
+                        spoken_confirm::OutcomeKind::Confirm | spoken_confirm::OutcomeKind::Cancel
+                    ) {
+                        pending_transcript.clear();
+                        swallow_delegation_until =
+                            Some(Instant::now() + SWALLOW_DELEGATION_WINDOW);
+                    }
+                    // Resolved by the tick, not a delegation event: there is
+                    // no delegation id to attach a `session.commentary.append`
+                    // to, so speak via `session.instructions.append` instead.
+                    spawn_resolve_spoken_outcome(
+                        &state,
+                        &session_id,
+                        &user_id,
+                        &commentary_tx,
+                        None,
+                        outcome,
+                    );
                 }
             }
             event = sideband.recv() => {
@@ -1010,45 +1038,76 @@ async fn run_billing_loop(
                                     &session_id,
                                     &user_id,
                                     &commentary_tx,
+                                    None,
                                     outcome,
                                 );
                             }
                         }
                     }
                     Some("session.delegation.created") => {
-                        match route_delegation(&state, &session_id) {
-                            DelegationRouting::ConsumedBySpokenMatcher(outcome) => {
-                                // This delegation was the spoken yes/no (or
-                                // unmatched) reply to an already-open confirm
-                                // window, not a new task: consumed here so it
-                                // never reaches `send_paid_reply` — a real
-                                // turn would also reserve credits and could
-                                // propose a fresh pending row, voiding this
-                                // one out from under itself. The accumulated
-                                // transcript that fed the matcher is
-                                // discarded, not carried into whatever
-                                // delegation comes next.
-                                pending_transcript.clear();
-                                spawn_resolve_spoken_outcome(
-                                    &state,
-                                    &session_id,
-                                    &user_id,
-                                    &commentary_tx,
-                                    outcome,
-                                );
-                            }
-                            DelegationRouting::Delegate => {
-                                handle_delegation_created(
-                                    &event,
-                                    &state,
-                                    &session_id,
-                                    &user_id,
-                                    conversation_id.as_deref(),
-                                    &delegation_busy,
-                                    &delegation_cancel,
-                                    &mut pending_transcript,
-                                    &commentary_tx,
-                                );
+                        // Checked first, before `route_delegation` even runs:
+                        // a tick may have already resolved the spoken
+                        // Confirm/Cancel that this delegation is the tail end
+                        // of (see `swallow_delegation_until`'s own doc). By
+                        // the time this event arrives the matcher itself has
+                        // moved on to `Resolved`, so `route_delegation` alone
+                        // would no longer catch it and would delegate it as
+                        // a brand-new paid request.
+                        let swallow = swallow_delegation_until
+                            .take()
+                            .is_some_and(|deadline| Instant::now() <= deadline);
+                        if swallow {
+                            // Consumed outright: no `send_paid_reply`, no
+                            // reservation. `pending_transcript` was already
+                            // cleared when the tick resolved it.
+                        } else {
+                            match route_delegation(&state, &session_id) {
+                                DelegationRouting::ConsumedBySpokenMatcher(outcome) => {
+                                    // This delegation was the spoken yes/no
+                                    // reply to an already-open confirm
+                                    // window, not a new task: consumed here
+                                    // so it never reaches `send_paid_reply` —
+                                    // a real turn would also reserve credits
+                                    // and could propose a fresh pending row,
+                                    // voiding this one out from under itself.
+                                    // The accumulated transcript that fed the
+                                    // matcher is discarded, not carried into
+                                    // whatever delegation comes next.
+                                    //
+                                    // A `Closed` outcome (unmatched speech)
+                                    // is not routed here at all —
+                                    // `route_delegation` only returns this
+                                    // variant for Confirm/Cancel — so it
+                                    // falls through to `Delegate` below and
+                                    // reaches `handle_delegation_created` like
+                                    // any other real request.
+                                    pending_transcript.clear();
+                                    let delegation_id = event
+                                        .pointer("/delegation/id")
+                                        .and_then(Value::as_str)
+                                        .map(str::to_string);
+                                    spawn_resolve_spoken_outcome(
+                                        &state,
+                                        &session_id,
+                                        &user_id,
+                                        &commentary_tx,
+                                        delegation_id,
+                                        outcome,
+                                    );
+                                }
+                                DelegationRouting::Delegate => {
+                                    handle_delegation_created(
+                                        &event,
+                                        &state,
+                                        &session_id,
+                                        &user_id,
+                                        conversation_id.as_deref(),
+                                        &delegation_busy,
+                                        &delegation_cancel,
+                                        &mut pending_transcript,
+                                        &commentary_tx,
+                                    );
+                                }
                             }
                         }
                     }
@@ -1346,6 +1405,24 @@ fn commentary_event(delegation_id: &str, content: &str) -> Value {
     })
 }
 
+/// Build one `session.instructions.append` event, for the rare case where
+/// [`resolve_spoken_outcome`] needs to speak a result but has no delegation
+/// id to send a `session.commentary.append` event for (an outcome resolved
+/// by `spoken_tick` rather than by a `session.delegation.created` event).
+///
+/// UNVERIFIED against the live API: nothing else in this codebase sends
+/// `session.instructions.append`, so this shape — a bare `type`/`content`
+/// object, mirroring [`commentary_event`] minus the delegation id — is
+/// inferred, not confirmed against OpenAI's docs or a live GPT-Live session.
+/// If OpenAI rejects it in this position, that needs its own follow-up.
+fn instructions_append_event(content: &str) -> Value {
+    let content: String = content.chars().take(COMMENTARY_CHAR_CAP).collect();
+    serde_json::json!({
+        "type": "session.instructions.append",
+        "content": content,
+    })
+}
+
 /// The fixed server template spoken (well — sent as commentary for GPT-Live
 /// to paraphrase aloud) when a voice delegation proposes a `Risk::Confirm`
 /// tool. Never the model's own words: the model never sees the tool's
@@ -1430,8 +1507,12 @@ where
 
 /// What `session.delegation.created` becomes once the spoken matcher has had
 /// first look at it: either the matcher consumed it as the currently-open
-/// window's yes/no (or unmatched) reply, or no window was open for it and it
-/// is a normal delegated task.
+/// window's yes/no reply, or it is a normal delegated task — either because
+/// no window was open for it, or because the window's utterance matched
+/// neither yes nor no (`OutcomeKind::Closed`). A `Closed` outcome only means
+/// the *spoken* path is done for that action; the words the user actually
+/// said are still a real request and must reach `handle_delegation_created`
+/// like any other, with `pending_transcript` intact.
 enum DelegationRouting {
     ConsumedBySpokenMatcher(spoken_confirm::Outcome),
     Delegate,
@@ -1441,10 +1522,32 @@ enum DelegationRouting {
 /// first, exactly as [`run_billing_loop`]'s event loop does, so this
 /// decision is one small, directly testable function rather than inline
 /// branch logic that only a full session run could exercise.
+///
+/// Only `Confirm`/`Cancel` are consumed here. `on_delegation` can also
+/// resolve `Closed` (an in-progress utterance that matched neither yes nor
+/// no) — that is still routed as `Delegate`, since a `Closed` result closes
+/// only the spoken-confirm window, not the user's actual request.
+///
+/// Reverse ordering: a delegation can also arrive while the window is open
+/// and an utterance is *in progress but not yet resolved* — e.g. GPT-Live
+/// decides to start a turn before the 1.0s silence gap `tick` waits for
+/// would have fired. Rather than deferring the delegation for up to ~1.5s
+/// to let the matcher resolve it on its own, this just feeds it straight
+/// into [`spoken_confirm::Matcher::on_delegation`] (via `lock_spoken_matcher`
+/// below), which already ends and classifies the in-progress utterance
+/// immediately when a delegation starts — the simpler of the two options,
+/// and no extra state or timer is needed for it.
 fn route_delegation(state: &Arc<AppState>, session_id: &str) -> DelegationRouting {
     match lock_spoken_matcher(state, session_id, |m| m.on_delegation(Instant::now())) {
-        Some(outcome) => DelegationRouting::ConsumedBySpokenMatcher(outcome),
-        None => DelegationRouting::Delegate,
+        Some(outcome)
+            if matches!(
+                outcome.kind,
+                spoken_confirm::OutcomeKind::Confirm | spoken_confirm::OutcomeKind::Cancel
+            ) =>
+        {
+            DelegationRouting::ConsumedBySpokenMatcher(outcome)
+        }
+        _ => DelegationRouting::Delegate,
     }
 }
 
@@ -1453,11 +1556,18 @@ fn route_delegation(state: &Arc<AppState>, session_id: &str) -> DelegationRoutin
 /// `Risk::Confirm` tool all the way through, e.g. `open_pr`'s `git push` —
 /// never blocks this session's single event-loop task from processing the
 /// next sideband event.
+/// `delegation_id` is the real `/delegation/id` from the
+/// `session.delegation.created` event that this outcome was consumed from —
+/// `commentary_event` (`session.commentary.append`) needs it, per GPT-Live's
+/// documented shape for that event. `None` when the outcome was resolved by
+/// `spoken_tick` instead, with no delegation to attach to; see
+/// [`resolve_spoken_outcome`] for what it speaks through in that case.
 fn spawn_resolve_spoken_outcome(
     state: &Arc<AppState>,
     session_id: &str,
     user_id: &str,
     commentary_tx: &mpsc::Sender<Value>,
+    delegation_id: Option<String>,
     outcome: spoken_confirm::Outcome,
 ) {
     let state = state.clone();
@@ -1465,7 +1575,15 @@ fn spawn_resolve_spoken_outcome(
     let user_id = user_id.to_string();
     let commentary_tx = commentary_tx.clone();
     tokio::spawn(async move {
-        resolve_spoken_outcome(&state, &session_id, &user_id, &commentary_tx, outcome).await;
+        resolve_spoken_outcome(
+            &state,
+            &session_id,
+            &user_id,
+            &commentary_tx,
+            delegation_id,
+            outcome,
+        )
+        .await;
     });
 }
 
@@ -1514,18 +1632,26 @@ async fn confirm_spoken_action(
 /// Resolves one terminal [`spoken_confirm::Outcome`] for `session_id`:
 /// confirms or cancels through the same gates the tap route uses, publishes
 /// `VoiceEvent::ConfirmResolved` when the row's status actually changed, and
-/// speaks a short result via `session.commentary.append`
-/// ([`commentary_event`]) — GPT-Live's documented channel for text this
-/// session wants spoken back, so no `session.instructions.append` fallback
-/// is wired here; if OpenAI ever rejects commentary in this position, that
-/// would need its own follow-up.
+/// speaks a short result back. When `delegation_id` is `Some` (the outcome
+/// was consumed from a real `session.delegation.created` event), that speaks
+/// through `session.commentary.append` ([`commentary_event`]) carrying that
+/// event's own delegation id — GPT-Live's documented channel for text this
+/// session wants spoken back. When `delegation_id` is `None` (the outcome
+/// was resolved by `spoken_tick`'s own timer, with no delegation at all),
+/// there is nothing to attach a commentary event to, so this speaks through
+/// `session.instructions.append` ([`instructions_append_event`]) instead.
 async fn resolve_spoken_outcome(
     state: &Arc<AppState>,
     session_id: &str,
     user_id: &str,
     commentary_tx: &mpsc::Sender<Value>,
+    delegation_id: Option<String>,
     outcome: spoken_confirm::Outcome,
 ) {
+    let speak = |text: &str| match &delegation_id {
+        Some(id) => commentary_event(id, text),
+        None => instructions_append_event(text),
+    };
     let spoken_confirm::Outcome { action_id, kind } = outcome;
     match kind {
         spoken_confirm::OutcomeKind::Confirm => {
@@ -1541,15 +1667,17 @@ async fn resolve_spoken_outcome(
                     },
                 );
             }
-            let _ = commentary_tx
-                .send(commentary_event(&action_id, &spoken_text))
-                .await;
+            let _ = commentary_tx.send(speak(&spoken_text)).await;
         }
         spoken_confirm::OutcomeKind::Cancel => {
             let Some(db) = state.db.as_ref() else {
                 return;
             };
             let now = chrono::Utc::now().timestamp();
+            // A spoken cancel skips the premium check on purpose (unlike the
+            // spoken `Confirm` arm above): cancelling a pending action is
+            // harmless and costs nothing, so there is nothing here for the
+            // premium gate to protect.
             if crate::agent_confirm::cancel_pending_action_spoken(db, user_id, &action_id, now) {
                 publish_voice_event(
                     state,
@@ -1559,13 +1687,10 @@ async fn resolve_spoken_outcome(
                         status: "cancelled".to_string(),
                     },
                 );
-                let _ = commentary_tx
-                    .send(commentary_event(&action_id, "OK, cancelled."))
-                    .await;
+                let _ = commentary_tx.send(speak("OK, cancelled.")).await;
             } else {
                 let _ = commentary_tx
-                    .send(commentary_event(
-                        &action_id,
+                    .send(speak(
                         "I couldn't confirm that. Tap Confirm on screen if it's still there.",
                     ))
                     .await;
@@ -1573,10 +1698,7 @@ async fn resolve_spoken_outcome(
         }
         spoken_confirm::OutcomeKind::Expired | spoken_confirm::OutcomeKind::Closed => {
             let _ = commentary_tx
-                .send(commentary_event(
-                    &action_id,
-                    "Tap Confirm on screen if you still want it.",
-                ))
+                .send(speak("Tap Confirm on screen if you still want it."))
                 .await;
         }
     }
@@ -5401,8 +5523,14 @@ mod tests {
                 .await
                 .unwrap_or_else(|_| panic!("prompt-ended must open the window"));
 
-            let db = state.db.as_ref().unwrap();
-            let before = db.get_credit_balance_row(USER);
+            // `handle_delegation_created` — the only path `send_paid_reply`
+            // can be reached from — publishes a `VoiceEvent::VoiceMessage`
+            // (role "user") synchronously, before it ever spawns the paid
+            // agent turn. Subscribing here gives a real seam: if this "yes"
+            // were ever wrongly routed to `DelegationRouting::Delegate`
+            // instead of being consumed, that event would show up below.
+            let mut events = subscribe_voice_events(&state, USER, "sess-1")
+                .unwrap_or_else(|_| panic!("subscribing to this session's events must succeed"));
 
             assert_eq!(
                 lock_spoken_matcher(&state, "sess-1", |m| m.on_transcript("yes", Instant::now())),
@@ -5419,8 +5547,9 @@ mod tests {
             assert_eq!(outcome.kind, spoken_confirm::OutcomeKind::Confirm);
 
             let (tx, mut rx) = mpsc::channel::<Value>(8);
-            resolve_spoken_outcome(&state, "sess-1", USER, &tx, outcome).await;
+            resolve_spoken_outcome(&state, "sess-1", USER, &tx, None, outcome).await;
 
+            let db = state.db.as_ref().unwrap();
             assert_eq!(
                 db.get_pending_action(&action_id, USER).unwrap().status,
                 "confirmed",
@@ -5428,10 +5557,14 @@ mod tests {
             );
             rx.try_recv()
                 .expect("a spoken result must be sent as commentary");
-            assert_eq!(
-                db.get_credit_balance_row(USER),
-                before,
-                "no credit reservation must happen on the spoken-confirm path"
+
+            // Give any wrongly-spawned delegation task a beat to publish,
+            // then confirm nothing did: no `send_paid_reply`/
+            // `handle_delegation_created` turn ever ran for this "yes".
+            tokio::task::yield_now().await;
+            assert!(
+                matches!(events.try_recv(), Err(mpsc::error::TryRecvError::Empty)),
+                "a consumed spoken yes must never reach handle_delegation_created/send_paid_reply"
             );
         }
 
@@ -5498,7 +5631,7 @@ mod tests {
             assert_eq!(outcome.action_id, second.id);
 
             let (tx, _rx) = mpsc::channel::<Value>(8);
-            resolve_spoken_outcome(&state, "sess-1", USER, &tx, outcome).await;
+            resolve_spoken_outcome(&state, "sess-1", USER, &tx, None, outcome).await;
 
             assert_eq!(
                 db.get_pending_action(&second.id, USER).unwrap().status,
@@ -5566,7 +5699,7 @@ mod tests {
             assert_eq!(outcome.kind, spoken_confirm::OutcomeKind::Cancel);
 
             let (tx, _rx) = mpsc::channel::<Value>(8);
-            resolve_spoken_outcome(&state, "sess-1", USER, &tx, outcome).await;
+            resolve_spoken_outcome(&state, "sess-1", USER, &tx, None, outcome).await;
 
             let db = state.db.as_ref().unwrap();
             assert_eq!(
@@ -5617,7 +5750,7 @@ mod tests {
             };
 
             let (tx, mut rx) = mpsc::channel::<Value>(8);
-            resolve_spoken_outcome(&state, "sess-1", USER, &tx, outcome).await;
+            resolve_spoken_outcome(&state, "sess-1", USER, &tx, None, outcome).await;
 
             let db = state.db.as_ref().unwrap();
             assert_eq!(
@@ -5649,10 +5782,21 @@ mod tests {
             let db = state.db.as_ref().unwrap();
             let nonce = db.get_pending_action(&action_id, USER).unwrap().nonce;
 
-            let confirmed = db
-                .confirm_pending_action(&action_id, USER, &nonce, now)
-                .expect("the tap route's own gate must still accept this row");
-            assert_eq!(confirmed.id, action_id);
+            // Goes through the real tap route handler, `agent_confirm::confirm_action`,
+            // rather than its underlying db helper directly — this is what
+            // actually proves the spoken window opening in-memory does not
+            // interfere with the tap route the client still uses.
+            let response = crate::agent_confirm::confirm_action(
+                State(state.clone()),
+                crate::billing::PremiumUser {
+                    user_id: USER.to_string(),
+                },
+                Path(action_id.clone()),
+                Json(crate::agent_confirm::ActionNonceRequest { nonce }),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("the tap route's own gate must still accept this row"));
+            assert_eq!(response.0.status, "confirmed");
             assert_eq!(
                 db.get_pending_action(&action_id, USER).unwrap().status,
                 "confirmed"
@@ -5678,7 +5822,7 @@ mod tests {
             assert_eq!(outcome.kind, spoken_confirm::OutcomeKind::Expired);
 
             let (tx, _rx) = mpsc::channel::<Value>(8);
-            resolve_spoken_outcome(&state, "sess-1", USER, &tx, outcome).await;
+            resolve_spoken_outcome(&state, "sess-1", USER, &tx, None, outcome).await;
 
             let db = state.db.as_ref().unwrap();
             assert_eq!(
