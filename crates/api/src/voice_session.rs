@@ -77,11 +77,17 @@ const MIN_SUPPLIER_KEY_LEN: usize = 20;
 /// disconnect or a panic must not leave this hanging forever.
 const SIDEBAND_ATTACH_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// The session's shape sent to OpenAI, held in one function so a later PR
-/// adding client delegation and tools has exactly one place to change. No
-/// delegation and no tools yet — gpt-live-1 only listens and speaks.
+/// The session's shape sent to OpenAI, held in one function so client
+/// delegation and tools have exactly one place to change. `delegation.type:
+/// "client"` hands requests the model can't answer on its own to this
+/// server (see `handle_delegation_created` in the billing sideband), which
+/// runs the same paid agent loop text chat uses and answers back with
+/// `session.commentary.append`.
 pub(crate) fn live_session_config() -> Value {
-    serde_json::json!({ "model": LIVE_MODEL })
+    serde_json::json!({
+        "model": LIVE_MODEL,
+        "delegation": { "type": "client" },
+    })
 }
 
 /// The same two states the provider gateway and dictation can be in,
@@ -1503,6 +1509,13 @@ mod tests {
             max_micro_usd: 1_000_000_000,
             funded_micro_usd: 1_000_000_000,
         }
+    }
+
+    #[test]
+    fn live_session_config_requests_client_delegation() {
+        let config = live_session_config();
+        assert_eq!(config["model"], LIVE_MODEL);
+        assert_eq!(config["delegation"]["type"], "client");
     }
 
     #[tokio::test]
