@@ -40,15 +40,14 @@ async fn router_as_local_user() -> (tempfile::TempDir, axum::Router, std::sync::
 /// takes the real premium-check branch instead of the local-dev bypass.
 /// `CORTEX_AUTH_DISABLED=1` still short-circuits `ClerkUser` to
 /// `user_id == "local"` with no bearer token needed, and clearing
-/// `CORTEX_ADMIN_EMAILS`/`CORTEX_ADMIN_USERS` while setting the real
-/// `CLERK_SECRET_KEY` env var (read by `admin::admin_set`, separately from
-/// `AppState::clerk_secret_key`) makes the admin bypass fail closed without
-/// any network call, leaving only the subscription check — which "local" has
-/// none of.
+/// `CORTEX_ADMIN_EMAILS`/`CORTEX_ADMIN_USERS` plus passing a
+/// `clerk_secret_key` into `AppState::new` below (read by
+/// `admin::authorize_admin` from state, not a process-global env var) makes
+/// the admin bypass fail closed without any network call, leaving only the
+/// subscription check — which "local" has none of.
 async fn router_as_non_premium_user() -> (tempfile::TempDir, axum::Router, std::sync::Arc<AppState>)
 {
     std::env::set_var("CORTEX_AUTH_DISABLED", "1");
-    std::env::set_var("CLERK_SECRET_KEY", "sk_test_fake_for_router_tests");
     std::env::remove_var("CORTEX_ADMIN_EMAILS");
     std::env::remove_var("CORTEX_ADMIN_USERS");
     let temp = tempfile::tempdir().expect("tempdir");

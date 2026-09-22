@@ -30,7 +30,11 @@ pub async fn authorize_admin(
 ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
     let admins = admin_set();
     if admins.is_empty() {
-        if std::env::var("CLERK_SECRET_KEY").is_err() {
+        // `state.clerk_secret_key`, not the env var directly — reading the
+        // process-global `CLERK_SECRET_KEY` here would make this fail-closed
+        // check depend on whichever value some other, unrelated test last
+        // set it to, since tests in the same binary run in parallel.
+        if state.clerk_secret_key.is_none() {
             return Ok(());
         }
         return Err((
