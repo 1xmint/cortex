@@ -3,6 +3,7 @@ mod agent_confirm;
 mod agent_tools;
 pub mod api_error;
 pub mod billing;
+pub mod byok;
 mod chat;
 mod chat_paid;
 pub mod clerk;
@@ -28,6 +29,7 @@ pub mod mission_control;
 pub mod pricing;
 pub mod provider_gateway;
 mod provider_gateway_http;
+mod provider_keys;
 mod supplier_anthropic;
 mod supplier_openai;
 mod supplier_zen;
@@ -544,6 +546,14 @@ pub fn build_cortex_router(state: Arc<AppState>) -> Router {
         .route("/api/user/routing", post(user::update_profile))
         .route("/api/user/github/status", get(user::github_status))
         .route("/api/user/repos/select", post(user::select_repos))
+        .route(
+            "/api/provider-keys",
+            get(provider_keys::list_keys),
+        )
+        .route(
+            "/api/provider-keys/{provider}",
+            put(provider_keys::save_key).delete(provider_keys::delete_key),
+        )
         .route("/api/integrations/status", get(integrations::integration_status))
         .route("/api/integrations/slack/oauth/start", post(integrations::slack_oauth_start))
         .route("/api/integrations/slack/oauth/callback", get(integrations::slack_oauth_callback))

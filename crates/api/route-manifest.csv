@@ -67,6 +67,8 @@ cortex,GET|POST,/api/projects
 cortex,DELETE|GET,/api/projects/{id}
 cortex,POST,/api/projects/{id}/chat
 cortex,POST,/api/projects/import
+cortex,GET,/api/provider-keys
+cortex,DELETE|PUT,/api/provider-keys/{provider}
 cortex,GET,/api/providers
 cortex,GET|POST,/api/runs
 cortex,GET,/api/runs/{id}
