@@ -364,6 +364,7 @@ export function useLiveVoiceToggle() {
 
   useEffect(() => {
     const handlePageHide = (event: PageTransitionEvent) => {
+      cancelledRef.current = true;
       closeRequestedRef.current = true;
       // `session.close` is synchronous and needs no auth, so it goes out
       // first, over the data channel, even if the keepalive DELETE below
