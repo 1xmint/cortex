@@ -60,9 +60,9 @@ pub enum ConfirmActionError {
 }
 
 fn canonical_json(value: &Value) -> String {
-    // `serde_json`'s `Map` is a `BTreeMap` in this workspace (no crate here
-    // enables the `preserve_order` feature — see the migration v69 doc
-    // comment), so `to_string` already emits object keys in sorted order.
+    // `serde_json`'s `Map` is a `BTreeMap` here (no crate in this workspace
+    // enables the `preserve_order` feature), so `to_string` already emits
+    // object keys in sorted order.
     serde_json::to_string(value).unwrap_or_else(|_| "null".to_string())
 }
 
@@ -98,11 +98,12 @@ impl Database {
     /// in an old browser tab can never confirm an action the model isn't
     /// currently asking about.
     pub fn void_pending_actions_for_conversation(&self, user_id: &str, conversation_id: &str) {
+        let now = chrono::Utc::now().timestamp();
         let conn = self.conn();
         conn.execute(
-            "UPDATE agent_pending_actions SET status = 'cancelled'
-             WHERE user_id = ?1 AND conversation_id = ?2 AND status = 'pending'",
-            params![user_id, conversation_id],
+            "UPDATE agent_pending_actions SET status = 'cancelled', resolved_at = ?1
+             WHERE user_id = ?2 AND conversation_id = ?3 AND status = 'pending'",
+            params![now, user_id, conversation_id],
         )
         .ok();
     }
@@ -130,9 +131,9 @@ impl Database {
             .transaction()
             .expect("begin pending-action transaction");
         tx.execute(
-            "UPDATE agent_pending_actions SET status = 'cancelled'
-             WHERE user_id = ?1 AND conversation_id = ?2 AND status = 'pending'",
-            params![user_id, conversation_id],
+            "UPDATE agent_pending_actions SET status = 'cancelled', resolved_at = ?1
+             WHERE user_id = ?2 AND conversation_id = ?3 AND status = 'pending'",
+            params![now, user_id, conversation_id],
         )
         .expect("void prior pending actions");
         tx.execute(

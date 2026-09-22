@@ -653,12 +653,29 @@ pub(crate) async fn send_paid_reply<T: ProviderTransport + Clone>(
             // Every other tool, including the still-refused `cancel_run`,
             // falls through to the unchanged path below.
             if name == "open_pr" {
-                match agent_tools::validate_confirm_tool(db, user_id, &name, &input) {
+                // A pending row's `conversation_id` is a `NOT NULL` foreign
+                // key that `agent_confirm::confirm_action` later writes an
+                // assistant message against (`Database::add_message`).
+                // Without this check a missing, unknown, or another user's
+                // `conversation_id` (`.unwrap_or_default()` used to paper
+                // over the missing case with `""`) would sail through here
+                // and only blow up later, at confirm time, as a foreign-key
+                // panic — so check ownership up front and refuse before any
+                // row is written, exactly like an invalid-argument tool call.
+                let owned_conversation =
+                    conversation_id.filter(|c| db.get_conversation(c, user_id).is_some());
+                let validated = match owned_conversation {
+                    Some(_) => agent_tools::validate_confirm_tool(db, user_id, &name, &input),
+                    None => Err(agent_tools::ToolError::InvalidArguments(
+                        "confirmable actions need a saved conversation".to_string(),
+                    )),
+                };
+                match validated {
                     Ok(summary) => {
                         let now = chrono::Utc::now().timestamp();
                         let action = db.insert_pending_action(
                             user_id,
-                            conversation_id.unwrap_or_default(),
+                            owned_conversation.expect("checked above"),
                             &name,
                             &input,
                             &summary,
@@ -674,10 +691,11 @@ pub(crate) async fn send_paid_reply<T: ProviderTransport + Clone>(
                                 })
                                 .await;
                         }
-                        tool_activity.push(ToolActivity {
-                            tool_name: name.clone(),
-                            ok: true,
-                        });
+                        // Proposing is not running: no `ToolActivity` entry
+                        // (and no "Checked open_pr." line via
+                        // `tool_activity_summary`) — the client's only signal
+                        // for a proposal is `StepEvent::ConfirmRequired`
+                        // above.
                         tool_results.push(serde_json::json!({
                             "type": "tool_result",
                             "tool_use_id": tool_use_id,
@@ -1467,6 +1485,152 @@ mod tests {
                 .is_some_and(|tools| !tools.is_empty()),
             "the last turn must still carry a non-empty tools list: {last_body}"
         );
+    }
+
+    /// The `Risk::Confirm` `open_pr` tool never actually opens a PR from the
+    /// tool loop itself: asking for it only proposes an
+    /// `agent_pending_actions` row and streams `StepEvent::ConfirmRequired`.
+    /// The only place `agent_tools::execute_confirmed`
+    /// (`crate::routes::create_pr_core`'s caller) is ever invoked is
+    /// `agent_confirm::confirm_action`, which this test never calls — so the
+    /// pending row still reading back as `pending` (not `confirmed`) here is
+    /// direct proof the PR side effect did not run.
+    #[tokio::test]
+    async fn risky_tool_never_executes_without_confirm() {
+        let (_dir, db) = test_db();
+        db.init_credit_balance("user-1", 1000).unwrap();
+        let conversation = db.create_conversation("user-1", None);
+
+        let run_id = db
+            .create_run_with_steps_and_resource_leases(
+                "user-1",
+                "Ship a feature",
+                "auto",
+                &["src/lib.rs".to_string()],
+                None,
+                None,
+                Some(&conversation.id),
+                &[crate::db::ResourceLeaseRequest {
+                    resource_type: "path".to_string(),
+                    repo_key: "github:test/repo".to_string(),
+                    resource_key: "src/lib.rs".to_string(),
+                    mode: "write".to_string(),
+                    reason: Some("test".to_string()),
+                    metadata: serde_json::json!({}),
+                }],
+                &[],
+                &[],
+            )
+            .expect("run created with a write lease");
+        db.record_run_branch(&run_id, "cortex/run-open-pr");
+
+        let transport = SequenceTransport::new(vec![tool_use_response(
+            10,
+            10,
+            "toolu_1",
+            "open_pr",
+            serde_json::json!({"run_id": run_id}),
+        )]);
+        let (tx, mut rx) = mpsc::channel(8);
+
+        let reply = send_paid_reply(
+            &db,
+            SIGNING_KEY,
+            SUPPLIER_KEY,
+            transport.clone(),
+            big_limits(),
+            "user-1",
+            Some(&conversation.id),
+            MODEL,
+            "system",
+            "open a pr for my run",
+            "reply-open-pr",
+            NOW,
+            20,
+            Some(&tx),
+        )
+        .await
+        .expect("reply should succeed even though the tool never ran");
+        drop(tx);
+
+        assert_eq!(transport.call_count(), 1, "the loop stops after proposing");
+        assert!(
+            reply.tool_activity.is_empty(),
+            "proposing is not running: no ToolActivity entry (and no \"Checked open_pr.\" \
+             line), only the ConfirmRequired event below"
+        );
+
+        let mut confirm_action_id = None;
+        while let Some(event) = rx.recv().await {
+            if let StepEvent::ConfirmRequired { action_id, .. } = event {
+                confirm_action_id = Some(action_id);
+            }
+        }
+        let action_id =
+            confirm_action_id.expect("a ConfirmRequired event should have been streamed");
+
+        let pending = db
+            .get_pending_action(&action_id, "user-1")
+            .expect("the proposal was written to agent_pending_actions");
+        assert_eq!(pending.tool_name, "open_pr");
+        assert_eq!(
+            pending.status, "pending",
+            "still pending — nothing confirmed it, so execute_confirmed/create_pr_core never ran"
+        );
+    }
+
+    /// `open_pr` with no `conversation_id` (or one that isn't the caller's
+    /// own, e.g. another user's) is refused before any row is written —
+    /// otherwise `agent_confirm::confirm_action` would later panic on the
+    /// `messages.conversation_id` foreign key when it tried to save the
+    /// tool's result.
+    #[tokio::test]
+    async fn open_pr_without_owned_conversation_is_refused() {
+        let (_dir, db) = test_db();
+        db.init_credit_balance("user-1", 1000).unwrap();
+
+        let transport = SequenceTransport::new(vec![tool_use_response(
+            10,
+            10,
+            "toolu_1",
+            "open_pr",
+            serde_json::json!({"run_id": "does-not-matter"}),
+        )]);
+        let (tx, mut rx) = mpsc::channel(8);
+
+        let reply = send_paid_reply(
+            &db,
+            SIGNING_KEY,
+            SUPPLIER_KEY,
+            transport.clone(),
+            big_limits(),
+            "user-1",
+            None, // no saved conversation
+            MODEL,
+            "system",
+            "open a pr for my run",
+            "reply-no-conv",
+            NOW,
+            20,
+            Some(&tx),
+        )
+        .await
+        .expect("reply should still succeed — the tool call is refused, not the whole reply");
+        drop(tx);
+
+        assert_eq!(
+            reply.tool_activity,
+            vec![ToolActivity {
+                tool_name: "open_pr".into(),
+                ok: false
+            }]
+        );
+        while let Some(event) = rx.recv().await {
+            assert!(
+                !matches!(event, StepEvent::ConfirmRequired { .. }),
+                "a refused proposal must not stream ConfirmRequired"
+            );
+        }
     }
 
     /// A turn's reservation is refused when its worst-case cost would push

@@ -1,12 +1,18 @@
 //! The paid chat agent's tool catalogue.
 //!
 //! A fixed list, not a plugin system: every tool a model can ask for is
-//! named here, with its own JSON schema and its own [`Risk`]. Only
-//! [`Risk::Safe`] tools execute in this PR — [`Risk::Confirm`] exists as a
-//! type so a future PR can add a tool that needs the user's explicit
-//! go-ahead before it runs, without redesigning the catalogue, but every
-//! `Confirm` tool is refused here exactly like an unknown one (see
-//! [`execute`]).
+//! named here, with its own JSON schema and its own [`Risk`]. [`execute`]
+//! (the model-facing path, called straight from the tool loop) still never
+//! runs a [`Risk::Confirm`] tool itself — every `Confirm` tool is refused
+//! there exactly like an unknown one. Instead, a `Confirm` tool with an
+//! implementation in [`validate_confirm_tool`]/[`execute_confirmed`] (today
+//! just `open_pr`) is proposed: `chat_paid.rs`'s tool loop writes an
+//! `agent_pending_actions` row and only [`execute_confirmed`] — called from
+//! `crate::agent_confirm::confirm_action`, never from [`execute`] — actually
+//! runs it, and only once the user has confirmed. A `Confirm` tool with no
+//! such implementation (`cancel_run`) still falls through to
+//! [`validate_confirm_tool`]'s catch-all refusal, so "not implemented yet"
+//! and "not confirmed yet" stay two distinct, separately tested outcomes.
 //!
 //! Every executor takes the requesting user's id and scopes its query to
 //! that user. There is no executor here that can read another user's runs,
@@ -30,7 +36,7 @@ pub enum Risk {
     /// model asks for it.
     Safe,
     /// Would change state, spend money beyond the reply itself, or act on
-    /// another party. Not implemented in this PR — see the module docs.
+    /// another party. Never run from [`execute`] — see the module docs.
     Confirm,
 }
 
@@ -50,8 +56,8 @@ pub struct ToolSpec {
 pub enum ToolError {
     /// Not in [`CATALOGUE`] at all.
     Unknown(String),
-    /// In the catalogue, but its risk is [`Risk::Confirm`] and this PR
-    /// executes no `Confirm` tool.
+    /// In the catalogue, but its risk is [`Risk::Confirm`] — [`execute`]
+    /// never runs one; it is proposed instead (see the module docs).
     ConfirmRequired(String),
     /// The catalogue entry matched but the arguments the model sent do not
     /// satisfy it (e.g. a missing required field).
@@ -184,8 +190,7 @@ pub fn catalogue() -> Vec<ToolSpec> {
         // `crate::agent_confirm` and `chat_paid::send_paid_reply`'s tool loop.
         ToolSpec {
             name: "open_pr",
-            description:
-                "Open a pull request for one of the requesting user's own finished runs. \
+            description: "Open a pull request for one of the requesting user's own finished runs. \
                  Requires the user's explicit confirmation before it runs.",
             schema: json!({
                 "type": "object",

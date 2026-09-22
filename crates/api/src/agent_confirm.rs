@@ -126,13 +126,27 @@ pub async fn confirm_action(
                 )
             })?;
 
-    db.add_message(
-        &action.conversation_id,
-        "assistant",
-        &result.to_string(),
-        None,
-        None,
-    );
+    // The tool has already run by this point — its result must reach the
+    // caller either way. `messages.conversation_id` is a `NOT NULL` foreign
+    // key (`Database::add_message` panics on a violation), and the
+    // conversation the row was proposed against can in principle be gone by
+    // now (deleted, or — before the chat_paid.rs fix that refuses a
+    // proposal with no owned conversation — never valid at all), so this is
+    // best-effort: save the message when the conversation still exists for
+    // this user, but never let a missing conversation turn a successful
+    // confirm into a 500 or a panic.
+    if db
+        .get_conversation(&action.conversation_id, &user.user_id)
+        .is_some()
+    {
+        db.add_message(
+            &action.conversation_id,
+            "assistant",
+            &result.to_string(),
+            None,
+            None,
+        );
+    }
 
     Ok(Json(ConfirmActionResponse {
         status: "confirmed".into(),
@@ -164,4 +178,79 @@ pub async fn cancel_action(
     Ok(Json(CancelActionResponse {
         status: "cancelled".into(),
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Builds a real `AppState` (own tempdir, own sqlite database) so these
+    /// tests call `confirm_action`/`cancel_action` exactly as the router
+    /// would, without a router or Clerk auth in the way — `PremiumUser` is
+    /// constructed directly, the same shortcut `crate::routes` tests use.
+    async fn test_state() -> (tempfile::TempDir, Arc<AppState>) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".cortex")).unwrap();
+        let state = AppState::new(
+            dir.path().join(".cortex/ledger.jsonl"),
+            dir.path().to_path_buf(),
+            None,
+        )
+        .await;
+        (dir, state)
+    }
+
+    /// A pending row scoped to `user-1` reads as a plain 404 for `user-2` on
+    /// both routes — deliberately indistinguishable from a row that never
+    /// existed at all (see the module doc comment).
+    #[tokio::test]
+    async fn other_users_action_is_404() {
+        let (_dir, state) = test_state().await;
+        let db = state.db.as_ref().expect("db configured");
+        let now = chrono::Utc::now().timestamp();
+        let action = db.insert_pending_action(
+            "user-1",
+            "conv-1",
+            "open_pr",
+            &serde_json::json!({"run_id": "r1"}),
+            "Open a pull request for run r1",
+            now,
+        );
+
+        let other = PremiumUser {
+            user_id: "user-2".to_string(),
+        };
+
+        let confirm_err = confirm_action(
+            State(state.clone()),
+            other.clone(),
+            Path(action.id.clone()),
+            Json(ActionNonceRequest {
+                nonce: action.nonce.clone(),
+            }),
+        )
+        .await
+        .expect_err("another user's row must not confirm");
+        assert_eq!(confirm_err.0, StatusCode::NOT_FOUND);
+
+        let cancel_err = cancel_action(
+            State(state.clone()),
+            other,
+            Path(action.id.clone()),
+            Json(ActionNonceRequest {
+                nonce: action.nonce.clone(),
+            }),
+        )
+        .await
+        .expect_err("another user's row must not cancel");
+        assert_eq!(cancel_err.0, StatusCode::NOT_FOUND);
+
+        // The row itself is untouched — still pending, still readable by its
+        // actual owner. `user-2`'s 404s never leaked a status flip.
+        let reread = db
+            .get_pending_action(&action.id, "user-1")
+            .expect("the owner can still see their own row");
+        assert_eq!(reread.status, "pending");
+        drop(state);
+    }
 }
