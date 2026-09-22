@@ -276,6 +276,13 @@ export function streamChat(
   onEvent: (event: WorkerEvent) => void,
   onDone: () => void,
   onError: (err: Error) => void,
+  /**
+   * `"zen:<id>"` to route this turn to an OpenCode Zen model on the
+   * customer's own key. Omit for the existing Claude-tier behaviour --
+   * the server ignores any other value sent here, so a Claude selection
+   * must never be sent as `model`. See crates/api/src/chat.rs.
+   */
+  model?: string,
 ): AbortController {
   const controller = new AbortController();
 
@@ -292,6 +299,7 @@ export function streamChat(
               ...routingContext,
               routing_preferences: routingContext.routing_preferences,
             } : routingContext,
+            ...(model ? { model } : {}),
           }),
           signal: controller.signal,
         });
@@ -299,6 +307,18 @@ export function streamChat(
         if (!res.ok) {
           const body = await res.text();
           const status = res.status;
+          if (status === 409) {
+            let zenMessage = body;
+            try {
+              const parsed = JSON.parse(body) as { error?: string; message?: string };
+              if (parsed.error === 'zen_key_required') {
+                throw new ZenKeyRequiredError(parsed.message ?? zenMessage);
+              }
+            } catch (parseErr) {
+              if (parseErr instanceof ZenKeyRequiredError) throw parseErr;
+              // fall through to the generic client-error handling below
+            }
+          }
           // Non-retryable client errors
           if (status >= 400 && status < 500) {
             throw new CortexApiError(status, body);
@@ -348,6 +368,12 @@ export function streamChat(
       } catch (err) {
         if (controller.signal.aborted) return;
         if (err instanceof Error && err.name === 'AbortError') return;
+        // 409 zen_key_required: never retry, never fall through to another
+        // model. The caller shows the server's message and links to Settings.
+        if (err instanceof ZenKeyRequiredError) {
+          onError(err);
+          return;
+        }
         // Non-retryable HTTP errors
         if (err instanceof CortexApiError && err.status >= 400 && err.status < 500) {
           onError(err);
@@ -370,6 +396,88 @@ export function streamChat(
   })();
 
   return controller;
+}
+
+// --- Provider keys (bring-your-own-key, e.g. OpenCode Zen) ---
+//
+// Write-only on the wire: the backend never returns more than `last4` of a
+// saved key (see crates/api/src/provider_keys.rs), and nothing here logs or
+// echoes the raw key the caller submits.
+
+export interface ProviderKeySummary {
+  provider: string;
+  last4: string;
+  status: 'active' | 'rejected' | string;
+  created_at: number;
+  updated_at: number;
+  last_used_at: number | null;
+}
+
+export async function getProviderKeys(): Promise<ProviderKeySummary[]> {
+  return requestJson<ProviderKeySummary[]>('/api/provider-keys');
+}
+
+/**
+ * `PUT /api/provider-keys/{provider}`. Resolves on 204; throws
+ * `CortexApiError` with the server's message on 400 (bad key), 429 (rate
+ * limit) or 503 (feature off). Callers must clear the key input after this
+ * settles either way -- success or failure -- never on a timer, and never
+ * hold the value anywhere else in state.
+ */
+export async function saveProviderKey(provider: string, apiKey: string): Promise<void> {
+  const res = await authedFetch(apiUrl(`/api/provider-keys/${encodeURIComponent(provider)}`), {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ api_key: apiKey }),
+  });
+  if (!res.ok) {
+    if (res.status === 401) dispatchUnauthorized();
+    throw new CortexApiError(res.status, await readErrorMessage(res), res.headers.get('Retry-After'));
+  }
+}
+
+/** `DELETE /api/provider-keys/{provider}`. Resolves on 204, throws on 404. */
+export async function deleteProviderKey(provider: string): Promise<void> {
+  const res = await authedFetch(apiUrl(`/api/provider-keys/${encodeURIComponent(provider)}`), {
+    method: 'DELETE',
+  });
+  if (!res.ok) {
+    if (res.status === 401) dispatchUnauthorized();
+    throw new CortexApiError(res.status, await readErrorMessage(res), res.headers.get('Retry-After'));
+  }
+}
+
+// --- Chat model picker (Claude tiers billed to Cortex credits, plus Zen
+// BYOK models billed to the customer's own key) ---
+
+export interface ChatModelEntry {
+  provider: 'claude' | 'zen' | string;
+  model: string;
+  label: string;
+  billing: 'credits' | 'your_zen_key' | string;
+  available: boolean;
+  unavailable_reason: 'byok_disabled' | 'key_rejected' | 'needs_key' | string | null;
+}
+
+export interface ChatModelsResponse {
+  models: ChatModelEntry[];
+}
+
+export async function getChatModels(): Promise<ChatModelsResponse> {
+  return requestJson<ChatModelsResponse>('/api/chat/models');
+}
+
+/**
+ * Thrown by `streamChat` when `/api/chat` answers 409 `zen_key_required`
+ * before any SSE stream opens (no key, a rejected key, or an unreadable
+ * one). Carries the server's own user-facing `message` -- callers show it
+ * verbatim and must never retry with a different model on their own.
+ */
+export class ZenKeyRequiredError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'ZenKeyRequiredError';
+  }
 }
 
 export async function getProviders() {
