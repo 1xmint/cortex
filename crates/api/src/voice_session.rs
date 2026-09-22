@@ -118,6 +118,10 @@ pub(crate) enum LiveSessionError {
     SupplierFailed,
     /// The session id does not exist (already closed, or never was ours).
     NotFound,
+    /// The `conversation_id` passed to start a session does not exist, or
+    /// belongs to another user — reported identically either way so a
+    /// foreign id can't be distinguished from a missing one.
+    ConversationNotFound,
     /// The caller does not own this session.
     Forbidden,
     /// The user already has a live voice session open.
@@ -140,6 +144,9 @@ impl LiveSessionError {
                 "Live voice is temporarily unavailable. Please try again in a moment.",
             ),
             LiveSessionError::NotFound => (StatusCode::NOT_FOUND, "No such voice session."),
+            LiveSessionError::ConversationNotFound => {
+                (StatusCode::NOT_FOUND, "No such conversation.")
+            }
             LiveSessionError::Forbidden => {
                 (StatusCode::FORBIDDEN, "That is not your voice session.")
             }
@@ -342,6 +349,7 @@ pub(crate) async fn start_session(
     user_id: &str,
     sdp: &str,
     now_ms: i64,
+    conversation_id: Option<String>,
 ) -> Result<(String, String, String), LiveSessionError> {
     let supplier_key = match mode {
         // Stub never leaves the machine and never spends: no session is
@@ -393,6 +401,7 @@ pub(crate) async fn start_session(
     let spawn_user_id = user_id.to_string();
     let spawn_sdp = sdp.to_string();
     let spawn_local_id = local_id.clone();
+    let spawn_conversation_id = conversation_id;
     let join_handle = tokio::spawn(async move {
         let mut guard = PlaceholderGuard::new(spawn_state.clone(), spawn_local_id.clone());
         let result = start_live_session(
@@ -406,6 +415,7 @@ pub(crate) async fn start_session(
             &spawn_sdp,
             now_ms,
             spawn_local_id,
+            spawn_conversation_id,
         )
         .await;
         if result.is_ok() {
@@ -439,6 +449,7 @@ async fn start_live_session(
     sdp: &str,
     now_ms: i64,
     local_id: String,
+    conversation_id: Option<String>,
 ) -> Result<(String, String, String), LiveSessionError> {
     let db = state.db.as_ref().ok_or(LiveSessionError::Unavailable)?;
     let price_list = db
@@ -604,6 +615,7 @@ async fn start_live_session(
     let loop_ws_base = ws_base.to_string();
     let loop_supplier_key = supplier_key.to_string();
     let micros_per_credit = price_list.micros_per_credit;
+    let loop_conversation_id = conversation_id;
     tokio::spawn(async move {
         run_billing_loop(
             loop_state,
@@ -619,6 +631,7 @@ async fn start_live_session(
             max_micro_usd,
             segment0_micro,
             close_rx,
+            loop_conversation_id,
         )
         .await;
     });
@@ -744,6 +757,7 @@ async fn run_billing_loop(
     max_micro_usd: i64,
     segment0_micro: i64,
     mut close_rx: mpsc::Receiver<()>,
+    conversation_id: Option<String>,
 ) {
     let Some(db) = state.db.as_ref() else {
         state
@@ -835,6 +849,7 @@ async fn run_billing_loop(
                             &event,
                             &state,
                             &user_id,
+                            conversation_id.as_deref(),
                             &delegation_busy,
                             &delegation_cancel,
                             &mut pending_transcript,
@@ -1165,6 +1180,7 @@ fn handle_delegation_created(
     event: &Value,
     state: &Arc<AppState>,
     user_id: &str,
+    conversation_id: Option<&str>,
     delegation_busy: &Arc<std::sync::atomic::AtomicBool>,
     delegation_cancel: &Arc<std::sync::atomic::AtomicBool>,
     pending_transcript: &mut String,
@@ -1195,12 +1211,20 @@ fn handle_delegation_created(
     let task_text = std::mem::take(pending_transcript);
     let state = state.clone();
     let user_id = user_id.to_string();
+    let conversation_id = conversation_id.map(str::to_string);
     let busy = delegation_busy.clone();
     let cancel = delegation_cancel.clone();
     let tx = commentary_tx.clone();
     tokio::spawn(async move {
         let _busy_guard = BusyGuard(busy);
-        let answer = run_voice_delegation(&state, &user_id, &task_text, &cancel).await;
+        let answer = run_voice_delegation(
+            &state,
+            &user_id,
+            conversation_id.as_deref(),
+            &task_text,
+            &cancel,
+        )
+        .await;
         let _ = tx.send(commentary_event(&delegation_id, &answer)).await;
     });
 }
@@ -1220,6 +1244,7 @@ fn handle_delegation_created(
 async fn run_voice_delegation(
     state: &Arc<AppState>,
     user_id: &str,
+    conversation_id: Option<&str>,
     task_text: &str,
     cancel: &Arc<std::sync::atomic::AtomicBool>,
 ) -> String {
@@ -1245,6 +1270,7 @@ async fn run_voice_delegation(
         transport,
         limits,
         user_id,
+        conversation_id,
         task_text,
         cancel,
     )
@@ -1262,6 +1288,7 @@ async fn run_voice_delegation_with<T: crate::provider_gateway::ProviderTransport
     transport: T,
     limits: SpendLimits,
     user_id: &str,
+    conversation_id: Option<&str>,
     task_text: &str,
     cancel: &Arc<std::sync::atomic::AtomicBool>,
 ) -> String {
@@ -1274,17 +1301,32 @@ async fn run_voice_delegation_with<T: crate::provider_gateway::ProviderTransport
     let now_ms = chrono::Utc::now().timestamp_millis();
     let turn_cap = crate::chat_paid::turn_cap_per_minute();
 
-    match crate::chat_paid::send_paid_reply(
+    // Saved the same way `chat_paid::run` saves a text-chat turn: the
+    // user's text first (so it is there even if the reply never comes
+    // back), the tool-activity summary and answer after, in that order. A
+    // session with no linked conversation (`conversation_id: None`) saves
+    // nothing, matching M-D-0013 behavior. Each save is guarded by a fresh
+    // `get_conversation` check: the conversation can be deleted out from
+    // under a long-running delegation (mid-call), and
+    // `Database::add_message` panics on the resulting foreign-key failure
+    // rather than erroring — a panic here would also kill the spoken
+    // answer, since it never reaches `tx.send` back in
+    // `handle_delegation_created`. Guarding keeps that panic from ever
+    // happening instead of catching it after the fact.
+    if let Some(cid) = conversation_id {
+        if db.get_conversation(cid, user_id).is_some() {
+            db.add_message(cid, "user", task_text, None, None);
+        }
+    }
+
+    let reply = crate::chat_paid::send_paid_reply(
         db,
         signing_key,
         supplier_key,
         transport,
         limits,
         user_id,
-        // Live voice sessions do not carry a conversation id today, so
-        // there is nothing to save the delegated turn's messages against;
-        // see the module notes on `VoiceSessionHandle`.
-        None,
+        conversation_id,
         crate::chat_paid::model_for_tier(None),
         VOICE_DELEGATION_SYSTEM_PROMPT,
         task_text,
@@ -1295,10 +1337,11 @@ async fn run_voice_delegation_with<T: crate::provider_gateway::ProviderTransport
         true,
         Some(cancel.as_ref()),
     )
-    .await
-    {
-        Ok(reply) if reply.text.trim().is_empty() => "Done.".to_string(),
-        Ok(reply) => reply.text,
+    .await;
+
+    let answer = match &reply {
+        Ok(paid_reply) if paid_reply.text.trim().is_empty() => "Done.".to_string(),
+        Ok(paid_reply) => paid_reply.text.clone(),
         Err(crate::chat_paid::PaidReplyError::NoCredits)
         | Err(crate::chat_paid::PaidReplyError::NotEnoughCredits) => {
             "You're out of credits for that request.".to_string()
@@ -1308,7 +1351,30 @@ async fn run_voice_delegation_with<T: crate::provider_gateway::ProviderTransport
                 .to_string()
         }
         Err(_) => "Sorry, I couldn't complete that just now.".to_string(),
+    };
+
+    // Only a genuine successful reply is worth persisting: none of the
+    // spoken failure strings above (out of credits, turn-cap exceeded, or
+    // a generic failure) and not the "Done." fallback for an empty reply
+    // — matching `chat_paid::run`'s own save gate (chat_paid.rs). The
+    // tool-activity summary is saved whenever tools ran, even if the reply
+    // text itself came back empty.
+    if let Ok(paid_reply) = &reply {
+        if let Some(cid) = conversation_id {
+            if db.get_conversation(cid, user_id).is_some() {
+                if let Some(summary) =
+                    crate::chat_paid::tool_activity_summary(&paid_reply.tool_activity)
+                {
+                    db.add_message(cid, "assistant", &summary, Some("cortex"), None);
+                }
+                if !paid_reply.text.is_empty() {
+                    db.add_message(cid, "assistant", &paid_reply.text, Some("cortex"), None);
+                }
+            }
+        }
     }
+
+    answer
 }
 
 /// Best effort: re-attach the sideband once and immediately ask the session
@@ -1552,6 +1618,13 @@ pub struct LiveSessionStartResponse {
 #[derive(Debug, serde::Deserialize)]
 pub struct LiveSessionStartRequest {
     pub sdp: String,
+    /// Links this live session to an existing text conversation, so
+    /// delegated turns save into it the same way chat does. Checked for
+    /// ownership before anything is reserved — a foreign or missing id is a
+    /// 404 with no placeholder left behind. `None` keeps today's behavior:
+    /// no conversation, nothing saved.
+    #[serde(default)]
+    pub conversation_id: Option<String>,
 }
 
 pub async fn live_session_start(
@@ -1568,6 +1641,19 @@ pub async fn live_session_start(
             }),
         ));
     }
+    // Ownership is checked before anything else touches the ledger or the
+    // session map: a foreign or missing conversation id is a plain 404, and
+    // nothing is reserved for it.
+    if let Some(cid) = &body.conversation_id {
+        let owned = state
+            .db
+            .as_ref()
+            .map(|db| db.get_conversation(cid, &user.user_id).is_some())
+            .unwrap_or(false);
+        if !owned {
+            return Err(LiveSessionError::ConversationNotFound.into_response());
+        }
+    }
     let Some(mode) = live_voice_mode() else {
         return Err(LiveSessionError::Unavailable.into_response());
     };
@@ -1580,18 +1666,46 @@ pub async fn live_session_start(
     let Some(limits) = SpendLimits::from_env() else {
         return Err(LiveSessionError::Unavailable.into_response());
     };
-    let now_ms = chrono::Utc::now().timestamp_millis();
 
-    start_session(
+    live_session_start_with(
         &state,
         mode,
-        OPENAI_HTTP_BASE,
-        OPENAI_WS_BASE,
         &signing_key,
         limits,
         &user.user_id,
         &body.sdp,
+        body.conversation_id.clone(),
+    )
+    .await
+}
+
+/// The env-injectable core of [`live_session_start`] — kept separate so
+/// tests can exercise the "no conversation id" path (and any future
+/// gateway-mode path) with explicit arguments instead of mutating
+/// process-wide env vars, matching [`run_voice_delegation`]/
+/// [`run_voice_delegation_with`]'s own split.
+async fn live_session_start_with(
+    state: &Arc<AppState>,
+    mode: LiveVoiceMode,
+    signing_key: &str,
+    limits: SpendLimits,
+    user_id: &str,
+    sdp: &str,
+    conversation_id: Option<String>,
+) -> Result<Json<LiveSessionStartResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let now_ms = chrono::Utc::now().timestamp_millis();
+
+    start_session(
+        state,
+        mode,
+        OPENAI_HTTP_BASE,
+        OPENAI_WS_BASE,
+        signing_key,
+        limits,
+        user_id,
+        sdp,
         now_ms,
+        conversation_id,
     )
     .await
     .map(|(session_id, sdp, _local_id)| Json(LiveSessionStartResponse { session_id, sdp }))
@@ -1820,6 +1934,7 @@ mod tests {
             USER,
             "offer-sdp",
             0,
+            None,
         )
         .await
         .expect("stub start must succeed");
@@ -1861,6 +1976,7 @@ mod tests {
             USER,
             "offer-sdp",
             chrono::Utc::now().timestamp_millis(),
+            None,
         )
         .await
         .expect("live start against the fake must succeed");
@@ -1945,6 +2061,7 @@ mod tests {
             USER,
             "offer-sdp",
             0,
+            None,
         )
         .await
         .expect("live start must succeed even on a small balance");
@@ -2000,6 +2117,7 @@ mod tests {
             USER,
             "offer-sdp",
             0,
+            None,
         )
         .await
         .expect("live start must succeed");
@@ -2073,6 +2191,7 @@ mod tests {
             USER,
             "offer-sdp",
             chrono::Utc::now().timestamp_millis(),
+            None,
         )
         .await
         .expect("live start must succeed");
@@ -2169,6 +2288,7 @@ mod tests {
             USER,
             "offer-sdp",
             chrono::Utc::now().timestamp_millis(),
+            None,
         )
         .await
         .expect("live start must succeed on a tightly-funded balance");
@@ -2221,6 +2341,7 @@ mod tests {
             USER,
             "offer-sdp",
             0,
+            None,
         )
         .await
         .expect_err("an attach that hangs past the timeout must fail start_session");
@@ -2266,6 +2387,7 @@ mod tests {
             USER,
             "offer-sdp",
             0,
+            None,
         )
         .await
         .expect("a later start for the same user must not be 409'd by the hung attempt");
@@ -2308,6 +2430,7 @@ mod tests {
                 USER,
                 "offer-sdp",
                 0,
+                None,
             ),
         )
         .await;
@@ -2373,6 +2496,7 @@ mod tests {
             USER,
             "offer-sdp",
             0,
+            None,
         )
         .await
         .expect("a later start for the same user must not be 409'd by the disconnected attempt");
@@ -2426,6 +2550,7 @@ mod tests {
             USER,
             "offer-sdp",
             0,
+            None,
         )
         .await
         .expect("live start must succeed");
@@ -2503,6 +2628,7 @@ mod tests {
             USER,
             "offer-sdp",
             0,
+            None,
         )
         .await
         .expect("live start must succeed");
@@ -2539,6 +2665,7 @@ mod tests {
             USER,
             "offer-sdp",
             0,
+            None,
         )
         .await
         .expect_err("a refused attach must fail start_session");
@@ -2591,6 +2718,7 @@ mod tests {
             USER,
             "offer-sdp",
             0,
+            None,
         )
         .await
         .expect("first live start must succeed");
@@ -2612,6 +2740,7 @@ mod tests {
             USER,
             "offer-sdp",
             0,
+            None,
         )
         .await
         .expect_err("a second start for the same user must be refused");
@@ -2676,6 +2805,7 @@ mod tests {
             USER,
             "offer-sdp",
             0,
+            None,
         )
         .await
         .expect("live start must succeed with exactly enough balance for segment 0");
@@ -2811,6 +2941,7 @@ mod tests {
             USER,
             "offer-sdp",
             0,
+            None,
         )
         .await
         .expect("live start must succeed");
@@ -2830,6 +2961,100 @@ mod tests {
         assert_eq!(
             after.terminal_reason.as_deref(),
             Some("server restarted during live session")
+        );
+    }
+
+    #[tokio::test]
+    async fn foreign_conversation_id_is_404_and_reserves_nothing() {
+        let (_dir, state) = test_state().await;
+        let db = state.db.as_ref().unwrap();
+        let owner_conversation = db.create_conversation("someone-else", None);
+        let balance_before = db.get_credit_balance_row(USER);
+
+        let result = live_session_start(
+            State(state.clone()),
+            ClerkUser {
+                user_id: USER.to_string(),
+            },
+            HeaderMap::new(),
+            Json(LiveSessionStartRequest {
+                sdp: "offer-sdp".to_string(),
+                conversation_id: Some(owner_conversation.id.clone()),
+            }),
+        )
+        .await;
+
+        let Err((status, _)) = result else {
+            panic!("a foreign conversation id must be refused");
+        };
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(
+            db.get_credit_balance_row(USER),
+            balance_before,
+            "nothing must be reserved for a refused start"
+        );
+        assert!(
+            state.voice_sessions.lock().unwrap().is_empty(),
+            "no placeholder may be left behind"
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_conversation_id_is_404_and_reserves_nothing() {
+        let (_dir, state) = test_state().await;
+        let db = state.db.as_ref().unwrap();
+        let balance_before = db.get_credit_balance_row(USER);
+
+        let result = live_session_start(
+            State(state.clone()),
+            ClerkUser {
+                user_id: USER.to_string(),
+            },
+            HeaderMap::new(),
+            Json(LiveSessionStartRequest {
+                sdp: "offer-sdp".to_string(),
+                conversation_id: Some("no-such-conversation".to_string()),
+            }),
+        )
+        .await;
+
+        let Err((status, _)) = result else {
+            panic!("a conversation id that does not exist must be refused");
+        };
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(db.get_credit_balance_row(USER), balance_before);
+        assert!(state.voice_sessions.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn no_conversation_id_keeps_todays_behavior() {
+        let (_dir, state) = test_state().await;
+
+        // Stub mode, so this exercises only the handler's ownership gate
+        // (skipped entirely with no id) and not the rest of the pipeline,
+        // which the other `start_session` tests already cover directly.
+        // Config is injected straight into `live_session_start_with`
+        // instead of process-wide env vars, so this test cannot race other
+        // tests reading the same `CORTEX_PROVIDER_GATEWAY_*` vars.
+        let limits = SpendLimits {
+            max_micro_usd: 1_000_000_000,
+            funded_micro_usd: 1_000_000_000,
+        };
+        let result = live_session_start_with(
+            &state,
+            LiveVoiceMode::Stub,
+            SIGNING_KEY,
+            limits,
+            USER,
+            "offer-sdp",
+            None,
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "no conversation id must not be refused: {:?}",
+            result.err().map(|(status, _)| status)
         );
     }
 
@@ -2910,6 +3135,65 @@ mod tests {
             }
         }
 
+        /// Returns one queued response per call, repeating the last one once
+        /// the queue is exhausted — enough to script a `tool_use` turn
+        /// followed by a final text turn, the way `chat_paid.rs`'s own
+        /// `SequenceTransport` does.
+        #[derive(Clone)]
+        struct SequencedTransport {
+            calls: Arc<AtomicUsize>,
+            responses: Arc<Vec<Result<TransportResponse, TransportFailure>>>,
+        }
+
+        impl SequencedTransport {
+            fn new(responses: Vec<Result<TransportResponse, TransportFailure>>) -> Self {
+                assert!(!responses.is_empty());
+                Self {
+                    calls: Arc::new(AtomicUsize::new(0)),
+                    responses: Arc::new(responses),
+                }
+            }
+        }
+
+        impl ProviderTransport for SequencedTransport {
+            fn forward(
+                &self,
+                supplier_key: &str,
+                _request: &GatewayRequest,
+            ) -> impl Future<Output = Result<TransportResponse, TransportFailure>> + Send
+            {
+                assert_eq!(supplier_key, SUPPLIER_KEY);
+                let i = self.calls.fetch_add(1, AtomicOrdering::SeqCst);
+                let idx = i.min(self.responses.len() - 1);
+                std::future::ready(self.responses[idx].clone())
+            }
+        }
+
+        fn tool_use_response(
+            tool_use_id: &str,
+            name: &str,
+            input: Value,
+        ) -> Result<TransportResponse, TransportFailure> {
+            Ok(TransportResponse {
+                body: serde_json::json!({
+                    "id": "msg_test",
+                    "type": "message",
+                    "role": "assistant",
+                    "model": DELEGATION_MODEL,
+                    "content": [{"type": "tool_use", "id": tool_use_id, "name": name, "input": input}],
+                    "stop_reason": "tool_use",
+                    "stop_sequence": null,
+                    "usage": {"input_tokens": 10, "output_tokens": 10}
+                }),
+                upstream_request_id: Some("upstream-1".into()),
+                usage: Some(ObservedUsage {
+                    input_tokens: 10,
+                    cached_input_tokens: 0,
+                    output_tokens: 10,
+                }),
+            })
+        }
+
         #[test]
         fn accumulate_transcript_reads_delta_or_text() {
             let mut pending = String::new();
@@ -2958,6 +3242,7 @@ mod tests {
                 transport.clone(),
                 ample_limits(),
                 USER,
+                None,
                 "   ",
                 &cancel,
             )
@@ -2983,6 +3268,7 @@ mod tests {
                 transport.clone(),
                 ample_limits(),
                 USER,
+                None,
                 "what is two plus two",
                 &cancel,
             )
@@ -3004,6 +3290,75 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn a_delegation_in_a_linked_session_saves_user_text_and_answer() {
+            let (_dir, state) = test_state_with_balance(1_000_000_000).await;
+            let db = state.db.as_ref().unwrap();
+            let conversation = db.create_conversation(USER, None);
+
+            let transport = CountingTransport::ok("the answer is four");
+            let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let answer = run_voice_delegation_with(
+                db,
+                SIGNING_KEY,
+                SUPPLIER_KEY,
+                transport.clone(),
+                ample_limits(),
+                USER,
+                Some(conversation.id.as_str()),
+                "what is two plus two",
+                &cancel,
+            )
+            .await;
+
+            assert_eq!(answer, "the answer is four");
+            let messages = db
+                .get_conversation(&conversation.id, USER)
+                .unwrap()
+                .messages;
+            assert_eq!(
+                messages.len(),
+                2,
+                "a delegation must save exactly the user's text and the answer"
+            );
+            assert_eq!(messages[0].role, "user");
+            assert_eq!(messages[0].content, "what is two plus two");
+            assert_eq!(messages[1].role, "assistant");
+            assert_eq!(messages[1].content, "the answer is four");
+        }
+
+        #[tokio::test]
+        async fn a_delegation_in_an_unlinked_session_saves_nothing() {
+            let (_dir, state) = test_state_with_balance(1_000_000_000).await;
+            let db = state.db.as_ref().unwrap();
+            let conversation = db.create_conversation(USER, None);
+
+            let transport = CountingTransport::ok("the answer is four");
+            let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let answer = run_voice_delegation_with(
+                db,
+                SIGNING_KEY,
+                SUPPLIER_KEY,
+                transport.clone(),
+                ample_limits(),
+                USER,
+                None,
+                "what is two plus two",
+                &cancel,
+            )
+            .await;
+
+            assert_eq!(answer, "the answer is four");
+            assert_eq!(
+                db.get_conversation(&conversation.id, USER)
+                    .unwrap()
+                    .messages
+                    .len(),
+                0,
+                "a session with no linked conversation must save nothing anywhere"
+            );
+        }
+
+        #[tokio::test]
         async fn insufficient_credits_yields_spoken_failure_and_no_charge() {
             let (_dir, state) = test_state_with_balance(0).await;
             let db = state.db.as_ref().unwrap();
@@ -3018,6 +3373,7 @@ mod tests {
                 transport.clone(),
                 ample_limits(),
                 USER,
+                None,
                 "do something",
                 &cancel,
             )
@@ -3030,6 +3386,116 @@ mod tests {
                 "a zero balance must refuse before any provider call"
             );
             assert_eq!(db.get_credit_balance_row(USER), before, "nothing charged");
+        }
+
+        #[tokio::test]
+        async fn insufficient_credits_still_saves_the_user_text_but_not_a_failure_reply() {
+            let (_dir, state) = test_state_with_balance(0).await;
+            let db = state.db.as_ref().unwrap();
+            let conversation = db.create_conversation(USER, None);
+
+            let transport = CountingTransport::unreachable();
+            let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let answer = run_voice_delegation_with(
+                db,
+                SIGNING_KEY,
+                SUPPLIER_KEY,
+                transport,
+                ample_limits(),
+                USER,
+                Some(conversation.id.as_str()),
+                "do something",
+                &cancel,
+            )
+            .await;
+
+            assert_eq!(answer, "You're out of credits for that request.");
+            let messages = db
+                .get_conversation(&conversation.id, USER)
+                .unwrap()
+                .messages;
+            assert_eq!(
+                messages.len(),
+                1,
+                "a failed reply must save the user's text but never a failure string"
+            );
+            assert_eq!(messages[0].role, "user");
+            assert_eq!(messages[0].content, "do something");
+        }
+
+        #[tokio::test]
+        async fn conversation_deleted_before_the_turn_answers_without_panicking_or_saving() {
+            let (_dir, state) = test_state_with_balance(1_000_000_000).await;
+            let db = state.db.as_ref().unwrap();
+            let conversation = db.create_conversation(USER, None);
+            assert!(db.delete_conversation(&conversation.id, USER));
+
+            let transport = CountingTransport::ok("the answer is four");
+            let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let answer = run_voice_delegation_with(
+                db,
+                SIGNING_KEY,
+                SUPPLIER_KEY,
+                transport,
+                ample_limits(),
+                USER,
+                Some(conversation.id.as_str()),
+                "what is two plus two",
+                &cancel,
+            )
+            .await;
+
+            assert_eq!(
+                answer, "the answer is four",
+                "the spoken answer must still be delivered even though the \
+                 conversation it would have saved into is gone"
+            );
+            assert!(
+                db.get_conversation(&conversation.id, USER).is_none(),
+                "still deleted: nothing was recreated by the guarded save"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_successful_reply_with_tool_activity_saves_user_summary_and_answer_in_order() {
+            let (_dir, state) = test_state_with_balance(1_000_000_000).await;
+            let db = state.db.as_ref().unwrap();
+            let conversation = db.create_conversation(USER, None);
+
+            let transport = SequencedTransport::new(vec![
+                tool_use_response("toolu_1", "list_runs", serde_json::json!({})),
+                CountingTransport::ok("the answer is four").response.clone(),
+            ]);
+            let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let answer = run_voice_delegation_with(
+                db,
+                SIGNING_KEY,
+                SUPPLIER_KEY,
+                transport,
+                ample_limits(),
+                USER,
+                Some(conversation.id.as_str()),
+                "check my runs and tell me the answer",
+                &cancel,
+            )
+            .await;
+
+            assert_eq!(answer, "the answer is four");
+            let messages = db
+                .get_conversation(&conversation.id, USER)
+                .unwrap()
+                .messages;
+            assert_eq!(
+                messages.len(),
+                3,
+                "user text, tool-activity summary, and the answer must all be saved"
+            );
+            assert_eq!(messages[0].role, "user");
+            assert_eq!(messages[0].content, "check my runs and tell me the answer");
+            assert_eq!(messages[1].role, "assistant");
+            assert_eq!(messages[1].content, "Checked your runs.");
+            assert_eq!(messages[2].role, "assistant");
+            assert_eq!(messages[2].content, "the answer is four");
         }
 
         #[tokio::test]
@@ -3052,6 +3518,7 @@ mod tests {
                 &serde_json::json!({"delegation": {"id": "deleg-1"}}),
                 &state,
                 USER,
+                None,
                 &busy,
                 &cancel,
                 &mut pending_transcript,
@@ -3085,6 +3552,7 @@ mod tests {
                 &serde_json::json!({"delegation": {"id": "deleg-2"}}),
                 &state,
                 USER,
+                None,
                 &busy,
                 &cancel,
                 &mut pending_transcript,
@@ -3146,6 +3614,7 @@ mod tests {
                 &serde_json::json!({"delegation": {"id": "deleg-3"}}),
                 &state,
                 USER,
+                None,
                 &busy,
                 &cancel,
                 &mut pending_transcript,
