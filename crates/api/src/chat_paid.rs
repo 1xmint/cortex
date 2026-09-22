@@ -116,6 +116,64 @@ fn reset_turn_windows_for_test() {
         .clear();
 }
 
+/// One paid reply per user at a time. Without this, two concurrent replies
+/// for the same user each read the balance before either has charged
+/// anything, each get authorized against the full balance, and each run
+/// real (billable-to-Cortex) supplier turns — only for the second one's
+/// final charge to be clamped down to whatever the first left behind (see
+/// `deduct_credits_up_to`), handing out real work for free. Serializing
+/// per user means the second reply's turn-by-turn balance checks see what
+/// the first actually spent.
+///
+/// In-process only, same as `TURN_WINDOWS` above: `CORTEX_SINGLE_NODE=1` is
+/// required for this server (see `AGENTS.md`), so one process holds every
+/// in-flight reply for a given user and this lock is never bypassed by a
+/// sibling process.
+static USER_REPLY_LOCKS: Lazy<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+
+/// Holds the per-user reply slot until dropped, then removes the map entry
+/// if nothing else is waiting on it — otherwise a long-lived server
+/// accumulates one entry per distinct user it has ever replied to.
+struct UserReplyPermit {
+    user_id: String,
+    guard: Option<tokio::sync::OwnedMutexGuard<()>>,
+}
+
+impl Drop for UserReplyPermit {
+    fn drop(&mut self) {
+        // Release the tokio lock itself before checking whether anyone
+        // else still holds a clone of the `Arc` — otherwise our own guard
+        // would always make the strong count look like more than one.
+        self.guard.take();
+        let mut locks = USER_REPLY_LOCKS.lock().unwrap_or_else(|e| e.into_inner());
+        if locks
+            .get(&self.user_id)
+            .is_some_and(|arc| Arc::strong_count(arc) == 1)
+        {
+            locks.remove(&self.user_id);
+        }
+    }
+}
+
+/// Wait for, and hold, this user's reply slot. A second concurrent call for
+/// the same `user_id` waits here until the first one's `UserReplyPermit` is
+/// dropped.
+async fn acquire_user_reply_permit(user_id: &str) -> UserReplyPermit {
+    let arc = {
+        let mut locks = USER_REPLY_LOCKS.lock().unwrap_or_else(|e| e.into_inner());
+        locks
+            .entry(user_id.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    };
+    let guard = arc.lock_owned().await;
+    UserReplyPermit {
+        user_id: user_id.to_string(),
+        guard: Some(guard),
+    }
+}
+
 /// Round a micro-USD cost up to the nearest whole credit. `i64::div_ceil` is
 /// still unstable on this toolchain, so this spells out the same arithmetic
 /// by hand rather than reaching for a nightly feature.
@@ -390,6 +448,10 @@ pub(crate) async fn send_paid_reply<T: ProviderTransport + Clone>(
         tracing::error!(model, "chat: no price for this model tier; refusing");
         return Err(PaidReplyError::Unavailable);
     }
+
+    // Serialize the whole loop-plus-final-charge per user (see
+    // `UserReplyPermit`'s doc comment). Held for the rest of this function.
+    let _user_reply_permit = acquire_user_reply_permit(user_id).await;
 
     let run_id = conversation_id
         .map(|c| format!("chat:{c}"))
@@ -1594,6 +1656,131 @@ mod tests {
             balance.subscription_remaining + balance.pack_remaining,
             0,
             "the clamped charge must take exactly what was left, not go negative"
+        );
+    }
+
+    /// A transport that tracks how many calls are in flight at once (and the
+    /// high-water mark), and sleeps briefly so two concurrent callers would
+    /// overlap if nothing serialized them.
+    #[derive(Clone)]
+    struct ConcurrencyTrackingTransport {
+        in_flight: Arc<AtomicUsize>,
+        max_in_flight: Arc<AtomicUsize>,
+        input_tokens: i64,
+        output_tokens: i64,
+    }
+
+    impl ProviderTransport for ConcurrencyTrackingTransport {
+        fn forward(
+            &self,
+            _supplier_key: &str,
+            _request: &GatewayRequest,
+        ) -> impl Future<Output = Result<TransportResponse, TransportFailure>> + Send {
+            let in_flight = self.in_flight.clone();
+            let max_in_flight = self.max_in_flight.clone();
+            let input_tokens = self.input_tokens;
+            let output_tokens = self.output_tokens;
+            async move {
+                let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                max_in_flight.fetch_max(now, Ordering::SeqCst);
+                tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+                in_flight.fetch_sub(1, Ordering::SeqCst);
+                Ok(TransportResponse {
+                    body: serde_json::json!({
+                        "id": "msg_test",
+                        "type": "message",
+                        "role": "assistant",
+                        "model": MODEL,
+                        "content": [{"type": "text", "text": "hello there"}],
+                        "stop_reason": "end_turn",
+                        "stop_sequence": null,
+                        "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens}
+                    }),
+                    upstream_request_id: Some("upstream-1".into()),
+                    usage: Some(ObservedUsage {
+                        input_tokens,
+                        cached_input_tokens: 0,
+                        output_tokens,
+                    }),
+                })
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_replies_same_user_do_not_overspend() {
+        let (_dir, db) = test_db();
+        let price_list = db.active_price_list().unwrap();
+        let rate = price_list.model("claude", MODEL).unwrap();
+        let per_reply_credits = ceil_div(rate.cost_micros(10, 0, 10), price_list.micros_per_credit);
+        // Enough for both replies run one at a time, not enough to give
+        // either of them a second helping.
+        let initial_balance = per_reply_credits * 2;
+        db.init_credit_balance("user-1", initial_balance).unwrap();
+
+        let limits = SpendLimits {
+            max_micro_usd: 1_000_000_000_000,
+            funded_micro_usd: 1_000_000_000_000,
+        };
+        let transport = ConcurrencyTrackingTransport {
+            in_flight: Arc::new(AtomicUsize::new(0)),
+            max_in_flight: Arc::new(AtomicUsize::new(0)),
+            input_tokens: 10,
+            output_tokens: 10,
+        };
+
+        let fut_a = send_paid_reply(
+            &db,
+            SIGNING_KEY,
+            SUPPLIER_KEY,
+            transport.clone(),
+            limits,
+            "user-1",
+            Some("conv-a"),
+            MODEL,
+            "system",
+            "hi",
+            "reply-a",
+            NOW,
+            20,
+            None,
+        );
+        let fut_b = send_paid_reply(
+            &db,
+            SIGNING_KEY,
+            SUPPLIER_KEY,
+            transport.clone(),
+            limits,
+            "user-1",
+            Some("conv-b"),
+            MODEL,
+            "system",
+            "hi",
+            "reply-b",
+            NOW,
+            20,
+            None,
+        );
+
+        let (result_a, result_b) = tokio::join!(fut_a, fut_b);
+
+        assert!(result_a.is_ok(), "first reply should succeed: {result_a:?}");
+        assert!(
+            result_b.is_ok(),
+            "second reply should succeed: {result_b:?}"
+        );
+        assert_eq!(
+            transport.max_in_flight.load(Ordering::SeqCst),
+            1,
+            "the per-user lock must keep the two replies' supplier calls from overlapping"
+        );
+
+        let balance = db.get_credit_balance_row("user-1").unwrap();
+        let total_charged =
+            initial_balance - (balance.subscription_remaining + balance.pack_remaining);
+        assert!(
+            total_charged <= initial_balance,
+            "total charged ({total_charged}) must never exceed the starting balance ({initial_balance})"
         );
     }
 }
