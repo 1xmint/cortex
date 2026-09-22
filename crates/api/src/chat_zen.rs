@@ -1034,29 +1034,26 @@ mod tests {
         };
 
         let result = crate::chat::chat(State(state.clone()), user, Json(req)).await;
-        // `chat_zen::chat` only ever returns `zen_key_required`,
-        // `zen_model_not_allowed`, or `database_unavailable` -- with no
-        // `model` field, `chat::chat`'s own guard never calls into this
-        // module at all, so the only possible outcomes are the pre-existing
-        // ones: a normal SSE stream (no provider gateway configured here,
-        // so `ProviderPath::None`) or one of `chat::chat`'s own pre-routing
-        // refusals, never a zen-tagged error body.
-        if let Err(response) = result {
-            let status = response.status();
-            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-                .await
-                .unwrap();
-            let body: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
-            assert_ne!(
-                body.get("error").and_then(|v| v.as_str()),
-                Some("zen_key_required")
-            );
-            assert_ne!(
-                body.get("error").and_then(|v| v.as_str()),
-                Some("zen_model_not_allowed")
-            );
-            let _ = status;
-        }
+        // With no `model` field, `chat::chat`'s own guard never calls into
+        // `chat_zen` at all -- this must succeed exactly as it did before
+        // the Zen path existed, and its first event must be the pre-existing
+        // `Started` event tagged with the non-zen provider (`ProviderPath::
+        // None` in this test environment, no gateway configured), never a
+        // zen-tagged one.
+        let response = result
+            .expect("no model field must take the pre-existing path, never error")
+            .into_response();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        let first_data_line = text
+            .lines()
+            .find_map(|line| line.strip_prefix("data: "))
+            .expect("an SSE stream must send at least one data event");
+        let first_event: serde_json::Value = serde_json::from_str(first_data_line).unwrap();
+        assert_eq!(first_event["type"], "started");
+        assert_ne!(first_event["provider"], "zen");
     }
 
     // --- billing hole: `model` values that are neither `"zen:"`-prefixed
