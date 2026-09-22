@@ -1,12 +1,14 @@
 import { Check, Copy, Bot, Sparkles, User } from 'lucide-react';
 import { useEffect, useState } from 'react';
 import ApprovalCard from './ApprovalCard';
+import ConfirmActionCard from './ConfirmActionCard';
 import FlowOptions from './FlowOptions';
-import type { ApprovalState, ChatMessage as ChatMessageType } from '../../types';
+import type { ApprovalState, ChatMessage as ChatMessageType, ConfirmActionStatus } from '../../types';
 
 interface ChatMessageProps {
   message: ChatMessageType;
   onApprovalAction: (messageId: string, nextState: ApprovalState) => void;
+  onConfirmActionStatusChange?: (messageId: string, status: ConfirmActionStatus) => void;
   onSelectFlowOption?: (optionId: string, optionLabel: string) => void;
   flowOptionsDisabled?: boolean;
 }
@@ -21,6 +23,7 @@ function formatTime(timestamp: string) {
 export default function ChatMessage({
   message,
   onApprovalAction,
+  onConfirmActionStatusChange,
   onSelectFlowOption,
   flowOptionsDisabled = false
 }: ChatMessageProps) {
@@ -64,6 +67,12 @@ export default function ChatMessage({
           <p className="whitespace-pre-wrap">{message.content}</p>
           {message.approvalRequest ? (
             <ApprovalCard request={message.approvalRequest} onAction={onApprovalAction} />
+          ) : null}
+          {message.confirmAction && onConfirmActionStatusChange ? (
+            <ConfirmActionCard
+              request={message.confirmAction}
+              onStatusChange={onConfirmActionStatusChange}
+            />
           ) : null}
           {message.conversationFlow && message.conversationFlow.options.length > 0 && onSelectFlowOption ? (
             <FlowOptions

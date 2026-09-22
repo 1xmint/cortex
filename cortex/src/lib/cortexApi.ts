@@ -197,7 +197,7 @@ async function requestBillingJson<T>(path: string, init?: RequestInit): Promise<
 }
 
 export interface WorkerEvent {
-  type: 'started' | 'output' | 'completed' | 'failed' | 'tool_activity';
+  type: 'started' | 'output' | 'completed' | 'failed' | 'tool_activity' | 'confirm_required';
   task_id?: string;
   step_id?: string;
   provider?: string;
@@ -209,6 +209,50 @@ export interface WorkerEvent {
   // and whether it succeeded. Never carries the tool's arguments or result.
   tool_name?: string;
   ok?: boolean;
+  // Only present for `confirm_required`: a risky action awaiting tap-to-confirm.
+  // `expires_at` is RFC 3339. The nonce round-trips through the confirm/cancel
+  // calls below and is never logged or displayed.
+  action_id?: string;
+  nonce?: string;
+  summary?: string;
+  expires_at?: string;
+}
+
+export interface ConfirmAgentActionResponse {
+  status: string;
+  result?: unknown;
+}
+
+/**
+ * Tap-to-confirm for a risky agent action raised via a `confirm_required`
+ * stream event. A 404 or 409 means the action is gone -- expired or already
+ * used -- and callers should treat that as "no longer available" rather than
+ * retrying.
+ */
+export async function confirmAgentAction(
+  actionId: string,
+  nonce: string,
+): Promise<ConfirmAgentActionResponse> {
+  return requestJson<ConfirmAgentActionResponse>(
+    `/api/agent/actions/${encodeURIComponent(actionId)}/confirm`,
+    {
+      method: 'POST',
+      body: JSON.stringify({ nonce }),
+    },
+  );
+}
+
+export async function cancelAgentAction(
+  actionId: string,
+  nonce: string,
+): Promise<ConfirmAgentActionResponse> {
+  return requestJson<ConfirmAgentActionResponse>(
+    `/api/agent/actions/${encodeURIComponent(actionId)}/cancel`,
+    {
+      method: 'POST',
+      body: JSON.stringify({ nonce }),
+    },
+  );
 }
 
 export function streamChat(

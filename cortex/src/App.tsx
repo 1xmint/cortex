@@ -472,6 +472,7 @@ function CortexShell() {
     sendMessage,
     stopStreaming,
     updateApproval,
+    updateConfirmActionStatus,
     renameConversation,
   } = useChatSession({
     activeConversationId,
@@ -973,6 +974,7 @@ function CortexShell() {
             onStop={isStreaming ? stopStreaming : undefined}
             onSubscribe={() => handleOpenSettings('billing')}
             onApprovalAction={updateApproval}
+            onConfirmActionStatusChange={updateConfirmActionStatus}
           />
 
           <div className="hidden lg:flex">

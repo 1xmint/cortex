@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import ChatMessage from './ChatMessage';
-import type { ApprovalState, ChatMessage as ChatMessageType } from '../../types';
+import type { ApprovalState, ChatMessage as ChatMessageType, ConfirmActionStatus } from '../../types';
 
 interface ChatTimelineProps {
   messages: ChatMessageType[];
@@ -9,6 +9,7 @@ interface ChatTimelineProps {
   starterPrompts?: string[];
   onSelectStarter?: (prompt: string) => void;
   onApprovalAction: (messageId: string, nextState: ApprovalState) => void;
+  onConfirmActionStatusChange?: (messageId: string, status: ConfirmActionStatus) => void;
   onSelectFlowOption?: (optionId: string, optionLabel: string) => void;
   flowOptionsDisabled?: boolean;
 }
@@ -55,6 +56,7 @@ export default function ChatTimeline({
   starterPrompts = STARTER_PROMPTS,
   onSelectStarter,
   onApprovalAction,
+  onConfirmActionStatusChange,
   onSelectFlowOption,
   flowOptionsDisabled = false,
 }: ChatTimelineProps) {
@@ -98,6 +100,7 @@ export default function ChatTimeline({
               key={message.id}
               message={message}
               onApprovalAction={onApprovalAction}
+              onConfirmActionStatusChange={onConfirmActionStatusChange}
               onSelectFlowOption={onSelectFlowOption}
               flowOptionsDisabled={flowOptionsDisabled}
             />
