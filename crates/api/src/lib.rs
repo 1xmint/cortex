@@ -1,4 +1,5 @@
 mod admin;
+mod agent_tools;
 pub mod api_error;
 pub mod billing;
 mod chat;
