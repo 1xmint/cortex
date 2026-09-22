@@ -9,7 +9,7 @@ interface AuthGateResult {
   isSignedIn: boolean;
   userId: string;
   AuthScreen: ComponentType | null;
-  getToken: (() => Promise<string | null>) | null;
+  getToken: ((opts?: { skipCache?: boolean }) => Promise<string | null>) | null;
   clerkEnabled: boolean;
 }
 
@@ -20,7 +20,7 @@ function useClerkGate(): AuthGateResult {
     isSignedIn: isSignedIn ?? false,
     userId: userId ?? 'anonymous',
     AuthScreen: SignInScreen,
-    getToken: () => getToken(),
+    getToken: (opts) => getToken(opts),
     clerkEnabled: true,
   };
 }

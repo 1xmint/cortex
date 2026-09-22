@@ -26,6 +26,10 @@ function unauthorizedResponse(): Response {
   return { ok: false, status: 401, headers: new Headers(), body: null } as unknown as Response;
 }
 
+function forbiddenResponse(): Response {
+  return { ok: false, status: 403, headers: new Headers(), body: null } as unknown as Response;
+}
+
 beforeEach(() => {
   setAuthTokenGetter(async () => null);
   vi.useFakeTimers();
@@ -85,7 +89,7 @@ describe('openLiveVoiceEventsStream reconnect', () => {
     expect(calls).toBe(1);
   });
 
-  it('stops reconnecting once the stream 401s', async () => {
+  it('stops reconnecting once a 401 retry with a fresh token also 401s', async () => {
     let calls = 0;
     const fetchMock = vi.fn(async () => {
       calls += 1;
@@ -95,10 +99,71 @@ describe('openLiveVoiceEventsStream reconnect', () => {
 
     openLiveVoiceEventsStream('sess-401', () => {});
 
-    await vi.waitFor(() => expect(calls).toBe(1));
+    // One outer attempt makes two requests: the original 401, then the
+    // single fresh-token retry, which also 401s -- so the stream stops for
+    // good without ever looping past that pair.
+    await vi.waitFor(() => expect(calls).toBe(2));
 
     await vi.advanceTimersByTimeAsync(20000);
-    expect(calls).toBe(1);
+    expect(calls).toBe(2);
+  });
+
+  it('retries once with a fresh token on 403 and keeps the stream going if that retry succeeds', async () => {
+    let calls = 0;
+    const events: unknown[] = [];
+    const fetchMock = vi.fn(async () => {
+      calls += 1;
+      if (calls === 1) return forbiddenResponse();
+      return sseResponse([{ type: 'voice_message', role: 'assistant', content: 'hi' }]);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    openLiveVoiceEventsStream('sess-403-retry', (event) => events.push(event));
+
+    // The 403 retry succeeds within the same outer attempt (no backoff
+    // delay between the two), delivering an event.
+    await vi.waitFor(() => expect(calls).toBe(2));
+    await vi.waitFor(() =>
+      expect(events).toEqual([{ type: 'voice_message', role: 'assistant', content: 'hi' }]),
+    );
+  });
+
+  it('asks the token getter for a fresh (non-cached) token on the auth retry', async () => {
+    // Like Clerk: the cached token is stale until the caller asks to skip the cache.
+    setAuthTokenGetter(async (opts) => (opts?.skipCache ? 'fresh' : 'stale'));
+
+    let calls = 0;
+    const authHeaders: Array<string | null> = [];
+    const fetchMock = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      calls += 1;
+      authHeaders.push(new Headers(init?.headers).get('Authorization'));
+      if (calls === 1) return forbiddenResponse();
+      return sseResponse([]);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    openLiveVoiceEventsStream('sess-403-fresh-token', () => {});
+
+    await vi.waitFor(() => expect(calls).toBe(2));
+    expect(authHeaders).toEqual(['Bearer stale', 'Bearer fresh']);
+  });
+
+  it('stops for good, without looping, when a 403 retry also 403s', async () => {
+    let calls = 0;
+    const fetchMock = vi.fn(async () => {
+      calls += 1;
+      return forbiddenResponse();
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    openLiveVoiceEventsStream('sess-403-twice', () => {});
+
+    await vi.waitFor(() => expect(calls).toBe(2));
+
+    // No infinite loop: no further requests happen, even after plenty of
+    // time for any number of backoff-scheduled reconnects.
+    await vi.advanceTimersByTimeAsync(60000);
+    expect(calls).toBe(2);
   });
 
   it('resets the backoff after a connection that delivered an event', async () => {

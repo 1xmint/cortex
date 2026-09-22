@@ -9,7 +9,7 @@
  * The rule: the server-written confirm prompt always ends with the fixed
  * text ". Say yes, or tap Confirm on screen." -- so the transcript is the
  * anchor. Until the accumulated transcript (normalised: lowercased,
- * whitespace-collapsed, punctuation-stripped) contains "tap confirm on
+ * whitespace-collapsed, punctuation-stripped) ends with "tap confirm on
  * screen", audio level is ignored entirely: speech from *before* the prompt
  * (e.g. the model saying "Sure, I'll delete those" while still deciding)
  * followed by a gap must never look like the prompt ending. Once that anchor
@@ -41,7 +41,11 @@ const ANCHOR_TEXT = 'tap confirm on screen';
 function normalize(text: string): string {
   return text
     .toLowerCase()
-    .replace(/[.,!?;:'"()]/g, '')
+    // Any non-letter, non-digit, non-whitespace character -- not just the
+    // plain ASCII punctuation set -- so an ellipsis ("…"), a curly closing
+    // quote ("”"), or an em dash ("—") after the anchor phrase never keeps
+    // it from matching the end of the buffer.
+    .replace(/[^\p{L}\p{N}\s]/gu, ' ')
     .replace(/\s+/g, ' ')
     .trim();
 }
@@ -70,15 +74,24 @@ export class SpokenPromptEndDetector {
    * text from a previous prompt never carries over.
    */
   onTranscript(delta: string): void {
-    if (this.decided || this.anchorReached) return;
+    if (this.decided) return;
     this.transcriptBuffer += delta;
-    if (normalize(this.transcriptBuffer).includes(ANCHOR_TEXT)) {
-      this.anchorReached = true;
+    // Recomputed on every delta, not latched -- the anchor is only ever
+    // "reached" while the end of the buffer, right now, matches. A delta
+    // that mentions the phrase mid-buffer and is then followed by more text
+    // must un-arm it just as readily as a fresh delta that lands the phrase
+    // at the end re-arms it (anchored at the end of the buffer, after
+    // normalising away trailing whitespace/punctuation, so a summary that
+    // happens to mention the phrase before its real, final occurrence never
+    // fires early).
+    const reachedNow = normalize(this.transcriptBuffer).endsWith(ANCHOR_TEXT);
+    if (reachedNow && !this.anchorReached) {
       // Whatever silence run was accumulating before the anchor landed
       // doesn't count toward the hold -- restart the clock from here so the
       // full `silenceHoldMs` is measured after the prompt's fixed tail.
       this.silenceSinceMs = null;
     }
+    this.anchorReached = reachedNow;
   }
 
   /** Feeds one audio-level sample at `atMs` and returns the decision so far. */

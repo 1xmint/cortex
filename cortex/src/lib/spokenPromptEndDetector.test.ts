@@ -78,6 +78,68 @@ describe('SpokenPromptEndDetector', () => {
     expect(detector.sample(0.9, 800)).toBe('ended');
   });
 
+  it('does not fire when the anchor mention is split across deltas but more text follows in a later delta', () => {
+    const detector = new SpokenPromptEndDetector();
+    // The anchor phrase lands at the end of the buffer after the first
+    // delta -- but a second delta immediately extends the buffer past it,
+    // so the anchor must un-arm rather than staying latched from delta 1.
+    detector.onTranscript('I said tap Confirm on screen');
+    detector.onTranscript(' last time, but let\'s try again.');
+    expect(detector.sample(0, 0)).toBe('listening');
+    expect(detector.sample(0, 5000)).toBe('listening'); // no anchor at the end, so no decision
+  });
+
+  it('re-arms once a later delta lands the anchor at the end of the buffer again', () => {
+    const detector = new SpokenPromptEndDetector();
+    detector.onTranscript('I said tap Confirm on screen');
+    detector.onTranscript(" last time, but let's try again. Say yes, or tap ");
+    detector.onTranscript('Confirm on screen.');
+    expect(detector.sample(0, 0)).toBe('listening'); // silence clock only just started
+    expect(detector.sample(0, 700)).toBe('ended');
+  });
+
+  it('restarts the silence clock when the anchor re-arms, so silence from before does not count', () => {
+    const detector = new SpokenPromptEndDetector();
+    detector.onTranscript('Say yes, or tap Confirm on screen.');
+    expect(detector.sample(0, 0)).toBe('listening');
+    expect(detector.sample(0, 600)).toBe('listening');
+    detector.onTranscript(' and more');
+    expect(detector.sample(0, 650)).toBe('listening');
+    detector.onTranscript(' Say yes, or tap Confirm on screen.');
+    expect(detector.sample(0, 700)).toBe('listening'); // clock restarts here, not at 0
+    expect(detector.sample(0, 1399)).toBe('listening');
+    expect(detector.sample(0, 1400)).toBe('ended');
+  });
+
+  it('matches the anchor text ending in an ellipsis, a curly quote, or a dash', () => {
+    for (const suffix of ['…', '”', ' —']) {
+      const detector = new SpokenPromptEndDetector();
+      detector.onTranscript(`Say yes, or tap Confirm on screen${suffix}`);
+      expect(detector.sample(0, 0)).toBe('listening'); // silence clock only just started
+      expect(detector.sample(0, 700)).toBe('ended');
+    }
+  });
+
+  it('does not fire when the anchor phrase appears mid-buffer but the buffer keeps going', () => {
+    const detector = new SpokenPromptEndDetector();
+    // The model's summary itself references the confirm phrasing, but more
+    // text follows it, so the anchor is not at the end of the buffer yet.
+    detector.onTranscript(
+      "I said tap Confirm on screen last time, but let's try again. Say yes, or tap ",
+    );
+    expect(detector.sample(0, 0)).toBe('listening');
+    expect(detector.sample(0, 5000)).toBe('listening'); // no anchor at the end yet, so no decision
+  });
+
+  it('fires once the anchor phrase finally lands at the end of the buffer, even if mentioned earlier', () => {
+    const detector = new SpokenPromptEndDetector();
+    detector.onTranscript(
+      "I said tap Confirm on screen last time, but let's try again. Say yes, or tap Confirm on screen.",
+    );
+    expect(detector.sample(0, 0)).toBe('listening'); // silence clock only just started
+    expect(detector.sample(0, 700)).toBe('ended');
+  });
+
   it('honors custom thresholds', () => {
     const detector = new SpokenPromptEndDetector({
       silenceThreshold: 0.1,
