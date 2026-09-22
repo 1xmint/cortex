@@ -308,11 +308,10 @@ export function streamChat(
           const body = await res.text();
           const status = res.status;
           if (status === 409) {
-            let zenMessage = body;
             try {
               const parsed = JSON.parse(body) as { error?: string; message?: string };
               if (parsed.error === 'zen_key_required') {
-                throw new ZenKeyRequiredError(parsed.message ?? zenMessage);
+                throw new ZenKeyRequiredError(parsed.message ?? body);
               }
             } catch (parseErr) {
               if (parseErr instanceof ZenKeyRequiredError) throw parseErr;
