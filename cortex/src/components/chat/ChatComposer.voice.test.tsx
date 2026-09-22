@@ -512,13 +512,13 @@ describe('ChatComposer voice controls', () => {
     });
     await waitFor(() => expect(screen.getByLabelText('Live voice')).toHaveAttribute('aria-pressed', 'true'));
 
+    const pc = lastPeerConnection;
+    const dc = pc?.lastDataChannel;
     await act(async () => {
       window.dispatchEvent(new Event('pagehide'));
     });
 
-    expect(lastPeerConnection?.lastDataChannel?.send).toHaveBeenCalledWith(
-      JSON.stringify({ type: 'session.close' }),
-    );
+    expect(dc?.send).toHaveBeenCalledWith(JSON.stringify({ type: 'session.close' }));
     const deleteCalls = fetchSpy.mock.calls.filter(([, init]) => (init?.method ?? 'GET') === 'DELETE');
     expect(deleteCalls.length).toBe(1);
     expect(deleteCalls[0][1]?.keepalive).toBe(true);
@@ -590,6 +590,59 @@ describe('ChatComposer voice controls', () => {
     const deleteCalls = fetchSpy.mock.calls.filter(([, init]) => (init?.method ?? 'GET') === 'DELETE');
     expect(deleteCalls.length).toBe(1);
     expect(deleteCalls[0][1]?.keepalive).toBe(true);
+  });
+
+  it('a bfcache pagehide while getUserMedia is still pending cancels the in-flight start', async () => {
+    let resolveMedia: (stream: MediaStream) => void = () => {};
+    const mediaPromise = new Promise<MediaStream>((resolve) => {
+      resolveMedia = resolve;
+    });
+    const fakeTrack = { stop: vi.fn(), addEventListener: vi.fn() };
+    const fakeStream = { getTracks: () => [fakeTrack] } as unknown as MediaStream;
+    Object.defineProperty(navigator, 'mediaDevices', {
+      value: { getUserMedia: vi.fn(() => mediaPromise) },
+      configurable: true,
+    });
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
+      const url = String(input);
+      const method = init?.method ?? 'GET';
+      if (url.includes('/api/voice/live/sessions') && method === 'POST') {
+        return jsonResponse({ session_id: 'sess-pending', sdp: 'fake-answer-sdp' });
+      }
+      if (url.includes('/api/voice/live/sessions/') && method === 'DELETE') {
+        return jsonResponse({});
+      }
+      return jsonResponse({}, 404);
+    });
+
+    render(<ChatComposer draft="" onDraftChange={noop} onSend={noop} />);
+    fireEvent.click(screen.getByLabelText('Live voice'));
+
+    await act(async () => {
+      const pageHideEvent = new Event('pagehide') as PageTransitionEvent;
+      Object.defineProperty(pageHideEvent, 'persisted', { value: true });
+      window.dispatchEvent(pageHideEvent);
+    });
+
+    expect(screen.getByLabelText('Live voice')).toHaveAttribute('aria-pressed', 'false');
+
+    await act(async () => {
+      resolveMedia(fakeStream);
+      for (let i = 0; i < 20; i += 1) {
+        await Promise.resolve();
+      }
+    });
+
+    const postCalls = fetchSpy.mock.calls.filter(
+      ([url, init]) => String(url).includes('/api/voice/live/sessions') && (init?.method ?? 'GET') === 'POST',
+    );
+    const deleteCalls = fetchSpy.mock.calls.filter(([, init]) => (init?.method ?? 'GET') === 'DELETE');
+    // A cancelled start must never leave a session running with no UI
+    // pointed at it: either it never got as far as the POST, or it did and
+    // the cancellation's DELETE cleaned it up.
+    expect(deleteCalls.length).toBe(postCalls.length);
+    expect(fakeTrack.stop).toHaveBeenCalled();
+    expect(screen.getByLabelText('Live voice')).toHaveAttribute('aria-pressed', 'false');
   });
 
   it('refreshes the auth token every ~30s so the pagehide DELETE carries a fresh one', async () => {
