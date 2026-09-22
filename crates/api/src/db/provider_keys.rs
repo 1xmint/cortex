@@ -30,6 +30,12 @@ pub struct ProviderKeyRow {
     pub nonce: Vec<u8>,
     pub ciphertext: Vec<u8>,
     pub status: String,
+    /// The row's `updated_at` as read here. Callers that later act on this
+    /// key (e.g. `mark_provider_key_rejected`) pass it back so the update
+    /// only applies if the row has not changed since -- a user replacing
+    /// the key while an old request is still in flight must not have the
+    /// new key marked rejected because of the old one's failure.
+    pub updated_at: i64,
 }
 
 impl Database {
@@ -109,7 +115,7 @@ impl Database {
     pub fn get_provider_key_row(&self, user_id: &str, provider: &str) -> Option<ProviderKeyRow> {
         let conn = self.conn();
         conn.query_row(
-            "SELECT user_id, provider, key_version, nonce, ciphertext, status
+            "SELECT user_id, provider, key_version, nonce, ciphertext, status, updated_at
              FROM user_provider_keys WHERE user_id = ?1 AND provider = ?2",
             params![user_id, provider],
             |row| {
@@ -120,18 +126,30 @@ impl Database {
                     nonce: row.get(3)?,
                     ciphertext: row.get(4)?,
                     status: row.get(5)?,
+                    updated_at: row.get(6)?,
                 })
             },
         )
         .ok()
     }
 
-    pub fn mark_provider_key_rejected(&self, user_id: &str, provider: &str, now_ms: i64) {
+    /// Marks the key rejected, but only if the row is still the same one the
+    /// caller decrypted -- `expected_updated_at` is that row's `updated_at`
+    /// as read at decrypt time. If the customer has since replaced the key
+    /// (which bumps `updated_at`), this is a no-op: a 401 for the old key
+    /// must never mark the new one rejected.
+    pub fn mark_provider_key_rejected(
+        &self,
+        user_id: &str,
+        provider: &str,
+        expected_updated_at: i64,
+        now_ms: i64,
+    ) {
         let conn = self.conn();
         conn.execute(
-            "UPDATE user_provider_keys SET status = 'rejected', updated_at = ?3
-             WHERE user_id = ?1 AND provider = ?2",
-            params![user_id, provider, now_ms],
+            "UPDATE user_provider_keys SET status = 'rejected', updated_at = ?4
+             WHERE user_id = ?1 AND provider = ?2 AND updated_at = ?3",
+            params![user_id, provider, expected_updated_at, now_ms],
         )
         .expect("mark provider key rejected");
     }
@@ -156,7 +174,7 @@ impl Database {
         let conn = self.conn();
         let mut stmt = conn
             .prepare(
-                "SELECT user_id, provider, key_version, nonce, ciphertext, status
+                "SELECT user_id, provider, key_version, nonce, ciphertext, status, updated_at
                  FROM user_provider_keys WHERE key_version != ?1",
             )
             .expect("prepare list_provider_key_rows_needing_rewrap");
@@ -169,6 +187,7 @@ impl Database {
                     nonce: row.get(3)?,
                     ciphertext: row.get(4)?,
                     status: row.get(5)?,
+                    updated_at: row.get(6)?,
                 })
             })
             .expect("query list_provider_key_rows_needing_rewrap");
@@ -300,6 +319,31 @@ mod tests {
             // Second run is a no-op: nothing left below the current version.
             let rewrapped_again = byok::rewrap_provider_keys(&db).unwrap();
             assert!(rewrapped_again.is_empty());
+        });
+    }
+
+    #[test]
+    fn mark_rejected_with_stale_updated_at_leaves_row_active() {
+        with_test_kek(|| {
+            let db = test_db();
+            let enc = byok::encrypt("user-a", "zen", "zen-test-SECRETSECRET1234").unwrap();
+            db.upsert_provider_key("user-a", "zen", &enc, "1234", 1000);
+
+            let stale_row = db.get_provider_key_row("user-a", "zen").unwrap();
+            assert_eq!(stale_row.updated_at, 1000);
+
+            // The customer replaces the key -- bumps `updated_at` -- while a
+            // 401 for the old key is still in flight.
+            let replacement = byok::encrypt("user-a", "zen", "zen-test-SECRETSECRET5678").unwrap();
+            db.upsert_provider_key("user-a", "zen", &replacement, "5678", 2000);
+
+            // The in-flight failure marks rejected using the stale
+            // `updated_at` it read before the replacement landed.
+            db.mark_provider_key_rejected("user-a", "zen", stale_row.updated_at, 3000);
+
+            let row = db.get_provider_key_row("user-a", "zen").unwrap();
+            assert_eq!(row.status, "active");
+            assert_eq!(row.updated_at, 2000);
         });
     }
 }

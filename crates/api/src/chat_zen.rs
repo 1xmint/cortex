@@ -76,6 +76,13 @@ fn needs_key_message(model: &str) -> String {
     )
 }
 
+/// A key row exists but this process could not decrypt it (e.g. a KEK
+/// rotation gap) -- distinct from `needs_key_message`'s "you never added
+/// one" so the customer knows to re-enter it, never the raw crypto error.
+/// Same status/error code as `zen_key_required` (409 `zen_key_required`):
+/// the client's handling is identical either way, only the copy differs.
+const KEY_UNREADABLE_MESSAGE: &str = "Your saved Zen key can't be read. Re-enter it in Settings.";
+
 /// `POST /api/chat` when `model` is `"zen:<model>"`. Returns the same SSE
 /// contract as `chat::chat`'s other paths (`Started`/`Output`/`Completed`/
 /// `Failed`), except that every refusal in this function returns a plain
@@ -121,12 +128,14 @@ pub(crate) async fn chat(
         nonce: row.nonce.clone(),
         ciphertext: row.ciphertext.clone(),
     };
+    let key_updated_at = row.updated_at;
     let key: ZenApiKey = match byok::decrypt(&user.user_id, "zen", &encrypted) {
         Ok(key) => key,
-        // Unreadable under any KEK this process has -- the same recoverable
-        // case `rewrap_provider_keys` documents: the customer re-enters
-        // their key. Never a 500 for this.
-        Err(_) => return Err(zen_key_required(needs_key_message(&zen_model))),
+        // Unreadable under any KEK this process has -- a row exists but
+        // this process cannot read it (e.g. a KEK rotation gap). Distinct
+        // from "no key on file" so the customer knows to re-enter it,
+        // never a 500, and never the raw crypto error.
+        Err(_) => return Err(zen_key_required(KEY_UNREADABLE_MESSAGE.into())),
     };
 
     let (tx, rx) = mpsc::channel::<StepEvent>(64);
@@ -149,6 +158,7 @@ pub(crate) async fn chat(
         system_prompt,
         user_message,
         key,
+        key_updated_at,
         tx,
         ZenTransport::new(),
     ));
@@ -294,6 +304,7 @@ async fn run<T: ProviderTransport + Clone>(
     system_prompt: String,
     user_message: String,
     key: ZenApiKey,
+    key_updated_at: i64,
     tx: mpsc::Sender<StepEvent>,
     transport: T,
 ) {
@@ -424,7 +435,7 @@ async fn run<T: ProviderTransport + Clone>(
                 (failure.kind, status_from_message(&failure.message)),
                 (TransportFailureKind::Rejected, Some(401 | 403))
             ) {
-                db.mark_provider_key_rejected(&user_id, "zen", now_ms);
+                db.mark_provider_key_rejected(&user_id, "zen", key_updated_at, now_ms);
             }
             let (user_text, _marked_rejected) =
                 user_message_for_failure(failure.kind, &failure.message);
@@ -574,6 +585,7 @@ mod tests {
             "system".into(),
             "hi".into(),
             key,
+            1_800_000_000_000,
             tx,
             ZenTransport::with_base_url(url),
         )
@@ -708,11 +720,12 @@ mod tests {
             "1234",
             1_800_000_000_000,
         );
-        state
-            .db
-            .as_ref()
-            .unwrap()
-            .mark_provider_key_rejected("user-4", "zen", 1_800_000_000_000);
+        state.db.as_ref().unwrap().mark_provider_key_rejected(
+            "user-4",
+            "zen",
+            1_800_000_000_000,
+            1_800_000_000_000,
+        );
 
         let user = ClerkUser {
             user_id: "user-4".into(),
@@ -822,6 +835,7 @@ mod tests {
             "system".into(),
             "hi".into(),
             key,
+            1_800_000_000_000,
             tx,
             ZenTransport::with_base_url(url),
         )
@@ -870,6 +884,7 @@ mod tests {
             "system".into(),
             "hi".into(),
             key,
+            1_800_000_000_000,
             tx,
             ZenTransport::with_base_url(url),
         )
@@ -994,6 +1009,10 @@ mod tests {
         );
 
         let after = crate::chat::chat_models(State(state.clone()), user).await.0;
+
+        std::env::remove_var("CORTEX_BYOK_KEK_V1");
+        std::env::remove_var("CORTEX_BYOK_KEK_CURRENT");
+
         let zen_after: Vec<_> = after
             .models
             .iter()
@@ -1010,9 +1029,6 @@ mod tests {
             .map(|m| serde_json::to_value(m).unwrap())
             .collect();
         assert_eq!(claude_before, claude_after, "claude entries never change");
-
-        std::env::remove_var("CORTEX_BYOK_KEK_V1");
-        std::env::remove_var("CORTEX_BYOK_KEK_CURRENT");
     }
 
     // --- 9: no `model` field behaves exactly as before -- it never reaches
