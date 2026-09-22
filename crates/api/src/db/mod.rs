@@ -16,9 +16,11 @@ use uuid::Uuid;
 use crate::lock::LockRecovering;
 
 mod ledger;
+mod pending_actions;
 mod provider_gateway;
 mod verification_queue;
 
+pub use pending_actions::{ConfirmActionError, PendingAction, PENDING_ACTION_TTL_SECS};
 pub use provider_gateway::{ProviderReservation, SpendAuthorization};
 
 pub struct Database {
@@ -537,6 +539,9 @@ fn apply_migrations(conn: &Connection) {
     if current < 68 {
         migrate_v68(conn);
     }
+    if current < 69 {
+        migrate_v69(conn);
+    }
 }
 
 fn migrate_v68(conn: &Connection) {
@@ -602,6 +607,68 @@ fn migrate_v68(conn: &Connection) {
     tracing::info!(
         "applied migration v68: provider gateway authorizations and durable reservations"
     );
+}
+
+fn migrate_v69(conn: &Connection) {
+    // The confirm-before-run queue for `Risk::Confirm` agent tools
+    // (`agent_tools::Risk`, `crates/api/src/agent_tools.rs`).
+    //
+    // A `Confirm` tool's arguments are validated and a plain-language
+    // `summary` is written by the server from those arguments — never from
+    // model text — the moment the model asks for the tool. That becomes one
+    // row here, not an executed action: nothing runs until the user taps
+    // Confirm in the UI, which posts `nonce` back to
+    // `POST /api/agent/actions/{id}/confirm`.
+    //
+    // `args_json` is the canonical (sorted-key) form of the arguments the
+    // model sent, and `args_hash` is its SHA-256. Confirming re-hashes the
+    // stored `args_json` and checks it against `args_hash` in the same
+    // transaction as the status flip, so a row edited by anything other than
+    // this module between proposal and confirmation is refused rather than
+    // executed with different arguments than the user was shown.
+    //
+    // `nonce` is a second, unguessable secret alongside the row `id`: the id
+    // alone appears in the SSE stream and, once rendered, in the DOM, so it
+    // is not treated as proof of possession by itself.
+    //
+    // Only one pending action is live per (user, conversation) at a time —
+    // proposing a new one voids (`status = 'cancelled'`) whatever pending row
+    // preceded it, so a stale card in an old browser tab can never confirm
+    // an action the model isn't currently asking about.
+    //
+    // Numbered v69: the maximum on main at rebase time was v68 (PR — provider
+    // gateway spend controls). `schema_version` is one counter shared with
+    // the HeyVera Socials product — re-check the maximum before claiming a
+    // number, because whichever branch merges second has its migration
+    // silently skipped.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS agent_pending_actions (
+            id              TEXT PRIMARY KEY,
+            user_id         TEXT NOT NULL,
+            conversation_id TEXT NOT NULL,
+            tool_name       TEXT NOT NULL,
+            args_json       TEXT NOT NULL,
+            args_hash       TEXT NOT NULL,
+            summary         TEXT NOT NULL,
+            nonce           TEXT NOT NULL,
+            status          TEXT NOT NULL DEFAULT 'pending'
+                CHECK(status IN ('pending', 'confirmed', 'cancelled', 'expired')),
+            created_at      INTEGER NOT NULL,
+            expires_at      INTEGER NOT NULL,
+            resolved_at     INTEGER
+        );
+
+        -- The confirm/cancel routes look up by id; the loop looks up the
+        -- live pending row for a (user, conversation) to void it when a new
+        -- proposal arrives.
+        CREATE INDEX IF NOT EXISTS idx_agent_pending_actions_conversation
+            ON agent_pending_actions(user_id, conversation_id, status);
+
+        UPDATE schema_version SET version = 69;",
+    )
+    .expect("migration v69 failed creating agent_pending_actions");
+
+    tracing::info!("applied migration v69: agent_pending_actions (confirm-before-run queue)");
 }
 
 fn migrate_v67(conn: &Connection) {

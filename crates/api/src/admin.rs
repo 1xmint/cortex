@@ -30,7 +30,12 @@ pub async fn authorize_admin(
 ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
     let admins = admin_set();
     if admins.is_empty() {
-        if std::env::var("CLERK_SECRET_KEY").is_err() {
+        // Local-dev bypass only when the key is absent from BOTH the state
+        // and the environment. main.rs turns an empty `CLERK_SECRET_KEY=""`
+        // into a `None` state, and that must stay fail-closed here, so the
+        // env check is kept. The state check lets tests that build a keyed
+        // `AppState` exercise the real path without touching the env.
+        if state.clerk_secret_key.is_none() && std::env::var("CLERK_SECRET_KEY").is_err() {
             return Ok(());
         }
         return Err((

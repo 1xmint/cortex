@@ -979,26 +979,24 @@ fn truncate_str(s: &str, max_len: usize) -> String {
     }
 }
 
-/// `POST /api/runs/{id}/pr` — push the run's branch and create a GitHub PR.
+/// The checks `create_pr_core` needs before it may push or open anything:
+/// the run exists, the requesting user owns it, PR authority is granted, and
+/// the run actually produced a branch. Split out so the `open_pr` agent tool
+/// (`agent_tools.rs`, via `chat_paid.rs`'s confirm loop) can run exactly this
+/// validation *before* a `Risk::Confirm` proposal is ever written to
+/// `agent_pending_actions` — refusing up front, with no pending row created,
+/// rather than only discovering the run can't be PR'd after the user has
+/// already tapped Confirm.
 ///
-/// Tries the GitHub API first (if `GITHUB_TOKEN` is set), falls back to `gh` CLI.
-pub async fn create_pr(
-    State(state): State<Arc<AppState>>,
-    user: PremiumUser,
-    axum::extract::Path(id): axum::extract::Path<String>,
-    Json(req): Json<CreatePrRequest>,
-) -> Result<Json<CreatePrResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let db = state.db.as_ref().ok_or_else(|| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: "database not available".into(),
-            }),
-        )
-    })?;
-
+/// Returns `(goal, branch)` on success — both are needed to build the PR
+/// title/body.
+pub(crate) fn validate_run_for_pr(
+    db: &crate::db::Database,
+    user_id: &str,
+    run_id: &str,
+) -> Result<(String, String), (StatusCode, Json<ErrorResponse>)> {
     // Verify the run exists
-    let goal = db.get_run_goal(&id).ok_or_else(|| {
+    let goal = db.get_run_goal(run_id).ok_or_else(|| {
         (
             StatusCode::NOT_FOUND,
             Json(ErrorResponse {
@@ -1008,7 +1006,7 @@ pub async fn create_pr(
     })?;
 
     // Verify the requesting user owns this run
-    if !db.verify_run_owner(&id, &user.user_id) {
+    if !db.verify_run_owner(run_id, user_id) {
         return Err((
             StatusCode::FORBIDDEN,
             Json(ErrorResponse {
@@ -1017,10 +1015,10 @@ pub async fn create_pr(
         ));
     }
 
-    validate_pr_authority(db, &user.user_id, &id)?;
+    validate_pr_authority(db, user_id, run_id)?;
 
     // Get the branch
-    let branch = db.get_run_branch(&id).ok_or_else(|| {
+    let branch = db.get_run_branch(run_id).ok_or_else(|| {
         (
             StatusCode::UNPROCESSABLE_ENTITY,
             Json(ErrorResponse {
@@ -1028,6 +1026,23 @@ pub async fn create_pr(
             }),
         )
     })?;
+
+    Ok((goal, branch))
+}
+
+/// The shared core behind `POST /api/runs/{id}/pr` and the `open_pr` agent
+/// tool's confirm handler (`crate::agent_confirm`): validate, push the run's
+/// branch, and create the GitHub PR. Tries the GitHub API first (if
+/// `GITHUB_TOKEN` is set), falls back to `gh` CLI.
+pub(crate) async fn create_pr_core(
+    state: &AppState,
+    db: &crate::db::Database,
+    user_id: &str,
+    run_id: &str,
+    title: Option<String>,
+    base: &str,
+) -> Result<CreatePrResponse, (StatusCode, Json<ErrorResponse>)> {
+    let (goal, branch) = validate_run_for_pr(db, user_id, run_id)?;
 
     // Push the branch to origin
     let push_output = std::process::Command::new("git")
@@ -1054,25 +1069,25 @@ pub async fn create_pr(
     }
 
     // Build PR metadata
-    let title = req.title.unwrap_or_else(|| format!("cortex: {goal}"));
+    let title = title.unwrap_or_else(|| format!("cortex: {goal}"));
     let authority_scope_id = db
-        .get_run_pr_authority_context(&id, &user.user_id)
+        .get_run_pr_authority_context(run_id, user_id)
         .and_then(|ctx| ctx.authority_scope_id);
-    let body = build_pr_body(&id, &goal, &branch, db, authority_scope_id.as_deref());
+    let body = build_pr_body(run_id, &goal, &branch, db, authority_scope_id.as_deref());
 
     // Try GitHub API first, fall back to gh CLI
     if let Some(gh_client) = &state.github_client {
         if let Some((owner, repo)) = github::parse_github_remote(&state.workspace_dir) {
             match gh_client
-                .create_pull_request(&owner, &repo, &title, &body, &branch, &req.base)
+                .create_pull_request(&owner, &repo, &title, &body, &branch, base)
                 .await
             {
                 Ok(pr) => {
                     tracing::info!("PR #{} created via GitHub API: {}", pr.number, pr.html_url);
-                    return Ok(Json(CreatePrResponse {
+                    return Ok(CreatePrResponse {
                         pr_url: pr.html_url,
                         branch,
-                    }));
+                    });
                 }
                 Err(e) => {
                     tracing::warn!("GitHub API PR creation failed, falling back to gh CLI: {e}");
@@ -1087,8 +1102,7 @@ pub async fn create_pr(
     // Fallback: create PR via gh CLI
     let pr_output = std::process::Command::new("gh")
         .args([
-            "pr", "create", "--title", &title, "--body", &body, "--base", &req.base, "--head",
-            &branch,
+            "pr", "create", "--title", &title, "--body", &body, "--base", base, "--head", &branch,
         ])
         .current_dir(&state.workspace_dir)
         .output()
@@ -1115,7 +1129,28 @@ pub async fn create_pr(
         .trim()
         .to_string();
 
-    Ok(Json(CreatePrResponse { pr_url, branch }))
+    Ok(CreatePrResponse { pr_url, branch })
+}
+
+/// `POST /api/runs/{id}/pr` — push the run's branch and create a GitHub PR.
+/// See `create_pr_core` for the actual work; this handler is just the HTTP
+/// extractor shell shared with the `open_pr` agent tool.
+pub async fn create_pr(
+    State(state): State<Arc<AppState>>,
+    user: PremiumUser,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    Json(req): Json<CreatePrRequest>,
+) -> Result<Json<CreatePrResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let db = state.db.as_ref().ok_or_else(|| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: "database not available".into(),
+            }),
+        )
+    })?;
+    let result = create_pr_core(&state, db, &user.user_id, &id, req.title, &req.base).await?;
+    Ok(Json(result))
 }
 
 // --- Cost Projection ---
