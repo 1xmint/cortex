@@ -1,8 +1,9 @@
-//! The real wire to OpenCode Zen, on Cortex's own key.
+//! The wire to OpenCode Zen, on the customer's own key.
 //!
-//! One supplier per file. The gateway in `provider_gateway.rs` decides
-//! whether a call may happen and what it is allowed to cost; this file only
-//! makes the call and reports honestly what came back. Mirrors
+//! Zen is bring-your-own-key only: Cortex never holds a Zen key of its own,
+//! and this transport never runs behind the Cortex-funded provider gateway
+//! in `provider_gateway.rs`. It will be called directly, with a customer's
+//! own key, from the chat BYOK path arriving in M-D-0003. Mirrors
 //! `supplier_openai.rs`, since Zen's `/chat/completions` family speaks the
 //! same OpenAI-compatible chat-completions shape.
 //!
@@ -18,6 +19,15 @@
 //! `max_output_tokens` respectively, and a request that asked for anything
 //! else there is refused rather than silently downgraded, so nothing can
 //! spend past what the gateway reserved.
+
+// This module has no production caller yet: the Cortex-funded gateway path
+// that used to call it was removed (Zen is BYOK-only, never Cortex-funded),
+// and the BYOK chat path that will call it directly is `chat_zen.rs`, a
+// later step (M-D-0003). `ZenTransport::new` and `ZEN_BASE_URL` are dead in
+// both the lib and test builds — `mod tests` below exercises
+// `ZenTransport::with_base_url(..).forward(..)` directly, never `new()` —
+// so `expect` is satisfiable rather than a blanket `allow`.
+#![expect(dead_code, reason = "wired by chat_zen.rs in M-D-0003")]
 
 use std::future::Future;
 use std::time::Duration;

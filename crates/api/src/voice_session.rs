@@ -1192,10 +1192,7 @@ async fn run_billing_loop(
                             // goodbye path.
                             if warning_deadline.is_none() {
                                 sideband
-                                    .send(serde_json::json!({
-                                        "type": "session.instructions.append",
-                                        "instructions": WARNING_TEXT,
-                                    }))
+                                    .send(instructions_append_event(WARNING_TEXT))
                                     .await;
                                 warning_deadline = Some(tokio::time::Instant::now() + WARNING_GRACE);
                             }
@@ -1208,10 +1205,7 @@ async fn run_billing_loop(
                                 warning_deadline = None;
                             } else if warning_deadline.is_none() {
                                 sideband
-                                    .send(serde_json::json!({
-                                        "type": "session.instructions.append",
-                                        "instructions": WARNING_TEXT,
-                                    }))
+                                    .send(instructions_append_event(WARNING_TEXT))
                                     .await;
                                 warning_deadline = Some(tokio::time::Instant::now() + WARNING_GRACE);
                             }
@@ -1400,12 +1394,21 @@ fn accumulate_transcript(pending_transcript: &mut String, event: &Value) {
     }
 }
 
+/// A fresh client `event_id`. OpenAI's GPT-Live docs show one on every
+/// client event (developers.openai.com/api/docs/guides/live-conversations,
+/// checked 2026-09-22); it is what a server error names when it refers back
+/// to the event that caused it.
+fn client_event_id() -> String {
+    format!("evt_{}", uuid::Uuid::new_v4().simple())
+}
+
 /// Build one `session.commentary.append` event, trimmed to
 /// [`COMMENTARY_CHAR_CAP`] characters.
 fn commentary_event(delegation_id: &str, content: &str) -> Value {
     let content: String = content.chars().take(COMMENTARY_CHAR_CAP).collect();
     serde_json::json!({
         "type": "session.commentary.append",
+        "event_id": client_event_id(),
         "delegation_id": delegation_id,
         "content": content,
     })
@@ -1416,15 +1419,16 @@ fn commentary_event(delegation_id: &str, content: &str) -> Value {
 /// id to send a `session.commentary.append` event for (an outcome resolved
 /// by `spoken_tick` rather than by a `session.delegation.created` event).
 ///
-/// UNVERIFIED against the live API: nothing else in this codebase sends
-/// `session.instructions.append`, so this shape — a bare `type`/`content`
-/// object, mirroring [`commentary_event`] minus the delegation id — is
-/// inferred, not confirmed against OpenAI's docs or a live GPT-Live session.
-/// If OpenAI rejects it in this position, that needs its own follow-up.
+/// The shape follows OpenAI's documented example (live-conversations guide,
+/// checked 2026-09-22): `delegation_id` is required and is `null` for
+/// session-wide context, and each append is capped at 500 tokens, the same
+/// as commentary. Not yet exercised against a live session.
 fn instructions_append_event(content: &str) -> Value {
     let content: String = content.chars().take(COMMENTARY_CHAR_CAP).collect();
     serde_json::json!({
         "type": "session.instructions.append",
+        "event_id": client_event_id(),
+        "delegation_id": Value::Null,
         "content": content,
     })
 }
@@ -2808,6 +2812,49 @@ mod tests {
 
     const USER: &str = "user-1";
     const SIGNING_KEY: &str = "0123456789abcdef0123456789abcdef";
+
+    // Shapes from OpenAI's GPT-Live live-conversations guide: every client
+    // event carries an `event_id`, and instructions.append carries a
+    // `delegation_id` that is null for session-wide context.
+    #[test]
+    fn commentary_event_matches_documented_shape() {
+        let event = commentary_event("del_1", "Working on it.");
+        assert_eq!(event["type"], "session.commentary.append");
+        assert_eq!(event["delegation_id"], "del_1");
+        assert_eq!(event["content"], "Working on it.");
+        let id = event["event_id"].as_str().expect("event_id is a string");
+        assert!(id.starts_with("evt_") && id.len() > 4, "{id}");
+        assert_eq!(event.as_object().map(|o| o.len()), Some(4));
+    }
+
+    #[test]
+    fn instructions_append_event_matches_documented_shape() {
+        let event = instructions_append_event("Say yes, or tap Confirm on screen.");
+        assert_eq!(event["type"], "session.instructions.append");
+        assert!(event["delegation_id"].is_null());
+        assert!(event
+            .as_object()
+            .expect("object")
+            .contains_key("delegation_id"));
+        assert_eq!(event["content"], "Say yes, or tap Confirm on screen.");
+        assert!(event.get("instructions").is_none());
+        let id = event["event_id"].as_str().expect("event_id is a string");
+        assert!(id.starts_with("evt_") && id.len() > 4, "{id}");
+        assert_eq!(event.as_object().map(|o| o.len()), Some(4));
+    }
+
+    #[test]
+    fn client_event_ids_are_unique() {
+        let a = instructions_append_event("x");
+        let b = instructions_append_event("x");
+        assert_ne!(a["event_id"], b["event_id"]);
+    }
+
+    #[test]
+    fn low_credit_warning_puts_its_text_in_content() {
+        let event = instructions_append_event(WARNING_TEXT);
+        assert_eq!(event["content"], WARNING_TEXT);
+    }
 
     async fn test_state() -> (tempfile::TempDir, Arc<AppState>) {
         test_state_with_balance(1_000_000_000).await

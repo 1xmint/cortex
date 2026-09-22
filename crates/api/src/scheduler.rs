@@ -1114,13 +1114,11 @@ fn route_step(
         .map(|(p, total, successes)| (p, (total, successes)))
         .collect();
 
-    // Build candidate scores for all available providers × requested tier
-    let providers = [
-        ProviderId::Claude,
-        ProviderId::Openai,
-        ProviderId::Gemini,
-        ProviderId::Zen,
-    ];
+    // Build candidate scores for all available providers × requested tier.
+    // Zen is excluded on purpose: it is bring-your-own-key, chat-only, and
+    // has no sandbox-side HTTP agent backend, so a run can never be routed
+    // to it (see CREDITS.md, "Suppliers Cortex pays for vs. BYOK").
+    let providers = [ProviderId::Claude, ProviderId::Openai, ProviderId::Gemini];
     let mut candidates = Vec::new();
 
     for &provider in &providers {
@@ -2555,5 +2553,37 @@ mod tests {
         );
 
         assert!(checks.is_empty());
+    }
+
+    #[test]
+    fn a_zen_capability_row_never_makes_zen_the_chosen_provider() {
+        // Zen is BYOK, chat-only, and has no sandbox backend, so a run must
+        // never route to it, even when a worker has reported a Zen
+        // capability row. This fails on current main, where Zen is still a
+        // run candidate.
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(&dir.path().join("scheduler-zen.sqlite"));
+        db.register_worker("worker-zen", "user-zen");
+        db.upsert_provider_capability("worker-zen", "user-zen", "zen", None);
+
+        let step = StepRef {
+            step_id: "step-zen".into(),
+            run_id: "run-zen".into(),
+            user_id: "user-zen".into(),
+            kind: StepKind::Execute,
+            work_kind: None,
+            tier: "balanced".into(),
+            risk: "low".into(),
+            objective: "say hello".into(),
+        };
+
+        let (decision, _evidence) =
+            route_step(&db, "user-zen", &step, Tier::Execute, RiskLevel::Low, None);
+
+        assert_ne!(decision.provider, ProviderId::Zen);
+        assert!(decision
+            .alternatives_considered
+            .iter()
+            .all(|route| route.provider != ProviderId::Zen));
     }
 }

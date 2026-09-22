@@ -501,6 +501,13 @@ pub fn seed_models() -> Vec<ModelPrice> {
             1_000_000,
             "fast",
         ),
+        // Zen is bring-your-own-key only (see CREDITS.md, "Suppliers Cortex
+        // pays for vs. BYOK"): the gateway's `KNOWN_PROVIDERS` no longer
+        // includes `"zen"`, so these rows can never back a Cortex-funded
+        // authorization. They stay here, inert, because a published price
+        // list is immutable; removing them would be a new price-list
+        // version, not an edit to this one.
+        //
         // OpenCode Zen (https://opencode.ai/docs/zen, "Pricing" table) and
         // https://opencode.ai/zen/v1/models for exact model ids, both read
         // 2026-09-21. This slice covers only the `/chat/completions` family
