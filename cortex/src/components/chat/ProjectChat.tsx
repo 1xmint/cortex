@@ -29,6 +29,10 @@ interface ProjectChatProps {
   onVoiceConfirmRequired?: (event: { action_id: string; nonce: string; summary: string; expires_at: number }) => void;
   onVoiceSpokenWindow?: (event: { action_id: string; deadline: number }) => void;
   onVoiceConfirmResolved?: (event: { action_id: string; status: string }) => void;
+  selectedModel?: string;
+  onModelChange?: (model: string | undefined) => void;
+  onOpenModelSettings?: () => void;
+  zenKeyError?: string | null;
 }
 
 const PROJECT_STARTER_PROMPTS = [
@@ -60,6 +64,10 @@ export default function ProjectChat({
   onVoiceConfirmRequired,
   onVoiceSpokenWindow,
   onVoiceConfirmResolved,
+  selectedModel,
+  onModelChange,
+  onOpenModelSettings,
+  zenKeyError,
 }: ProjectChatProps) {
   // Count messages sent by the user (not system/assistant) for preview prompt
   const userMessageCount = messages.filter(msg => msg.role === 'user').length;
@@ -126,6 +134,10 @@ export default function ProjectChat({
         onVoiceConfirmRequired={onVoiceConfirmRequired}
         onVoiceSpokenWindow={onVoiceSpokenWindow}
         onVoiceConfirmResolved={onVoiceConfirmResolved}
+        selectedModel={selectedModel}
+        onModelChange={onModelChange}
+        onOpenModelSettings={onOpenModelSettings}
+        zenKeyError={zenKeyError}
       />
     </main>
   );
