@@ -63,7 +63,7 @@ const MAX_AGENT_TURNS: u32 = 8;
 ///
 /// `CORTEX_CHAT_AGENT_TURN_CAP_PER_MINUTE` — default 20 if unset or
 /// unparseable.
-fn turn_cap_per_minute() -> u32 {
+pub(crate) fn turn_cap_per_minute() -> u32 {
     std::env::var("CORTEX_CHAT_AGENT_TURN_CAP_PER_MINUTE")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -450,6 +450,13 @@ pub(crate) async fn send_paid_reply<T: ProviderTransport + Clone>(
     // "Checked your runs" while a slow multi-turn reply is still running.
     // `None` in tests that don't care about the stream.
     tool_events: Option<&mpsc::Sender<StepEvent>>,
+    // A live-voice delegation turn: `Risk::Confirm` tools (`open_pr`,
+    // `cancel_run`) are withheld from the model's tool list entirely, and if
+    // the model names one anyway it is refused with a voice-appropriate
+    // message instead of being proposed or run — there is no spoken
+    // confirmation flow yet (see `voice_session::handle_delegation_created`).
+    // Text chat always passes `false`.
+    voice_turn: bool,
 ) -> Result<PaidReply, PaidReplyError> {
     // Chat is paid by Cortex on the Anthropic path only (`ProviderPath::Cortex`);
     // a run that wants a different supplier goes through the HTTP gateway
@@ -475,7 +482,11 @@ pub(crate) async fn send_paid_reply<T: ProviderTransport + Clone>(
     let turn_cap_key = format!("{user_id}:{}", conversation_id.unwrap_or(reply_id));
     let turn_cap = turn_cap_per_minute;
 
-    let tools = agent_tools::tool_definitions();
+    let tools = if voice_turn {
+        agent_tools::tool_definitions_excluding_confirm()
+    } else {
+        agent_tools::tool_definitions()
+    };
     let mut messages = vec![serde_json::json!({"role": "user", "content": user_message})];
     // Summed across every turn and charged once at the very end (or once at
     // the point of an early, partial stop) — see `send_one_turn`'s doc
@@ -650,6 +661,20 @@ pub(crate) async fn send_paid_reply<T: ProviderTransport + Clone>(
 
         let mut tool_results = Vec::with_capacity(uses.len());
         for (tool_use_id, name, input) in uses {
+            // A voice turn never gets a `Risk::Confirm` tool in its `tools`
+            // list (see `tools` above), but the model can still name one
+            // anyway — refuse it here, before the `open_pr` proposal path or
+            // `execute`'s own (chat-worded) `ConfirmRequired` message, with
+            // the voice-appropriate wording. Nothing is proposed or run.
+            if voice_turn && agent_tools::is_confirm_risk(&name) {
+                tool_results.push(serde_json::json!({
+                    "type": "tool_result",
+                    "tool_use_id": tool_use_id,
+                    "content": "That needs confirmation in the chat; voice confirmation is not available yet.",
+                    "is_error": true,
+                }));
+                continue;
+            }
             // `open_pr` is the one `Risk::Confirm` tool wired up so far
             // (`agent_tools::validate_confirm_tool`/`execute_confirmed`):
             // instead of running it, or just refusing it, propose it — write
@@ -963,6 +988,7 @@ pub(crate) async fn run(
         now_ms,
         turn_cap,
         Some(&tx),
+        false,
     )
     .await
     {
@@ -1121,6 +1147,7 @@ mod tests {
             NOW,
             20,
             None,
+            false,
         )
         .await
         .expect("reply should succeed");
@@ -1155,6 +1182,7 @@ mod tests {
             NOW,
             20,
             None,
+            false,
         )
         .await
         .expect_err("supplier failure must not succeed");
@@ -1188,6 +1216,7 @@ mod tests {
             NOW,
             20,
             None,
+            false,
         )
         .await
         .expect_err("zero balance must refuse");
@@ -1227,6 +1256,7 @@ mod tests {
                 NOW,
                 20,
                 None,
+                false,
             )
             .await;
             if attempt == 0 {
@@ -1272,6 +1302,7 @@ mod tests {
             NOW,
             20,
             None,
+            false,
         )
         .await
         .expect("reply should succeed");
@@ -1432,6 +1463,7 @@ mod tests {
             NOW,
             20,
             None,
+            false,
         )
         .await
         .expect("reply should succeed");
@@ -1487,6 +1519,7 @@ mod tests {
             NOW,
             20,
             None,
+            false,
         )
         .await
         .expect("reply should succeed even though it never got a final answer on its own");
@@ -1587,6 +1620,7 @@ mod tests {
             NOW,
             20,
             Some(&tx),
+            false,
         )
         .await
         .expect("reply should succeed even though the tool never ran");
@@ -1662,6 +1696,7 @@ mod tests {
             NOW,
             20,
             Some(&tx),
+            false,
         )
         .await
         .expect("reply should still succeed — the tool call is refused, not the whole reply");
@@ -1744,6 +1779,7 @@ mod tests {
             NOW,
             20,
             Some(&tx),
+            false,
         )
         .await
         .expect("reply should succeed even though the tool never ran");
@@ -1849,6 +1885,7 @@ mod tests {
             NOW,
             20,
             None,
+            false,
         )
         .await
         .expect("probe reply should succeed");
@@ -1904,6 +1941,7 @@ mod tests {
             NOW,
             20,
             None,
+            false,
         )
         .await
         .expect("turn 1's work must still come back as a partial answer");
@@ -1957,6 +1995,7 @@ mod tests {
             NOW,
             20,
             None,
+            false,
         )
         .await
         .expect("a partial answer, not an error, once at least one turn ran");
@@ -2014,6 +2053,7 @@ mod tests {
             NOW,
             20,
             None,
+            false,
         )
         .await
         .expect("turn 1's work must still come back as a partial answer");
@@ -2060,6 +2100,7 @@ mod tests {
             NOW,
             1,
             None,
+            false,
         )
         .await;
 
@@ -2195,6 +2236,7 @@ mod tests {
             NOW,
             20,
             None,
+            false,
         )
         .await
         .expect("a shortfall at final-charge time must not discard the reply");
@@ -2293,6 +2335,7 @@ mod tests {
             NOW,
             20,
             None,
+            false,
         );
         let fut_b = send_paid_reply(
             &db,
@@ -2309,6 +2352,7 @@ mod tests {
             NOW,
             20,
             None,
+            false,
         );
 
         let (result_a, result_b) = tokio::join!(fut_a, fut_b);

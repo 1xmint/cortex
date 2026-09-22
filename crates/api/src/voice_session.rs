@@ -794,6 +794,19 @@ async fn run_billing_loop(
     let mut last_observed_total_micro: i64 = 0;
     let now_ms = || chrono::Utc::now().timestamp_millis();
 
+    // Delegation state, local to this session's billing task. The task text
+    // for the next delegation is whatever speech text has accumulated since
+    // the last one was answered — `session.delegation.created` itself
+    // carries no request text or tool arguments (confirmed against
+    // https://developers.openai.com/api/docs/guides/live-migration).
+    let mut pending_transcript = String::new();
+    let delegation_busy = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // The delegation task runs on its own spawned task (an agent turn can
+    // take much longer than this loop should ever block for) and answers
+    // through this channel rather than touching `sideband` directly, so the
+    // loop below stays the single owner of the socket.
+    let (commentary_tx, mut commentary_rx) = mpsc::channel::<Value>(8);
+
     loop {
         let warning_timer = async {
             match warning_deadline {
@@ -803,9 +816,25 @@ async fn run_billing_loop(
         };
 
         tokio::select! {
+            Some(commentary) = commentary_rx.recv() => {
+                sideband.send(commentary).await;
+            }
             event = sideband.recv() => {
                 let Some(event) = event else { break };
                 match event.get("type").and_then(Value::as_str) {
+                    Some("session.input_transcript.delta") => {
+                        accumulate_transcript(&mut pending_transcript, &event);
+                    }
+                    Some("session.delegation.created") => {
+                        handle_delegation_created(
+                            &event,
+                            &state,
+                            &user_id,
+                            &delegation_busy,
+                            &mut pending_transcript,
+                            &commentary_tx,
+                        );
+                    }
                     Some("session.usage.updated") => {
                         let seconds = event
                             .pointer("/usage/seconds")
@@ -1022,6 +1051,165 @@ async fn run_billing_loop(
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .remove(&session_id);
+}
+
+/// A safe character cap for `session.commentary.append`'s 500-token limit
+/// (https://developers.openai.com/api/docs/guides/live-migration): English
+/// text tokenizes at roughly 4 characters/token, so 500 tokens is normally
+/// well over 1000 characters — capping at 1200 characters leaves headroom
+/// even for token-dense text without ever needing an actual tokenizer here.
+const COMMENTARY_CHAR_CAP: usize = 1200;
+
+/// The system prompt the delegated agent turn runs under. Short and
+/// spoken-first: the text comes back as `session.commentary.append`, which
+/// GPT-Live paraphrases aloud rather than reading verbatim, so it does not
+/// need to be conversational itself — just accurate and short.
+const VOICE_DELEGATION_SYSTEM_PROMPT: &str = "You are Cortex's coding agent, answering a request that came in over a live voice call. Keep answers short and to the point; they will be read aloud.";
+
+/// Append a `session.input_transcript.delta`'s text to the accumulator that
+/// becomes the next delegation's task text. The event's own shape is not
+/// pinned down by the docs beyond "append to captions"; this reads the
+/// common `delta`/`text` fields defensively and drops the event if neither
+/// is present rather than guessing.
+fn accumulate_transcript(pending_transcript: &mut String, event: &Value) {
+    let delta = event
+        .get("delta")
+        .and_then(Value::as_str)
+        .or_else(|| event.get("text").and_then(Value::as_str));
+    if let Some(delta) = delta {
+        pending_transcript.push_str(delta);
+    }
+}
+
+/// Build one `session.commentary.append` event, trimmed to
+/// [`COMMENTARY_CHAR_CAP`] characters.
+fn commentary_event(delegation_id: &str, content: &str) -> Value {
+    let content: String = content.chars().take(COMMENTARY_CHAR_CAP).collect();
+    serde_json::json!({
+        "type": "session.commentary.append",
+        "delegation_id": delegation_id,
+        "content": content,
+    })
+}
+
+/// Answer a `session.delegation.created` event. `session.delegation.created`
+/// itself carries no request text or tool arguments (confirmed against
+/// https://developers.openai.com/api/docs/guides/live-migration) — the task
+/// text is whatever has accumulated in `pending_transcript` since the last
+/// delegation was answered, drained here.
+///
+/// One delegation runs at a time per session: `delegation_busy` is a
+/// session-lifetime flag checked (and set) synchronously, right here in the
+/// billing loop's single task, so there is no race between two delegations
+/// arriving back to back. A second one while the first is still running
+/// gets a short "still working" commentary instead of being queued or
+/// dropped silently.
+fn handle_delegation_created(
+    event: &Value,
+    state: &Arc<AppState>,
+    user_id: &str,
+    delegation_busy: &Arc<std::sync::atomic::AtomicBool>,
+    pending_transcript: &mut String,
+    commentary_tx: &mpsc::Sender<Value>,
+) {
+    let Some(delegation_id) = event
+        .pointer("/delegation/id")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+    else {
+        tracing::warn!("voice: session.delegation.created had no delegation.id; cannot answer it");
+        return;
+    };
+
+    if delegation_busy.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        let tx = commentary_tx.clone();
+        tokio::spawn(async move {
+            let _ = tx
+                .send(commentary_event(
+                    &delegation_id,
+                    "Still working on the last request.",
+                ))
+                .await;
+        });
+        return;
+    }
+
+    let task_text = std::mem::take(pending_transcript);
+    let state = state.clone();
+    let user_id = user_id.to_string();
+    let busy = delegation_busy.clone();
+    let tx = commentary_tx.clone();
+    tokio::spawn(async move {
+        let answer = run_voice_delegation(&state, &user_id, &task_text).await;
+        let _ = tx.send(commentary_event(&delegation_id, &answer)).await;
+        busy.store(false, std::sync::atomic::Ordering::SeqCst);
+    });
+}
+
+/// Run the same paid agent loop text chat uses (`chat_paid::send_paid_reply`,
+/// `voice_turn: true` so `Risk::Confirm` tools are withheld) for one
+/// delegated voice request, charged in credits exactly like chat reuses that
+/// same reservation/charge path. Never panics and never hangs the
+/// delegation: every failure becomes a short spoken-friendly string instead
+/// of being propagated.
+async fn run_voice_delegation(state: &Arc<AppState>, user_id: &str, task_text: &str) -> String {
+    let task_text = task_text.trim();
+    if task_text.is_empty() {
+        return "I didn't catch a request to act on.".to_string();
+    }
+    let Some(db) = state.db.as_ref() else {
+        return "Cortex is temporarily unavailable.".to_string();
+    };
+    let Some(provider_gateway_http::GatewayUsable {
+        signing_key,
+        supplier_key,
+        transport,
+    }) = provider_gateway_http::gateway_usable()
+    else {
+        return "Cortex is temporarily unavailable.".to_string();
+    };
+    let Some(limits) = SpendLimits::from_env() else {
+        return "Cortex is temporarily unavailable.".to_string();
+    };
+
+    let reply_id = uuid::Uuid::new_v4().to_string();
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let turn_cap = crate::chat_paid::turn_cap_per_minute();
+
+    match crate::chat_paid::send_paid_reply(
+        db,
+        &signing_key,
+        &supplier_key,
+        transport,
+        limits,
+        user_id,
+        // Live voice sessions do not carry a conversation id today, so
+        // there is nothing to save the delegated turn's messages against;
+        // see the module notes on `VoiceSessionHandle`.
+        None,
+        crate::chat_paid::model_for_tier(None),
+        VOICE_DELEGATION_SYSTEM_PROMPT,
+        task_text,
+        &reply_id,
+        now_ms,
+        turn_cap,
+        None,
+        true,
+    )
+    .await
+    {
+        Ok(reply) if reply.text.trim().is_empty() => "Done.".to_string(),
+        Ok(reply) => reply.text,
+        Err(crate::chat_paid::PaidReplyError::NoCredits)
+        | Err(crate::chat_paid::PaidReplyError::NotEnoughCredits) => {
+            "You're out of credits for that request.".to_string()
+        }
+        Err(crate::chat_paid::PaidReplyError::TurnCapExceeded) => {
+            "This conversation is using tools too quickly right now. Please try again shortly."
+                .to_string()
+        }
+        Err(_) => "Sorry, I couldn't complete that just now.".to_string(),
+    }
 }
 
 /// Best effort: re-attach the sideband once and immediately ask the session
