@@ -48,7 +48,7 @@ describe('useChatSession live voice event handling', () => {
         action_id: 'voice-action-1',
         nonce: 'voice-nonce-1',
         summary: 'Delete the staging database',
-        expires_at: new Date(Date.now() + 60_000).toISOString(),
+        expires_at: Math.floor(Date.now() / 1000) + 60,
       });
     });
 
@@ -57,6 +57,34 @@ describe('useChatSession live voice event handling', () => {
       expect(confirmMsg?.confirmAction?.actionId).toBe('voice-action-1');
       expect(confirmMsg?.confirmAction?.nonce).toBe('voice-nonce-1');
       expect(confirmMsg?.confirmAction?.status).toBe('pending');
+    });
+  });
+
+  it('reads expires_at and the spoken-window deadline as Unix seconds, the server wire format', async () => {
+    const { result } = renderSession();
+    const nowSecs = Math.floor(Date.now() / 1000);
+
+    act(() => {
+      result.current.handleVoiceConfirmRequired({
+        action_id: 'voice-action-2',
+        nonce: 'voice-nonce-2',
+        summary: 'Delete the staging database',
+        expires_at: nowSecs + 300,
+      });
+    });
+    act(() => {
+      result.current.handleVoiceSpokenWindow({ action_id: 'voice-action-2', deadline: nowSecs + 45 });
+    });
+    // A different action's window must not touch this card.
+    act(() => {
+      result.current.handleVoiceSpokenWindow({ action_id: 'other-action', deadline: nowSecs + 5 });
+    });
+
+    await waitFor(() => {
+      const card = result.current.messages.find((m) => m.confirmAction)?.confirmAction;
+      expect(card).toBeDefined();
+      expect(new Date(card!.expiresAt).getTime()).toBe((nowSecs + 300) * 1000);
+      expect(new Date(card!.spokenWindowDeadline!).getTime()).toBe((nowSecs + 45) * 1000);
     });
   });
 

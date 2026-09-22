@@ -91,6 +91,28 @@ export async function closeLiveVoiceSession(sessionId: string): Promise<void> {
 }
 
 /**
+ * `POST /api/voice/live/sessions/{id}/prompt-ended` (owner only). Tells the
+ * server the spoken confirm prompt for `actionId` has finished playing, so
+ * it opens the 45s "say yes" window. A 409 means the action id is stale or
+ * the window was already opened, and a 404 means the session or action is
+ * unknown -- both are routine races (the confirm resolved, or another
+ * detector already reported it) rather than failures worth surfacing.
+ */
+export async function postPromptEnded(sessionId: string, actionId: string): Promise<void> {
+  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+  const token = await getAuthToken();
+  if (token) headers.Authorization = `Bearer ${token}`;
+  const res = await fetch(
+    apiUrl(`/api/voice/live/sessions/${encodeURIComponent(sessionId)}/prompt-ended`),
+    { method: 'POST', headers, body: JSON.stringify({ action_id: actionId }) },
+  );
+  if (res.status === 204 || res.status === 409 || res.status === 404) return;
+  if (!res.ok) {
+    throw new CortexApiError(res.status, `Cortex API ${res.status}`, res.headers.get('Retry-After'));
+  }
+}
+
+/**
  * `GET /api/voice/live/sessions/{id}/events` (SSE, owner only). Same
  * `type`-tagged event shapes the chat stream's `confirm_required` uses --
  * see `WorkerEvent` in `cortexApi.ts` -- so a voice-proposed risky action
@@ -107,14 +129,16 @@ export interface VoiceConfirmRequiredEvent {
   action_id: string;
   nonce: string;
   summary: string;
-  expires_at: string;
+  /** Unix seconds. */
+  expires_at: number;
 }
 
 /** Accepted and typed now; the server does not emit these yet. */
 export interface VoiceSpokenWindowEvent {
   type: 'spoken_window';
   action_id: string;
-  deadline: string;
+  /** Unix seconds. */
+  deadline: number;
 }
 
 /** Accepted and typed now; the server does not emit these yet. */
@@ -130,18 +154,38 @@ export type LiveVoiceSessionEvent =
   | VoiceSpokenWindowEvent
   | VoiceConfirmResolvedEvent;
 
+/** Reconnect backoff schedule (ms), holding at the last value thereafter. */
+const RECONNECT_BACKOFF_MS = [1000, 2000, 4000, 10000];
+
+/** Result of one connection attempt in the reconnect loop below. */
+interface ConnectOnceResult {
+  /** True when reconnecting should stop for good (404/401/403). */
+  terminal: boolean;
+  /** True when this connection actually delivered at least one parsed
+   *  event -- proof it was a real, working connection rather than one that
+   *  opened and immediately failed, so the backoff counter can be reset. */
+  delivered: boolean;
+}
+
 /**
  * Opens the live voice session's text-mirror SSE stream and hands each
- * parsed event to `onEvent`. Reconnects once if the stream ends on its own
- * (the server lagging under overload closes it without a terminal event) --
- * a second natural end is left alone rather than looped forever.
+ * parsed event to `onEvent`. Reconnects with backoff (1s, 2s, 4s, capped at
+ * 10s) whenever the stream ends on its own (the server lagging under
+ * overload closes it without a terminal event) -- there is no limit on the
+ * number of reconnect attempts while the caller keeps voice active. The
+ * backoff counter resets to the start of the schedule once a connection
+ * actually delivers an event, so a stream that reconnects after a long,
+ * healthy run doesn't inherit a stale, maxed-out delay from earlier flaky
+ * attempts.
  *
  * A 404 means the deployment is in stub/dev mode, where this route does not
- * exist yet: treated as "no events" rather than an error, so the caller
- * shows nothing rather than an error banner.
+ * exist yet, and a 401/403 means the session's auth is no longer good for
+ * it -- both are treated as terminal: "no events" rather than an error, so
+ * the caller shows nothing rather than an error banner, and reconnecting
+ * stops rather than hammering a route that will never succeed.
  *
  * Returns an `AbortController` the caller closes when voice stops; closing
- * it never surfaces as an error.
+ * it never surfaces as an error and stops any pending reconnect.
  */
 export function openLiveVoiceEventsStream(
   sessionId: string,
@@ -149,7 +193,7 @@ export function openLiveVoiceEventsStream(
 ): AbortController {
   const controller = new AbortController();
 
-  const connectOnce = async (): Promise<'ended' | 'not-found'> => {
+  const connectOnce = async (): Promise<ConnectOnceResult> => {
     const headers: Record<string, string> = {};
     const token = await getAuthToken();
     if (token) headers.Authorization = `Bearer ${token}`;
@@ -159,16 +203,19 @@ export function openLiveVoiceEventsStream(
       { headers, signal: controller.signal },
     );
 
-    if (res.status === 404) return 'not-found';
+    if (res.status === 404 || res.status === 401 || res.status === 403) {
+      return { terminal: true, delivered: false };
+    }
     if (!res.ok) {
       throw new CortexApiError(res.status, `Cortex API ${res.status}`, res.headers.get('Retry-After'));
     }
 
     const reader = res.body?.getReader();
-    if (!reader) return 'ended';
+    if (!reader) return { terminal: false, delivered: false };
 
     const decoder = new TextDecoder();
     let buffer = '';
+    let delivered = false;
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
@@ -183,25 +230,47 @@ export function openLiveVoiceEventsStream(
         if (!json) continue;
         try {
           onEvent(JSON.parse(json) as LiveVoiceSessionEvent);
+          delivered = true;
         } catch {
           // Not JSON, or not an event shape we recognize -- skip the line.
         }
       }
     }
-    return 'ended';
+    return { terminal: false, delivered };
   };
 
+  const sleep = (ms: number) =>
+    new Promise<void>((resolve) => {
+      const onAbort = () => {
+        clearTimeout(timer);
+        resolve();
+      };
+      const timer = setTimeout(() => {
+        controller.signal.removeEventListener('abort', onAbort);
+        resolve();
+      }, ms);
+      controller.signal.addEventListener('abort', onAbort, { once: true });
+    });
+
   void (async () => {
-    try {
-      const first = await connectOnce();
-      if (first === 'ended' && !controller.signal.aborted) {
-        await connectOnce();
+    let attempt = 0;
+    while (!controller.signal.aborted) {
+      try {
+        const { terminal, delivered } = await connectOnce();
+        if (terminal) return;
+        if (controller.signal.aborted) return;
+        if (delivered) attempt = 0;
+      } catch (err) {
+        if (controller.signal.aborted) return;
+        if (err instanceof Error && err.name === 'AbortError') return;
+        // Best-effort: the spoken conversation keeps going even if this text
+        // mirror drops, so a broken events stream is not surfaced as an
+        // error -- it just reconnects below.
       }
-    } catch (err) {
-      if (controller.signal.aborted) return;
-      if (err instanceof Error && err.name === 'AbortError') return;
-      // Best-effort: the spoken conversation keeps going even if this text
-      // mirror drops, so a broken events stream is not surfaced as an error.
+
+      const delay = RECONNECT_BACKOFF_MS[Math.min(attempt, RECONNECT_BACKOFF_MS.length - 1)];
+      attempt += 1;
+      await sleep(delay);
     }
   })();
 

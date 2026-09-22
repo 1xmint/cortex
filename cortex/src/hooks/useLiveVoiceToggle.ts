@@ -3,10 +3,15 @@ import { apiUrl, getAuthToken, CortexApiError } from '../lib/cortexApi';
 import {
   closeLiveVoiceSession,
   openLiveVoiceEventsStream,
+  postPromptEnded,
   startLiveVoiceSession,
   type LiveVoiceSessionEvent,
 } from '../lib/voiceApi';
 import { routeLiveVoiceEvent } from './liveVoiceEvents';
+import { SpokenPromptEndDetector } from '../lib/spokenPromptEndDetector';
+
+/** How often the spoken-prompt watcher polls the remote receiver's audio level. */
+const PROMPT_WATCH_POLL_MS = 100;
 
 export type LiveVoiceStatus = 'idle' | 'connecting' | 'active';
 
@@ -134,6 +139,70 @@ export function useLiveVoiceToggle(options: UseLiveVoiceToggleOptions = {}) {
   // (which arrives as reason `close_requested`, same as a user-initiated
   // one) apart from a stop the user actually asked for.
   const closeRequestedRef = useRef(false);
+  // The remote (model) audio receiver, set from the `track` event -- the
+  // spoken-prompt watcher below polls its `audioLevel` to tell when the
+  // prompt has finished playing.
+  const remoteReceiverRef = useRef<RTCRtpReceiver | null>(null);
+  const promptWatcherRef = useRef<number | null>(null);
+  // The detector driving the current watcher, if any -- transcript deltas
+  // off the `oai-events` data channel are fed into it as they arrive (see
+  // the `dc` message handler below). `null` whenever no watcher is running.
+  const promptWatcherDetectorRef = useRef<SpokenPromptEndDetector | null>(null);
+  // The action id the current watcher is for, so a `confirm_resolved` event
+  // for that same action can stop it early.
+  const promptWatcherActionIdRef = useRef<string | null>(null);
+
+  const stopPromptWatcher = useCallback(() => {
+    if (promptWatcherRef.current !== null) {
+      window.clearInterval(promptWatcherRef.current);
+      promptWatcherRef.current = null;
+    }
+    promptWatcherDetectorRef.current = null;
+    promptWatcherActionIdRef.current = null;
+  }, []);
+
+  /**
+   * Watches the model's own transcript and the remote receiver's audio level
+   * after a `confirm_required` event to detect when the spoken confirm
+   * prompt has finished playing, and reports it once via
+   * `POST .../prompt-ended`. The prompt is anchored on its fixed tail text
+   * ("tap Confirm on screen") arriving over the transcript -- audio level is
+   * ignored until that anchor is seen, so speech from *before* the prompt
+   * (e.g. the model musing about the action) can never be mistaken for the
+   * prompt ending. See `SpokenPromptEndDetector` for the full rule. A new
+   * call (a fresh `confirm_required`) replaces whatever watcher is already
+   * running for a previous action, and a `confirm_resolved` for the same
+   * action stops it early (see the events-stream handler below).
+   */
+  const watchForPromptEnd = useCallback(
+    (sessionId: string, actionId: string) => {
+      stopPromptWatcher();
+      const receiver = remoteReceiverRef.current;
+      if (!receiver || typeof receiver.getSynchronizationSources !== 'function') {
+        // No remote receiver reachable in this code path -- nothing to poll,
+        // so there is no prompt-ended signal to send. Left silent: the 45s
+        // window still opens from a tap, just without the spoken shortcut.
+        return;
+      }
+      const detector = new SpokenPromptEndDetector();
+      promptWatcherDetectorRef.current = detector;
+      promptWatcherActionIdRef.current = actionId;
+      promptWatcherRef.current = window.setInterval(() => {
+        const sources = receiver.getSynchronizationSources();
+        const level = sources[0]?.audioLevel ?? 0;
+        const result = detector.sample(level, Date.now());
+        if (result === 'listening') return;
+        stopPromptWatcher();
+        if (result === 'ended') {
+          void postPromptEnded(sessionId, actionId).catch(() => {
+            // Best-effort -- a failed report just means the card falls back
+            // to the tap-to-confirm path already on screen.
+          });
+        }
+      }, PROMPT_WATCH_POLL_MS);
+    },
+    [stopPromptWatcher],
+  );
 
   const releaseLocal = useCallback(() => {
     dcRef.current?.close();
@@ -144,6 +213,8 @@ export function useLiveVoiceToggle(options: UseLiveVoiceToggleOptions = {}) {
     streamRef.current = null;
     eventsControllerRef.current?.abort();
     eventsControllerRef.current = null;
+    stopPromptWatcher();
+    remoteReceiverRef.current = null;
     if (audioRef.current) {
       audioRef.current.srcObject = null;
       audioRef.current = null;
@@ -152,7 +223,7 @@ export function useLiveVoiceToggle(options: UseLiveVoiceToggleOptions = {}) {
       window.clearTimeout(disconnectTimerRef.current);
       disconnectTimerRef.current = null;
     }
-  }, []);
+  }, [stopPromptWatcher]);
 
   /**
    * Sends the DELETE for the currently open session, if any, exactly once.
@@ -253,16 +324,26 @@ export function useLiveVoiceToggle(options: UseLiveVoiceToggleOptions = {}) {
         audio.autoplay = true;
         audio.srcObject = new MediaStream([event.track]);
         audioRef.current = audio;
+        remoteReceiverRef.current = event.receiver;
       });
 
       const dc = pc.createDataChannel('oai-events');
       dcRef.current = dc;
       dc.addEventListener('message', (event) => {
-        let payload: { type?: string; reason?: unknown };
+        let payload: { type?: string; reason?: unknown; delta?: unknown };
         try {
           payload = JSON.parse(event.data as string);
         } catch {
           return; // Not JSON -- nothing to route.
+        }
+        if (payload.type === 'session.output_transcript.delta') {
+          // The model's own speech transcript -- fed to whichever
+          // spoken-prompt watcher is currently running, if any, so it can
+          // recognize the fixed confirm-prompt tail text.
+          if (typeof payload.delta === 'string') {
+            promptWatcherDetectorRef.current?.onTranscript(payload.delta);
+          }
+          return;
         }
         if (payload.type === 'session.closed') {
           // The server can end this call on its own (credits ran out,
@@ -307,6 +388,17 @@ export function useLiveVoiceToggle(options: UseLiveVoiceToggleOptions = {}) {
       // the live audio, not a dependency the call itself needs, so opening
       // it never blocks reaching `active`.
       eventsControllerRef.current = openLiveVoiceEventsStream(response.session_id, (event) => {
+        if (event.type === 'confirm_required') {
+          watchForPromptEnd(response.session_id, event.action_id);
+        } else if (
+          event.type === 'confirm_resolved' &&
+          promptWatcherActionIdRef.current === event.action_id
+        ) {
+          // The action was resolved (confirmed/denied/expired) some other
+          // way before the spoken-prompt watcher decided anything -- stop
+          // watching rather than posting a stale prompt-ended afterward.
+          stopPromptWatcher();
+        }
         onVoiceEventRef.current?.(event);
       });
 

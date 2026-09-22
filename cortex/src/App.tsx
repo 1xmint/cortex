@@ -477,6 +477,8 @@ function CortexShell() {
     ensureConversationId,
     appendVoiceMessage,
     handleVoiceConfirmRequired,
+    handleVoiceSpokenWindow,
+    handleVoiceConfirmResolved,
   } = useChatSession({
     activeConversationId,
     userId: userId ?? 'local',
@@ -981,6 +983,8 @@ function CortexShell() {
             onLiveVoiceStart={ensureConversationId}
             onVoiceMessage={appendVoiceMessage}
             onVoiceConfirmRequired={handleVoiceConfirmRequired}
+            onVoiceSpokenWindow={handleVoiceSpokenWindow}
+            onVoiceConfirmResolved={handleVoiceConfirmResolved}
           />
 
           <div className="hidden lg:flex">

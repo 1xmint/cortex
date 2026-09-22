@@ -66,7 +66,7 @@ describe('streamChat event parsing', () => {
       action_id: 'action-1',
       nonce: 'nonce-1',
       summary: 'Delete 3 stale branches',
-      expires_at: '2026-09-22T12:00:00Z',
+      expires_at: 1790000000,
     };
     vi.stubGlobal('fetch', vi.fn(async () => sseResponse([JSON.stringify(event)])));
 
@@ -88,7 +88,7 @@ describe('streamChat event parsing', () => {
       action_id: 'action-1',
       nonce: 'nonce-1',
       summary: 'Delete 3 stale branches',
-      expires_at: '2026-09-22T12:00:00Z',
+      expires_at: 1790000000,
     });
   });
 });

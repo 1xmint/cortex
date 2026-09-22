@@ -163,6 +163,12 @@ export interface ConfirmActionRequest {
   summary: string;
   expiresAt: string;
   status: ConfirmActionStatus;
+  /**
+   * Set from a `spoken_window` event: the deadline (ISO) of the 45s window
+   * during which saying "yes" out loud confirms the action, opened once the
+   * spoken prompt finishes playing. `undefined` until that event arrives.
+   */
+  spokenWindowDeadline?: string;
 }
 
 export interface ChatMessage {

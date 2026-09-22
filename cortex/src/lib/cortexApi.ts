@@ -210,12 +210,12 @@ export interface WorkerEvent {
   tool_name?: string;
   ok?: boolean;
   // Only present for `confirm_required`: a risky action awaiting tap-to-confirm.
-  // `expires_at` is RFC 3339. The nonce round-trips through the confirm/cancel
+  // `expires_at` is Unix seconds. The nonce round-trips through the confirm/cancel
   // calls below and is never logged or displayed.
   action_id?: string;
   nonce?: string;
   summary?: string;
-  expires_at?: string;
+  expires_at?: number;
 }
 
 export interface ConfirmAgentActionResponse {

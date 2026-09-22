@@ -34,11 +34,20 @@ function createId(prefix: string) {
   return `${prefix}-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`;
 }
 
+/** Terminal statuses a `confirm_resolved` event's `status` can validly carry. */
+const RESOLVED_STATUSES = new Set<ConfirmActionStatus>(['confirmed', 'cancelled', 'expired']);
+
 interface ConfirmRequiredFields {
   action_id: string;
   nonce: string;
   summary: string;
-  expires_at: string;
+  /** Unix seconds, as the server sends it. */
+  expires_at: number;
+}
+
+/** The server sends times as Unix seconds; the cards keep ISO strings. */
+export function unixSecondsToIso(seconds: number): string {
+  return new Date(seconds * 1000).toISOString();
 }
 
 /**
@@ -61,7 +70,7 @@ function buildConfirmMessage(event: ConfirmRequiredFields, provider?: string): C
       actionId: event.action_id,
       nonce: event.nonce,
       summary: event.summary,
-      expiresAt: event.expires_at,
+      expiresAt: unixSecondsToIso(event.expires_at),
       status: 'pending',
     },
   };
@@ -428,6 +437,41 @@ export function useChatSession({
     setMessages((cur) => withConfirmMessageAppended(cur, confirmMessage));
   }, []);
 
+  /**
+   * A `spoken_window` event: the spoken prompt finished playing and the
+   * server opened its 45s "say yes" window for `action_id` -- the matching
+   * card (if still pending) shows a countdown to `deadline` alongside its
+   * regular controls.
+   */
+  const handleVoiceSpokenWindow = useCallback((event: { action_id: string; deadline: number }) => {
+    setMessages((cur) =>
+      cur.map((m) => {
+        if (!m.confirmAction || m.confirmAction.actionId !== event.action_id) return m;
+        if (m.confirmAction.status !== 'pending') return m;
+        return { ...m, confirmAction: { ...m.confirmAction, spokenWindowDeadline: unixSecondsToIso(event.deadline) } };
+      }),
+    );
+  }, []);
+
+  /**
+   * A `confirm_resolved` event: the action for `action_id` was confirmed,
+   * cancelled, or failed by whatever means (a spoken "yes", a tap on another
+   * device, expiry) -- resolves the matching card through the exact same
+   * status-setting path a tap confirm/cancel here already uses.
+   */
+  const handleVoiceConfirmResolved = useCallback((event: { action_id: string; status: string }) => {
+    const status = RESOLVED_STATUSES.has(event.status as ConfirmActionStatus)
+      ? (event.status as ConfirmActionStatus)
+      : 'unavailable';
+    setMessages((cur) =>
+      cur.map((m) => {
+        if (!m.confirmAction || m.confirmAction.actionId !== event.action_id) return m;
+        if (m.confirmAction.status !== 'pending') return m;
+        return { ...m, confirmAction: { ...m.confirmAction, status } };
+      }),
+    );
+  }, []);
+
   const renameConversation = useCallback(async (title: string) => {
     const conversationId = activeConversationIdRef.current;
     const nextTitle = truncateTitle(title);
@@ -754,7 +798,7 @@ export function useChatSession({
               }
 
               case 'confirm_required': {
-                if (!event.action_id || !event.nonce || !event.summary || !event.expires_at) break;
+                if (!event.action_id || !event.nonce || !event.summary || typeof event.expires_at !== 'number') break;
                 const confirmMessage = buildConfirmMessage(
                   {
                     action_id: event.action_id,
@@ -996,5 +1040,7 @@ export function useChatSession({
     ensureConversationId,
     appendVoiceMessage,
     handleVoiceConfirmRequired,
+    handleVoiceSpokenWindow,
+    handleVoiceConfirmResolved,
   };
 }
