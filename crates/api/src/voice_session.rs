@@ -28,16 +28,20 @@
 //! pattern `voice.rs`'s dictation tests use against a loopback
 //! `client_secrets` fake.
 
+use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::Duration;
 
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
+use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::Json;
+use futures_core::Stream;
 use futures_util::{SinkExt, StreamExt};
 use serde::Serialize;
 use serde_json::Value;
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
+use tokio_stream::wrappers::ReceiverStream;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::Message as TungsteniteMessage;
 
@@ -169,6 +173,62 @@ impl LiveSessionError {
 pub struct VoiceSessionHandle {
     pub user_id: String,
     close_tx: mpsc::Sender<()>,
+    /// Broadcasts everything `GET /api/voice/live/sessions/{id}/events`
+    /// streams to the UI for this session: no chat SSE stream is open
+    /// during live voice, so this is how the UI learns about voice turns
+    /// and confirms proposals. Created with the session (alongside
+    /// `close_tx`, above) and dropped — along with every subscriber's
+    /// stream ending — when the handle is removed from
+    /// `state.voice_sessions` at session end.
+    events_tx: broadcast::Sender<VoiceEvent>,
+}
+
+/// How many events a lagging subscriber can fall behind before older ones
+/// are dropped for it. Small: a live voice session's own event volume is
+/// low (a couple of messages per delegated turn), so this only needs to
+/// absorb momentary stream backpressure, not act as a real buffer.
+const VOICE_EVENTS_CAPACITY: usize = 32;
+
+/// Everything the voice live-session event stream can send. Tagged JSON
+/// (`"type"`, snake_case) so the UI can discriminate without a second
+/// field.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum VoiceEvent {
+    /// A delegation's user text or assistant answer was produced. Emitted
+    /// once for the user's turn and once for the assistant's reply — never
+    /// batched — so the UI can render them as they happen instead of
+    /// waiting for both.
+    VoiceMessage { role: String, content: String },
+    /// The model asked for a `Risk::Confirm` tool. Forwards the same data
+    /// `state::StepEvent::ConfirmRequired` carries on the chat path
+    /// (`chat_paid.rs`) — `nonce` must never be sent to OpenAI, only to
+    /// this stream, since it is what proves the confirm/cancel call back
+    /// to `POST /api/agent/actions/{action_id}/confirm` came from the
+    /// user who saw the proposal.
+    ///
+    /// Voice turns withhold `Risk::Confirm` tools today (`voice_turn:
+    /// true` in `chat_paid::send_paid_reply`), so nothing in production
+    /// emits this yet; `push_test_event` (test-only, below) is how the
+    /// tests exercise it ahead of that wiring landing.
+    #[allow(dead_code)]
+    ConfirmRequired {
+        action_id: String,
+        nonce: String,
+        summary: String,
+        expires_at: i64,
+    },
+    /// The spoken confirmation window for a proposal opened, with the
+    /// deadline the user has to say yes/no before it lapses. Defined now;
+    /// unused until the wiring slice that lets a voice turn ask for
+    /// confirmation emits it.
+    #[allow(dead_code)]
+    SpokenWindow { action_id: String, deadline: i64 },
+    /// A proposal was confirmed, cancelled, or lapsed. Defined now; unused
+    /// until the wiring slice that lets a voice turn ask for confirmation
+    /// emits it.
+    #[allow(dead_code)]
+    ConfirmResolved { action_id: String, status: String },
 }
 
 fn error_message(text: &str) -> String {
@@ -378,11 +438,13 @@ pub(crate) async fn start_session(
             return Err(LiveSessionError::AlreadyOpen);
         }
         let (close_tx, _close_rx) = mpsc::channel(1);
+        let (events_tx, _) = broadcast::channel(VOICE_EVENTS_CAPACITY);
         sessions.insert(
             local_id.clone(),
             VoiceSessionHandle {
                 user_id: user_id.to_string(),
                 close_tx,
+                events_tx,
             },
         );
     }
@@ -593,6 +655,7 @@ async fn start_live_session(
     // close channel — nothing that could race the one-per-user check is
     // still pending.
     let (close_tx, close_rx) = mpsc::channel(1);
+    let (events_tx, _) = broadcast::channel(VOICE_EVENTS_CAPACITY);
     {
         let mut sessions = state
             .voice_sessions
@@ -604,6 +667,7 @@ async fn start_live_session(
             VoiceSessionHandle {
                 user_id: user_id.to_string(),
                 close_tx,
+                events_tx,
             },
         );
     }
@@ -848,6 +912,7 @@ async fn run_billing_loop(
                         handle_delegation_created(
                             &event,
                             &state,
+                            &session_id,
                             &user_id,
                             conversation_id.as_deref(),
                             &delegation_busy,
@@ -1176,9 +1241,16 @@ impl Drop for BusyGuard {
 /// of aborting it outright — see the `delegation_cancel` field's own doc for
 /// why a hard abort is unsafe here. The task is not tracked or waited on: it
 /// finishes (or stops) on its own.
+///
+/// Also publishes a `VoiceEvent::VoiceMessage` to `session_id`'s events
+/// broadcast channel (if the session is still in `state.voice_sessions`)
+/// for the user's drained transcript and, once it comes back, the
+/// assistant's answer — the two moments the event stream's doc calls "a
+/// delegation's user text and assistant answer are produced".
 fn handle_delegation_created(
     event: &Value,
     state: &Arc<AppState>,
+    session_id: &str,
     user_id: &str,
     conversation_id: Option<&str>,
     delegation_busy: &Arc<std::sync::atomic::AtomicBool>,
@@ -1209,7 +1281,16 @@ fn handle_delegation_created(
     }
 
     let task_text = std::mem::take(pending_transcript);
+    publish_voice_event(
+        state,
+        session_id,
+        VoiceEvent::VoiceMessage {
+            role: "user".to_string(),
+            content: task_text.clone(),
+        },
+    );
     let state = state.clone();
+    let session_id = session_id.to_string();
     let user_id = user_id.to_string();
     let conversation_id = conversation_id.map(str::to_string);
     let busy = delegation_busy.clone();
@@ -1225,8 +1306,42 @@ fn handle_delegation_created(
             &cancel,
         )
         .await;
+        publish_voice_event(
+            &state,
+            &session_id,
+            VoiceEvent::VoiceMessage {
+                role: "assistant".to_string(),
+                content: answer.clone(),
+            },
+        );
         let _ = tx.send(commentary_event(&delegation_id, &answer)).await;
     });
+}
+
+/// Send `event` to `session_id`'s events broadcast channel, if the session
+/// is still in `state.voice_sessions` and has at least one subscriber.
+/// `broadcast::Sender::send` errors when there are no receivers, which is
+/// the common case (nothing has opened the event stream) and not a
+/// failure worth logging.
+fn publish_voice_event(state: &Arc<AppState>, session_id: &str, event: VoiceEvent) {
+    let sessions = state
+        .voice_sessions
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if let Some(handle) = sessions.get(session_id) {
+        let _ = handle.events_tx.send(event);
+    }
+}
+
+/// Test-only seam for pushing an event straight onto a live session's
+/// broadcast channel, bypassing the delegation path entirely. Voice turns
+/// withhold `Risk::Confirm` tools today, so there is no production call
+/// site that ever emits `VoiceEvent::ConfirmRequired` yet — this is how
+/// the event-stream tests exercise that event ahead of the wiring slice
+/// that will.
+#[cfg(test)]
+pub(crate) fn push_test_event(state: &Arc<AppState>, session_id: &str, event: VoiceEvent) {
+    publish_voice_event(state, session_id, event);
 }
 
 /// Run the same paid agent loop text chat uses (`chat_paid::send_paid_reply`,
@@ -1721,6 +1836,84 @@ pub async fn live_session_close(
         .await
         .map(|_| StatusCode::NO_CONTENT)
         .map_err(LiveSessionError::into_response)
+}
+
+fn step_voice_event_to_sse(event: VoiceEvent) -> Result<Event, Infallible> {
+    let data = serde_json::to_string(&event).unwrap_or_default();
+    Ok(Event::default().data(data))
+}
+
+/// `GET /api/voice/live/sessions/{id}/events` — the UI's own stream for
+/// what is happening in a live voice session, since no chat SSE stream is
+/// open while live voice runs. Owner only: an unknown session id and a
+/// foreign one both come back as [`LiveSessionError::NotFound`] with the
+/// identical body, the same "no hint which" shape `live_session_start`
+/// already uses for a bad `conversation_id`.
+///
+/// Subscribes to the session's `events_tx` (created with the session,
+/// dropped with its `VoiceSessionHandle` at session end) and forwards onto
+/// a fresh `mpsc` channel/`ReceiverStream`, matching `chat::chat`'s own
+/// stream shape, rather than streaming the `broadcast::Receiver` directly.
+/// Ownership check plus subscribe, forwarded onto a fresh `mpsc` channel —
+/// the part of [`live_session_events_with`] worth testing without going
+/// through the `Sse`/`Event` wire format. `pub(crate)` (not private) so the
+/// tests below, in this same module, can drive it directly.
+pub(crate) fn subscribe_voice_events(
+    state: &Arc<AppState>,
+    user_id: &str,
+    session_id: &str,
+) -> Result<mpsc::Receiver<VoiceEvent>, (StatusCode, Json<ErrorResponse>)> {
+    let mut broadcast_rx = {
+        let sessions = state
+            .voice_sessions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let handle = sessions
+            .get(session_id)
+            .filter(|handle| handle.user_id == user_id)
+            .ok_or(LiveSessionError::NotFound)
+            .map_err(LiveSessionError::into_response)?;
+        handle.events_tx.subscribe()
+    };
+
+    let (tx, rx) = mpsc::channel(VOICE_EVENTS_CAPACITY);
+    tokio::spawn(async move {
+        loop {
+            match broadcast_rx.recv().await {
+                Ok(event) => {
+                    if tx.send(event).await.is_err() {
+                        break;
+                    }
+                }
+                // A slow subscriber missed some events; keep going rather
+                // than ending the stream over it.
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                // The session ended: `VoiceSessionHandle` (and its
+                // `events_tx`) was dropped from `state.voice_sessions`.
+                Err(broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    });
+
+    Ok(rx)
+}
+
+async fn live_session_events_with(
+    state: &Arc<AppState>,
+    user_id: &str,
+    session_id: &str,
+) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, (StatusCode, Json<ErrorResponse>)> {
+    let rx = subscribe_voice_events(state, user_id, session_id)?;
+    let stream = tokio_stream::StreamExt::map(ReceiverStream::new(rx), step_voice_event_to_sse);
+    Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
+}
+
+pub async fn live_session_events(
+    State(state): State<Arc<AppState>>,
+    user: ClerkUser,
+    Path(session_id): Path<String>,
+) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, (StatusCode, Json<ErrorResponse>)> {
+    live_session_events_with(&state, &user.user_id, &session_id).await
 }
 
 /// Registers the fake OpenAI Live endpoints this module's tests run against
@@ -3517,6 +3710,7 @@ mod tests {
             handle_delegation_created(
                 &serde_json::json!({"delegation": {"id": "deleg-1"}}),
                 &state,
+                "sess-1",
                 USER,
                 None,
                 &busy,
@@ -3551,6 +3745,7 @@ mod tests {
             handle_delegation_created(
                 &serde_json::json!({"delegation": {"id": "deleg-2"}}),
                 &state,
+                "sess-1",
                 USER,
                 None,
                 &busy,
@@ -3613,6 +3808,7 @@ mod tests {
             handle_delegation_created(
                 &serde_json::json!({"delegation": {"id": "deleg-3"}}),
                 &state,
+                "sess-1",
                 USER,
                 None,
                 &busy,
@@ -3658,6 +3854,133 @@ mod tests {
             assert!(
                 !agent_tools::tool_definitions().is_empty(),
                 "fixture sanity: there must be at least one tool"
+            );
+        }
+    }
+
+    mod events_stream {
+        use super::*;
+
+        /// Inserts a `VoiceSessionHandle` for `session_id` owned by
+        /// `owner_id` directly, bypassing the whole OpenAI/billing-loop
+        /// start path — this module only needs a session that exists and
+        /// is owned by someone, not a real one.
+        fn insert_session(state: &Arc<AppState>, session_id: &str, owner_id: &str) {
+            let (close_tx, _close_rx) = mpsc::channel(1);
+            let (events_tx, _) = broadcast::channel(VOICE_EVENTS_CAPACITY);
+            state.voice_sessions.lock().unwrap().insert(
+                session_id.to_string(),
+                VoiceSessionHandle {
+                    user_id: owner_id.to_string(),
+                    close_tx,
+                    events_tx,
+                },
+            );
+        }
+
+        #[tokio::test]
+        async fn non_owner_gets_404() {
+            let (_dir, state) = test_state().await;
+            insert_session(&state, "sess-1", "someone-else");
+
+            let err = subscribe_voice_events(&state, USER, "sess-1")
+                .expect_err("a non-owner must be refused");
+            assert_eq!(err.0, StatusCode::NOT_FOUND);
+        }
+
+        #[tokio::test]
+        async fn unknown_id_gets_404_with_identical_body_to_non_owner() {
+            let (_dir, state) = test_state().await;
+            insert_session(&state, "sess-1", "someone-else");
+
+            let non_owner = subscribe_voice_events(&state, USER, "sess-1")
+                .expect_err("a non-owner must be refused");
+            let unknown = subscribe_voice_events(&state, USER, "no-such-session")
+                .expect_err("an unknown session id must be refused");
+
+            assert_eq!(non_owner.0, unknown.0);
+            assert_eq!(non_owner.1 .0.error, unknown.1 .0.error);
+        }
+
+        #[tokio::test]
+        async fn a_voice_message_published_on_the_session_reaches_a_subscriber() {
+            let (_dir, state) = test_state().await;
+            insert_session(&state, "sess-1", USER);
+
+            let mut rx = subscribe_voice_events(&state, USER, "sess-1")
+                .unwrap_or_else(|_| panic!("the owner must be able to subscribe"));
+
+            publish_voice_event(
+                &state,
+                "sess-1",
+                VoiceEvent::VoiceMessage {
+                    role: "assistant".to_string(),
+                    content: "hello there".to_string(),
+                },
+            );
+
+            let event = tokio::time::timeout(StdDuration::from_secs(5), rx.recv())
+                .await
+                .expect("an event must arrive")
+                .expect("the channel must not close");
+            assert_eq!(
+                event,
+                VoiceEvent::VoiceMessage {
+                    role: "assistant".to_string(),
+                    content: "hello there".to_string(),
+                }
+            );
+        }
+
+        #[tokio::test]
+        async fn a_confirm_required_pushed_through_the_test_seam_reaches_the_stream_with_its_nonce()
+        {
+            let (_dir, state) = test_state().await;
+            insert_session(&state, "sess-1", USER);
+
+            let mut rx = subscribe_voice_events(&state, USER, "sess-1")
+                .unwrap_or_else(|_| panic!("the owner must be able to subscribe"));
+
+            push_test_event(
+                &state,
+                "sess-1",
+                VoiceEvent::ConfirmRequired {
+                    action_id: "action-1".to_string(),
+                    nonce: "nonce-secret".to_string(),
+                    summary: "delete the run".to_string(),
+                    expires_at: 123,
+                },
+            );
+
+            let event = tokio::time::timeout(StdDuration::from_secs(5), rx.recv())
+                .await
+                .expect("an event must arrive")
+                .expect("the channel must not close");
+            let VoiceEvent::ConfirmRequired { nonce, .. } = event else {
+                panic!("expected ConfirmRequired, got {event:?}");
+            };
+            assert_eq!(nonce, "nonce-secret");
+        }
+
+        #[tokio::test]
+        async fn the_channel_is_removed_when_the_session_closes() {
+            let (_dir, state) = test_state().await;
+            insert_session(&state, "sess-1", USER);
+
+            let mut rx = subscribe_voice_events(&state, USER, "sess-1")
+                .unwrap_or_else(|_| panic!("the owner must be able to subscribe"));
+
+            // Simulate the billing loop's end-of-session cleanup: the
+            // handle (and its `events_tx`) is removed from
+            // `state.voice_sessions`.
+            state.voice_sessions.lock().unwrap().remove("sess-1");
+
+            let closed = tokio::time::timeout(StdDuration::from_secs(5), rx.recv())
+                .await
+                .expect("recv must not hang");
+            assert!(
+                closed.is_none(),
+                "the forwarding task must end once events_tx is dropped"
             );
         }
     }
