@@ -555,6 +555,14 @@ mod tests {
         let (_dir, state) = test_state().await;
         let db = state.db.as_ref().unwrap();
         let conversation = db.create_conversation("user-1", None);
+        // A real subscriber balance, the way db/ledger.rs's own tests seed
+        // one -- with no balance row at all, `deduct_credits_up_to` rolls
+        // back without writing anything, which would make the
+        // zero-credit-rows assertions below pass even if this path wrongly
+        // called it. Seeding a real balance means those assertions only
+        // pass because this path never calls `deduct_credits_up_to`, not
+        // because there was nothing to deduct from.
+        db.init_credit_balance("user-1", 100).expect("balance");
         let (tx, rx) = mpsc::channel::<StepEvent>(64);
         let key = ZenApiKey::new("zen-secret-CUSTKEY1234".into());
 
@@ -596,9 +604,12 @@ mod tests {
         assert_eq!(table_row_count(db, "provider_request_reservations"), 0);
         assert_eq!(table_row_count(db, "provider_spend_authorizations"), 0);
         assert_eq!(table_row_count(db, "provider_spend"), 1);
-        assert!(
-            db.get_credit_balance_row("user-1").is_none(),
-            "byok never touches credit_balances"
+        let balance = db
+            .get_credit_balance_row("user-1")
+            .expect("balance row was seeded above");
+        assert_eq!(
+            balance.subscription_remaining, 100,
+            "byok never touches credit_balances -- the seeded balance must be untouched"
         );
         let (cost_type, cost_micro_usd): (String, i64) = db
             .conn()
