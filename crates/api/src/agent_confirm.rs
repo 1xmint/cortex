@@ -11,7 +11,7 @@
 //! PR #27 — a missing or wrong nonce on cancel is also a 404, not a 400,
 //! so a guess can't distinguish "wrong nonce" from "no such row".
 
-use crate::clerk::ClerkUser;
+use crate::billing::PremiumUser;
 use crate::db::{ConfirmActionError, Database};
 use crate::routes::ErrorResponse;
 use crate::state::AppState;
@@ -46,9 +46,7 @@ fn not_found() -> (StatusCode, Json<ErrorResponse>) {
     )
 }
 
-fn db_from_state(
-    state: &AppState,
-) -> Result<&Database, (StatusCode, Json<ErrorResponse>)> {
+fn db_from_state(state: &AppState) -> Result<&Database, (StatusCode, Json<ErrorResponse>)> {
     state.db.as_ref().ok_or_else(|| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -65,7 +63,7 @@ fn db_from_state(
 /// to the conversation as an assistant message.
 pub async fn confirm_action(
     State(state): State<Arc<AppState>>,
-    user: ClerkUser,
+    user: PremiumUser,
     Path(id): Path<String>,
     Json(req): Json<ActionNonceRequest>,
 ) -> Result<Json<ConfirmActionResponse>, (StatusCode, Json<ErrorResponse>)> {
@@ -78,35 +76,36 @@ pub async fn confirm_action(
     }
 
     let now = chrono::Utc::now().timestamp();
-    let action = match db.confirm_pending_action(&id, &user.user_id, &req.nonce, now) {
-        Ok(action) => action,
-        Err(ConfirmActionError::NotFound) => return Err(not_found()),
-        Err(ConfirmActionError::WrongNonce) => return Err(not_found()),
-        Err(ConfirmActionError::Expired) => {
-            return Err((
+    let action =
+        match db.confirm_pending_action(&id, &user.user_id, &req.nonce, now) {
+            Ok(action) => action,
+            Err(ConfirmActionError::NotFound) => return Err(not_found()),
+            Err(ConfirmActionError::WrongNonce) => return Err(not_found()),
+            Err(ConfirmActionError::Expired) => {
+                return Err((
+                    StatusCode::CONFLICT,
+                    Json(ErrorResponse {
+                        error: "this action has expired; ask again".into(),
+                    }),
+                ))
+            }
+            Err(ConfirmActionError::AlreadyResolved) => {
+                return Err((
+                    StatusCode::CONFLICT,
+                    Json(ErrorResponse {
+                        error: "this action was already confirmed or cancelled".into(),
+                    }),
+                ))
+            }
+            Err(ConfirmActionError::ArgsTampered) => return Err((
                 StatusCode::CONFLICT,
                 Json(ErrorResponse {
-                    error: "this action has expired; ask again".into(),
+                    error:
+                        "this action's arguments changed since it was proposed; refusing to run it"
+                            .into(),
                 }),
-            ))
-        }
-        Err(ConfirmActionError::AlreadyResolved) => {
-            return Err((
-                StatusCode::CONFLICT,
-                Json(ErrorResponse {
-                    error: "this action was already confirmed or cancelled".into(),
-                }),
-            ))
-        }
-        Err(ConfirmActionError::ArgsTampered) => {
-            return Err((
-                StatusCode::CONFLICT,
-                Json(ErrorResponse {
-                    error: "this action's arguments changed since it was proposed; refusing to run it".into(),
-                }),
-            ))
-        }
-    };
+            )),
+        };
 
     let input: serde_json::Value = serde_json::from_str(&action.args_json).map_err(|e| {
         (
@@ -117,20 +116,15 @@ pub async fn confirm_action(
         )
     })?;
 
-    let result = crate::agent_tools::execute_confirmed(
-        &state,
-        db,
-        &user.user_id,
-        &action.tool_name,
-        &input,
-    )
-    .await
-    .map_err(|e| {
-        (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            Json(ErrorResponse { error: e.message() }),
-        )
-    })?;
+    let result =
+        crate::agent_tools::execute_confirmed(&state, db, &user.user_id, &action.tool_name, &input)
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    Json(ErrorResponse { error: e.message() }),
+                )
+            })?;
 
     db.add_message(
         &action.conversation_id,
@@ -152,7 +146,7 @@ pub async fn confirm_action(
 /// missing row, another user's row, or a wrong nonce are all a 404.
 pub async fn cancel_action(
     State(state): State<Arc<AppState>>,
-    user: ClerkUser,
+    user: PremiumUser,
     Path(id): Path<String>,
     Json(req): Json<ActionNonceRequest>,
 ) -> Result<Json<CancelActionResponse>, (StatusCode, Json<ErrorResponse>)> {

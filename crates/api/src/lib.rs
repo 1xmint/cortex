@@ -1,4 +1,5 @@
 mod admin;
+mod agent_confirm;
 mod agent_tools;
 pub mod api_error;
 pub mod billing;
@@ -410,6 +411,14 @@ pub fn build_cortex_router(state: Arc<AppState>) -> Router {
         )
         .route("/api/runs/{id}/pr", post(routes::create_pr))
         .route("/api/runs/{id}/stream", get(run_stream::stream_run))
+        .route(
+            "/api/agent/actions/{id}/confirm",
+            post(agent_confirm::confirm_action),
+        )
+        .route(
+            "/api/agent/actions/{id}/cancel",
+            post(agent_confirm::cancel_action),
+        )
         .route("/api/chat/suggestions", get(chat::chat_suggestions))
         .route("/api/chat/options", post(chat::chat_options))
         .route(

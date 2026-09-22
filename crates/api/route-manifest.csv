@@ -8,6 +8,8 @@ cortex,GET,/api/admin/runs/{id}
 cortex,GET,/api/admin/usage
 cortex,GET,/api/admin/usage/users
 cortex,GET,/api/admin/workers
+cortex,POST,/api/agent/actions/{id}/cancel
+cortex,POST,/api/agent/actions/{id}/confirm
 cortex,GET|POST,/api/authority/delegations
 cortex,DELETE,/api/authority/delegations/{delegation_id}
 cortex,GET|POST,/api/authority/scopes
