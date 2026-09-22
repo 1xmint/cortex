@@ -38,8 +38,10 @@ afterEach(() => {
 
 const CONTROLS = { speed: 'balanced', intelligence: 'balanced', autonomy: 'guided' } as const;
 
-function renderSession(activeConversationId: string | null = 'conv-open') {
-  return renderHook(() =>
+// Waits for the open conversation's initial load to finish: that load
+// replaces `messages`, so anything a test appends before it lands is wiped.
+async function renderSession(activeConversationId: string | null = 'conv-open') {
+  const rendered = renderHook(() =>
     useChatSession({
       activeConversationId,
       userId: 'user-1',
@@ -51,6 +53,8 @@ function renderSession(activeConversationId: string | null = 'conv-open') {
       onConversationsChanged: vi.fn(),
     }),
   );
+  await waitFor(() => expect(rendered.result.current.isLoadingConversation).toBe(false));
+  return rendered;
 }
 
 // The fixed inputs behind every fixture entry (crates/api/src/chat.rs and
@@ -66,7 +70,7 @@ describe('wire contract: chat SSE confirm_required', () => {
       return new AbortController();
     });
 
-    const { result } = renderSession(null);
+    const { result } = await renderSession(null);
 
     act(() => {
       result.current.setDraft('do the risky thing');
@@ -94,7 +98,7 @@ describe('wire contract: chat SSE confirm_required', () => {
 
 describe('wire contract: live voice events', () => {
   it('handleVoiceConfirmRequired accepts the server fixture and produces the right card', async () => {
-    const { result } = renderSession();
+    const { result } = await renderSession();
     const event: VoiceConfirmRequiredEvent = wireEvents.voice_confirm_required as VoiceConfirmRequiredEvent;
 
     act(() => {
@@ -120,7 +124,7 @@ describe('wire contract: live voice events', () => {
   // lands, same as `useChatSession.voiceEvents.test.tsx`'s own
   // spoken-window test avoids it.
   it('handleVoiceSpokenWindow accepts the server fixture and sets the countdown deadline', async () => {
-    const { result } = renderSession();
+    const { result } = await renderSession();
 
     act(() => {
       result.current.handleVoiceConfirmRequired(wireEvents.voice_confirm_required as VoiceConfirmRequiredEvent);
@@ -138,7 +142,7 @@ describe('wire contract: live voice events', () => {
   });
 
   it('handleVoiceConfirmResolved accepts the server "confirmed" fixture and resolves the card', async () => {
-    const { result } = renderSession();
+    const { result } = await renderSession();
 
     act(() => {
       result.current.handleVoiceConfirmRequired(wireEvents.voice_confirm_required as VoiceConfirmRequiredEvent);
@@ -157,7 +161,7 @@ describe('wire contract: live voice events', () => {
   });
 
   it('handleVoiceConfirmResolved accepts the server "cancelled" fixture and resolves the card', async () => {
-    const { result } = renderSession();
+    const { result } = await renderSession();
 
     act(() => {
       result.current.handleVoiceConfirmRequired(wireEvents.voice_confirm_required as VoiceConfirmRequiredEvent);
@@ -176,7 +180,7 @@ describe('wire contract: live voice events', () => {
   });
 
   it('appendVoiceMessage accepts the server voice_message fixture', async () => {
-    const { result } = renderSession();
+    const { result } = await renderSession();
     const event: VoiceMessageEvent = wireEvents.voice_message as VoiceMessageEvent;
 
     act(() => {
