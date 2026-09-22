@@ -252,6 +252,7 @@ impl ProviderTransport for StubTransport {
 
 /// Either transport the gateway can run against, behind one type so a caller
 /// that only knows "the gateway is usable" doesn't need to be generic.
+#[derive(Clone)]
 pub(crate) enum GatewayTransport {
     Stub(StubTransport),
     Live(crate::supplier_anthropic::AnthropicTransport),

@@ -33,6 +33,16 @@ function createId(prefix: string) {
   return `${prefix}-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`;
 }
 
+// Human-readable labels for the paid chat agent's read-only tool catalogue
+// (see crates/api/src/agent_tools.rs), used to render `tool_activity` events.
+const TOOL_ACTIVITY_LABELS: Record<string, string> = {
+  list_runs: 'your runs',
+  run_status: "a run's status",
+  list_projects: 'your projects',
+  credit_balance: 'your credit balance',
+  run_estimate: 'a cost estimate',
+};
+
 const PROJECT: ChatProject = {
   id: 'project-cortex',
   name: 'ClawNet / Cortex',
@@ -616,6 +626,25 @@ export function useChatSession({
                       : m,
                   ),
                 );
+                break;
+              }
+
+              case 'tool_activity': {
+                const stepId = event.step_id ?? event.task_id;
+                const label = TOOL_ACTIVITY_LABELS[event.tool_name ?? ''] ?? event.tool_name ?? 'a tool';
+                setWorkEvents((currentEvents) => [
+                  {
+                    id: createId('work-tool'),
+                    taskId: stepId,
+                    title: event.ok === false ? 'Tool call failed' : 'Checked',
+                    detail: event.ok === false ? `Could not check ${label}.` : `Checked ${label}.`,
+                    timestamp: new Date().toISOString(),
+                    state: 'done' as const,
+                    provider: assistantProvider,
+                    model: assistantModel,
+                  },
+                  ...currentEvents,
+                ].slice(0, 24));
                 break;
               }
 
