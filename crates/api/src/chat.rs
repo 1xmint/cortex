@@ -184,6 +184,25 @@ pub async fn chat(
         return crate::chat_zen::chat(State(state), user, req, zen_model, system_prompt).await;
     }
 
+    // Billing hole guard: `/api/chat/models` is the only source of truth for
+    // what a client may echo back in `model`. A Zen id always carries the
+    // "zen:" prefix (handled above) and a Claude entry's `model` is always
+    // one of `claude_tier_model_values()` (see `chat_models` below). Any
+    // other non-empty value is unknown to this server -- accepting it here
+    // would fall through to the Claude-tier path below and bill Cortex
+    // credits for a model nobody offered at that price, or none at all.
+    if let Some(model) = req.model.as_deref() {
+        if !claude_tier_model_values().contains(&model) {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: "unknown_model".into(),
+                }),
+            )
+                .into_response());
+        }
+    }
+
     let (tx, rx) = mpsc::channel::<StepEvent>(64);
 
     let model_tier = req
@@ -326,6 +345,13 @@ pub async fn chat(
 /// a Zen model is actually usable -- `chat_zen::chat` re-checks the same key
 /// state and refuses even if a stale client sends a Zen model this response
 /// marked unavailable.
+/// The exact `model` values `chat_models` returns for its Claude entries --
+/// the only values `chat()` accepts in `ChatRequest.model` besides a
+/// `"zen:"`-prefixed one. Kept as one array so the two can never drift.
+fn claude_tier_model_values() -> [&'static str; 3] {
+    ["fast", "balanced", "powerful"].map(|tier| crate::chat_paid::model_for_tier(Some(tier)))
+}
+
 pub async fn chat_models(
     State(state): State<Arc<AppState>>,
     user: ClerkUser,
@@ -365,7 +391,7 @@ pub async fn chat_models(
         };
         models.push(ModelEntry {
             provider: "zen".into(),
-            model: (*model).to_string(),
+            model: format!("zen:{model}"),
             label: (*model).to_string(),
             billing: "your_zen_key".into(),
             available,

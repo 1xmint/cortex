@@ -1041,4 +1041,58 @@ mod tests {
             let _ = status;
         }
     }
+
+    // --- billing hole: `model` values that are neither `"zen:"`-prefixed
+    // nor an exact Claude tier value must refuse with 400 before any
+    // provider work, never fall through to the Claude-tier path and get
+    // billed. ---
+
+    #[tokio::test]
+    async fn an_unknown_model_value_refuses_with_400_before_any_provider_work() {
+        let (_dir, state) = test_state().await;
+        let user = ClerkUser {
+            user_id: "user-unknown-model".into(),
+        };
+        let req = ChatRequest {
+            message: "hi".into(),
+            file_paths: vec![],
+            user_id: None,
+            conversation_id: None,
+            routing_preferences: None,
+            model: Some("glm-5.2".into()),
+        };
+
+        let result = crate::chat::chat(State(state.clone()), user, Json(req)).await;
+
+        let response = result.expect_err("an unknown model value must refuse, not stream");
+        assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"], "unknown_model");
+
+        let db = state.db.as_ref().unwrap();
+        assert_eq!(table_row_count(db, "credit_transactions"), 0);
+    }
+
+    #[tokio::test]
+    async fn chat_models_zen_entries_carry_the_zen_prefix() {
+        let (_dir, state) = test_state().await;
+        let user = ClerkUser {
+            user_id: "user-models-prefix".into(),
+        };
+
+        let response = crate::chat::chat_models(State(state), user).await.0;
+        let zen_entries: Vec<_> = response
+            .models
+            .iter()
+            .filter(|m| m.provider == "zen")
+            .collect();
+        assert!(!zen_entries.is_empty(), "at least one zen model exists");
+        assert!(
+            zen_entries.iter().all(|m| m.model.starts_with("zen:")),
+            "every zen model entry must be echoable back to chat() unchanged"
+        );
+    }
 }
