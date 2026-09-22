@@ -2290,6 +2290,53 @@ mod tests {
         assert_eq!(config["delegation"]["type"], "client");
     }
 
+    /// The hand-written `Debug` impl on `VoiceEvent` must redact `nonce` —
+    /// a derived impl would have printed it verbatim, and `Debug` output is
+    /// exactly the kind of thing that ends up in a `tracing::debug!`/`{:?}`
+    /// log line by accident.
+    #[test]
+    fn confirm_required_debug_never_contains_the_nonce() {
+        let event = VoiceEvent::ConfirmRequired {
+            action_id: "action-1".to_string(),
+            nonce: "super-secret-nonce".to_string(),
+            summary: "delete the run".to_string(),
+            expires_at: 123,
+        };
+
+        let debug = format!("{event:?}");
+        assert!(
+            !debug.contains("super-secret-nonce"),
+            "the nonce must never appear in Debug output: {debug}"
+        );
+        assert!(debug.contains("action-1"), "other fields must still print");
+    }
+
+    /// `spoken_confirm_prompt` truncates only `summary`, on a char
+    /// boundary — a byte-slice truncation would panic mid multi-byte
+    /// character instead of just failing an assertion, so a very long,
+    /// all-multi-byte summary is the sharpest test of both properties at
+    /// once.
+    #[test]
+    fn spoken_confirm_prompt_caps_a_long_multibyte_summary_without_splitting_a_char() {
+        let summary: String = "語".repeat(1000);
+        let prompt = spoken_confirm_prompt(&summary);
+
+        assert!(
+            prompt.chars().count() <= COMMENTARY_CHAR_CAP,
+            "prompt must stay at or under the cap: {} chars",
+            prompt.chars().count()
+        );
+
+        const SUFFIX: &str = ". Say yes, or tap Confirm on screen.";
+        let before_suffix = prompt
+            .strip_suffix(SUFFIX)
+            .expect("the fixed suffix must survive intact even when the summary is truncated");
+        assert!(
+            before_suffix.ends_with('語'),
+            "truncation must land on a whole character, not split one: {before_suffix:?}"
+        );
+    }
+
     #[tokio::test]
     async fn stub_mode_never_touches_the_ledger_or_the_map() {
         let (_dir, state) = test_state().await;
@@ -3567,6 +3614,249 @@ mod tests {
             })
         }
 
+        /// Inserts a `VoiceSessionHandle` for `session_id` owned by
+        /// `owner_id` directly, the same seam `events_stream::insert_session`
+        /// uses — this module needs it too, to observe what
+        /// `run_voice_delegation_with` publishes on the session's event
+        /// stream.
+        fn insert_session(state: &Arc<AppState>, session_id: &str, owner_id: &str) {
+            let (close_tx, _close_rx) = mpsc::channel(1);
+            let (events_tx, _) = broadcast::channel(VOICE_EVENTS_CAPACITY);
+            state.voice_sessions.lock().unwrap().insert(
+                session_id.to_string(),
+                VoiceSessionHandle {
+                    user_id: owner_id.to_string(),
+                    close_tx,
+                    events_tx,
+                    pending_confirm: std::sync::Mutex::new(None),
+                },
+            );
+        }
+
+        /// A run with a write lease the caller owns, so `open_pr` (the one
+        /// wired-up `Risk::Confirm` tool) validates and can be proposed —
+        /// same setup `chat_paid.rs`'s own `open_pr` confirm tests use.
+        fn run_with_write_lease(
+            db: &crate::db::Database,
+            conversation_id: &str,
+            path: &str,
+        ) -> String {
+            let run_id = db
+                .create_run_with_steps_and_resource_leases(
+                    USER,
+                    "Ship a feature",
+                    "auto",
+                    &[path.to_string()],
+                    None,
+                    None,
+                    Some(conversation_id),
+                    &[crate::db::ResourceLeaseRequest {
+                        resource_type: "path".to_string(),
+                        repo_key: "github:test/repo".to_string(),
+                        resource_key: path.to_string(),
+                        mode: "write".to_string(),
+                        reason: Some("test".to_string()),
+                        metadata: serde_json::json!({}),
+                    }],
+                    &[],
+                    &[],
+                )
+                .expect("run created with a write lease");
+            db.record_run_branch(&run_id, &format!("cortex/{run_id}"));
+            run_id
+        }
+
+        /// A voice turn in an owned conversation whose scripted model calls
+        /// `open_pr` (the one `Risk::Confirm` tool wired up so far) must
+        /// publish `VoiceEvent::ConfirmRequired` with a non-empty nonce on
+        /// the session's own event stream, and the commentary text sent
+        /// toward OpenAI (the returned answer) must be exactly
+        /// `spoken_confirm_prompt(summary)` — never the model's own words,
+        /// and never containing the nonce.
+        #[tokio::test]
+        async fn a_confirm_proposal_reaches_the_session_with_a_spoken_prompt() {
+            let (_dir, state) = test_state_with_balance(1_000_000_000).await;
+            let db = state.db.as_ref().unwrap();
+            let conversation = db.create_conversation(USER, None);
+            let run_id = run_with_write_lease(db, &conversation.id, "src/lib.rs");
+
+            insert_session(&state, "sess-1", USER);
+            let mut rx = subscribe_voice_events(&state, USER, "sess-1")
+                .unwrap_or_else(|_| panic!("the owner must be able to subscribe"));
+
+            let transport = SequencedTransport::new(vec![
+                tool_use_response("toolu_1", "open_pr", serde_json::json!({"run_id": run_id})),
+                CountingTransport::ok("waiting on you").response.clone(),
+            ]);
+            let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+            let answer = run_voice_delegation_with(
+                &state,
+                "sess-1",
+                db,
+                SIGNING_KEY,
+                SUPPLIER_KEY,
+                transport,
+                ample_limits(),
+                USER,
+                Some(conversation.id.as_str()),
+                "open a pr for my run",
+                &cancel,
+            )
+            .await;
+
+            let event = tokio::time::timeout(StdDuration::from_secs(5), rx.recv())
+                .await
+                .expect("an event must arrive")
+                .expect("the channel must not close");
+            let VoiceEvent::ConfirmRequired { nonce, summary, .. } = event else {
+                panic!("expected ConfirmRequired, got {event:?}");
+            };
+            assert!(!nonce.is_empty(), "the nonce must not be empty");
+
+            assert_eq!(
+                answer,
+                spoken_confirm_prompt(&summary),
+                "the commentary sent toward OpenAI must be the fixed server template"
+            );
+            assert!(
+                !answer.contains(&nonce),
+                "the spoken commentary must never contain the nonce: {answer:?}"
+            );
+        }
+
+        /// With no `conversation_id`, `open_pr` is withheld — see
+        /// `VoiceConfirm::Spoken`'s own doc comment in `chat_paid.rs` — so
+        /// nothing writes to the session's pending-confirm slot.
+        #[tokio::test]
+        async fn no_conversation_id_withholds_confirm_and_stores_nothing() {
+            let (_dir, state) = test_state_with_balance(1_000_000_000).await;
+            let db = state.db.as_ref().unwrap();
+            insert_session(&state, "sess-1", USER);
+
+            let transport = SequencedTransport::new(vec![
+                tool_use_response("toolu_1", "open_pr", serde_json::json!({"run_id": "run-1"})),
+                CountingTransport::ok("done").response.clone(),
+            ]);
+            let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+            let answer = run_voice_delegation_with(
+                &state,
+                "sess-1",
+                db,
+                SIGNING_KEY,
+                SUPPLIER_KEY,
+                transport,
+                ample_limits(),
+                USER,
+                None,
+                "open a pr for my run",
+                &cancel,
+            )
+            .await;
+
+            assert_eq!(
+                answer, "done",
+                "no proposal was made, so the model's own final-turn text is returned"
+            );
+
+            let sessions = state.voice_sessions.lock().unwrap();
+            let handle = sessions.get("sess-1").expect("the session is still open");
+            assert!(
+                handle
+                    .pending_confirm
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .is_none(),
+                "a withheld tool call must never reach the pending-confirm slot"
+            );
+        }
+
+        /// A second proposal replaces the pending slot rather than queuing:
+        /// after two delegations each propose `open_pr`, the slot holds only
+        /// the second `action_id`.
+        #[tokio::test]
+        async fn a_second_proposal_replaces_the_pending_slot() {
+            let (_dir, state) = test_state_with_balance(1_000_000_000).await;
+            let db = state.db.as_ref().unwrap();
+            let conversation = db.create_conversation(USER, None);
+            insert_session(&state, "sess-1", USER);
+            let mut rx = subscribe_voice_events(&state, USER, "sess-1")
+                .unwrap_or_else(|_| panic!("the owner must be able to subscribe"));
+
+            let run_id_1 = run_with_write_lease(db, &conversation.id, "src/lib.rs");
+            let run_id_2 = run_with_write_lease(db, &conversation.id, "src/main.rs");
+
+            async fn propose(
+                state: &Arc<AppState>,
+                db: &crate::db::Database,
+                conversation_id: &str,
+                run_id: &str,
+            ) {
+                let transport = SequencedTransport::new(vec![
+                    tool_use_response("toolu_1", "open_pr", serde_json::json!({"run_id": run_id})),
+                    CountingTransport::ok("waiting on you").response.clone(),
+                ]);
+                let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                run_voice_delegation_with(
+                    state,
+                    "sess-1",
+                    db,
+                    SIGNING_KEY,
+                    SUPPLIER_KEY,
+                    transport,
+                    ample_limits(),
+                    USER,
+                    Some(conversation_id),
+                    "open a pr for my run",
+                    &cancel,
+                )
+                .await;
+            }
+
+            propose(&state, db, &conversation.id, &run_id_1).await;
+            let first_event = tokio::time::timeout(StdDuration::from_secs(5), rx.recv())
+                .await
+                .expect("an event must arrive")
+                .expect("the channel must not close");
+            let VoiceEvent::ConfirmRequired {
+                action_id: first_id,
+                ..
+            } = first_event
+            else {
+                panic!("expected ConfirmRequired, got {first_event:?}");
+            };
+
+            propose(&state, db, &conversation.id, &run_id_2).await;
+            let second_event = tokio::time::timeout(StdDuration::from_secs(5), rx.recv())
+                .await
+                .expect("an event must arrive")
+                .expect("the channel must not close");
+            let VoiceEvent::ConfirmRequired {
+                action_id: second_id,
+                ..
+            } = second_event
+            else {
+                panic!("expected ConfirmRequired, got {second_event:?}");
+            };
+            assert_ne!(
+                first_id, second_id,
+                "sanity: two distinct actions were proposed"
+            );
+
+            let sessions = state.voice_sessions.lock().unwrap();
+            let handle = sessions.get("sess-1").expect("the session is still open");
+            let pending = handle
+                .pending_confirm
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let pending = pending.as_ref().expect("a pending confirm must be stored");
+            assert_eq!(
+                pending.action_id, second_id,
+                "the slot must hold the second proposal, not the first"
+            );
+        }
+
         #[test]
         fn accumulate_transcript_reads_delta_or_text() {
             let mut pending = String::new();
@@ -3887,6 +4177,65 @@ mod tests {
             assert_eq!(messages[2].content, "the answer is four");
         }
 
+        /// `handle_delegation_created` publishes the user's transcript as a
+        /// `VoiceMessage` before spawning the delegation, then the
+        /// delegation's answer as a second `VoiceMessage` once it completes
+        /// — in that order, user first.
+        #[tokio::test]
+        async fn publishes_user_then_assistant_voice_message_in_order() {
+            let (_dir, state) = test_state().await;
+            insert_session(&state, "sess-1", USER);
+            let mut rx = subscribe_voice_events(&state, USER, "sess-1")
+                .unwrap_or_else(|_| panic!("the owner must be able to subscribe"));
+
+            let busy = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let (tx, mut commentary_rx) = mpsc::channel::<Value>(8);
+            let mut pending_transcript = "what is the weather".to_string();
+
+            handle_delegation_created(
+                &serde_json::json!({"delegation": {"id": "deleg-1"}}),
+                &state,
+                "sess-1",
+                USER,
+                None,
+                &busy,
+                &cancel,
+                &mut pending_transcript,
+                &tx,
+            );
+
+            let first = tokio::time::timeout(StdDuration::from_secs(5), rx.recv())
+                .await
+                .expect("the user's voice message must arrive")
+                .expect("the channel must not close");
+            let VoiceEvent::VoiceMessage {
+                role: first_role,
+                content: first_content,
+            } = first
+            else {
+                panic!("expected VoiceMessage, got {first:?}");
+            };
+            assert_eq!(first_role, "user");
+            assert_eq!(first_content, "what is the weather");
+
+            let second = tokio::time::timeout(StdDuration::from_secs(5), rx.recv())
+                .await
+                .expect("the assistant's voice message must arrive")
+                .expect("the channel must not close");
+            let VoiceEvent::VoiceMessage {
+                role: second_role, ..
+            } = second
+            else {
+                panic!("expected VoiceMessage, got {second:?}");
+            };
+            assert_eq!(second_role, "assistant");
+
+            // Drain the commentary side-channel so the spawned task's send
+            // does not block; its content is covered elsewhere.
+            let _ = tokio::time::timeout(StdDuration::from_secs(5), commentary_rx.recv()).await;
+        }
+
         #[tokio::test]
         async fn a_delegation_drains_the_transcript_and_answers_with_matching_id() {
             // Exercises the real production path end to end: no gateway env
@@ -4179,6 +4528,59 @@ mod tests {
                 closed.is_none(),
                 "the forwarding task must end once events_tx is dropped"
             );
+        }
+
+        /// A subscriber that falls behind the broadcast channel's capacity
+        /// gets `RecvError::Lagged`, and `subscribe_voice_events` ends the
+        /// stream over it rather than silently resuming mid-stream — see
+        /// its own doc comment. A small-capacity broadcast channel, built
+        /// directly (not through `insert_session`, which uses the real
+        /// `VOICE_EVENTS_CAPACITY`), overflows from a burst of publishes
+        /// sent before the forwarding task ever gets scheduled to drain any
+        /// of them.
+        #[tokio::test]
+        async fn the_stream_ends_when_the_subscriber_lags() {
+            let (_dir, state) = test_state().await;
+            let (close_tx, _close_rx) = mpsc::channel(1);
+            let (events_tx, _) = broadcast::channel(2);
+            state.voice_sessions.lock().unwrap().insert(
+                "sess-1".to_string(),
+                VoiceSessionHandle {
+                    user_id: USER.to_string(),
+                    close_tx,
+                    events_tx,
+                    pending_confirm: std::sync::Mutex::new(None),
+                },
+            );
+
+            let mut rx = subscribe_voice_events(&state, USER, "sess-1")
+                .unwrap_or_else(|_| panic!("the owner must be able to subscribe"));
+
+            for i in 0..10 {
+                publish_voice_event(
+                    &state,
+                    "sess-1",
+                    VoiceEvent::VoiceMessage {
+                        role: "assistant".to_string(),
+                        content: format!("msg {i}"),
+                    },
+                );
+            }
+
+            let mut ended = false;
+            for _ in 0..20 {
+                match tokio::time::timeout(StdDuration::from_secs(5), rx.recv())
+                    .await
+                    .expect("recv must not hang")
+                {
+                    Some(_) => continue,
+                    None => {
+                        ended = true;
+                        break;
+                    }
+                }
+            }
+            assert!(ended, "the stream must end once the subscriber lags");
         }
     }
 }
