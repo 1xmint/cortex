@@ -342,6 +342,7 @@ pub(crate) async fn start_session(
     user_id: &str,
     sdp: &str,
     now_ms: i64,
+    conversation_id: Option<String>,
 ) -> Result<(String, String, String), LiveSessionError> {
     let supplier_key = match mode {
         // Stub never leaves the machine and never spends: no session is
@@ -393,6 +394,7 @@ pub(crate) async fn start_session(
     let spawn_user_id = user_id.to_string();
     let spawn_sdp = sdp.to_string();
     let spawn_local_id = local_id.clone();
+    let spawn_conversation_id = conversation_id;
     let join_handle = tokio::spawn(async move {
         let mut guard = PlaceholderGuard::new(spawn_state.clone(), spawn_local_id.clone());
         let result = start_live_session(
@@ -406,6 +408,7 @@ pub(crate) async fn start_session(
             &spawn_sdp,
             now_ms,
             spawn_local_id,
+            spawn_conversation_id,
         )
         .await;
         if result.is_ok() {
@@ -439,6 +442,7 @@ async fn start_live_session(
     sdp: &str,
     now_ms: i64,
     local_id: String,
+    conversation_id: Option<String>,
 ) -> Result<(String, String, String), LiveSessionError> {
     let db = state.db.as_ref().ok_or(LiveSessionError::Unavailable)?;
     let price_list = db
@@ -604,6 +608,7 @@ async fn start_live_session(
     let loop_ws_base = ws_base.to_string();
     let loop_supplier_key = supplier_key.to_string();
     let micros_per_credit = price_list.micros_per_credit;
+    let loop_conversation_id = conversation_id;
     tokio::spawn(async move {
         run_billing_loop(
             loop_state,
@@ -619,6 +624,7 @@ async fn start_live_session(
             max_micro_usd,
             segment0_micro,
             close_rx,
+            loop_conversation_id,
         )
         .await;
     });
@@ -744,6 +750,7 @@ async fn run_billing_loop(
     max_micro_usd: i64,
     segment0_micro: i64,
     mut close_rx: mpsc::Receiver<()>,
+    conversation_id: Option<String>,
 ) {
     let Some(db) = state.db.as_ref() else {
         state
@@ -835,6 +842,7 @@ async fn run_billing_loop(
                             &event,
                             &state,
                             &user_id,
+                            conversation_id.as_deref(),
                             &delegation_busy,
                             &delegation_cancel,
                             &mut pending_transcript,
@@ -1165,6 +1173,7 @@ fn handle_delegation_created(
     event: &Value,
     state: &Arc<AppState>,
     user_id: &str,
+    conversation_id: Option<&str>,
     delegation_busy: &Arc<std::sync::atomic::AtomicBool>,
     delegation_cancel: &Arc<std::sync::atomic::AtomicBool>,
     pending_transcript: &mut String,
@@ -1195,12 +1204,20 @@ fn handle_delegation_created(
     let task_text = std::mem::take(pending_transcript);
     let state = state.clone();
     let user_id = user_id.to_string();
+    let conversation_id = conversation_id.map(str::to_string);
     let busy = delegation_busy.clone();
     let cancel = delegation_cancel.clone();
     let tx = commentary_tx.clone();
     tokio::spawn(async move {
         let _busy_guard = BusyGuard(busy);
-        let answer = run_voice_delegation(&state, &user_id, &task_text, &cancel).await;
+        let answer = run_voice_delegation(
+            &state,
+            &user_id,
+            conversation_id.as_deref(),
+            &task_text,
+            &cancel,
+        )
+        .await;
         let _ = tx.send(commentary_event(&delegation_id, &answer)).await;
     });
 }
@@ -1220,6 +1237,7 @@ fn handle_delegation_created(
 async fn run_voice_delegation(
     state: &Arc<AppState>,
     user_id: &str,
+    conversation_id: Option<&str>,
     task_text: &str,
     cancel: &Arc<std::sync::atomic::AtomicBool>,
 ) -> String {
@@ -1245,6 +1263,7 @@ async fn run_voice_delegation(
         transport,
         limits,
         user_id,
+        conversation_id,
         task_text,
         cancel,
     )
@@ -1262,6 +1281,7 @@ async fn run_voice_delegation_with<T: crate::provider_gateway::ProviderTransport
     transport: T,
     limits: SpendLimits,
     user_id: &str,
+    conversation_id: Option<&str>,
     task_text: &str,
     cancel: &Arc<std::sync::atomic::AtomicBool>,
 ) -> String {
@@ -1274,17 +1294,22 @@ async fn run_voice_delegation_with<T: crate::provider_gateway::ProviderTransport
     let now_ms = chrono::Utc::now().timestamp_millis();
     let turn_cap = crate::chat_paid::turn_cap_per_minute();
 
-    match crate::chat_paid::send_paid_reply(
+    // Saved the same way `chat_paid::run` saves a text-chat turn: the
+    // user's text first (so it is there even if the reply never comes
+    // back), the answer after. A session with no linked conversation
+    // (`conversation_id: None`) saves nothing, matching M-D-0013 behavior.
+    if let Some(cid) = conversation_id {
+        db.add_message(cid, "user", task_text, None, None);
+    }
+
+    let answer = match crate::chat_paid::send_paid_reply(
         db,
         signing_key,
         supplier_key,
         transport,
         limits,
         user_id,
-        // Live voice sessions do not carry a conversation id today, so
-        // there is nothing to save the delegated turn's messages against;
-        // see the module notes on `VoiceSessionHandle`.
-        None,
+        conversation_id,
         crate::chat_paid::model_for_tier(None),
         VOICE_DELEGATION_SYSTEM_PROMPT,
         task_text,
@@ -1308,7 +1333,13 @@ async fn run_voice_delegation_with<T: crate::provider_gateway::ProviderTransport
                 .to_string()
         }
         Err(_) => "Sorry, I couldn't complete that just now.".to_string(),
+    };
+
+    if let Some(cid) = conversation_id {
+        db.add_message(cid, "assistant", &answer, Some("cortex"), None);
     }
+
+    answer
 }
 
 /// Best effort: re-attach the sideband once and immediately ask the session
@@ -1552,6 +1583,13 @@ pub struct LiveSessionStartResponse {
 #[derive(Debug, serde::Deserialize)]
 pub struct LiveSessionStartRequest {
     pub sdp: String,
+    /// Links this live session to an existing text conversation, so
+    /// delegated turns save into it the same way chat does. Checked for
+    /// ownership before anything is reserved — a foreign or missing id is a
+    /// 404 with no placeholder left behind. `None` keeps today's behavior:
+    /// no conversation, nothing saved.
+    #[serde(default)]
+    pub conversation_id: Option<String>,
 }
 
 pub async fn live_session_start(
@@ -1567,6 +1605,19 @@ pub async fn live_session_start(
                 error: format!("Subscription required to access chat. Status: {blocked:?}. Go to Settings → Billing to subscribe."),
             }),
         ));
+    }
+    // Ownership is checked before anything else touches the ledger or the
+    // session map: a foreign or missing conversation id is a plain 404, and
+    // nothing is reserved for it.
+    if let Some(cid) = &body.conversation_id {
+        let owned = state
+            .db
+            .as_ref()
+            .map(|db| db.get_conversation(cid, &user.user_id).is_some())
+            .unwrap_or(false);
+        if !owned {
+            return Err(LiveSessionError::NotFound.into_response());
+        }
     }
     let Some(mode) = live_voice_mode() else {
         return Err(LiveSessionError::Unavailable.into_response());
@@ -1592,6 +1643,7 @@ pub async fn live_session_start(
         &user.user_id,
         &body.sdp,
         now_ms,
+        body.conversation_id.clone(),
     )
     .await
     .map(|(session_id, sdp, _local_id)| Json(LiveSessionStartResponse { session_id, sdp }))
@@ -1820,6 +1872,7 @@ mod tests {
             USER,
             "offer-sdp",
             0,
+            None,
         )
         .await
         .expect("stub start must succeed");
@@ -1861,6 +1914,7 @@ mod tests {
             USER,
             "offer-sdp",
             chrono::Utc::now().timestamp_millis(),
+            None,
         )
         .await
         .expect("live start against the fake must succeed");
@@ -1945,6 +1999,7 @@ mod tests {
             USER,
             "offer-sdp",
             0,
+            None,
         )
         .await
         .expect("live start must succeed even on a small balance");
@@ -2000,6 +2055,7 @@ mod tests {
             USER,
             "offer-sdp",
             0,
+            None,
         )
         .await
         .expect("live start must succeed");
@@ -2073,6 +2129,7 @@ mod tests {
             USER,
             "offer-sdp",
             chrono::Utc::now().timestamp_millis(),
+            None,
         )
         .await
         .expect("live start must succeed");
@@ -2169,6 +2226,7 @@ mod tests {
             USER,
             "offer-sdp",
             chrono::Utc::now().timestamp_millis(),
+            None,
         )
         .await
         .expect("live start must succeed on a tightly-funded balance");
@@ -2221,6 +2279,7 @@ mod tests {
             USER,
             "offer-sdp",
             0,
+            None,
         )
         .await
         .expect_err("an attach that hangs past the timeout must fail start_session");
@@ -2266,6 +2325,7 @@ mod tests {
             USER,
             "offer-sdp",
             0,
+            None,
         )
         .await
         .expect("a later start for the same user must not be 409'd by the hung attempt");
@@ -2308,6 +2368,7 @@ mod tests {
                 USER,
                 "offer-sdp",
                 0,
+                None,
             ),
         )
         .await;
@@ -2373,6 +2434,7 @@ mod tests {
             USER,
             "offer-sdp",
             0,
+            None,
         )
         .await
         .expect("a later start for the same user must not be 409'd by the disconnected attempt");
@@ -2426,6 +2488,7 @@ mod tests {
             USER,
             "offer-sdp",
             0,
+            None,
         )
         .await
         .expect("live start must succeed");
@@ -2503,6 +2566,7 @@ mod tests {
             USER,
             "offer-sdp",
             0,
+            None,
         )
         .await
         .expect("live start must succeed");
@@ -2539,6 +2603,7 @@ mod tests {
             USER,
             "offer-sdp",
             0,
+            None,
         )
         .await
         .expect_err("a refused attach must fail start_session");
@@ -2591,6 +2656,7 @@ mod tests {
             USER,
             "offer-sdp",
             0,
+            None,
         )
         .await
         .expect("first live start must succeed");
@@ -2612,6 +2678,7 @@ mod tests {
             USER,
             "offer-sdp",
             0,
+            None,
         )
         .await
         .expect_err("a second start for the same user must be refused");
@@ -2676,6 +2743,7 @@ mod tests {
             USER,
             "offer-sdp",
             0,
+            None,
         )
         .await
         .expect("live start must succeed with exactly enough balance for segment 0");
@@ -2811,6 +2879,7 @@ mod tests {
             USER,
             "offer-sdp",
             0,
+            None,
         )
         .await
         .expect("live start must succeed");
@@ -2958,6 +3027,7 @@ mod tests {
                 transport.clone(),
                 ample_limits(),
                 USER,
+                None,
                 "   ",
                 &cancel,
             )
@@ -2983,6 +3053,7 @@ mod tests {
                 transport.clone(),
                 ample_limits(),
                 USER,
+                None,
                 "what is two plus two",
                 &cancel,
             )
@@ -3018,6 +3089,7 @@ mod tests {
                 transport.clone(),
                 ample_limits(),
                 USER,
+                None,
                 "do something",
                 &cancel,
             )
@@ -3052,6 +3124,7 @@ mod tests {
                 &serde_json::json!({"delegation": {"id": "deleg-1"}}),
                 &state,
                 USER,
+                None,
                 &busy,
                 &cancel,
                 &mut pending_transcript,
@@ -3085,6 +3158,7 @@ mod tests {
                 &serde_json::json!({"delegation": {"id": "deleg-2"}}),
                 &state,
                 USER,
+                None,
                 &busy,
                 &cancel,
                 &mut pending_transcript,
@@ -3146,6 +3220,7 @@ mod tests {
                 &serde_json::json!({"delegation": {"id": "deleg-3"}}),
                 &state,
                 USER,
+                None,
                 &busy,
                 &cancel,
                 &mut pending_transcript,
