@@ -644,6 +644,73 @@ pub(crate) async fn send_paid_reply<T: ProviderTransport + Clone>(
 
         let mut tool_results = Vec::with_capacity(uses.len());
         for (tool_use_id, name, input) in uses {
+            // `open_pr` is the one `Risk::Confirm` tool wired up so far
+            // (`agent_tools::validate_confirm_tool`/`execute_confirmed`):
+            // instead of running it, or just refusing it, propose it — write
+            // a row to `agent_pending_actions` and tell the model (and, via
+            // `StepEvent::ConfirmRequired`, the client) that it's waiting on
+            // the user's own tap on `POST /api/agent/actions/{id}/confirm`.
+            // Every other tool, including the still-refused `cancel_run`,
+            // falls through to the unchanged path below.
+            if name == "open_pr" {
+                match agent_tools::validate_confirm_tool(db, user_id, &name, &input) {
+                    Ok(summary) => {
+                        let now = chrono::Utc::now().timestamp();
+                        let action = db.insert_pending_action(
+                            user_id,
+                            conversation_id.unwrap_or_default(),
+                            &name,
+                            &input,
+                            &summary,
+                            now,
+                        );
+                        if let Some(tx) = tool_events {
+                            let _ = tx
+                                .send(StepEvent::ConfirmRequired {
+                                    action_id: action.id.clone(),
+                                    nonce: action.nonce.clone(),
+                                    summary: action.summary.clone(),
+                                    expires_at: action.expires_at,
+                                })
+                                .await;
+                        }
+                        tool_activity.push(ToolActivity {
+                            tool_name: name.clone(),
+                            ok: true,
+                        });
+                        tool_results.push(serde_json::json!({
+                            "type": "tool_result",
+                            "tool_use_id": tool_use_id,
+                            "content": "Waiting for the user's confirmation. This has not run yet.",
+                            "is_error": false,
+                        }));
+                    }
+                    Err(e) => {
+                        // No row written — refuse exactly like an
+                        // unconfirmable tool call would today.
+                        tool_activity.push(ToolActivity {
+                            tool_name: name.clone(),
+                            ok: false,
+                        });
+                        if let Some(tx) = tool_events {
+                            let _ = tx
+                                .send(StepEvent::ToolActivity {
+                                    step_id: "chat".into(),
+                                    tool_name: name.clone(),
+                                    ok: false,
+                                })
+                                .await;
+                        }
+                        tool_results.push(serde_json::json!({
+                            "type": "tool_result",
+                            "tool_use_id": tool_use_id,
+                            "content": e.message(),
+                            "is_error": true,
+                        }));
+                    }
+                }
+                continue;
+            }
             let (activity, content, is_error) =
                 match agent_tools::execute(db, user_id, &name, &input) {
                     Ok(rendered) => (

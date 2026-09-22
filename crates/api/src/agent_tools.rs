@@ -177,9 +177,30 @@ pub fn catalogue() -> Vec<ToolSpec> {
             }),
             risk: Risk::Safe,
         },
-        // Not executed in this PR (see module docs): kept in the catalogue
-        // so `Risk::Confirm` has a concrete member and refusal is tested
-        // against a real entry rather than an invented name.
+        // `Risk::Confirm`: never executed straight from `execute` (see below)
+        // — asking for this tool proposes an `agent_pending_actions` row
+        // instead, and only `POST /api/agent/actions/{id}/confirm` (with the
+        // right nonce, before it expires) actually runs it. See
+        // `crate::agent_confirm` and `chat_paid::send_paid_reply`'s tool loop.
+        ToolSpec {
+            name: "open_pr",
+            description:
+                "Open a pull request for one of the requesting user's own finished runs. \
+                 Requires the user's explicit confirmation before it runs.",
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "run_id": {"type": "string"}
+                },
+                "required": ["run_id"],
+                "additionalProperties": false
+            }),
+            risk: Risk::Confirm,
+        },
+        // Not implemented at all yet (no whole-run cancel exists): kept in
+        // the catalogue as a second `Risk::Confirm` member so refusal-before-
+        // confirmation-exists and refusal-because-not-built-yet stay two
+        // separate, separately tested things.
         ToolSpec {
             name: "cancel_run",
             description:
@@ -303,6 +324,84 @@ pub fn execute(
     };
 
     Ok(render_tool_output(&result))
+}
+
+/// A run id, shortened for a summary a human reads — the full id stays in
+/// the stored `args_json`, this is display only.
+fn short_run_id(run_id: &str) -> &str {
+    &run_id[..run_id.len().min(8)]
+}
+
+/// Validate a `Risk::Confirm` tool call's arguments the way the tool itself
+/// would, and build the plain-language summary the user sees on the Confirm
+/// card. Runs nothing — a green result here only means the proposal is worth
+/// writing to `agent_pending_actions`; the tool call still waits on the
+/// user's own tap on `POST /api/agent/actions/{id}/confirm`.
+///
+/// The summary is built from the run's own stored goal — database data, not
+/// anything the model just said in this turn — never from model text (see
+/// the module docs on [`ToolOutput::render`] for why model text never
+/// becomes something a human reads as fact).
+pub fn validate_confirm_tool(
+    db: &Database,
+    user_id: &str,
+    name: &str,
+    input: &Value,
+) -> Result<String, ToolError> {
+    let spec = find(name).ok_or_else(|| ToolError::Unknown(name.to_string()))?;
+    if spec.risk != Risk::Confirm {
+        return Err(ToolError::InvalidArguments(format!(
+            "'{name}' is not a confirm-risk tool"
+        )));
+    }
+    match name {
+        "open_pr" => {
+            let run_id = str_arg(input, "run_id")?;
+            let (goal, _branch) = crate::routes::validate_run_for_pr(db, user_id, &run_id)
+                .map_err(|(_, body)| ToolError::NotFound(body.0.error))?;
+            let project = truncate_for_summary(&goal, 60);
+            Ok(format!(
+                "Open a pull request for run {} in {project}",
+                short_run_id(&run_id)
+            ))
+        }
+        // Refused exactly as before: no pending row, no confirm card.
+        _ => Err(ToolError::ConfirmRequired(name.to_string())),
+    }
+}
+
+/// Clip a database string to a bounded length for a one-line summary,
+/// without splitting a multi-byte UTF-8 character.
+fn truncate_for_summary(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        return s.to_string();
+    }
+    let mut clipped: String = s.chars().take(max_chars).collect();
+    clipped.push('\u{2026}');
+    clipped
+}
+
+/// Actually run a `Risk::Confirm` tool, using only the stored arguments of an
+/// already-confirmed `agent_pending_actions` row (see
+/// `crate::agent_confirm::confirm_action`). Never called from the model-facing
+/// [`execute`] path.
+pub async fn execute_confirmed(
+    state: &crate::state::AppState,
+    db: &Database,
+    user_id: &str,
+    name: &str,
+    input: &Value,
+) -> Result<Value, ToolError> {
+    match name {
+        "open_pr" => {
+            let run_id = str_arg(input, "run_id")?;
+            let result = crate::routes::create_pr_core(state, db, user_id, &run_id, None, "main")
+                .await
+                .map_err(|(_, body)| ToolError::InvalidArguments(body.0.error))?;
+            serde_json::to_value(result).map_err(|e| ToolError::InvalidArguments(e.to_string()))
+        }
+        _ => Err(ToolError::Unknown(name.to_string())),
+    }
 }
 
 #[cfg(test)]

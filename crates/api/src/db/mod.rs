@@ -16,9 +16,11 @@ use uuid::Uuid;
 use crate::lock::LockRecovering;
 
 mod ledger;
+mod pending_actions;
 mod provider_gateway;
 mod verification_queue;
 
+pub use pending_actions::{ConfirmActionError, PendingAction, PENDING_ACTION_TTL_SECS};
 pub use provider_gateway::{ProviderReservation, SpendAuthorization};
 
 pub struct Database {

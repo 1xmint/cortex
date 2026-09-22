@@ -178,6 +178,18 @@ pub enum StepEvent {
         tool_name: String,
         ok: bool,
     },
+    /// The model asked for a `Risk::Confirm` tool. Nothing ran — a row was
+    /// written to `agent_pending_actions` (`db::pending_actions`) and this is
+    /// the client's only copy of `nonce`, which it must send back to
+    /// `POST /api/agent/actions/{action_id}/confirm` to actually run the
+    /// tool. `summary` is written by the server from the tool's arguments
+    /// and the database, never from model text (see `agent_tools.rs`).
+    ConfirmRequired {
+        action_id: String,
+        nonce: String,
+        summary: String,
+        expires_at: i64,
+    },
 }
 
 impl AppState {
