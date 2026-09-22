@@ -195,10 +195,10 @@ async fn confirm_and_execute(
 ///
 /// This function does not itself gate on premium: the tap route
 /// (`confirm_action`) gets that for free from the `PremiumUser` extractor.
-/// Whatever caller wires this in for part 2b must enforce that same premium
-/// check before reaching here.
-#[allow(dead_code)] // Wired to the transcript matcher in part 2b.
-async fn confirm_and_execute_spoken(
+/// The spoken-confirm wiring in `voice_session.rs` (`confirm_spoken_action`)
+/// runs the identical check — `billing::premium_user_check` — before
+/// reaching here, since it never goes through axum extraction.
+pub(crate) async fn confirm_and_execute_spoken(
     state: &Arc<AppState>,
     db: &Database,
     user_id: &str,
@@ -209,6 +209,25 @@ async fn confirm_and_execute_spoken(
         .ok_or(ConfirmAndExecuteError::NotFound)?
         .nonce;
     confirm_and_execute(state, db, user_id, action_id, &nonce).await
+}
+
+/// The spoken-cancel entry point: the exact same DB update the tap route's
+/// `cancel_action` uses (`Database::cancel_pending_action`) — no new db
+/// helper — but with the nonce looked up server-side from the row itself,
+/// mirroring [`confirm_and_execute_spoken`] above, since the spoken path
+/// never has a client-supplied nonce either. Returns `false` for the same
+/// reasons `cancel_pending_action` itself does: no such row, another user's
+/// row, or a row that is no longer `pending`.
+pub(crate) fn cancel_pending_action_spoken(
+    db: &Database,
+    user_id: &str,
+    action_id: &str,
+    now: i64,
+) -> bool {
+    let Some(nonce) = db.get_pending_action(action_id, user_id).map(|a| a.nonce) else {
+        return false;
+    };
+    db.cancel_pending_action(action_id, user_id, &nonce, now)
 }
 
 /// `POST /api/agent/actions/{id}/confirm` — run the `Risk::Confirm` tool

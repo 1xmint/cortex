@@ -18,8 +18,6 @@
 //! - A result is single-use: once the matcher resolves (Confirm, Cancel,
 //!   Closed, or Expired) it yields nothing further until re-armed.
 
-#![allow(dead_code)] // Not wired into any caller yet (see plan slice 0014d).
-
 use std::time::{Duration, Instant};
 
 /// How long the window stays open for an utterance to *start* after the
@@ -68,7 +66,10 @@ pub struct Outcome {
 
 #[derive(Debug, Clone)]
 struct Utterance {
-    /// When the first delta of this utterance arrived.
+    /// When the first delta of this utterance arrived. Kept for parity with
+    /// `last_delta` and future diagnostics (e.g. utterance duration); no
+    /// caller reads it today.
+    #[allow(dead_code)]
     start: Instant,
     /// When the most recent delta of this utterance arrived.
     last_delta: Instant,
@@ -87,6 +88,9 @@ enum Phase {
     /// utterance until it resolves or the window expires.
     Open {
         action_id: ActionId,
+        /// When the window opened. Kept for diagnostics; nothing reads it
+        /// today (`deadline` is what every timing check actually uses).
+        #[allow(dead_code)]
         armed_at: Instant,
         deadline: Instant,
         utterance: Option<Utterance>,

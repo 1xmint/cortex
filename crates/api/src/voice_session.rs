@@ -969,6 +969,14 @@ async fn run_billing_loop(
     // through this channel rather than touching `sideband` directly, so the
     // loop below stays the single owner of the socket.
     let (commentary_tx, mut commentary_rx) = mpsc::channel::<Value>(8);
+    // Drives `spoken_matcher`'s own clock. A fixed interval rather than
+    // "tick on every incoming event" because the one thing that must expire
+    // a stale utterance or window is *silence* — no delta, no delegation, no
+    // usage update — and an event-driven tick would never fire then. 250ms
+    // keeps the 1.0s utterance-gap and 45s window boundaries accurate to
+    // well under a spoken syllable without the loop spinning.
+    let mut spoken_tick = tokio::time::interval(Duration::from_millis(250));
+    spoken_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     loop {
         let warning_timer = async {
@@ -982,24 +990,67 @@ async fn run_billing_loop(
             Some(commentary) = commentary_rx.recv() => {
                 sideband.send(commentary).await;
             }
+            _ = spoken_tick.tick() => {
+                if let Some(outcome) = lock_spoken_matcher(&state, &session_id, |m| m.tick(Instant::now())) {
+                    spawn_resolve_spoken_outcome(&state, &session_id, &user_id, &commentary_tx, outcome);
+                }
+            }
             event = sideband.recv() => {
                 let Some(event) = event else { break };
                 match event.get("type").and_then(Value::as_str) {
                     Some("session.input_transcript.delta") => {
                         accumulate_transcript(&mut pending_transcript, &event);
+                        if let Some(delta) = transcript_delta_text(&event) {
+                            let now = Instant::now();
+                            if let Some(outcome) = lock_spoken_matcher(&state, &session_id, |m| {
+                                m.on_transcript(delta, now)
+                            }) {
+                                spawn_resolve_spoken_outcome(
+                                    &state,
+                                    &session_id,
+                                    &user_id,
+                                    &commentary_tx,
+                                    outcome,
+                                );
+                            }
+                        }
                     }
                     Some("session.delegation.created") => {
-                        handle_delegation_created(
-                            &event,
-                            &state,
-                            &session_id,
-                            &user_id,
-                            conversation_id.as_deref(),
-                            &delegation_busy,
-                            &delegation_cancel,
-                            &mut pending_transcript,
-                            &commentary_tx,
-                        );
+                        match route_delegation(&state, &session_id) {
+                            DelegationRouting::ConsumedBySpokenMatcher(outcome) => {
+                                // This delegation was the spoken yes/no (or
+                                // unmatched) reply to an already-open confirm
+                                // window, not a new task: consumed here so it
+                                // never reaches `send_paid_reply` — a real
+                                // turn would also reserve credits and could
+                                // propose a fresh pending row, voiding this
+                                // one out from under itself. The accumulated
+                                // transcript that fed the matcher is
+                                // discarded, not carried into whatever
+                                // delegation comes next.
+                                pending_transcript.clear();
+                                spawn_resolve_spoken_outcome(
+                                    &state,
+                                    &session_id,
+                                    &user_id,
+                                    &commentary_tx,
+                                    outcome,
+                                );
+                            }
+                            DelegationRouting::Delegate => {
+                                handle_delegation_created(
+                                    &event,
+                                    &state,
+                                    &session_id,
+                                    &user_id,
+                                    conversation_id.as_deref(),
+                                    &delegation_busy,
+                                    &delegation_cancel,
+                                    &mut pending_transcript,
+                                    &commentary_tx,
+                                );
+                            }
+                        }
                     }
                     Some("session.usage.updated") => {
                         let seconds = event
@@ -1254,17 +1305,24 @@ const VOICE_DELEGATION_SYSTEM_PROMPT: &str = "You are Cortex's coding agent, ans
 /// from the cut point.
 const PENDING_TRANSCRIPT_BYTE_CAP: usize = 2000;
 
-/// Append a `session.input_transcript.delta`'s text to the accumulator that
-/// becomes the next delegation's task text. The event's own shape is not
-/// pinned down by the docs beyond "append to captions"; this reads the
-/// common `delta`/`text` fields defensively and drops the event if neither
-/// is present rather than guessing.
-fn accumulate_transcript(pending_transcript: &mut String, event: &Value) {
-    let delta = event
+/// Reads a `session.input_transcript.delta` event's text, checking the
+/// common `delta`/`text` fields defensively since the event's own shape is
+/// not pinned down by the docs beyond "append to captions". Shared by
+/// [`accumulate_transcript`] (the next delegation's task text) and the
+/// spoken-confirm matcher (`Matcher::on_transcript`), so both see exactly
+/// the same text.
+fn transcript_delta_text(event: &Value) -> Option<&str> {
+    event
         .get("delta")
         .and_then(Value::as_str)
-        .or_else(|| event.get("text").and_then(Value::as_str));
-    if let Some(delta) = delta {
+        .or_else(|| event.get("text").and_then(Value::as_str))
+}
+
+/// Append a `session.input_transcript.delta`'s text to the accumulator that
+/// becomes the next delegation's task text. Drops the event if it carries no
+/// usable text rather than guessing.
+fn accumulate_transcript(pending_transcript: &mut String, event: &Value) {
+    if let Some(delta) = transcript_delta_text(event) {
         pending_transcript.push_str(delta);
     }
     if pending_transcript.len() > PENDING_TRANSCRIPT_BYTE_CAP {
@@ -1341,6 +1399,186 @@ fn store_pending_confirm(state: &Arc<AppState>, session_id: &str, action_id: &st
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .arm(action_id.to_string(), Instant::now());
+    }
+}
+
+/// Runs `f` against `session_id`'s `spoken_matcher` under its own lock, held
+/// only for `f`'s (synchronous, non-blocking) duration — never across an
+/// `.await` — and returns whatever [`spoken_confirm::Outcome`] it produced.
+/// A no-op returning `None` if the session is already gone from
+/// `state.voice_sessions`.
+fn lock_spoken_matcher<T>(
+    state: &Arc<AppState>,
+    session_id: &str,
+    f: impl FnOnce(&mut spoken_confirm::Matcher) -> T,
+) -> T
+where
+    T: Default,
+{
+    let sessions = state
+        .voice_sessions
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    match sessions.get(session_id) {
+        Some(handle) => f(&mut handle
+            .spoken_matcher
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())),
+        None => T::default(),
+    }
+}
+
+/// What `session.delegation.created` becomes once the spoken matcher has had
+/// first look at it: either the matcher consumed it as the currently-open
+/// window's yes/no (or unmatched) reply, or no window was open for it and it
+/// is a normal delegated task.
+enum DelegationRouting {
+    ConsumedBySpokenMatcher(spoken_confirm::Outcome),
+    Delegate,
+}
+
+/// Feeds `session.delegation.created` to `session_id`'s spoken matcher
+/// first, exactly as [`run_billing_loop`]'s event loop does, so this
+/// decision is one small, directly testable function rather than inline
+/// branch logic that only a full session run could exercise.
+fn route_delegation(state: &Arc<AppState>, session_id: &str) -> DelegationRouting {
+    match lock_spoken_matcher(state, session_id, |m| m.on_delegation(Instant::now())) {
+        Some(outcome) => DelegationRouting::ConsumedBySpokenMatcher(outcome),
+        None => DelegationRouting::Delegate,
+    }
+}
+
+/// Hands a terminal [`spoken_confirm::Outcome`] off to its own spawned task
+/// (never awaited inline here) so resolving it — which can run a
+/// `Risk::Confirm` tool all the way through, e.g. `open_pr`'s `git push` —
+/// never blocks this session's single event-loop task from processing the
+/// next sideband event.
+fn spawn_resolve_spoken_outcome(
+    state: &Arc<AppState>,
+    session_id: &str,
+    user_id: &str,
+    commentary_tx: &mpsc::Sender<Value>,
+    outcome: spoken_confirm::Outcome,
+) {
+    let state = state.clone();
+    let session_id = session_id.to_string();
+    let user_id = user_id.to_string();
+    let commentary_tx = commentary_tx.clone();
+    tokio::spawn(async move {
+        resolve_spoken_outcome(&state, &session_id, &user_id, &commentary_tx, outcome).await;
+    });
+}
+
+/// Runs the premium check the tap route gets for free from the `PremiumUser`
+/// extractor (`crate::billing::premium_user_check`, `crates/api/src/billing.rs`),
+/// then `confirm_and_execute_spoken`. Returns the short spoken-friendly
+/// result text plus, when the row's status actually changed, the
+/// `VoiceEvent::ConfirmResolved` status to publish for it — `None` for any
+/// refusal (not premium, not found, expired, already resolved, or tampered
+/// args), matching "publish nothing that marks it confirmed" on a refusal.
+async fn confirm_spoken_action(
+    state: &Arc<AppState>,
+    user_id: &str,
+    action_id: &str,
+) -> (String, Option<String>) {
+    let refusal = (
+        "I couldn't confirm that. Tap Confirm on screen if it's still there.".to_string(),
+        None,
+    );
+    let Some(db) = state.db.as_ref() else {
+        return refusal;
+    };
+
+    // This path never goes through axum extraction, so it cannot get the
+    // premium gate for free the way `confirm_action` does from the
+    // `PremiumUser` extractor — it must run the identical check itself
+    // rather than trust that voice session start already verified it.
+    let clerk_user = crate::clerk::ClerkUser {
+        user_id: user_id.to_string(),
+    };
+    if !crate::billing::premium_user_check(state, &clerk_user).await {
+        return refusal;
+    }
+
+    use crate::agent_confirm::ConfirmAndExecuteError as E;
+    match crate::agent_confirm::confirm_and_execute_spoken(state, db, user_id, action_id).await {
+        Ok(_) => ("Done.".to_string(), Some("confirmed".to_string())),
+        Err(E::NotFound | E::Expired | E::AlreadyResolved | E::ArgsTampered) => refusal,
+        Err(E::InvalidStoredArgs(reason) | E::ToolFailed(reason)) => (
+            format!("That didn't go through: {reason}"),
+            Some("failed".to_string()),
+        ),
+    }
+}
+
+/// Resolves one terminal [`spoken_confirm::Outcome`] for `session_id`:
+/// confirms or cancels through the same gates the tap route uses, publishes
+/// `VoiceEvent::ConfirmResolved` when the row's status actually changed, and
+/// speaks a short result via `session.commentary.append`
+/// ([`commentary_event`]) — GPT-Live's documented channel for text this
+/// session wants spoken back, so no `session.instructions.append` fallback
+/// is wired here; if OpenAI ever rejects commentary in this position, that
+/// would need its own follow-up.
+async fn resolve_spoken_outcome(
+    state: &Arc<AppState>,
+    session_id: &str,
+    user_id: &str,
+    commentary_tx: &mpsc::Sender<Value>,
+    outcome: spoken_confirm::Outcome,
+) {
+    let spoken_confirm::Outcome { action_id, kind } = outcome;
+    match kind {
+        spoken_confirm::OutcomeKind::Confirm => {
+            let (spoken_text, resolved_status) =
+                confirm_spoken_action(state, user_id, &action_id).await;
+            if let Some(status) = resolved_status {
+                publish_voice_event(
+                    state,
+                    session_id,
+                    VoiceEvent::ConfirmResolved {
+                        action_id: action_id.clone(),
+                        status,
+                    },
+                );
+            }
+            let _ = commentary_tx
+                .send(commentary_event(&action_id, &spoken_text))
+                .await;
+        }
+        spoken_confirm::OutcomeKind::Cancel => {
+            let Some(db) = state.db.as_ref() else {
+                return;
+            };
+            let now = chrono::Utc::now().timestamp();
+            if crate::agent_confirm::cancel_pending_action_spoken(db, user_id, &action_id, now) {
+                publish_voice_event(
+                    state,
+                    session_id,
+                    VoiceEvent::ConfirmResolved {
+                        action_id: action_id.clone(),
+                        status: "cancelled".to_string(),
+                    },
+                );
+                let _ = commentary_tx
+                    .send(commentary_event(&action_id, "OK, cancelled."))
+                    .await;
+            } else {
+                let _ = commentary_tx
+                    .send(commentary_event(
+                        &action_id,
+                        "I couldn't confirm that. Tap Confirm on screen if it's still there.",
+                    ))
+                    .await;
+            }
+        }
+        spoken_confirm::OutcomeKind::Expired | spoken_confirm::OutcomeKind::Closed => {
+            let _ = commentary_tx
+                .send(commentary_event(
+                    &action_id,
+                    "Tap Confirm on screen if you still want it.",
+                ))
+                .await;
+        }
     }
 }
 
@@ -5080,6 +5318,367 @@ mod tests {
                 pending.as_ref().unwrap().deadline,
                 Some(first_deadline),
                 "the deadline must be unchanged from the first call"
+            );
+        }
+    }
+
+    /// Part 2b: wiring the matcher into the event loop. Each test drives the
+    /// same small functions `run_billing_loop` calls (`lock_spoken_matcher`,
+    /// `route_delegation`, `resolve_spoken_outcome`) directly, rather than
+    /// standing up a full fake-live session, since those functions are
+    /// exactly what the loop's `select!` arms delegate to.
+    mod spoken_yes {
+        use super::*;
+
+        /// Same shape as `prompt_ended_route`'s helper of the same name —
+        /// each test submodule in this file keeps its own copy rather than
+        /// share one across module-privacy boundaries.
+        fn insert_session_and_action(
+            state: &Arc<AppState>,
+            session_id: &str,
+            owner_id: &str,
+        ) -> String {
+            let (close_tx, _close_rx) = mpsc::channel(1);
+            let (events_tx, _) = broadcast::channel(VOICE_EVENTS_CAPACITY);
+            state.voice_sessions.lock().unwrap().insert(
+                session_id.to_string(),
+                VoiceSessionHandle {
+                    user_id: owner_id.to_string(),
+                    close_tx,
+                    events_tx,
+                    pending_confirm: std::sync::Mutex::new(None),
+                    spoken_matcher: std::sync::Mutex::new(spoken_confirm::Matcher::new()),
+                },
+            );
+            let db = state.db.as_ref().expect("db configured");
+            let action = db.insert_pending_action(
+                owner_id,
+                "conv-1",
+                "open_pr",
+                &serde_json::json!({"run_id": "r1"}),
+                "Open a pull request for run r1",
+                chrono::Utc::now().timestamp(),
+            );
+            store_pending_confirm(
+                state,
+                session_id,
+                &action.id,
+                "Open a pull request for run r1",
+            );
+            action.id
+        }
+
+        /// A state with Clerk auth "enabled" (a secret key present) and no
+        /// admin/subscription rows for `USER` — `premium_user_check` must
+        /// refuse it, exactly like a real non-premium account.
+        async fn test_state_non_premium() -> (tempfile::TempDir, Arc<AppState>) {
+            let dir = tempfile::tempdir().unwrap();
+            let state = AppState::new(
+                dir.path().join(".cortex/ledger.jsonl"),
+                dir.path().to_path_buf(),
+                Some("test-clerk-secret".to_string()),
+            )
+            .await;
+            state
+                .db
+                .as_ref()
+                .unwrap()
+                .init_credit_balance(USER, 1_000_000_000)
+                .unwrap();
+            (dir, state)
+        }
+
+        /// a. Armed, prompt-ended, a "yes" transcript, then a delegation:
+        /// the delegation must be consumed (never delegated), and resolving
+        /// it must claim the row through the confirm gate — no credit
+        /// reservation happens on this path at all.
+        #[tokio::test]
+        async fn a_yes_in_window_confirms_without_a_reservation() {
+            let (_dir, state) = test_state().await;
+            let action_id = insert_session_and_action(&state, "sess-1", USER);
+            let now = chrono::Utc::now().timestamp();
+            prompt_ended_with(&state, USER, "sess-1", &action_id, now)
+                .await
+                .unwrap_or_else(|_| panic!("prompt-ended must open the window"));
+
+            let db = state.db.as_ref().unwrap();
+            let before = db.get_credit_balance_row(USER);
+
+            assert_eq!(
+                lock_spoken_matcher(&state, "sess-1", |m| m.on_transcript("yes", Instant::now())),
+                None,
+                "one delta starts an utterance; it must not resolve on its own"
+            );
+
+            let outcome = match route_delegation(&state, "sess-1") {
+                DelegationRouting::ConsumedBySpokenMatcher(outcome) => outcome,
+                DelegationRouting::Delegate => {
+                    panic!("a \"yes\" inside an open window must be consumed, not delegated")
+                }
+            };
+            assert_eq!(outcome.kind, spoken_confirm::OutcomeKind::Confirm);
+
+            let (tx, mut rx) = mpsc::channel::<Value>(8);
+            resolve_spoken_outcome(&state, "sess-1", USER, &tx, outcome).await;
+
+            assert_eq!(
+                db.get_pending_action(&action_id, USER).unwrap().status,
+                "confirmed",
+                "the spoken yes must claim the row through the confirm gate"
+            );
+            rx.try_recv()
+                .expect("a spoken result must be sent as commentary");
+            assert_eq!(
+                db.get_credit_balance_row(USER),
+                before,
+                "no credit reservation must happen on the spoken-confirm path"
+            );
+        }
+
+        /// b. A second proposal on the same conversation voids the first
+        /// row. Prompt-ended + "yes" for the second must confirm only the
+        /// second row, leaving the first exactly as the proposal path left
+        /// it: voided (`cancelled`).
+        #[tokio::test]
+        async fn b_second_proposal_voids_first_only_second_confirms() {
+            let (_dir, state) = test_state().await;
+            let (close_tx, _close_rx) = mpsc::channel(1);
+            let (events_tx, _) = broadcast::channel(VOICE_EVENTS_CAPACITY);
+            state.voice_sessions.lock().unwrap().insert(
+                "sess-1".to_string(),
+                VoiceSessionHandle {
+                    user_id: USER.to_string(),
+                    close_tx,
+                    events_tx,
+                    pending_confirm: std::sync::Mutex::new(None),
+                    spoken_matcher: std::sync::Mutex::new(spoken_confirm::Matcher::new()),
+                },
+            );
+            let db = state.db.as_ref().unwrap();
+            let now = chrono::Utc::now().timestamp();
+            let first = db.insert_pending_action(
+                USER,
+                "conv-1",
+                "open_pr",
+                &serde_json::json!({"run_id": "r1"}),
+                "first",
+                now,
+            );
+            store_pending_confirm(&state, "sess-1", &first.id, "first");
+
+            let second = db.insert_pending_action(
+                USER,
+                "conv-1",
+                "open_pr",
+                &serde_json::json!({"run_id": "r2"}),
+                "second",
+                now,
+            );
+            assert_eq!(
+                db.get_pending_action(&first.id, USER).unwrap().status,
+                "cancelled",
+                "the second proposal must already have voided the first"
+            );
+            store_pending_confirm(&state, "sess-1", &second.id, "second");
+
+            prompt_ended_with(&state, USER, "sess-1", &second.id, now)
+                .await
+                .unwrap_or_else(|_| {
+                    panic!("prompt-ended for the current (second) action must open the window")
+                });
+
+            assert_eq!(
+                lock_spoken_matcher(&state, "sess-1", |m| m.on_transcript("yes", Instant::now())),
+                None
+            );
+            let outcome = match route_delegation(&state, "sess-1") {
+                DelegationRouting::ConsumedBySpokenMatcher(outcome) => outcome,
+                DelegationRouting::Delegate => panic!("must be consumed"),
+            };
+            assert_eq!(outcome.action_id, second.id);
+
+            let (tx, _rx) = mpsc::channel::<Value>(8);
+            resolve_spoken_outcome(&state, "sess-1", USER, &tx, outcome).await;
+
+            assert_eq!(
+                db.get_pending_action(&second.id, USER).unwrap().status,
+                "confirmed"
+            );
+            assert_eq!(
+                db.get_pending_action(&first.id, USER).unwrap().status,
+                "cancelled",
+                "the first row must stay voided, untouched by the second's resolution"
+            );
+        }
+
+        /// c. A "yes" before `prompt_ended` ever runs: the window never
+        /// opened, so the delta is dropped and the delegation must go
+        /// through the normal (paid) path instead of being consumed.
+        #[tokio::test]
+        async fn c_yes_before_prompt_ended_leaves_row_pending_and_delegates() {
+            let (_dir, state) = test_state().await;
+            let action_id = insert_session_and_action(&state, "sess-1", USER);
+
+            assert_eq!(
+                lock_spoken_matcher(&state, "sess-1", |m| m.on_transcript("yes", Instant::now())),
+                None,
+                "a transcript delta before the window opens must be dropped"
+            );
+
+            match route_delegation(&state, "sess-1") {
+                DelegationRouting::Delegate => {}
+                DelegationRouting::ConsumedBySpokenMatcher(_) => {
+                    panic!("a delegation with no open window must go through the normal path")
+                }
+            }
+
+            let db = state.db.as_ref().unwrap();
+            assert_eq!(
+                db.get_pending_action(&action_id, USER).unwrap().status,
+                "pending",
+                "nothing must be confirmed when the window never opened"
+            );
+        }
+
+        /// d. "no" inside the window: the row must be cancelled through the
+        /// tap cancel route's own db helper, and `ConfirmResolved(cancelled)`
+        /// must be published.
+        #[tokio::test]
+        async fn d_no_in_window_cancels_and_publishes_resolved() {
+            let (_dir, state) = test_state().await;
+            let action_id = insert_session_and_action(&state, "sess-1", USER);
+            let now = chrono::Utc::now().timestamp();
+            prompt_ended_with(&state, USER, "sess-1", &action_id, now)
+                .await
+                .unwrap_or_else(|_| panic!("prompt-ended must open the window"));
+
+            let mut events = subscribe_voice_events(&state, USER, "sess-1")
+                .unwrap_or_else(|_| panic!("subscribing to this session's events must succeed"));
+
+            assert_eq!(
+                lock_spoken_matcher(&state, "sess-1", |m| m.on_transcript("no", Instant::now())),
+                None
+            );
+            let outcome = match route_delegation(&state, "sess-1") {
+                DelegationRouting::ConsumedBySpokenMatcher(outcome) => outcome,
+                DelegationRouting::Delegate => panic!("must be consumed"),
+            };
+            assert_eq!(outcome.kind, spoken_confirm::OutcomeKind::Cancel);
+
+            let (tx, _rx) = mpsc::channel::<Value>(8);
+            resolve_spoken_outcome(&state, "sess-1", USER, &tx, outcome).await;
+
+            let db = state.db.as_ref().unwrap();
+            assert_eq!(
+                db.get_pending_action(&action_id, USER).unwrap().status,
+                "cancelled"
+            );
+
+            match events
+                .try_recv()
+                .expect("a ConfirmResolved event must be published")
+            {
+                VoiceEvent::ConfirmResolved {
+                    action_id: id,
+                    status,
+                } => {
+                    assert_eq!(id, action_id);
+                    assert_eq!(status, "cancelled");
+                }
+                other => panic!("expected ConfirmResolved, got {other:?}"),
+            }
+        }
+
+        /// e. A non-premium user saying "yes": the premium check must
+        /// refuse before `confirm_and_execute_spoken` ever runs, leaving the
+        /// row pending and nothing executed.
+        #[tokio::test]
+        async fn e_non_premium_yes_leaves_row_pending() {
+            let (_dir, state) = test_state_non_premium().await;
+            let action_id = insert_session_and_action(&state, "sess-1", USER);
+            let now = chrono::Utc::now().timestamp();
+            prompt_ended_with(&state, USER, "sess-1", &action_id, now)
+                .await
+                .unwrap_or_else(|_| panic!("prompt-ended must open the window"));
+
+            assert_eq!(
+                lock_spoken_matcher(&state, "sess-1", |m| m.on_transcript("yes", Instant::now())),
+                None
+            );
+            let outcome = match route_delegation(&state, "sess-1") {
+                DelegationRouting::ConsumedBySpokenMatcher(outcome) => outcome,
+                DelegationRouting::Delegate => panic!("must be consumed"),
+            };
+
+            let (tx, mut rx) = mpsc::channel::<Value>(8);
+            resolve_spoken_outcome(&state, "sess-1", USER, &tx, outcome).await;
+
+            let db = state.db.as_ref().unwrap();
+            assert_eq!(
+                db.get_pending_action(&action_id, USER).unwrap().status,
+                "pending",
+                "a non-premium user's spoken yes must never execute the tool"
+            );
+
+            let commentary = rx.try_recv().expect("a refusal must still be spoken");
+            assert_eq!(
+                commentary["content"],
+                "I couldn't confirm that. Tap Confirm on screen if it's still there."
+            );
+        }
+
+        /// f. Tap must still work once the spoken window has opened: the
+        /// tap route's own atomic db claim (`confirm_pending_action`) must
+        /// still accept the row's real nonce, unaffected by the in-memory
+        /// spoken-matcher state that a prompt-ended report set up.
+        #[tokio::test]
+        async fn f_tap_confirms_after_window_opened() {
+            let (_dir, state) = test_state().await;
+            let action_id = insert_session_and_action(&state, "sess-1", USER);
+            let now = chrono::Utc::now().timestamp();
+            prompt_ended_with(&state, USER, "sess-1", &action_id, now)
+                .await
+                .unwrap_or_else(|_| panic!("prompt-ended must open the window"));
+
+            let db = state.db.as_ref().unwrap();
+            let nonce = db.get_pending_action(&action_id, USER).unwrap().nonce;
+
+            let confirmed = db
+                .confirm_pending_action(&action_id, USER, &nonce, now)
+                .expect("the tap route's own gate must still accept this row");
+            assert_eq!(confirmed.id, action_id);
+            assert_eq!(
+                db.get_pending_action(&action_id, USER).unwrap().status,
+                "confirmed"
+            );
+        }
+
+        /// g. A "yes" that arrives only after the window's deadline: the
+        /// matcher must report `Expired`, never `Confirm` — and resolving
+        /// that outcome must never confirm the row.
+        #[tokio::test]
+        async fn g_yes_after_deadline_is_not_confirmed() {
+            let (_dir, state) = test_state().await;
+            let action_id = insert_session_and_action(&state, "sess-1", USER);
+            let now = chrono::Utc::now().timestamp();
+            prompt_ended_with(&state, USER, "sess-1", &action_id, now)
+                .await
+                .unwrap_or_else(|_| panic!("prompt-ended must open the window"));
+
+            let after_deadline = Instant::now() + std::time::Duration::from_secs(60);
+            let outcome =
+                lock_spoken_matcher(&state, "sess-1", |m| m.on_transcript("yes", after_deadline))
+                    .expect("a delta after the deadline must resolve immediately, as Expired");
+            assert_eq!(outcome.kind, spoken_confirm::OutcomeKind::Expired);
+
+            let (tx, _rx) = mpsc::channel::<Value>(8);
+            resolve_spoken_outcome(&state, "sess-1", USER, &tx, outcome).await;
+
+            let db = state.db.as_ref().unwrap();
+            assert_eq!(
+                db.get_pending_action(&action_id, USER).unwrap().status,
+                "pending",
+                "an expired window must never confirm the row"
             );
         }
     }
