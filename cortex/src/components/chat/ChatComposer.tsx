@@ -3,6 +3,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import type { FormEvent, KeyboardEvent } from 'react';
 import { useDictation } from '../../hooks/useDictation';
 import { useLiveVoiceToggle } from '../../hooks/useLiveVoiceToggle';
+import type { LiveVoiceSessionEvent } from '../../lib/voiceApi';
 
 const BUILTIN_PHRASES = [
   'create task',
@@ -71,6 +72,17 @@ interface ChatComposerProps {
   onSend: () => void;
   onStop?: () => void;
   onSubscribe?: () => void;
+  /**
+   * Resolves the open conversation's id for live voice to attach to,
+   * creating one first if none is open yet. Omitted where the composer has
+   * no conversation to attach to (e.g. the task manager's chat) -- live
+   * voice still works, it just does not save turns to a conversation.
+   */
+  onLiveVoiceStart?: () => Promise<string | null | undefined>;
+  /** A `voice_message` event from the open live voice session. */
+  onVoiceMessage?: (role: 'user' | 'assistant', content: string) => void;
+  /** A voice session's `confirm_required` event -- same card as a typed one. */
+  onVoiceConfirmRequired?: (event: { action_id: string; nonce: string; summary: string; expires_at: string }) => void;
 }
 
 export default function ChatComposer({
@@ -82,6 +94,9 @@ export default function ChatComposer({
   onSend,
   onStop,
   onSubscribe,
+  onLiveVoiceStart,
+  onVoiceMessage,
+  onVoiceConfirmRequired,
 }: ChatComposerProps) {
   const canSend = draft.trim().length > 0 && !disabled && !locked;
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
@@ -102,7 +117,28 @@ export default function ChatComposer({
       onDraftChange(next);
     }, [onDraftChange]),
   });
-  const liveVoice = useLiveVoiceToggle();
+  const handleVoiceEvent = useCallback((event: LiveVoiceSessionEvent) => {
+    if (event.type === 'voice_message') {
+      onVoiceMessage?.(event.role, event.content);
+      return;
+    }
+    if (event.type === 'confirm_required') {
+      onVoiceConfirmRequired?.({
+        action_id: event.action_id,
+        nonce: event.nonce,
+        summary: event.summary,
+        expires_at: event.expires_at,
+      });
+      return;
+    }
+    // `spoken_window` / `confirm_resolved`: accepted and typed, not built
+    // here -- the server does not emit them yet.
+  }, [onVoiceMessage, onVoiceConfirmRequired]);
+
+  const liveVoice = useLiveVoiceToggle({
+    getConversationId: onLiveVoiceStart,
+    onVoiceEvent: handleVoiceEvent,
+  });
   const voiceError = dictation.error ?? liveVoice.error;
 
   const recomputeGhost = useCallback((value: string) => {

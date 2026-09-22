@@ -24,6 +24,9 @@ interface ProjectChatProps {
   onSubscribe: () => void;
   onApprovalAction: (messageId: string, nextState: ApprovalState) => void;
   onConfirmActionStatusChange?: (messageId: string, status: ConfirmActionStatus) => void;
+  onLiveVoiceStart?: () => Promise<string | null | undefined>;
+  onVoiceMessage?: (role: 'user' | 'assistant', content: string) => void;
+  onVoiceConfirmRequired?: (event: { action_id: string; nonce: string; summary: string; expires_at: string }) => void;
 }
 
 const PROJECT_STARTER_PROMPTS = [
@@ -50,6 +53,9 @@ export default function ProjectChat({
   onSubscribe,
   onApprovalAction,
   onConfirmActionStatusChange,
+  onLiveVoiceStart,
+  onVoiceMessage,
+  onVoiceConfirmRequired,
 }: ProjectChatProps) {
   // Count messages sent by the user (not system/assistant) for preview prompt
   const userMessageCount = messages.filter(msg => msg.role === 'user').length;
@@ -111,6 +117,9 @@ export default function ProjectChat({
         onSend={onSend}
         onStop={onStop}
         onSubscribe={onSubscribe}
+        onLiveVoiceStart={onLiveVoiceStart}
+        onVoiceMessage={onVoiceMessage}
+        onVoiceConfirmRequired={onVoiceConfirmRequired}
       />
     </main>
   );

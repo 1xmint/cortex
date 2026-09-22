@@ -1,6 +1,11 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { apiUrl, getAuthToken, CortexApiError } from '../lib/cortexApi';
-import { closeLiveVoiceSession, startLiveVoiceSession } from '../lib/voiceApi';
+import {
+  closeLiveVoiceSession,
+  openLiveVoiceEventsStream,
+  startLiveVoiceSession,
+  type LiveVoiceSessionEvent,
+} from '../lib/voiceApi';
 import { routeLiveVoiceEvent } from './liveVoiceEvents';
 
 export type LiveVoiceStatus = 'idle' | 'connecting' | 'active';
@@ -80,13 +85,34 @@ function microphoneErrorMessage(error: unknown): string {
  * closing, and the connection failing on its own -- funnels through
  * `sendClose`, which sends the DELETE at most once per session id.
  */
-export function useLiveVoiceToggle() {
+export interface UseLiveVoiceToggleOptions {
+  /**
+   * Resolves the conversation id a voice turn's user text and assistant
+   * answer get saved to -- creating one first (the same call the chat uses
+   * for a new chat) if none is open yet. `undefined`/`null` starts the
+   * session with no conversation attached.
+   */
+  getConversationId?: () => Promise<string | null | undefined>;
+  /** Every event off `GET /api/voice/live/sessions/{id}/events`. */
+  onVoiceEvent?: (event: LiveVoiceSessionEvent) => void;
+}
+
+export function useLiveVoiceToggle(options: UseLiveVoiceToggleOptions = {}) {
   const [status, setStatus] = useState<LiveVoiceStatus>('idle');
   const [error, setError] = useState<string | null>(null);
 
   const pcRef = useRef<RTCPeerConnection | null>(null);
   const dcRef = useRef<RTCDataChannel | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
+  const eventsControllerRef = useRef<AbortController | null>(null);
+  // Kept current across renders without re-running `start`/`releaseLocal`'s
+  // `useCallback`s on every parent render.
+  const getConversationIdRef = useRef(options.getConversationId);
+  const onVoiceEventRef = useRef(options.onVoiceEvent);
+  useEffect(() => {
+    getConversationIdRef.current = options.getConversationId;
+    onVoiceEventRef.current = options.onVoiceEvent;
+  });
   // The model's audio, played out through an autoplay <audio> element that
   // is never attached to the DOM -- WebRTC only hands us the remote track,
   // it doesn't play it for us.
@@ -116,6 +142,8 @@ export function useLiveVoiceToggle() {
     pcRef.current = null;
     streamRef.current?.getTracks().forEach((track) => track.stop());
     streamRef.current = null;
+    eventsControllerRef.current?.abort();
+    eventsControllerRef.current = null;
     if (audioRef.current) {
       audioRef.current.srcObject = null;
       audioRef.current = null;
@@ -257,12 +285,30 @@ export function useLiveVoiceToggle() {
       await waitForIceGatheringComplete(pc);
       if (bailIfCancelled()) return;
 
-      const response = await startLiveVoiceSession(pc.localDescription?.sdp ?? offer.sdp ?? '');
+      // Resolved (and, if none is open yet, created) before the session
+      // starts so the server can save this turn's text to it from the
+      // first message onward -- there is no way to attach a conversation
+      // to a session after the fact.
+      const conversationId = (await getConversationIdRef.current?.()) ?? null;
+      if (bailIfCancelled()) return;
+
+      const response = await startLiveVoiceSession(
+        pc.localDescription?.sdp ?? offer.sdp ?? '',
+        conversationId,
+      );
       sessionIdRef.current = response.session_id;
       if (bailIfCancelled()) return;
 
       await pc.setRemoteDescription({ type: 'answer', sdp: response.sdp });
       if (bailIfCancelled()) return;
+
+      // The events stream mirrors voice turns and risky-action confirms
+      // into the open conversation's UI; it is best-effort text alongside
+      // the live audio, not a dependency the call itself needs, so opening
+      // it never blocks reaching `active`.
+      eventsControllerRef.current = openLiveVoiceEventsStream(response.session_id, (event) => {
+        onVoiceEventRef.current?.(event);
+      });
 
       const endForConnectionFailure = () => {
         setError('Live voice ended.');
