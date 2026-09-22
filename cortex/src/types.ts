@@ -148,6 +148,23 @@ export interface ConversationFlow {
   };
 }
 
+export type ConfirmActionStatus =
+  | 'pending'
+  | 'confirmed'
+  | 'cancelled'
+  | 'expired'
+  | 'unavailable'
+  | 'replaced';
+
+export interface ConfirmActionRequest {
+  messageId: string;
+  actionId: string;
+  nonce: string;
+  summary: string;
+  expiresAt: string;
+  status: ConfirmActionStatus;
+}
+
 export interface ChatMessage {
   id: string;
   role: ChatRole;
@@ -161,6 +178,7 @@ export interface ChatMessage {
   approvalRequest?: ApprovalRequest;
   sovereignty?: SovereigntyLoopState;
   conversationFlow?: ConversationFlow;
+  confirmAction?: ConfirmActionRequest;
 }
 
 export type SessionSpeed = 'steady' | 'balanced' | 'rapid';

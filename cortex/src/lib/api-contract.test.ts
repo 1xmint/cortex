@@ -46,6 +46,13 @@ const KNOWN_UNSERVED: Record<string, string> = {
   // neutral value or refuse, with the reason on each function in cortexApi.ts.
   // Nothing calls those paths now, so they must not be listed here -- the
   // stale-allowance check below would fail if they were.
+
+  // Tap-to-confirm for risky agent actions (agent/confirm-card). The server
+  // half is landing in a separate, concurrent PR (agent/confirm-actions);
+  // once it merges and route-manifest.csv picks up these rows, delete both
+  // entries -- the stale-allowance check will catch it if they are forgotten.
+  '/api/agent/actions/{id}/confirm': 'server PR agent/confirm-actions not yet merged',
+  '/api/agent/actions/{id}/cancel': 'server PR agent/confirm-actions not yet merged',
 };
 
 function sourceFiles(dir: string): string[] {

@@ -4,6 +4,7 @@ import type {
   ChatMessage,
   ChatProject,
   ChatSessionControls,
+  ConfirmActionStatus,
   ConversationFlow,
   RunProfile,
   WorkEventItem,
@@ -322,6 +323,18 @@ export function useChatSession({
       }),
     );
   }, [userId]);
+
+  const updateConfirmActionStatus = useCallback((messageId: string, status: ConfirmActionStatus) => {
+    setMessages((cur) =>
+      cur.map((m) => {
+        if (m.id !== messageId || !m.confirmAction) return m;
+        // A resolved (or already-replaced) card is a fact; do not let a late
+        // countdown tick or duplicate click flip it back to pending.
+        if (m.confirmAction.status !== 'pending') return m;
+        return { ...m, confirmAction: { ...m.confirmAction, status } };
+      }),
+    );
+  }, []);
 
   const renameConversation = useCallback(async (title: string) => {
     const conversationId = activeConversationIdRef.current;
@@ -648,6 +661,38 @@ export function useChatSession({
                 break;
               }
 
+              case 'confirm_required': {
+                if (!event.action_id || !event.nonce || !event.summary || !event.expires_at) break;
+                const confirmMessage: ChatMessage = {
+                  id: createId('confirm'),
+                  role: 'assistant',
+                  content: '',
+                  createdAt: new Date().toISOString(),
+                  provider: assistantProvider,
+                  providerLabel: formatProviderLabel(assistantProvider),
+                  confirmAction: {
+                    messageId: '',
+                    actionId: event.action_id,
+                    nonce: event.nonce,
+                    summary: event.summary,
+                    expiresAt: event.expires_at,
+                    status: 'pending',
+                  },
+                };
+                confirmMessage.confirmAction!.messageId = confirmMessage.id;
+                setMessages((cur) => [
+                  // A newer confirm_required in this conversation replaces any
+                  // still-pending card from an earlier one.
+                  ...cur.map((m) =>
+                    m.confirmAction && m.confirmAction.status === 'pending'
+                      ? { ...m, confirmAction: { ...m.confirmAction, status: 'replaced' as const } }
+                      : m,
+                  ),
+                  confirmMessage,
+                ]);
+                break;
+              }
+
               case 'completed': {
                 const stepId = event.step_id ?? event.task_id;
                 setWorkEvents((currentEvents) => [
@@ -871,6 +916,7 @@ export function useChatSession({
     sendMessage,
     stopStreaming,
     updateApproval,
+    updateConfirmActionStatus,
     renameConversation,
   };
 }

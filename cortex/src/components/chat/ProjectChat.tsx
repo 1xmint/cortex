@@ -5,6 +5,7 @@ import type { CortexGroup } from '../../lib/groups';
 import type {
   ApprovalState,
   ChatMessage,
+  ConfirmActionStatus,
 } from '../../types';
 
 interface ProjectChatProps {
@@ -22,6 +23,7 @@ interface ProjectChatProps {
   onStop?: () => void;
   onSubscribe: () => void;
   onApprovalAction: (messageId: string, nextState: ApprovalState) => void;
+  onConfirmActionStatusChange?: (messageId: string, status: ConfirmActionStatus) => void;
 }
 
 const PROJECT_STARTER_PROMPTS = [
@@ -47,6 +49,7 @@ export default function ProjectChat({
   onStop,
   onSubscribe,
   onApprovalAction,
+  onConfirmActionStatusChange,
 }: ProjectChatProps) {
   // Count messages sent by the user (not system/assistant) for preview prompt
   const userMessageCount = messages.filter(msg => msg.role === 'user').length;
@@ -76,6 +79,7 @@ export default function ProjectChat({
         showStarters={!activeConversationId && !isStreaming}
         onSelectStarter={needsSubscription ? undefined : onDraftChange}
         onApprovalAction={onApprovalAction}
+        onConfirmActionStatusChange={onConfirmActionStatusChange}
         onSelectFlowOption={needsSubscription ? undefined : handleSelectFlowOption}
         flowOptionsDisabled={isStreaming}
         starterPrompts={PROJECT_STARTER_PROMPTS}
