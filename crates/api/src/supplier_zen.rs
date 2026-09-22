@@ -2,10 +2,10 @@
 //!
 //! Zen is bring-your-own-key only: Cortex never holds a Zen key of its own,
 //! and this transport never runs behind the Cortex-funded provider gateway
-//! in `provider_gateway.rs`. It is called directly, with a customer's own
-//! key, from the chat BYOK path. Mirrors `supplier_openai.rs`, since Zen's
-//! `/chat/completions` family speaks the same OpenAI-compatible
-//! chat-completions shape.
+//! in `provider_gateway.rs`. It will be called directly, with a customer's
+//! own key, from the chat BYOK path arriving in M-D-0003. Mirrors
+//! `supplier_openai.rs`, since Zen's `/chat/completions` family speaks the
+//! same OpenAI-compatible chat-completions shape.
 //!
 //! This slice covers only Zen's `/chat/completions` models: DeepSeek, GLM,
 //! Kimi, MiniMax. Zen also serves Claude/GPT/Gemini/Grok aliases behind
@@ -20,11 +20,14 @@
 //! else there is refused rather than silently downgraded, so nothing can
 //! spend past what the gateway reserved.
 
-// This module has no caller yet: the Cortex-funded gateway path that used to
-// call it was removed (Zen is BYOK-only, never Cortex-funded), and the BYOK
-// chat path that will call it directly is `chat_zen.rs`, a later step
-// (M-D-0003). Dead on purpose in between; not a leftover.
-#![allow(dead_code)]
+// This module has no production caller yet: the Cortex-funded gateway path
+// that used to call it was removed (Zen is BYOK-only, never Cortex-funded),
+// and the BYOK chat path that will call it directly is `chat_zen.rs`, a
+// later step (M-D-0003). `ZenTransport::new` and `ZEN_BASE_URL` are dead in
+// both the lib and test builds — `mod tests` below exercises
+// `ZenTransport::with_base_url(..).forward(..)` directly, never `new()` —
+// so `expect` is satisfiable rather than a blanket `allow`.
+#![expect(dead_code, reason = "wired by chat_zen.rs in M-D-0003")]
 
 use std::future::Future;
 use std::time::Duration;

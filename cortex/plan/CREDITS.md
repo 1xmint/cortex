@@ -196,7 +196,7 @@ CREATE TABLE provider_spend (
     step_id           TEXT,
     provider          TEXT NOT NULL,      -- claude | openai | gemini | ...
     model             TEXT NOT NULL,
-    cost_type         TEXT NOT NULL,      -- 'platform' | 'byok' | 'byos'
+    cost_type         TEXT NOT NULL,      -- 'platform' | 'byok' | 'byos' | 'gateway_observed'
     tokens_in         INTEGER NOT NULL,
     tokens_out        INTEGER NOT NULL,
     tokens_cached_in  INTEGER NOT NULL DEFAULT 0,
@@ -221,11 +221,12 @@ tokens consumed, the customer is buying tokens again and §D.4 is back in play.
 It is also the only way to see margin per task class, which is the number that
 tells you whether the pricing works.
 
-`cost_type` gains `'platform'`, which does not exist today. `cost_estimator.rs`
-was deleted in #17; the provider gateway now writes `provider_spend` rows
-itself, with `cost_type = 'gateway_observed'`
-(`crates/api/src/db/provider_gateway.rs:185`), which is why operator-funded
-spend currently has nowhere clearly named to be recorded. See PR #415.
+Operator-funded spend is recorded today, not under the `'platform'` name this
+section proposes: `cost_estimator.rs` was deleted in #17, and the provider
+gateway now writes `provider_spend` rows itself, with
+`cost_type = 'gateway_observed'` (`crates/api/src/db/provider_gateway.rs:185`).
+`'platform'` is this document's target name for that same row going forward;
+renaming it is future work, tracked in PR #415, not something already done.
 
 ---
 
@@ -249,7 +250,7 @@ gateway's reservation machinery at all — that machinery exists to cap
 Cortex's *own* spend, and a BYOK call spends the customer's money, not
 Cortex's.
 
-BYOK usage is still recorded for analytics, as one `provider_spend` row per
+BYOK usage will be recorded for analytics, as one `provider_spend` row per
 call with `cost_type = 'byok'` and `cost_micro_usd = 0`: real token counts,
 zero cost, because Cortex paid nothing.
 

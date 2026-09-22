@@ -997,10 +997,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_signed_zen_capability_gets_no_supplier_key_in_live_mode() {
-        // Even a validly signed capability naming "zen" must find no key for
-        // it: `SUPPLIER_KEY_ENV_VARS` no longer has an entry for Zen, so
-        // live mode's `supplier_keys` map can never contain one.
+    async fn a_zen_supplier_key_still_finds_no_live_transport() {
+        // Simulate an operator who never cleaned up their env: a "zen" entry
+        // still sits in the live `supplier_keys` map (as it would if
+        // `CORTEX_ZEN_SUPPLIER_KEY` were still set — this map is what
+        // `gateway_mode()` would have built from it). Even so, the request
+        // must be refused, because `live_transport_for` no longer has a
+        // "zen" arm.
+        //
+        // This is the discriminating case: on the old code, `SUPPLIER_KEY_ENV_VARS`
+        // had a `("zen", "CORTEX_ZEN_SUPPLIER_KEY")` entry and
+        // `live_transport_for("zen")` returned `Some(LiveZen(..))`, so with a
+        // "zen" entry present in `supplier_keys`, `handle_live_message` would
+        // find both a supplier key *and* a transport and go on to call
+        // `handle_message` — it would not stop here with this 503. An empty
+        // `supplier_keys` map would reach the same 503 on both old and new
+        // code (a false pass on revert), which is why this map is non-empty.
+        assert!(!SUPPLIER_KEY_ENV_VARS.iter().any(|(p, _)| *p == "zen"));
+        assert!(live_transport_for("zen").is_none());
+
         let token = sign_capability(
             SIGNING_KEY,
             &GatewayCapability::new(
@@ -1022,7 +1037,7 @@ mod tests {
         );
         headers.insert("x-cortex-request-key", "http-zen-1".parse().unwrap());
         let supplier_keys: std::collections::HashMap<String, String> =
-            std::collections::HashMap::new();
+            std::collections::HashMap::from([("zen".to_string(), "k".repeat(32))]);
         let response = handle_live_message(
             &fixture.db,
             SIGNING_KEY,
@@ -1042,7 +1057,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             String::from_utf8(body.to_vec()).unwrap(),
-            "gateway has no supplier key for this provider"
+            "gateway has no live transport for this provider"
         );
     }
 }
