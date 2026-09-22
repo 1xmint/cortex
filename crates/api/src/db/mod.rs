@@ -18,6 +18,7 @@ use crate::lock::LockRecovering;
 mod ledger;
 mod pending_actions;
 mod provider_gateway;
+mod provider_keys;
 mod verification_queue;
 
 pub use pending_actions::{ConfirmActionError, PendingAction, PENDING_ACTION_TTL_SECS};
@@ -25,6 +26,7 @@ pub use provider_gateway::{
     AdminHoldError, ProviderHoldRow, ProviderHoldsSummary, ProviderReservation, SpendAuthorization,
     HOLD_CAPACITY_WARN_SHARE, STALE_RESERVATION_AGE_MS,
 };
+pub use provider_keys::{ProviderKeyRow, ProviderKeySummary};
 
 pub struct Database {
     conn: Mutex<Connection>,
@@ -545,6 +547,9 @@ fn apply_migrations(conn: &Connection) {
     if current < 69 {
         migrate_v69(conn);
     }
+    if current < 70 {
+        migrate_v70(conn);
+    }
 }
 
 fn migrate_v68(conn: &Connection) {
@@ -672,6 +677,61 @@ fn migrate_v69(conn: &Connection) {
     .expect("migration v69 failed creating agent_pending_actions");
 
     tracing::info!("applied migration v69: agent_pending_actions (confirm-before-run queue)");
+}
+
+fn migrate_v70(conn: &Connection) {
+    // Encrypted customer provider keys ("bring your own key"). Today the only
+    // `provider` is `'zen'` — see `crates/api/src/byok.rs` for the cipher and
+    // key-management scheme, and `crates/api/src/provider_keys.rs` for the
+    // routes.
+    //
+    // The plaintext key never lands in this table. `ciphertext` is AES-256-GCM
+    // output; `nonce` is the 12 random bytes used for that write; `key_version`
+    // says which `CORTEX_BYOK_KEK_V<n>` unwraps it, so a KEK rotation can
+    // re-encrypt rows one at a time (`rewrap_provider_keys`) instead of all at
+    // once. `last4` is the only fragment of the key stored outside the
+    // ciphertext, and it is not sufficient to reconstruct or use the key — it
+    // exists purely so a customer can recognize which key is saved.
+    //
+    // This is a **new** table, not a revival of the older `user_api_keys`
+    // (v35) or `user_credentials` (v38) tables. Both of those still exist and
+    // may still hold customer keys encrypted under a KEK derived from
+    // `CLERK_SECRET_KEY` — a scheme this module deliberately does not reuse
+    // (see the module doc on `byok.rs`). This migration does not touch either
+    // table: whether to purge them is a separate, explicit decision an
+    // operator has not yet made, and dropping customer secrets without that
+    // sign-off is not something a migration should do quietly.
+    //
+    // `PRIMARY KEY (user_id, provider)` makes "one key per provider per user"
+    // a schema fact rather than an application convention: `upsert_provider_key`
+    // relies on this for its `ON CONFLICT` upsert.
+    //
+    // Numbered v70: the maximum on main at rebase time was v69 (PR — the
+    // confirm-before-run action queue). `schema_version` is one counter shared
+    // with the HeyVera Socials product — re-check the maximum before claiming
+    // a number, because whichever branch merges second has its migration
+    // silently skipped.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS user_provider_keys (
+            user_id      TEXT NOT NULL,
+            provider     TEXT NOT NULL CHECK (provider IN ('zen')),
+            key_version  INTEGER NOT NULL,
+            nonce        BLOB NOT NULL,
+            ciphertext   BLOB NOT NULL,
+            last4        TEXT NOT NULL,
+            status       TEXT NOT NULL DEFAULT 'active'
+                CHECK (status IN ('active', 'rejected')),
+            created_at   INTEGER NOT NULL,
+            updated_at   INTEGER NOT NULL,
+            last_used_at INTEGER,
+            PRIMARY KEY (user_id, provider)
+        );
+
+        UPDATE schema_version SET version = 70;",
+    )
+    .expect("migration v70 failed creating user_provider_keys");
+
+    tracing::info!("applied migration v70: user_provider_keys (encrypted BYOK provider keys)");
 }
 
 fn migrate_v67(conn: &Connection) {
