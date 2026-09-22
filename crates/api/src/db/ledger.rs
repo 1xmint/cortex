@@ -214,6 +214,156 @@ impl Database {
         })
     }
 
+    /// Like [`Self::deduct_credits`], but never fails for insufficient
+    /// funds: it clamps the charge to `min(amount, available)` in the same
+    /// `BEGIN IMMEDIATE` transaction and the same idempotency check, so a
+    /// reply that ran up a bill larger than the balance still gets charged
+    /// once, for whatever the user actually had, rather than the caller
+    /// having to choose between discarding the reply or eating the loss.
+    ///
+    /// Returns the number of credits actually charged (may be less than
+    /// `amount`, or `0` if there was nothing left). Logs the shortfall via
+    /// `tracing::warn` when the clamp bites.
+    pub fn deduct_credits_up_to(
+        &self,
+        clerk_user_id: &str,
+        amount: i64,
+        description: &str,
+        key: &cortex_core::billing_binding::ChargeKey,
+    ) -> Result<i64, String> {
+        let idempotency_key = key.as_str();
+        if amount < 0 {
+            return Err("credit amount must be non-negative".into());
+        }
+        if idempotency_key.trim().is_empty() {
+            return Err("idempotency key is required for a credit deduction".into());
+        }
+
+        let sub_key = format!("{idempotency_key}:subscription");
+        let pack_key = format!("{idempotency_key}:pack");
+
+        let conn = self.conn();
+
+        conn.execute("BEGIN IMMEDIATE", [])
+            .map_err(|e| format!("failed to begin transaction: {e}"))?;
+
+        let read_balance = |conn: &Connection| {
+            conn.query_row(
+                "SELECT subscription_remaining, pack_remaining, subscription_total
+                 FROM credit_balances WHERE clerk_user_id = ?1",
+                params![clerk_user_id],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+        };
+
+        let (sub_rem, pack_rem, _sub_total) = match read_balance(&conn) {
+            Ok(v) => v,
+            Err(_) => {
+                conn.execute("ROLLBACK", []).ok();
+                return Err(
+                    "no credit balance row — unmetered (refusing to invent a balance)".into(),
+                );
+            }
+        };
+
+        // Replay check, inside the transaction so it cannot race a concurrent
+        // charge of the same key.
+        let already: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM credit_transactions
+                 WHERE idempotency_key = ?1 OR idempotency_key = ?2",
+                params![sub_key, pack_key],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        if already > 0 {
+            conn.execute("ROLLBACK", []).ok();
+            tracing::debug!(
+                user_id = clerk_user_id,
+                idempotency_key,
+                "credit deduction replayed; balance unchanged"
+            );
+            return Ok(0);
+        }
+
+        let total_available = sub_rem + pack_rem;
+        let clamped_amount = amount.min(total_available).max(0);
+        if clamped_amount < amount {
+            tracing::warn!(
+                user_id = clerk_user_id,
+                idempotency_key,
+                wanted = amount,
+                available = total_available,
+                charged = clamped_amount,
+                "final charge exceeds balance; clamping instead of discarding the reply"
+            );
+        }
+
+        if clamped_amount == 0 {
+            conn.execute("ROLLBACK", []).ok();
+            return Ok(0);
+        }
+
+        let from_sub = clamped_amount.min(sub_rem);
+        let from_pack = clamped_amount - from_sub;
+
+        let new_sub_rem = sub_rem - from_sub;
+        let new_pack_rem = pack_rem - from_pack;
+
+        // UPDATE only — a deduction must never create an account.
+        let updated = conn
+            .execute(
+                "UPDATE credit_balances
+                 SET subscription_remaining = ?1, pack_remaining = ?2
+                 WHERE clerk_user_id = ?3",
+                params![new_sub_rem, new_pack_rem, clerk_user_id],
+            )
+            .map_err(|e| {
+                conn.execute("ROLLBACK", []).ok();
+                format!("failed to update credit balance: {e}")
+            })?;
+        if updated == 0 {
+            conn.execute("ROLLBACK", []).ok();
+            return Err("no credit balance row — unmetered (refusing to invent a balance)".into());
+        }
+
+        let insert_tx = |bucket: &str, delta: i64, key: &str| -> Result<(), String> {
+            let tx_id = Uuid::new_v4().to_string();
+            conn.execute(
+                "INSERT INTO credit_transactions
+                    (id, clerk_user_id, amount, balance_type, reason, description, idempotency_key)
+                 VALUES (?1, ?2, ?3, ?4, 'spend', ?5, ?6)",
+                params![tx_id, clerk_user_id, delta, bucket, description, key],
+            )
+            .map_err(|e| format!("failed to record {bucket} transaction: {e}"))?;
+            Ok(())
+        };
+
+        if from_sub > 0 {
+            if let Err(e) = insert_tx("subscription", -from_sub, &sub_key) {
+                conn.execute("ROLLBACK", []).ok();
+                return Err(e);
+            }
+        }
+        if from_pack > 0 {
+            if let Err(e) = insert_tx("pack", -from_pack, &pack_key) {
+                conn.execute("ROLLBACK", []).ok();
+                return Err(e);
+            }
+        }
+
+        conn.execute("COMMIT", [])
+            .map_err(|e| format!("failed to commit transaction: {e}"))?;
+
+        Ok(clamped_amount)
+    }
+
     /// Give back exactly what a charge took, when a verdict says the work
     /// failed. See `cortex/plan/VERIFIER.md` ("Billing binding").
     ///
@@ -1244,5 +1394,71 @@ mod tests {
             .deduct_credits(user, 10, "work", &ChargeKey::per_unit("   "))
             .is_err());
         assert_eq!(db.credit_ledger_totals(user), (0, 0));
+    }
+
+    #[test]
+    fn deduct_credits_up_to_replay_of_the_same_key_charges_nothing_twice() {
+        // Same idempotency-key protection as `deduct_credits`: a retried
+        // final charge must not double-spend.
+        let db = test_db();
+        let user = subscriber(&db, 100);
+        let key = ChargeKey::for_chat_reply("reply-1");
+
+        let first = db
+            .deduct_credits_up_to(user, 30, "work", &key)
+            .expect("first charge");
+        assert_eq!(first, 30);
+
+        let second = db
+            .deduct_credits_up_to(user, 30, "work", &key)
+            .expect("replayed charge");
+        assert_eq!(second, 0, "a replayed key must charge nothing further");
+
+        let balance = db.get_credit_balance_row(user).expect("balance row");
+        assert_eq!(
+            balance.subscription_remaining, 70,
+            "the balance must reflect only the first charge"
+        );
+    }
+
+    #[test]
+    fn deduct_credits_up_to_draws_the_subscription_bucket_before_the_pack() {
+        let db = test_db();
+        let user = subscriber(&db, 20);
+        db.add_pack_credits(user, 50).expect("pack");
+
+        let charged = db
+            .deduct_credits_up_to(user, 40, "work", &ChargeKey::for_chat_reply("reply-2"))
+            .expect("charge");
+        assert_eq!(charged, 40, "enough credit exists across both buckets");
+
+        let balance = db.get_credit_balance_row(user).expect("balance row");
+        assert_eq!(
+            balance.subscription_remaining, 0,
+            "the expiring bucket is drained first"
+        );
+        assert_eq!(
+            balance.pack_remaining, 30,
+            "only the remainder after the subscription spills into the pack"
+        );
+    }
+
+    #[test]
+    fn deduct_credits_up_to_clamps_to_the_total_balance_instead_of_failing() {
+        let db = test_db();
+        let user = subscriber(&db, 10);
+        db.add_pack_credits(user, 5).expect("pack");
+
+        let charged = db
+            .deduct_credits_up_to(user, 1_000, "work", &ChargeKey::for_chat_reply("reply-3"))
+            .expect("charge");
+        assert_eq!(
+            charged, 15,
+            "the charge is clamped to whatever was actually available"
+        );
+
+        let balance = db.get_credit_balance_row(user).expect("balance row");
+        assert_eq!(balance.subscription_remaining, 0);
+        assert_eq!(balance.pack_remaining, 0);
     }
 }

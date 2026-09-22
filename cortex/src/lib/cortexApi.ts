@@ -197,7 +197,7 @@ async function requestBillingJson<T>(path: string, init?: RequestInit): Promise<
 }
 
 export interface WorkerEvent {
-  type: 'started' | 'output' | 'completed' | 'failed';
+  type: 'started' | 'output' | 'completed' | 'failed' | 'tool_activity';
   task_id?: string;
   step_id?: string;
   provider?: string;
@@ -205,6 +205,10 @@ export interface WorkerEvent {
   line?: string;
   exit_code?: number;
   error?: string;
+  // Only present for `tool_activity`: which read-only tool the agent used
+  // and whether it succeeded. Never carries the tool's arguments or result.
+  tool_name?: string;
+  ok?: boolean;
 }
 
 export function streamChat(

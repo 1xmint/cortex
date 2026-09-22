@@ -1144,26 +1144,20 @@ fn fallback_tokens(kind: &str) -> (i64, i64, i64) {
     }
 }
 
-/// `POST /api/runs/estimate` — project the cost of a run without executing it.
-pub async fn estimate_run(
-    State(state): State<Arc<AppState>>,
-    user: ClerkUser,
-    Json(req): Json<CreateRunRequest>,
-) -> Result<Json<CostProjection>, (StatusCode, Json<ErrorResponse>)> {
-    let db = state.db.as_ref().ok_or_else(|| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: "database not available".into(),
-            }),
-        )
-    })?;
-
-    let file_paths = crate::validate::sanitize_file_paths(&req.file_paths)
-        .map_err(|e| (StatusCode::BAD_REQUEST, Json(ErrorResponse { error: e })))?;
+/// Project the cost of a run without executing it. Shared by the
+/// `POST /api/runs/estimate` route and the `run_estimate` agent tool
+/// (`agent_tools.rs`) so the two never compute two different numbers for the
+/// same goal.
+pub(crate) fn estimate_run_projection(
+    db: &crate::db::Database,
+    user_id: &str,
+    goal: &str,
+    file_paths: &[String],
+    profile: &str,
+) -> Result<CostProjection, String> {
+    let file_paths = crate::validate::sanitize_file_paths(file_paths)?;
     // Decompose the goal into steps (same as create_run)
-    let builder = decompose_goal(&user.user_id, &req.goal, &file_paths, &req.profile)
-        .map_err(|e| (StatusCode::BAD_REQUEST, Json(ErrorResponse { error: e })))?;
+    let builder = decompose_goal(user_id, goal, &file_paths, profile)?;
 
     let mut step_estimates = Vec::new();
     let mut total_confidence_sum = 0.0_f64;
@@ -1176,7 +1170,7 @@ pub async fn estimate_run(
         // Try historical data first, fall back to defaults
         let (tokens_in, tokens_out, duration_ms, confidence) =
             if let Some((avg_in, avg_out, avg_dur, sample_count)) =
-                db.get_historical_step_costs(&user.user_id, tier, provider)
+                db.get_historical_step_costs(user_id, tier, provider)
             {
                 // Confidence: min(1.0, sample_count / 10) — 10+ samples = full confidence
                 let conf = (sample_count as f64 / 10.0).min(1.0);
@@ -1210,12 +1204,34 @@ pub async fn estimate_run(
         0.0
     };
 
-    Ok(Json(CostProjection {
+    Ok(CostProjection {
         estimated_total_cost,
         estimated_duration_minutes,
         step_estimates,
         confidence,
-    }))
+    })
+}
+
+/// `POST /api/runs/estimate` — project the cost of a run without executing it.
+pub async fn estimate_run(
+    State(state): State<Arc<AppState>>,
+    user: ClerkUser,
+    Json(req): Json<CreateRunRequest>,
+) -> Result<Json<CostProjection>, (StatusCode, Json<ErrorResponse>)> {
+    let db = state.db.as_ref().ok_or_else(|| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: "database not available".into(),
+            }),
+        )
+    })?;
+
+    let projection =
+        estimate_run_projection(db, &user.user_id, &req.goal, &req.file_paths, &req.profile)
+            .map_err(|e| (StatusCode::BAD_REQUEST, Json(ErrorResponse { error: e })))?;
+
+    Ok(Json(projection))
 }
 
 // --- Deployment Capability Adapters ---

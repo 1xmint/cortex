@@ -506,7 +506,7 @@ fn validate_tools(tools: Option<&Value>) -> Result<(), GatewayError> {
     Ok(())
 }
 
-fn upper_bound_cost(
+pub(crate) fn upper_bound_cost(
     input_tokens: i64,
     output_tokens: i64,
     input_micros_per_1k: i64,

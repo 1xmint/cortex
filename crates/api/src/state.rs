@@ -168,6 +168,16 @@ pub enum StepEvent {
         step_id: String,
         error: String,
     },
+    /// The paid chat agent called a read-only tool. Emitted between model
+    /// turns (`chat_paid.rs`) so the UI can show what the agent looked at
+    /// without waiting for the final reply. Carries only the tool's name and
+    /// whether it succeeded — never its arguments or its result, which stay
+    /// server-side data (see `agent_tools::render_tool_output`).
+    ToolActivity {
+        step_id: String,
+        tool_name: String,
+        ok: bool,
+    },
 }
 
 impl AppState {
