@@ -1053,9 +1053,8 @@ async fn run_billing_loop(
                         // moved on to `Resolved`, so `route_delegation` alone
                         // would no longer catch it and would delegate it as
                         // a brand-new paid request.
-                        let swallow = swallow_delegation_until
-                            .take()
-                            .is_some_and(|deadline| Instant::now() <= deadline);
+                        let swallow =
+                            should_swallow_delegation(swallow_delegation_until.take(), Instant::now());
                         if swallow {
                             // Consumed outright: no `send_paid_reply`, no
                             // reservation. `pending_transcript` was already
@@ -1549,6 +1548,16 @@ fn route_delegation(state: &Arc<AppState>, session_id: &str) -> DelegationRoutin
         }
         _ => DelegationRouting::Delegate,
     }
+}
+
+/// Whether a `session.delegation.created` event arriving right now should be
+/// swallowed outright because a tick already resolved this same spoken
+/// Confirm/Cancel a moment ago — see `swallow_delegation_until`'s own doc in
+/// [`run_billing_loop`] for why that late delegation can still arrive.
+/// `swallow_until` is `None` when no tick resolution is pending (the common
+/// case), or when it has already been consumed by an earlier delegation.
+fn should_swallow_delegation(swallow_until: Option<Instant>, now: Instant) -> bool {
+    swallow_until.is_some_and(|deadline| now <= deadline)
 }
 
 /// Hands a terminal [`spoken_confirm::Outcome`] off to its own spawned task
@@ -5830,6 +5839,115 @@ mod tests {
                 "pending",
                 "an expired window must never confirm the row"
             );
+        }
+
+        /// h. An utterance inside the window that matches neither yes nor no
+        /// resolves `Closed`, not a consumable outcome: `route_delegation`
+        /// must route it to `Delegate` so the real request — whatever the
+        /// user actually said — still reaches the paid path, exactly as it
+        /// would with no window open at all.
+        #[tokio::test]
+        async fn h_closed_outcome_in_window_is_delegated_not_consumed() {
+            let (_dir, state) = test_state().await;
+            let action_id = insert_session_and_action(&state, "sess-1", USER);
+            let now = chrono::Utc::now().timestamp();
+            prompt_ended_with(&state, USER, "sess-1", &action_id, now)
+                .await
+                .unwrap_or_else(|_| panic!("prompt-ended must open the window"));
+
+            assert_eq!(
+                lock_spoken_matcher(&state, "sess-1", |m| m
+                    .on_transcript("open a pull request", Instant::now())),
+                None
+            );
+
+            match route_delegation(&state, "sess-1") {
+                DelegationRouting::Delegate => {}
+                DelegationRouting::ConsumedBySpokenMatcher(outcome) => panic!(
+                    "an unmatched utterance must be delegated as a real request, got {outcome:?}"
+                ),
+            }
+
+            let db = state.db.as_ref().unwrap();
+            assert_eq!(
+                db.get_pending_action(&action_id, USER).unwrap().status,
+                "pending",
+                "an unmatched utterance must never touch the pending row"
+            );
+        }
+
+        /// i. `should_swallow_delegation` is what the billing loop's
+        /// `session.delegation.created` arm checks first, before
+        /// `route_delegation` even runs, to catch a delegation that arrives
+        /// shortly after `spoken_tick` already resolved the same spoken
+        /// Confirm/Cancel (the matcher itself is `Resolved` by then, so
+        /// `route_delegation` alone can no longer catch it). It must swallow
+        /// within the window and stop swallowing once the deadline passes.
+        #[test]
+        fn i_tick_then_delegation_is_swallowed_within_the_window_only() {
+            let t0 = Instant::now();
+            let deadline = t0 + Duration::from_secs(3);
+
+            assert!(
+                should_swallow_delegation(Some(deadline), t0),
+                "a delegation arriving right after the tick resolved must be swallowed"
+            );
+            assert!(
+                should_swallow_delegation(Some(deadline), deadline),
+                "a delegation arriving exactly at the deadline must still be swallowed"
+            );
+            assert!(
+                !should_swallow_delegation(Some(deadline), deadline + Duration::from_millis(1)),
+                "a delegation arriving after the deadline must not be swallowed"
+            );
+            assert!(
+                !should_swallow_delegation(None, t0),
+                "no pending tick resolution means nothing to swallow"
+            );
+        }
+
+        /// j. When a consumed outcome came from a real
+        /// `session.delegation.created` event, the commentary spoken back
+        /// for it must carry that event's own `/delegation/id` — never the
+        /// action id — since that is the id GPT-Live actually associates the
+        /// commentary with.
+        #[tokio::test]
+        async fn j_commentary_for_a_consumed_delegation_carries_its_own_delegation_id() {
+            let (_dir, state) = test_state().await;
+            let action_id = insert_session_and_action(&state, "sess-1", USER);
+            let now = chrono::Utc::now().timestamp();
+            prompt_ended_with(&state, USER, "sess-1", &action_id, now)
+                .await
+                .unwrap_or_else(|_| panic!("prompt-ended must open the window"));
+
+            assert_eq!(
+                lock_spoken_matcher(&state, "sess-1", |m| m.on_transcript("yes", Instant::now())),
+                None
+            );
+            let outcome = match route_delegation(&state, "sess-1") {
+                DelegationRouting::ConsumedBySpokenMatcher(outcome) => outcome,
+                DelegationRouting::Delegate => panic!("must be consumed"),
+            };
+
+            // The real delegation id `session.delegation.created` carried,
+            // extracted from its event the same way the billing loop does —
+            // deliberately different from `action_id` so the assertion below
+            // can't pass by coincidence.
+            let event = serde_json::json!({
+                "type": "session.delegation.created",
+                "delegation": { "id": "deleg-77" },
+            });
+            let delegation_id = event
+                .pointer("/delegation/id")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            assert_ne!(delegation_id.as_deref(), Some(action_id.as_str()));
+
+            let (tx, mut rx) = mpsc::channel::<Value>(8);
+            resolve_spoken_outcome(&state, "sess-1", USER, &tx, delegation_id, outcome).await;
+
+            let commentary = rx.try_recv().expect("a spoken result must be sent");
+            assert_eq!(commentary["delegation_id"], "deleg-77");
         }
     }
 }

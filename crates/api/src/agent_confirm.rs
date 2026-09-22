@@ -189,9 +189,10 @@ async fn confirm_and_execute(
 /// too — the in-memory pending slot in `voice_session.rs` is never trusted
 /// for this, since it is never cleared on tap, cancel, expiry, or void.
 ///
-/// Not called from any route yet — the transcript-driven wiring lands in
-/// part 2b of the spoken-confirm plan. Exercised directly by the tests
-/// below in the meantime.
+/// Called from `voice_session.rs`'s `confirm_spoken_action`, which runs the
+/// premium check this function itself doesn't do (see below) before
+/// reaching here — the transcript-driven wiring from part 2b of the
+/// spoken-confirm plan. Also still exercised directly by the tests below.
 ///
 /// This function does not itself gate on premium: the tap route
 /// (`confirm_action`) gets that for free from the `PremiumUser` extractor.
