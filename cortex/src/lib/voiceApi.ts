@@ -91,6 +91,28 @@ export async function closeLiveVoiceSession(sessionId: string): Promise<void> {
 }
 
 /**
+ * `POST /api/voice/live/sessions/{id}/prompt-ended` (owner only). Tells the
+ * server the spoken confirm prompt for `actionId` has finished playing, so
+ * it opens the 45s "say yes" window. A 409 means the action id is stale or
+ * the window was already opened, and a 404 means the session or action is
+ * unknown -- both are routine races (the confirm resolved, or another
+ * detector already reported it) rather than failures worth surfacing.
+ */
+export async function postPromptEnded(sessionId: string, actionId: string): Promise<void> {
+  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+  const token = await getAuthToken();
+  if (token) headers.Authorization = `Bearer ${token}`;
+  const res = await fetch(
+    apiUrl(`/api/voice/live/sessions/${encodeURIComponent(sessionId)}/prompt-ended`),
+    { method: 'POST', headers, body: JSON.stringify({ action_id: actionId }) },
+  );
+  if (res.status === 204 || res.status === 409 || res.status === 404) return;
+  if (!res.ok) {
+    throw new CortexApiError(res.status, `Cortex API ${res.status}`, res.headers.get('Retry-After'));
+  }
+}
+
+/**
  * `GET /api/voice/live/sessions/{id}/events` (SSE, owner only). Same
  * `type`-tagged event shapes the chat stream's `confirm_required` uses --
  * see `WorkerEvent` in `cortexApi.ts` -- so a voice-proposed risky action
@@ -130,18 +152,22 @@ export type LiveVoiceSessionEvent =
   | VoiceSpokenWindowEvent
   | VoiceConfirmResolvedEvent;
 
+/** Reconnect backoff schedule (ms), holding at the last value thereafter. */
+const RECONNECT_BACKOFF_MS = [1000, 2000, 4000, 10000];
+
 /**
  * Opens the live voice session's text-mirror SSE stream and hands each
- * parsed event to `onEvent`. Reconnects once if the stream ends on its own
- * (the server lagging under overload closes it without a terminal event) --
- * a second natural end is left alone rather than looped forever.
+ * parsed event to `onEvent`. Reconnects with backoff (1s, 2s, 4s, capped at
+ * 10s) whenever the stream ends on its own (the server lagging under
+ * overload closes it without a terminal event) -- there is no limit on the
+ * number of reconnect attempts while the caller keeps voice active.
  *
  * A 404 means the deployment is in stub/dev mode, where this route does not
  * exist yet: treated as "no events" rather than an error, so the caller
- * shows nothing rather than an error banner.
+ * shows nothing rather than an error banner, and reconnecting stops.
  *
  * Returns an `AbortController` the caller closes when voice stops; closing
- * it never surfaces as an error.
+ * it never surfaces as an error and stops any pending reconnect.
  */
 export function openLiveVoiceEventsStream(
   sessionId: string,
@@ -191,17 +217,33 @@ export function openLiveVoiceEventsStream(
     return 'ended';
   };
 
+  const sleep = (ms: number) =>
+    new Promise<void>((resolve) => {
+      const timer = setTimeout(resolve, ms);
+      controller.signal.addEventListener('abort', () => {
+        clearTimeout(timer);
+        resolve();
+      });
+    });
+
   void (async () => {
-    try {
-      const first = await connectOnce();
-      if (first === 'ended' && !controller.signal.aborted) {
-        await connectOnce();
+    let attempt = 0;
+    while (!controller.signal.aborted) {
+      try {
+        const result = await connectOnce();
+        if (result === 'not-found') return;
+        if (controller.signal.aborted) return;
+      } catch (err) {
+        if (controller.signal.aborted) return;
+        if (err instanceof Error && err.name === 'AbortError') return;
+        // Best-effort: the spoken conversation keeps going even if this text
+        // mirror drops, so a broken events stream is not surfaced as an
+        // error -- it just reconnects below.
       }
-    } catch (err) {
-      if (controller.signal.aborted) return;
-      if (err instanceof Error && err.name === 'AbortError') return;
-      // Best-effort: the spoken conversation keeps going even if this text
-      // mirror drops, so a broken events stream is not surfaced as an error.
+
+      const delay = RECONNECT_BACKOFF_MS[Math.min(attempt, RECONNECT_BACKOFF_MS.length - 1)];
+      attempt += 1;
+      await sleep(delay);
     }
   })();
 
