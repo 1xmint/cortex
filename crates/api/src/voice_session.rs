@@ -1439,14 +1439,13 @@ fn instructions_append_event(content: &str) -> Value {
 /// it.
 ///
 /// `summary` is truncated on a char boundary, not the assembled prompt as a
-/// whole, so the fixed wording around it — in particular "Tap Confirm on
-/// screen." — always survives intact even when the summary is long; the
-/// total is still at most [`COMMENTARY_CHAR_CAP`] characters either way.
+/// whole, so the fixed wording around it — in particular ". Say yes, or tap
+/// Confirm on screen." — always survives intact even when the summary is
+/// long; the total is still at most [`COMMENTARY_CHAR_CAP`] characters
+/// either way.
 fn spoken_confirm_prompt(summary: &str) -> String {
     const PREFIX: &str = "I need your OK to ";
-    // Part 2 restores "Say yes" once the spoken matcher is wired; today
-    // approval only ever comes from a tap, so the prompt doesn't ask for one.
-    const SUFFIX: &str = ". Tap Confirm on screen.";
+    const SUFFIX: &str = ". Say yes, or tap Confirm on screen.";
     let budget =
         COMMENTARY_CHAR_CAP.saturating_sub(PREFIX.chars().count() + SUFFIX.chars().count());
     let summary: String = summary.chars().take(budget).collect();
@@ -2876,7 +2875,7 @@ mod tests {
             prompt.chars().count()
         );
 
-        const SUFFIX: &str = ". Tap Confirm on screen.";
+        const SUFFIX: &str = ". Say yes, or tap Confirm on screen.";
         let before_suffix = prompt
             .strip_suffix(SUFFIX)
             .expect("the fixed suffix must survive intact even when the summary is truncated");
