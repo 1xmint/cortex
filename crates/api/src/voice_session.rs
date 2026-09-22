@@ -801,6 +801,11 @@ async fn run_billing_loop(
     // https://developers.openai.com/api/docs/guides/live-migration).
     let mut pending_transcript = String::new();
     let delegation_busy = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // The currently-running delegation's `JoinHandle`, if any — aborted once
+    // this loop exits so a delegation's agent turn never keeps running (and
+    // billing) after the voice session it was answering for is gone.
+    let delegation_task: Arc<std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>> =
+        Arc::new(std::sync::Mutex::new(None));
     // The delegation task runs on its own spawned task (an agent turn can
     // take much longer than this loop should ever block for) and answers
     // through this channel rather than touching `sideband` directly, so the
@@ -831,6 +836,7 @@ async fn run_billing_loop(
                             &state,
                             &user_id,
                             &delegation_busy,
+                            &delegation_task,
                             &mut pending_transcript,
                             &commentary_tx,
                         );
@@ -1045,6 +1051,17 @@ async fn run_billing_loop(
         reattach_and_close(&ws_base, &session_id, &supplier_key).await;
     }
 
+    // The loop is done with this session; a delegation still running its
+    // agent turn must not outlive it, so abort it here rather than let it
+    // keep going (and keep billing) unattended.
+    if let Some(handle) = delegation_task
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take()
+    {
+        handle.abort();
+    }
+
     guard.disarm();
     state
         .voice_sessions
@@ -1118,17 +1135,37 @@ fn commentary_event(delegation_id: &str, content: &str) -> Value {
 /// text is whatever has accumulated in `pending_transcript` since the last
 /// delegation was answered, drained here.
 ///
+/// Releases `delegation_busy` when dropped — including when the spawned
+/// delegation task panics, since dropping still runs during the unwind. The
+/// old code stored `false` as the last line of the spawned task's async
+/// block, which never ran on panic and would wedge every later
+/// `session.delegation.created` behind "still working on the last request."
+/// for the rest of the session.
+struct BusyGuard(Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for BusyGuard {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 /// One delegation runs at a time per session: `delegation_busy` is a
 /// session-lifetime flag checked (and set) synchronously, right here in the
 /// billing loop's single task, so there is no race between two delegations
 /// arriving back to back. A second one while the first is still running
 /// gets a short "still working" commentary instead of being queued or
 /// dropped silently.
+///
+/// The spawned delegation task's handle is stashed in `delegation_task` so
+/// the billing loop can abort it when the session ends — without this, a
+/// delegation still running an agent turn would keep going (and keep
+/// billing) after the session it was answering for is gone.
 fn handle_delegation_created(
     event: &Value,
     state: &Arc<AppState>,
     user_id: &str,
     delegation_busy: &Arc<std::sync::atomic::AtomicBool>,
+    delegation_task: &Arc<std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
     pending_transcript: &mut String,
     commentary_tx: &mpsc::Sender<Value>,
 ) {
@@ -1159,11 +1196,12 @@ fn handle_delegation_created(
     let user_id = user_id.to_string();
     let busy = delegation_busy.clone();
     let tx = commentary_tx.clone();
-    tokio::spawn(async move {
+    let handle = tokio::spawn(async move {
+        let _busy_guard = BusyGuard(busy);
         let answer = run_voice_delegation(&state, &user_id, &task_text).await;
         let _ = tx.send(commentary_event(&delegation_id, &answer)).await;
-        busy.store(false, std::sync::atomic::Ordering::SeqCst);
     });
+    *delegation_task.lock().unwrap_or_else(|e| e.into_inner()) = Some(handle);
 }
 
 /// Run the same paid agent loop text chat uses (`chat_paid::send_paid_reply`,
@@ -2979,6 +3017,7 @@ mod tests {
             // above already covers directly against a fake transport.
             let (_dir, state) = test_state().await;
             let busy = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let task = Arc::new(std::sync::Mutex::new(None));
             let (tx, mut rx) = mpsc::channel::<Value>(8);
             let mut pending_transcript = "what is the weather".to_string();
 
@@ -2987,6 +3026,7 @@ mod tests {
                 &state,
                 USER,
                 &busy,
+                &task,
                 &mut pending_transcript,
                 &tx,
             );
@@ -3010,6 +3050,7 @@ mod tests {
         async fn a_second_delegation_while_busy_is_refused() {
             let (_dir, state) = test_state().await;
             let busy = Arc::new(std::sync::atomic::AtomicBool::new(true));
+            let task = Arc::new(std::sync::Mutex::new(None));
             let (tx, mut rx) = mpsc::channel::<Value>(8);
             let mut pending_transcript = "some accumulated speech".to_string();
 
@@ -3018,6 +3059,7 @@ mod tests {
                 &state,
                 USER,
                 &busy,
+                &task,
                 &mut pending_transcript,
                 &tx,
             );
@@ -3035,6 +3077,58 @@ mod tests {
             assert!(
                 busy.load(std::sync::atomic::Ordering::SeqCst),
                 "the still-running first delegation's busy flag must stay set"
+            );
+        }
+
+        #[test]
+        fn busy_guard_releases_the_flag_even_when_dropped_during_a_panic_unwind() {
+            let busy = Arc::new(std::sync::atomic::AtomicBool::new(true));
+            let guard_busy = busy.clone();
+
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _guard = BusyGuard(guard_busy);
+                panic!("simulated delegation task panic");
+            }));
+
+            assert!(result.is_err(), "the closure must have panicked");
+            assert!(
+                !busy.load(std::sync::atomic::Ordering::SeqCst),
+                "BusyGuard must release the busy flag even when dropped while unwinding"
+            );
+        }
+
+        #[tokio::test]
+        async fn delegation_task_is_aborted_when_the_session_ends() {
+            let (_dir, state) = test_state().await;
+            let busy = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let task: Arc<std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>> =
+                Arc::new(std::sync::Mutex::new(None));
+            let (tx, _rx) = mpsc::channel::<Value>(8);
+            let mut pending_transcript = "some long-running request".to_string();
+
+            handle_delegation_created(
+                &serde_json::json!({"delegation": {"id": "deleg-3"}}),
+                &state,
+                USER,
+                &busy,
+                &task,
+                &mut pending_transcript,
+                &tx,
+            );
+
+            // Simulate the billing loop ending: take and abort the handle,
+            // exactly like the cleanup path after the loop breaks.
+            let handle = task
+                .lock()
+                .unwrap()
+                .take()
+                .expect("a delegation task must have been spawned");
+            handle.abort();
+
+            let joined = handle.await;
+            assert!(
+                joined.is_err_and(|e| e.is_cancelled()),
+                "the delegation task must report cancelled once aborted"
             );
         }
     }
