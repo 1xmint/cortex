@@ -684,14 +684,14 @@ pub(crate) async fn send_paid_reply<T: ProviderTransport + Clone>(
                         // second `open_pr` — a fake ignoring
                         // `tool_choice: none`, in practice — does not get a
                         // second pending row or a second
-                        // `StepEvent::ConfirmRequired`. Just tell the model
-                        // it's still waiting; the loop ends after this turn
-                        // either way.
+                        // `StepEvent::ConfirmRequired`. Tell the model
+                        // plainly that this one was not proposed; the loop
+                        // ends after this turn either way.
                         tool_results.push(serde_json::json!({
                             "type": "tool_result",
                             "tool_use_id": tool_use_id,
-                            "content": "Waiting for the user's confirmation. This has not run yet.",
-                            "is_error": false,
+                            "content": "Not proposed: only one action can wait for confirmation per reply. Ask the user to confirm or cancel the pending one first.",
+                            "is_error": true,
                         }));
                     }
                     Ok(summary) => {
