@@ -633,7 +633,11 @@ mod tests {
         assert_eq!(stored, "hello from zen");
     }
 
-    // --- 3: no key -> 409 zen_key_required, before any transport call. ---
+    // --- 3: no key -> 409 zen_key_required, before any transport call.
+    // Driven through `crate::chat::chat` (not `chat_zen::chat` directly) so
+    // that deleting the "zen:" dispatch in `chat::chat` would fail this
+    // test, and with a subscribed user so the subscription check above the
+    // dispatch never intercepts it first. ---
 
     #[tokio::test]
     async fn no_key_refuses_with_409_before_any_call() {
@@ -641,7 +645,22 @@ mod tests {
         std::env::set_var("CORTEX_BYOK_KEK_V1", STANDARD.encode([11u8; 32]));
         std::env::set_var("CORTEX_BYOK_KEK_CURRENT", "1");
 
-        let (_dir, state) = test_state().await;
+        let (_dir, state) = test_state_with_clerk_secret(Some("test-clerk-secret".into())).await;
+        state
+            .db
+            .as_ref()
+            .unwrap()
+            .upsert_subscription(&crate::db::SubscriptionRecord {
+                clerk_user_id: "user-3".into(),
+                stripe_customer_id: "cus_test".into(),
+                stripe_subscription_id: None,
+                plan_type: "pro".into(),
+                status: "active".into(),
+                trial_end: None,
+                current_period_start: None,
+                current_period_end: None,
+            });
+
         let user = ClerkUser {
             user_id: "user-3".into(),
         };
@@ -654,14 +673,7 @@ mod tests {
             model: Some(format!("zen:{MODEL}")),
         };
 
-        let result = chat(
-            State(state.clone()),
-            user,
-            req,
-            MODEL.into(),
-            "system".into(),
-        )
-        .await;
+        let result = crate::chat::chat(State(state.clone()), user, Json(req)).await;
 
         std::env::remove_var("CORTEX_BYOK_KEK_V1");
         std::env::remove_var("CORTEX_BYOK_KEK_CURRENT");
@@ -673,6 +685,11 @@ mod tests {
             .unwrap();
         let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(body["error"], "zen_key_required");
+
+        let db = state.db.as_ref().unwrap();
+        assert_eq!(table_row_count(db, "provider_request_reservations"), 0);
+        assert_eq!(table_row_count(db, "provider_spend_authorizations"), 0);
+        assert_eq!(table_row_count(db, "credit_transactions"), 0);
     }
 
     // --- 4: a rejected key -> the same 409, never falls through. ---
