@@ -1279,13 +1279,14 @@ fn commentary_event(delegation_id: &str, content: &str) -> Value {
 /// it.
 ///
 /// `summary` is truncated on a char boundary, not the assembled prompt as a
-/// whole, so the fixed wording around it — in particular "Say yes, or tap
-/// Confirm on screen." — always survives intact even when the summary is
-/// long; the total is still at most [`COMMENTARY_CHAR_CAP`] characters
-/// either way.
+/// whole, so the fixed wording around it — in particular "Tap Confirm on
+/// screen." — always survives intact even when the summary is long; the
+/// total is still at most [`COMMENTARY_CHAR_CAP`] characters either way.
 fn spoken_confirm_prompt(summary: &str) -> String {
     const PREFIX: &str = "I need your OK to ";
-    const SUFFIX: &str = ". Say yes, or tap Confirm on screen.";
+    // Part 2 restores "Say yes" once the spoken matcher is wired; today
+    // approval only ever comes from a tap, so the prompt doesn't ask for one.
+    const SUFFIX: &str = ". Tap Confirm on screen.";
     let budget =
         COMMENTARY_CHAR_CAP.saturating_sub(PREFIX.chars().count() + SUFFIX.chars().count());
     let summary: String = summary.chars().take(budget).collect();
@@ -1439,18 +1440,19 @@ fn publish_voice_event(state: &Arc<AppState>, session_id: &str, event: VoiceEven
 }
 
 /// Test-only seam for pushing an event straight onto a live session's
-/// broadcast channel, bypassing the delegation path entirely. Voice turns
-/// withhold `Risk::Confirm` tools today, so there is no production call
-/// site that ever emits `VoiceEvent::ConfirmRequired` yet — this is how
-/// the event-stream tests exercise that event ahead of the wiring slice
-/// that will.
+/// broadcast channel, bypassing the delegation path entirely. Production
+/// does emit `VoiceEvent::ConfirmRequired` — the delegation forwards
+/// `StepEvent::ConfirmRequired` from a `Spoken` turn with an owned
+/// conversation — but this seam lets the event-stream tests exercise the
+/// event directly, without running a full delegation to trigger it.
 #[cfg(test)]
 pub(crate) fn push_test_event(state: &Arc<AppState>, session_id: &str, event: VoiceEvent) {
     publish_voice_event(state, session_id, event);
 }
 
 /// Run the same paid agent loop text chat uses (`chat_paid::send_paid_reply`,
-/// `voice_turn: true` so `Risk::Confirm` tools are withheld) for one
+/// `VoiceConfirm::Spoken` — see that type's doc comment for when
+/// `Risk::Confirm` tools are offered vs. withheld) for one
 /// delegated voice request, charged in credits exactly like chat reuses that
 /// same reservation/charge path. Never panics and never hangs the
 /// delegation: every failure becomes a short spoken-friendly string instead
@@ -2062,9 +2064,12 @@ pub(crate) fn subscribe_voice_events(
                     }
                 }
                 // A slow subscriber missed events it can never get back —
-                // rather than silently resuming mid-stream (and risking a
+                // `broadcast` does not replay past events on a new
+                // subscription, so a reconnect would not recover them either.
+                // Rather than silently resuming mid-stream (and risking a
                 // client that never learns it missed a `ConfirmRequired`),
-                // end the stream so the client's reconnect starts clean.
+                // end the stream so the client notices; the missed events
+                // themselves stay lost either way.
                 Err(broadcast::error::RecvError::Lagged(_)) => break,
                 // The session ended: `VoiceSessionHandle` (and its
                 // `events_tx`) was dropped from `state.voice_sessions`.
@@ -2327,7 +2332,7 @@ mod tests {
             prompt.chars().count()
         );
 
-        const SUFFIX: &str = ". Say yes, or tap Confirm on screen.";
+        const SUFFIX: &str = ". Tap Confirm on screen.";
         let before_suffix = prompt
             .strip_suffix(SUFFIX)
             .expect("the fixed suffix must survive intact even when the summary is truncated");
@@ -3727,9 +3732,9 @@ mod tests {
 
         /// With no `conversation_id`, `open_pr` is withheld — see
         /// `VoiceConfirm::Spoken`'s own doc comment in `chat_paid.rs` — so
-        /// nothing writes to the session's pending-confirm slot.
+        /// nothing reaches the session's pending-confirm slot.
         #[tokio::test]
-        async fn no_conversation_id_withholds_confirm_and_stores_nothing() {
+        async fn no_conversation_id_means_nothing_reaches_the_pending_slot() {
             let (_dir, state) = test_state_with_balance(1_000_000_000).await;
             let db = state.db.as_ref().unwrap();
             insert_session(&state, "sess-1", USER);
