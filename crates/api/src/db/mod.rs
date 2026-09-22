@@ -21,7 +21,10 @@ mod provider_gateway;
 mod verification_queue;
 
 pub use pending_actions::{ConfirmActionError, PendingAction, PENDING_ACTION_TTL_SECS};
-pub use provider_gateway::{ProviderReservation, SpendAuthorization};
+pub use provider_gateway::{
+    ProviderHoldRow, ProviderHoldsSummary, ProviderReservation, SpendAuthorization,
+    HOLD_CAPACITY_WARN_SHARE, STALE_RESERVATION_AGE_MS,
+};
 
 pub struct Database {
     conn: Mutex<Connection>,

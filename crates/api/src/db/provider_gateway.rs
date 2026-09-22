@@ -2,6 +2,19 @@
 
 use super::*;
 
+/// A `reserved` row older than this at startup is treated as orphaned: the
+/// process that would settle, release, or explicitly mark it unresolved died
+/// with the request in flight. The longest upstream call the gateway makes
+/// is capped at 600s (`UPSTREAM_TIMEOUT` in `supplier_anthropic.rs` and
+/// `supplier_openai.rs`); this adds a generous margin on top so an in-flight
+/// request from just before restart is never swept out from under it.
+pub const STALE_RESERVATION_AGE_MS: i64 = 15 * 60 * 1000;
+
+/// Share of funded supplier capacity that `reserved` + `unresolved` holds
+/// may occupy before operators are warned that stuck holds are crowding out
+/// real capacity.
+pub const HOLD_CAPACITY_WARN_SHARE: f64 = 0.5;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SpendAuthorization {
     pub id: String,
@@ -27,6 +40,35 @@ pub struct ProviderReservation {
     pub upstream_request_id: Option<String>,
     pub terminal_reason: Option<String>,
     pub replayed: bool,
+}
+
+/// One `reserved` or `unresolved` hold, for the admin operator view.
+#[derive(Debug, Clone, Serialize)]
+pub struct ProviderHoldRow {
+    pub request_key: String,
+    pub provider: String,
+    pub model: String,
+    pub amount_micro_usd: i64,
+    pub status: String,
+    pub age_ms: i64,
+    pub terminal_reason: Option<String>,
+}
+
+/// Aggregate view of supplier holds for the admin dashboard: how much is
+/// tied up `reserved` or `unresolved`, how that compares to funded supplier
+/// capacity, and a bounded, oldest-first sample of the actual rows so an
+/// operator can see what is stuck without pulling the database open.
+#[derive(Debug, Clone, Serialize)]
+pub struct ProviderHoldsSummary {
+    pub reserved_count: i64,
+    pub reserved_total_micro_usd: i64,
+    pub unresolved_count: i64,
+    pub unresolved_total_micro_usd: i64,
+    pub mismatch_count: i64,
+    pub oldest_age_ms: Option<i64>,
+    pub funded_total_micro_usd: i64,
+    pub over_threshold: bool,
+    pub rows: Vec<ProviderHoldRow>,
 }
 
 fn read_reservation(conn: &Connection, request_key: &str) -> Option<ProviderReservation> {
@@ -326,7 +368,44 @@ impl Database {
             params![upstream_request_id, reason, now_ms, request_key],
         )
         .map_err(|e| format!("failed to preserve unresolved reservation: {e}"))?;
-        read_reservation(&conn, request_key).ok_or_else(|| "reservation does not exist".to_string())
+        let reservation = read_reservation(&conn, request_key)
+            .ok_or_else(|| "reservation does not exist".to_string())?;
+        drop(conn);
+        self.warn_if_holds_over_threshold(now_ms);
+        Ok(reservation)
+    }
+
+    /// Startup sweep: any non-voice (`chat`, etc.) reservation still
+    /// `reserved` at process start and older than `STALE_RESERVATION_AGE_MS`
+    /// was left mid-flight by a server restart or a crashed request — mark
+    /// it `unresolved` for reconciliation instead of leaving it `reserved`
+    /// (and counted against funded capacity) forever. Only rows are aged out
+    /// because a genuinely fresh `reserved` row could still be an in-flight
+    /// request from just before this process started. Voice reservations are
+    /// swept separately by `sweep_stale_voice_reservations` (no age check —
+    /// see its doc comment) and are excluded here so this never double-acts
+    /// on them.
+    ///
+    /// This assumes this process is the only server using this database
+    /// (`CORTEX_SINGLE_NODE`), same as the voice sweep.
+    pub fn sweep_stale_reservations(&self, now_ms: i64) -> Result<usize, String> {
+        let conn = self.conn();
+        let reason = "server restarted with a non-voice reservation stuck in flight";
+        let cutoff_ms = now_ms - STALE_RESERVATION_AGE_MS;
+        let swept = conn
+            .execute(
+                "UPDATE provider_request_reservations
+                 SET status = 'unresolved', terminal_reason = ?1, reconciled_at = ?2
+                 WHERE status = 'reserved' AND request_key NOT LIKE 'voice:%'
+                   AND created_at < ?3",
+                params![reason, now_ms, cutoff_ms],
+            )
+            .map_err(|e| format!("failed to sweep stale reservations: {e}"))?;
+        drop(conn);
+        if swept > 0 {
+            self.warn_if_holds_over_threshold(now_ms);
+        }
+        Ok(swept)
     }
 
     /// Startup sweep: any `voice:*` reservation still `reserved` at process
@@ -351,6 +430,10 @@ impl Database {
                 params![reason, now_ms],
             )
             .map_err(|e| format!("failed to sweep stale voice reservations: {e}"))?;
+        drop(conn);
+        if swept > 0 {
+            self.warn_if_holds_over_threshold(now_ms);
+        }
         Ok(swept)
     }
 
@@ -453,6 +536,138 @@ impl Database {
             .ok_or_else(|| "settled reservation could not be read".to_string())
     }
 
+    /// Sum of `reserved` + `unresolved` exposure across all providers,
+    /// alongside total funded supplier capacity. Used both by the admin
+    /// summary endpoint and by `warn_if_holds_over_threshold`.
+    fn holds_vs_funded(&self, conn: &Connection) -> (i64, i64) {
+        let holds_total: i64 = conn
+            .query_row(
+                "SELECT COALESCE(SUM(reserved_micro_usd), 0)
+                 FROM provider_request_reservations WHERE status IN ('reserved', 'unresolved')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+        let funded_total: i64 = conn
+            .query_row(
+                "SELECT COALESCE(SUM(funded_micro_usd), 0) FROM supplier_capacities",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+        (holds_total, funded_total)
+    }
+
+    /// Log a `tracing::warn!` when stuck (`reserved` + `unresolved`) holds
+    /// occupy more than `HOLD_CAPACITY_WARN_SHARE` of funded supplier
+    /// capacity. Called at startup after the sweeps run, and whenever a row
+    /// newly becomes `unresolved`, so an operator sees the warning close to
+    /// when it started being true rather than only on the next GET.
+    pub fn warn_if_holds_over_threshold(&self, now_ms: i64) {
+        let _ = now_ms;
+        let conn = self.conn();
+        let (holds_total, funded_total) = self.holds_vs_funded(&conn);
+        if funded_total > 0
+            && (holds_total as f64) >= (funded_total as f64) * HOLD_CAPACITY_WARN_SHARE
+        {
+            tracing::warn!(
+                holds_total_micro_usd = holds_total,
+                funded_total_micro_usd = funded_total,
+                share = holds_total as f64 / funded_total as f64,
+                "provider gateway: reserved+unresolved holds exceed {}% of funded supplier capacity",
+                (HOLD_CAPACITY_WARN_SHARE * 100.0) as i64,
+            );
+        }
+    }
+
+    /// Admin operator view: counts and totals for `reserved` and
+    /// `unresolved` holds, the mismatch count, the oldest outstanding hold's
+    /// age, funded capacity comparison, and a bounded, oldest-first sample of
+    /// the rows themselves. Oldest-first because the rows most worth an
+    /// operator's attention are the ones that have been stuck longest, not
+    /// the ones that just started.
+    pub fn provider_holds_summary(&self, now_ms: i64, limit: i64) -> ProviderHoldsSummary {
+        let conn = self.conn();
+        let limit = limit.clamp(1, 500);
+
+        let (reserved_count, reserved_total_micro_usd, reserved_oldest): (i64, i64, Option<i64>) =
+            conn.query_row(
+                "SELECT COUNT(*), COALESCE(SUM(reserved_micro_usd), 0), MIN(created_at)
+                 FROM provider_request_reservations WHERE status = 'reserved'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap_or((0, 0, None));
+
+        let (unresolved_count, unresolved_total_micro_usd, unresolved_oldest): (
+            i64,
+            i64,
+            Option<i64>,
+        ) = conn
+            .query_row(
+                "SELECT COUNT(*), COALESCE(SUM(reserved_micro_usd), 0), MIN(created_at)
+                 FROM provider_request_reservations WHERE status = 'unresolved'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap_or((0, 0, None));
+
+        let mismatch_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM provider_request_reservations WHERE status = 'mismatch'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+
+        let oldest_created_at = [reserved_oldest, unresolved_oldest]
+            .into_iter()
+            .flatten()
+            .min();
+        let oldest_age_ms = oldest_created_at.map(|created_at| (now_ms - created_at).max(0));
+
+        let (holds_total, funded_total_micro_usd) = self.holds_vs_funded(&conn);
+        let over_threshold = funded_total_micro_usd > 0
+            && (holds_total as f64) >= (funded_total_micro_usd as f64) * HOLD_CAPACITY_WARN_SHARE;
+
+        let mut rows = Vec::new();
+        if let Ok(mut stmt) = conn.prepare(
+            "SELECT request_key, provider, model, reserved_micro_usd, status, created_at,
+                    terminal_reason
+             FROM provider_request_reservations
+             WHERE status IN ('reserved', 'unresolved')
+             ORDER BY created_at ASC
+             LIMIT ?1",
+        ) {
+            if let Ok(mapped) = stmt.query_map(params![limit], |row| {
+                let created_at: i64 = row.get(5)?;
+                Ok(ProviderHoldRow {
+                    request_key: row.get(0)?,
+                    provider: row.get(1)?,
+                    model: row.get(2)?,
+                    amount_micro_usd: row.get(3)?,
+                    status: row.get(4)?,
+                    age_ms: (now_ms - created_at).max(0),
+                    terminal_reason: row.get(6)?,
+                })
+            }) {
+                rows.extend(mapped.filter_map(|r| r.ok()));
+            }
+        }
+
+        ProviderHoldsSummary {
+            reserved_count,
+            reserved_total_micro_usd,
+            unresolved_count,
+            unresolved_total_micro_usd,
+            mismatch_count,
+            oldest_age_ms,
+            funded_total_micro_usd,
+            over_threshold,
+            rows,
+        }
+    }
+
     pub fn provider_spend_row_count(&self, request_key: &str) -> i64 {
         let conn = self.conn();
         conn.query_row(
@@ -475,5 +690,212 @@ impl Database {
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap_or((0, 0))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::tests::test_db;
+    use super::*;
+    use crate::provider_gateway::GatewayCapability;
+
+    const NOW: i64 = 1_800_000_000_000;
+    const PROVIDER: &str = "claude";
+    const MODEL: &str = "claude-sonnet-5";
+
+    /// A funded provider with an active spend authorization, ready for
+    /// `reserve_provider_request`.
+    fn fixture(db: &Database, max_micro_usd: i64, funded_micro_usd: i64) -> GatewayCapability {
+        let price_list_id = db.active_price_list().unwrap().id;
+        db.set_supplier_capacity(PROVIDER, funded_micro_usd, NOW)
+            .unwrap();
+        let authorization = SpendAuthorization {
+            id: "auth-1".into(),
+            user_id: "tenant-1".into(),
+            run_id: "run-1".into(),
+            attempt_id: "attempt-1".into(),
+            provider: PROVIDER.into(),
+            model: MODEL.into(),
+            price_list_id,
+            max_micro_usd,
+            expires_at_ms: NOW + 60_000,
+        };
+        db.create_spend_authorization(&authorization, NOW).unwrap();
+        GatewayCapability::new(
+            authorization.id,
+            authorization.user_id,
+            authorization.run_id,
+            authorization.attempt_id,
+            authorization.provider,
+            authorization.model,
+            authorization.expires_at_ms,
+        )
+    }
+
+    fn reserve(db: &Database, claims: &GatewayCapability, request_key: &str, now_ms: i64) {
+        db.reserve_provider_request(claims, request_key, "digest", 1_000, now_ms)
+            .unwrap();
+    }
+
+    // --- sweep_stale_reservations ---
+
+    #[test]
+    fn sweep_marks_old_chat_reserved_rows_unresolved_and_leaves_fresh_rows_alone() {
+        let db = test_db();
+        let claims = fixture(&db, 1_000_000, 1_000_000);
+
+        // Created well before the staleness cutoff: orphaned by a restart.
+        reserve(&db, &claims, "chat:old", NOW);
+        // Created just now (relative to the sweep's `now_ms`): still could be
+        // a genuinely in-flight request, must not be touched.
+        reserve(&db, &claims, "chat:fresh", NOW);
+        // Voice rows are swept separately and must never be touched here.
+        reserve(&db, &claims, "voice:old", NOW);
+
+        let sweep_now = NOW + STALE_RESERVATION_AGE_MS + 1;
+        let swept = db.sweep_stale_reservations(sweep_now).unwrap();
+        assert_eq!(swept, 1, "only the old, non-voice row should be swept");
+
+        let old = db.get_provider_reservation("chat:old").unwrap();
+        assert_eq!(old.status, "unresolved");
+        assert!(old.terminal_reason.is_some());
+
+        let fresh = db.get_provider_reservation("chat:fresh").unwrap();
+        assert_eq!(
+            fresh.status, "reserved",
+            "a row younger than the staleness cutoff must be left alone"
+        );
+
+        let voice = db.get_provider_reservation("voice:old").unwrap();
+        assert_eq!(
+            voice.status, "reserved",
+            "voice rows are swept by sweep_stale_voice_reservations, not this sweep"
+        );
+
+        // Sweeping again is a no-op: nothing left to sweep.
+        assert_eq!(db.sweep_stale_reservations(sweep_now).unwrap(), 0);
+    }
+
+    // --- provider_holds_summary ---
+
+    #[test]
+    fn get_totals_reflect_reserved_and_unresolved_holds() {
+        let db = test_db();
+        let claims = fixture(&db, 1_000_000, 1_000_000);
+
+        reserve(&db, &claims, "chat:a", NOW);
+        reserve(&db, &claims, "chat:b", NOW + 10);
+        db.mark_provider_request_unresolved("chat:b", None, "timed out", NOW + 20)
+            .unwrap();
+
+        let summary = db.provider_holds_summary(NOW + 1_000, 10);
+        assert_eq!(summary.reserved_count, 1);
+        assert_eq!(summary.reserved_total_micro_usd, 1_000);
+        assert_eq!(summary.unresolved_count, 1);
+        assert_eq!(summary.unresolved_total_micro_usd, 1_000);
+        assert_eq!(summary.mismatch_count, 0);
+        assert_eq!(summary.funded_total_micro_usd, 1_000_000);
+        assert!(!summary.over_threshold);
+        assert_eq!(summary.oldest_age_ms, Some(1_000));
+        assert_eq!(summary.rows.len(), 2);
+        // Oldest-first.
+        assert_eq!(summary.rows[0].request_key, "chat:a");
+        assert_eq!(summary.rows[1].request_key, "chat:b");
+        assert_eq!(summary.rows[0].provider, PROVIDER);
+        assert_eq!(summary.rows[0].model, MODEL);
+    }
+
+    #[test]
+    fn get_reports_over_threshold_once_holds_pass_the_warn_share() {
+        let db = test_db();
+        // Funded for 2_000; reserving 1_500 total (75%) must trip the 50% threshold.
+        let claims = fixture(&db, 1_000_000, 2_000);
+        reserve(&db, &claims, "chat:big", NOW);
+        db.reserve_provider_request(&claims, "chat:big2", "digest", 500, NOW)
+            .unwrap();
+
+        let summary = db.provider_holds_summary(NOW, 10);
+        assert_eq!(summary.reserved_total_micro_usd, 1_500);
+        assert!(summary.over_threshold);
+    }
+
+    // --- settle / release happy paths ---
+
+    #[test]
+    fn settle_happy_path_moves_a_reserved_row_to_settled() {
+        let db = test_db();
+        let claims = fixture(&db, 1_000_000, 1_000_000);
+        reserve(&db, &claims, "chat:settle", NOW);
+
+        let settled = db
+            .settle_provider_request("chat:settle", 800, None, NOW + 5)
+            .unwrap();
+        assert_eq!(settled.status, "settled");
+        assert_eq!(settled.observed_micro_usd, Some(800));
+    }
+
+    #[test]
+    fn release_happy_path_moves_a_reserved_row_to_released() {
+        let db = test_db();
+        let claims = fixture(&db, 1_000_000, 1_000_000);
+        reserve(&db, &claims, "chat:release", NOW);
+
+        let released = db
+            .release_provider_request("chat:release", "operator released stuck hold", NOW + 5)
+            .unwrap();
+        assert_eq!(released.status, "released");
+        assert_eq!(
+            released.terminal_reason.as_deref(),
+            Some("operator released stuck hold")
+        );
+    }
+
+    #[test]
+    fn release_also_resolves_an_unresolved_row() {
+        let db = test_db();
+        let claims = fixture(&db, 1_000_000, 1_000_000);
+        reserve(&db, &claims, "chat:unresolved", NOW);
+        db.mark_provider_request_unresolved("chat:unresolved", None, "timed out", NOW + 1)
+            .unwrap();
+
+        let released = db
+            .release_provider_request("chat:unresolved", "confirmed never sent", NOW + 2)
+            .unwrap();
+        assert_eq!(released.status, "released");
+    }
+
+    // --- settle_provider_request already refuses to overwrite a terminal row ---
+
+    #[test]
+    fn settle_over_the_reserved_amount_flips_the_row_to_mismatch() {
+        let db = test_db();
+        let claims = fixture(&db, 1_000_000, 1_000_000);
+        reserve(&db, &claims, "chat:mismatch", NOW);
+        // Observed cost above the reservation flips the row to 'mismatch'
+        // rather than settling it — the admin layer's `require_resolvable_hold`
+        // (crates/api/src/admin.rs) checks this status before ever calling
+        // settle/release again, so a 'mismatch' row can't be reached through
+        // the admin endpoints once it lands here.
+        let result = db.settle_provider_request("chat:mismatch", 5_000, None, NOW + 1);
+        assert!(result.is_err());
+        let row = db.get_provider_reservation("chat:mismatch").unwrap();
+        assert_eq!(row.status, "mismatch");
+    }
+
+    #[test]
+    fn release_on_a_settled_row_is_a_no_op_not_an_overwrite() {
+        let db = test_db();
+        let claims = fixture(&db, 1_000_000, 1_000_000);
+        reserve(&db, &claims, "chat:settled", NOW);
+        db.settle_provider_request("chat:settled", 500, None, NOW + 1)
+            .unwrap();
+
+        // `release_provider_request`'s WHERE clause only matches
+        // reserved/unresolved, so this is a no-op that leaves the row
+        // 'settled' rather than overwriting it.
+        let after = db
+            .release_provider_request("chat:settled", "attempted release", NOW + 2)
+            .unwrap();
+        assert_eq!(after.status, "settled");
     }
 }

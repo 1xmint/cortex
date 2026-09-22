@@ -231,6 +231,24 @@ impl AppState {
             }
         }
 
+        // Same idea for non-voice (chat, etc.) reservations: a `reserved`
+        // row older than `STALE_RESERVATION_AGE_MS` at startup was left
+        // mid-flight by a server restart or a crashed request, and nothing
+        // else will ever resolve it. Age-bounded (unlike the voice sweep)
+        // because a genuinely fresh `reserved` row could still belong to an
+        // in-flight request from just before this process started.
+        match db.sweep_stale_reservations(chrono::Utc::now().timestamp_millis()) {
+            Ok(0) => {}
+            Ok(swept) => tracing::warn!(
+                swept,
+                "provider gateway: marked stale reservation(s) unresolved after restart"
+            ),
+            Err(error) => {
+                tracing::error!(%error, "provider gateway: startup sweep of stale reservations failed")
+            }
+        }
+        db.warn_if_holds_over_threshold(chrono::Utc::now().timestamp_millis());
+
         // The anonymous worker path is off unless explicitly opened. Note it is
         // NOT tied to `CORTEX_AUTH_DISABLED`: losing a Clerk secret is an
         // accident, and this has to be a decision.
