@@ -78,6 +78,26 @@ describe('SpokenPromptEndDetector', () => {
     expect(detector.sample(0.9, 800)).toBe('ended');
   });
 
+  it('does not fire when the anchor phrase appears mid-buffer but the buffer keeps going', () => {
+    const detector = new SpokenPromptEndDetector();
+    // The model's summary itself references the confirm phrasing, but more
+    // text follows it, so the anchor is not at the end of the buffer yet.
+    detector.onTranscript(
+      "I said tap Confirm on screen last time, but let's try again. Say yes, or tap ",
+    );
+    expect(detector.sample(0, 0)).toBe('listening');
+    expect(detector.sample(0, 5000)).toBe('listening'); // no anchor at the end yet, so no decision
+  });
+
+  it('fires once the anchor phrase finally lands at the end of the buffer, even if mentioned earlier', () => {
+    const detector = new SpokenPromptEndDetector();
+    detector.onTranscript(
+      "I said tap Confirm on screen last time, but let's try again. Say yes, or tap Confirm on screen.",
+    );
+    expect(detector.sample(0, 0)).toBe('listening'); // silence clock only just started
+    expect(detector.sample(0, 700)).toBe('ended');
+  });
+
   it('honors custom thresholds', () => {
     const detector = new SpokenPromptEndDetector({
       silenceThreshold: 0.1,

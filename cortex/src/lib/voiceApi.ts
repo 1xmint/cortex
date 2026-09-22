@@ -179,10 +179,12 @@ interface ConnectOnceResult {
  * attempts.
  *
  * A 404 means the deployment is in stub/dev mode, where this route does not
- * exist yet, and a 401/403 means the session's auth is no longer good for
- * it -- both are treated as terminal: "no events" rather than an error, so
- * the caller shows nothing rather than an error banner, and reconnecting
- * stops rather than hammering a route that will never succeed.
+ * exist yet, and is treated as terminal: "no events" rather than an error,
+ * so the caller shows nothing rather than an error banner, and reconnecting
+ * stops rather than hammering a route that will never succeed. A 401/403
+ * usually means the same -- the session's auth is no longer good for it --
+ * but can also just mean the token went briefly stale, so it gets one
+ * retry with a fresh token before being treated the same way.
  *
  * Returns an `AbortController` the caller closes when voice stops; closing
  * it never surfaces as an error and stops any pending reconnect.
@@ -193,7 +195,7 @@ export function openLiveVoiceEventsStream(
 ): AbortController {
   const controller = new AbortController();
 
-  const connectOnce = async (): Promise<ConnectOnceResult> => {
+  const connectOnce = async (allowAuthRetry = true): Promise<ConnectOnceResult> => {
     const headers: Record<string, string> = {};
     const token = await getAuthToken();
     if (token) headers.Authorization = `Bearer ${token}`;
@@ -203,7 +205,15 @@ export function openLiveVoiceEventsStream(
       { headers, signal: controller.signal },
     );
 
-    if (res.status === 404 || res.status === 401 || res.status === 403) {
+    if (res.status === 401 || res.status === 403) {
+      // A briefly stale token looks identical to a truly bad one -- get a
+      // fresh token and retry exactly once before giving up on this stream
+      // for good, so a token that rotated moments ago doesn't end the whole
+      // call.
+      if (allowAuthRetry) return connectOnce(false);
+      return { terminal: true, delivered: false };
+    }
+    if (res.status === 404) {
       return { terminal: true, delivered: false };
     }
     if (!res.ok) {

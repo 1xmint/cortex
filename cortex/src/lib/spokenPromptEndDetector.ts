@@ -72,7 +72,11 @@ export class SpokenPromptEndDetector {
   onTranscript(delta: string): void {
     if (this.decided || this.anchorReached) return;
     this.transcriptBuffer += delta;
-    if (normalize(this.transcriptBuffer).includes(ANCHOR_TEXT)) {
+    // Anchored at the end of the buffer (after normalising away trailing
+    // whitespace/punctuation) so a summary that happens to mention the
+    // phrase mid-buffer -- before the real, final occurrence -- never fires
+    // early.
+    if (normalize(this.transcriptBuffer).endsWith(ANCHOR_TEXT)) {
       this.anchorReached = true;
       // Whatever silence run was accumulating before the anchor landed
       // doesn't count toward the hold -- restart the clock from here so the
