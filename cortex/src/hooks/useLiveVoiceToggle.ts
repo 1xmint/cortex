@@ -166,8 +166,8 @@ export function useLiveVoiceToggle(options: UseLiveVoiceToggleOptions = {}) {
    * after a `confirm_required` event to detect when the spoken confirm
    * prompt has finished playing, and reports it once via
    * `POST .../prompt-ended`. The prompt is anchored on its fixed tail text
-   * ("tap Confirm on screen") arriving over the transcript -- audio level is
-   * ignored until that anchor is seen, so speech from *before* the prompt
+   * ("tap Confirm on screen") -- audio level is ignored until the transcript
+   * *ends with* that anchor, so speech from *before* the prompt
    * (e.g. the model musing about the action) can never be mistaken for the
    * prompt ending. See `SpokenPromptEndDetector` for the full rule. A new
    * call (a fresh `confirm_required`) replaces whatever watcher is already

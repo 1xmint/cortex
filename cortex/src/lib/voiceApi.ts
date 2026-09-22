@@ -195,9 +195,14 @@ export function openLiveVoiceEventsStream(
 ): AbortController {
   const controller = new AbortController();
 
-  const connectOnce = async (allowAuthRetry = true): Promise<ConnectOnceResult> => {
+  const connectOnce = async (isAuthRetry = false): Promise<ConnectOnceResult> => {
     const headers: Record<string, string> = {};
-    const token = await getAuthToken();
+    // The retry attempt must skip whatever short-lived cache the token
+    // getter keeps -- asking again without `skipCache` (e.g. Clerk's
+    // `getToken()`) just returns the same still-cached, possibly-stale
+    // token, which would make the "retry" indistinguishable from doing
+    // nothing.
+    const token = await getAuthToken(isAuthRetry ? { skipCache: true } : undefined);
     if (token) headers.Authorization = `Bearer ${token}`;
 
     const res = await fetch(
@@ -210,7 +215,7 @@ export function openLiveVoiceEventsStream(
       // fresh token and retry exactly once before giving up on this stream
       // for good, so a token that rotated moments ago doesn't end the whole
       // call.
-      if (allowAuthRetry) return connectOnce(false);
+      if (!isAuthRetry) return connectOnce(true);
       return { terminal: true, delivered: false };
     }
     if (res.status === 404) {

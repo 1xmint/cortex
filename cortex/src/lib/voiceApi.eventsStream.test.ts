@@ -110,6 +110,7 @@ describe('openLiveVoiceEventsStream reconnect', () => {
 
   it('retries once with a fresh token on 403 and keeps the stream going if that retry succeeds', async () => {
     let calls = 0;
+    const events: unknown[] = [];
     const fetchMock = vi.fn(async () => {
       calls += 1;
       if (calls === 1) return forbiddenResponse();
@@ -117,11 +118,37 @@ describe('openLiveVoiceEventsStream reconnect', () => {
     });
     vi.stubGlobal('fetch', fetchMock);
 
-    openLiveVoiceEventsStream('sess-403-retry', () => {});
+    openLiveVoiceEventsStream('sess-403-retry', (event) => events.push(event));
 
     // The 403 retry succeeds within the same outer attempt (no backoff
     // delay between the two), delivering an event.
     await vi.waitFor(() => expect(calls).toBe(2));
+    await vi.waitFor(() =>
+      expect(events).toEqual([{ type: 'voice_message', role: 'assistant', content: 'hi' }]),
+    );
+  });
+
+  it('asks the token getter for a fresh (non-cached) token on the auth retry', async () => {
+    const tokens = ['stale', 'fresh'];
+    setAuthTokenGetter(async (opts) => {
+      if (opts?.skipCache) return 'fresh';
+      return tokens.shift() ?? 'fresh';
+    });
+
+    let calls = 0;
+    const authHeaders: Array<string | null> = [];
+    const fetchMock = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      calls += 1;
+      authHeaders.push(new Headers(init?.headers).get('Authorization'));
+      if (calls === 1) return forbiddenResponse();
+      return sseResponse([]);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    openLiveVoiceEventsStream('sess-403-fresh-token', () => {});
+
+    await vi.waitFor(() => expect(calls).toBe(2));
+    expect(authHeaders).toEqual(['Bearer stale', 'Bearer fresh']);
   });
 
   it('stops for good, without looping, when a 403 retry also 403s', async () => {

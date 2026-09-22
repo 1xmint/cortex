@@ -79,10 +79,16 @@ export function apiUrl(path: string) {
   return `${base}${path}`;
 }
 
-let _tokenGetter: (() => Promise<string | null>) | null = null;
+/** Passed through to the underlying token getter (e.g. Clerk's `getToken`). */
+export interface AuthTokenOptions {
+  /** Bypass whatever short-lived cache the getter keeps and mint a fresh token. */
+  skipCache?: boolean;
+}
+
+let _tokenGetter: ((opts?: AuthTokenOptions) => Promise<string | null>) | null = null;
 let _somaDelegation: SomaDelegation | null = null;
 
-export function setAuthTokenGetter(getter: () => Promise<string | null>) {
+export function setAuthTokenGetter(getter: (opts?: AuthTokenOptions) => Promise<string | null>) {
   _tokenGetter = getter;
 }
 
@@ -102,9 +108,9 @@ export function setSomaDelegation(delegation: SomaDelegation | null) {
  * from a `pagehide` handler, where there is no time left to route through
  * the retry/JSON plumbing below.
  */
-export async function getAuthToken(): Promise<string | null> {
+export async function getAuthToken(opts?: AuthTokenOptions): Promise<string | null> {
   if (!_tokenGetter) return null;
-  return _tokenGetter();
+  return _tokenGetter(opts);
 }
 
 async function authedFetch(url: string, init?: RequestInit): Promise<Response> {
