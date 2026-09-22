@@ -118,6 +118,10 @@ pub(crate) enum LiveSessionError {
     SupplierFailed,
     /// The session id does not exist (already closed, or never was ours).
     NotFound,
+    /// The `conversation_id` passed to start a session does not exist, or
+    /// belongs to another user — reported identically either way so a
+    /// foreign id can't be distinguished from a missing one.
+    ConversationNotFound,
     /// The caller does not own this session.
     Forbidden,
     /// The user already has a live voice session open.
@@ -140,6 +144,9 @@ impl LiveSessionError {
                 "Live voice is temporarily unavailable. Please try again in a moment.",
             ),
             LiveSessionError::NotFound => (StatusCode::NOT_FOUND, "No such voice session."),
+            LiveSessionError::ConversationNotFound => {
+                (StatusCode::NOT_FOUND, "No such conversation.")
+            }
             LiveSessionError::Forbidden => {
                 (StatusCode::FORBIDDEN, "That is not your voice session.")
             }
@@ -1296,13 +1303,23 @@ async fn run_voice_delegation_with<T: crate::provider_gateway::ProviderTransport
 
     // Saved the same way `chat_paid::run` saves a text-chat turn: the
     // user's text first (so it is there even if the reply never comes
-    // back), the answer after. A session with no linked conversation
-    // (`conversation_id: None`) saves nothing, matching M-D-0013 behavior.
+    // back), the tool-activity summary and answer after, in that order. A
+    // session with no linked conversation (`conversation_id: None`) saves
+    // nothing, matching M-D-0013 behavior. Each save is guarded by a fresh
+    // `get_conversation` check: the conversation can be deleted out from
+    // under a long-running delegation (mid-call), and
+    // `Database::add_message` panics on the resulting foreign-key failure
+    // rather than erroring — a panic here would also kill the spoken
+    // answer, since it never reaches `tx.send` back in
+    // `handle_delegation_created`. Guarding keeps that panic from ever
+    // happening instead of catching it after the fact.
     if let Some(cid) = conversation_id {
-        db.add_message(cid, "user", task_text, None, None);
+        if db.get_conversation(cid, user_id).is_some() {
+            db.add_message(cid, "user", task_text, None, None);
+        }
     }
 
-    let answer = match crate::chat_paid::send_paid_reply(
+    let reply = crate::chat_paid::send_paid_reply(
         db,
         signing_key,
         supplier_key,
@@ -1320,10 +1337,11 @@ async fn run_voice_delegation_with<T: crate::provider_gateway::ProviderTransport
         true,
         Some(cancel.as_ref()),
     )
-    .await
-    {
-        Ok(reply) if reply.text.trim().is_empty() => "Done.".to_string(),
-        Ok(reply) => reply.text,
+    .await;
+
+    let answer = match &reply {
+        Ok(paid_reply) if paid_reply.text.trim().is_empty() => "Done.".to_string(),
+        Ok(paid_reply) => paid_reply.text.clone(),
         Err(crate::chat_paid::PaidReplyError::NoCredits)
         | Err(crate::chat_paid::PaidReplyError::NotEnoughCredits) => {
             "You're out of credits for that request.".to_string()
@@ -1335,8 +1353,25 @@ async fn run_voice_delegation_with<T: crate::provider_gateway::ProviderTransport
         Err(_) => "Sorry, I couldn't complete that just now.".to_string(),
     };
 
-    if let Some(cid) = conversation_id {
-        db.add_message(cid, "assistant", &answer, Some("cortex"), None);
+    // Only a genuine successful reply is worth persisting: none of the
+    // spoken failure strings above (out of credits, turn-cap exceeded, or
+    // a generic failure) and not the "Done." fallback for an empty reply
+    // — matching `chat_paid::run`'s own save gate (chat_paid.rs). The
+    // tool-activity summary is saved whenever tools ran, even if the reply
+    // text itself came back empty.
+    if let Ok(paid_reply) = &reply {
+        if let Some(cid) = conversation_id {
+            if db.get_conversation(cid, user_id).is_some() {
+                if let Some(summary) =
+                    crate::chat_paid::tool_activity_summary(&paid_reply.tool_activity)
+                {
+                    db.add_message(cid, "assistant", &summary, Some("cortex"), None);
+                }
+                if !paid_reply.text.is_empty() {
+                    db.add_message(cid, "assistant", &paid_reply.text, Some("cortex"), None);
+                }
+            }
+        }
     }
 
     answer
@@ -1616,7 +1651,7 @@ pub async fn live_session_start(
             .map(|db| db.get_conversation(cid, &user.user_id).is_some())
             .unwrap_or(false);
         if !owned {
-            return Err(LiveSessionError::NotFound.into_response());
+            return Err(LiveSessionError::ConversationNotFound.into_response());
         }
     }
     let Some(mode) = live_voice_mode() else {
@@ -1631,19 +1666,46 @@ pub async fn live_session_start(
     let Some(limits) = SpendLimits::from_env() else {
         return Err(LiveSessionError::Unavailable.into_response());
     };
-    let now_ms = chrono::Utc::now().timestamp_millis();
 
-    start_session(
+    live_session_start_with(
         &state,
         mode,
-        OPENAI_HTTP_BASE,
-        OPENAI_WS_BASE,
         &signing_key,
         limits,
         &user.user_id,
         &body.sdp,
-        now_ms,
         body.conversation_id.clone(),
+    )
+    .await
+}
+
+/// The env-injectable core of [`live_session_start`] — kept separate so
+/// tests can exercise the "no conversation id" path (and any future
+/// gateway-mode path) with explicit arguments instead of mutating
+/// process-wide env vars, matching [`run_voice_delegation`]/
+/// [`run_voice_delegation_with`]'s own split.
+async fn live_session_start_with(
+    state: &Arc<AppState>,
+    mode: LiveVoiceMode,
+    signing_key: &str,
+    limits: SpendLimits,
+    user_id: &str,
+    sdp: &str,
+    conversation_id: Option<String>,
+) -> Result<Json<LiveSessionStartResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let now_ms = chrono::Utc::now().timestamp_millis();
+
+    start_session(
+        state,
+        mode,
+        OPENAI_HTTP_BASE,
+        OPENAI_WS_BASE,
+        signing_key,
+        limits,
+        user_id,
+        sdp,
+        now_ms,
+        conversation_id,
     )
     .await
     .map(|(session_id, sdp, _local_id)| Json(LiveSessionStartResponse { session_id, sdp }))
@@ -2971,26 +3033,23 @@ mod tests {
         // Stub mode, so this exercises only the handler's ownership gate
         // (skipped entirely with no id) and not the rest of the pipeline,
         // which the other `start_session` tests already cover directly.
-        std::env::set_var("CORTEX_PROVIDER_GATEWAY_MODE", "stub");
-        std::env::set_var("CORTEX_PROVIDER_GATEWAY_SIGNING_KEY", SIGNING_KEY);
-        std::env::set_var("CORTEX_PROVIDER_GATEWAY_MAX_MICRO_USD", "1000000000");
-        std::env::set_var("CORTEX_PROVIDER_GATEWAY_FUNDED_MICRO_USD", "1000000000");
-        let result = live_session_start(
-            State(state.clone()),
-            ClerkUser {
-                user_id: USER.to_string(),
-            },
-            HeaderMap::new(),
-            Json(LiveSessionStartRequest {
-                sdp: "offer-sdp".to_string(),
-                conversation_id: None,
-            }),
+        // Config is injected straight into `live_session_start_with`
+        // instead of process-wide env vars, so this test cannot race other
+        // tests reading the same `CORTEX_PROVIDER_GATEWAY_*` vars.
+        let limits = SpendLimits {
+            max_micro_usd: 1_000_000_000,
+            funded_micro_usd: 1_000_000_000,
+        };
+        let result = live_session_start_with(
+            &state,
+            LiveVoiceMode::Stub,
+            SIGNING_KEY,
+            limits,
+            USER,
+            "offer-sdp",
+            None,
         )
         .await;
-        std::env::remove_var("CORTEX_PROVIDER_GATEWAY_MODE");
-        std::env::remove_var("CORTEX_PROVIDER_GATEWAY_SIGNING_KEY");
-        std::env::remove_var("CORTEX_PROVIDER_GATEWAY_MAX_MICRO_USD");
-        std::env::remove_var("CORTEX_PROVIDER_GATEWAY_FUNDED_MICRO_USD");
 
         assert!(
             result.is_ok(),
@@ -3074,6 +3133,65 @@ mod tests {
                 self.calls.fetch_add(1, AtomicOrdering::SeqCst);
                 std::future::ready(self.response.clone())
             }
+        }
+
+        /// Returns one queued response per call, repeating the last one once
+        /// the queue is exhausted — enough to script a `tool_use` turn
+        /// followed by a final text turn, the way `chat_paid.rs`'s own
+        /// `SequenceTransport` does.
+        #[derive(Clone)]
+        struct SequencedTransport {
+            calls: Arc<AtomicUsize>,
+            responses: Arc<Vec<Result<TransportResponse, TransportFailure>>>,
+        }
+
+        impl SequencedTransport {
+            fn new(responses: Vec<Result<TransportResponse, TransportFailure>>) -> Self {
+                assert!(!responses.is_empty());
+                Self {
+                    calls: Arc::new(AtomicUsize::new(0)),
+                    responses: Arc::new(responses),
+                }
+            }
+        }
+
+        impl ProviderTransport for SequencedTransport {
+            fn forward(
+                &self,
+                supplier_key: &str,
+                _request: &GatewayRequest,
+            ) -> impl Future<Output = Result<TransportResponse, TransportFailure>> + Send
+            {
+                assert_eq!(supplier_key, SUPPLIER_KEY);
+                let i = self.calls.fetch_add(1, AtomicOrdering::SeqCst);
+                let idx = i.min(self.responses.len() - 1);
+                std::future::ready(self.responses[idx].clone())
+            }
+        }
+
+        fn tool_use_response(
+            tool_use_id: &str,
+            name: &str,
+            input: Value,
+        ) -> Result<TransportResponse, TransportFailure> {
+            Ok(TransportResponse {
+                body: serde_json::json!({
+                    "id": "msg_test",
+                    "type": "message",
+                    "role": "assistant",
+                    "model": DELEGATION_MODEL,
+                    "content": [{"type": "tool_use", "id": tool_use_id, "name": name, "input": input}],
+                    "stop_reason": "tool_use",
+                    "stop_sequence": null,
+                    "usage": {"input_tokens": 10, "output_tokens": 10}
+                }),
+                upstream_request_id: Some("upstream-1".into()),
+                usage: Some(ObservedUsage {
+                    input_tokens: 10,
+                    cached_input_tokens: 0,
+                    output_tokens: 10,
+                }),
+            })
         }
 
         #[test]
@@ -3268,6 +3386,116 @@ mod tests {
                 "a zero balance must refuse before any provider call"
             );
             assert_eq!(db.get_credit_balance_row(USER), before, "nothing charged");
+        }
+
+        #[tokio::test]
+        async fn insufficient_credits_still_saves_the_user_text_but_not_a_failure_reply() {
+            let (_dir, state) = test_state_with_balance(0).await;
+            let db = state.db.as_ref().unwrap();
+            let conversation = db.create_conversation(USER, None);
+
+            let transport = CountingTransport::unreachable();
+            let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let answer = run_voice_delegation_with(
+                db,
+                SIGNING_KEY,
+                SUPPLIER_KEY,
+                transport,
+                ample_limits(),
+                USER,
+                Some(conversation.id.as_str()),
+                "do something",
+                &cancel,
+            )
+            .await;
+
+            assert_eq!(answer, "You're out of credits for that request.");
+            let messages = db
+                .get_conversation(&conversation.id, USER)
+                .unwrap()
+                .messages;
+            assert_eq!(
+                messages.len(),
+                1,
+                "a failed reply must save the user's text but never a failure string"
+            );
+            assert_eq!(messages[0].role, "user");
+            assert_eq!(messages[0].content, "do something");
+        }
+
+        #[tokio::test]
+        async fn conversation_deleted_before_the_turn_answers_without_panicking_or_saving() {
+            let (_dir, state) = test_state_with_balance(1_000_000_000).await;
+            let db = state.db.as_ref().unwrap();
+            let conversation = db.create_conversation(USER, None);
+            assert!(db.delete_conversation(&conversation.id, USER));
+
+            let transport = CountingTransport::ok("the answer is four");
+            let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let answer = run_voice_delegation_with(
+                db,
+                SIGNING_KEY,
+                SUPPLIER_KEY,
+                transport,
+                ample_limits(),
+                USER,
+                Some(conversation.id.as_str()),
+                "what is two plus two",
+                &cancel,
+            )
+            .await;
+
+            assert_eq!(
+                answer, "the answer is four",
+                "the spoken answer must still be delivered even though the \
+                 conversation it would have saved into is gone"
+            );
+            assert!(
+                db.get_conversation(&conversation.id, USER).is_none(),
+                "still deleted: nothing was recreated by the guarded save"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_successful_reply_with_tool_activity_saves_user_summary_and_answer_in_order() {
+            let (_dir, state) = test_state_with_balance(1_000_000_000).await;
+            let db = state.db.as_ref().unwrap();
+            let conversation = db.create_conversation(USER, None);
+
+            let transport = SequencedTransport::new(vec![
+                tool_use_response("toolu_1", "list_runs", serde_json::json!({})),
+                CountingTransport::ok("the answer is four").response.clone(),
+            ]);
+            let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let answer = run_voice_delegation_with(
+                db,
+                SIGNING_KEY,
+                SUPPLIER_KEY,
+                transport,
+                ample_limits(),
+                USER,
+                Some(conversation.id.as_str()),
+                "check my runs and tell me the answer",
+                &cancel,
+            )
+            .await;
+
+            assert_eq!(answer, "the answer is four");
+            let messages = db
+                .get_conversation(&conversation.id, USER)
+                .unwrap()
+                .messages;
+            assert_eq!(
+                messages.len(),
+                3,
+                "user text, tool-activity summary, and the answer must all be saved"
+            );
+            assert_eq!(messages[0].role, "user");
+            assert_eq!(messages[0].content, "check my runs and tell me the answer");
+            assert_eq!(messages[1].role, "assistant");
+            assert_eq!(messages[1].content, "Checked your runs.");
+            assert_eq!(messages[2].role, "assistant");
+            assert_eq!(messages[2].content, "the answer is four");
         }
 
         #[tokio::test]

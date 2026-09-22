@@ -897,7 +897,7 @@ pub(crate) async fn send_paid_reply<T: ProviderTransport + Clone>(
 /// A minimal, human-readable line summarizing what the agent looked at this
 /// reply, e.g. "Checked your runs, credit balance." `None` when no tool was
 /// called, so a plain reply gets no extra message.
-fn tool_activity_summary(activity: &[ToolActivity]) -> Option<String> {
+pub(crate) fn tool_activity_summary(activity: &[ToolActivity]) -> Option<String> {
     if activity.is_empty() {
         return None;
     }
