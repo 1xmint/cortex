@@ -286,9 +286,16 @@ async fn logs_never_contain_a_submitted_key() {
     drop(_dispatch_guard);
     let captured =
         String::from_utf8_lossy(&buf.lock().unwrap_or_else(|e| e.into_inner())).into_owned();
+    // The request-id middleware logs every response, so an empty capture
+    // means the subscriber saw nothing and the check below would prove nothing.
+    assert!(
+        captured.contains("request completed"),
+        "log capture saw nothing"
+    );
     assert!(
         !captured.contains("SECRETSECRET"),
-        "submitted key leaked into logs: {captured}"
+        "submitted key leaked into logs ({} bytes captured)",
+        captured.len()
     );
 
     clear_kek();
