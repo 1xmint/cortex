@@ -171,8 +171,8 @@ fn literal_manifest_exactly_matches_cortex_router() {
     let manifest = contracts();
     assert_eq!(
         manifest.len(),
-        102,
-        "cortex-standalone keeps 87 cortex + 15 duplicate routes"
+        105,
+        "cortex-standalone keeps 90 cortex + 15 duplicate routes"
     );
     assert_eq!(
         manifest
@@ -180,7 +180,7 @@ fn literal_manifest_exactly_matches_cortex_router() {
             .map(|contract| contract.path.as_str())
             .collect::<BTreeSet<_>>()
             .len(),
-        102,
+        105,
         "every path template must have exactly one owner"
     );
     assert_eq!(
@@ -188,7 +188,7 @@ fn literal_manifest_exactly_matches_cortex_router() {
             .iter()
             .filter(|contract| contract.owner == Owner::Cortex)
             .count(),
-        87
+        90
     );
     assert_eq!(
         manifest

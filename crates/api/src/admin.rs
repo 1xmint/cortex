@@ -675,3 +675,394 @@ pub async fn list_redemptions(
     let total = redemptions.len();
     Ok(Json(RedemptionListResponse { redemptions, total }))
 }
+
+// ─── Provider Gateway Holds ─────────────────────────────────────────────────
+//
+// Operator visibility into `provider_request_reservations` rows stuck
+// `reserved` or `unresolved` (see `crates/api/src/db/provider_gateway.rs`).
+// This is read/manual-resolve only — nothing here reconciles against a
+// supplier's own usage report; that remains a human decision until a report
+// pipeline exists.
+
+#[derive(Deserialize)]
+pub struct ProviderHoldsQuery {
+    #[serde(default = "default_provider_holds_limit")]
+    pub limit: i64,
+}
+
+fn default_provider_holds_limit() -> i64 {
+    50
+}
+
+pub async fn get_provider_holds(
+    State(state): State<Arc<AppState>>,
+    user: ClerkUser,
+    Query(query): Query<ProviderHoldsQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    authorize_admin(&state, &user).await?;
+    let db = state.db.as_ref().ok_or((
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(ErrorResponse {
+            error: "database unavailable".into(),
+        }),
+    ))?;
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let summary = db.provider_holds_summary(now_ms, query.limit);
+    Ok(Json(serde_json::json!({
+        "reserved_count": summary.reserved_count,
+        "reserved_total_micro_usd": summary.reserved_total_micro_usd,
+        "unresolved_count": summary.unresolved_count,
+        "unresolved_total_micro_usd": summary.unresolved_total_micro_usd,
+        "mismatch_count": summary.mismatch_count,
+        "oldest_age_ms": summary.oldest_age_ms,
+        "funded_total_micro_usd": summary.funded_total_micro_usd,
+        "over_threshold": summary.over_threshold,
+        "rows": summary.rows,
+    })))
+}
+
+#[derive(Deserialize)]
+pub struct SettleHoldRequest {
+    pub amount_micro_usd: i64,
+    pub reason: String,
+}
+
+#[derive(Deserialize)]
+pub struct ReleaseHoldRequest {
+    pub reason: String,
+}
+
+/// A hold's amount must be checked against its current reserved amount
+/// before settling; this reads the row outside any transaction purely to
+/// validate the request shape early (empty reason, out-of-range amount)
+/// with a 400 rather than a 409. The actual "is this row still resolvable"
+/// check happens again, atomically with the write, in
+/// `admin_settle_provider_hold`/`admin_release_provider_hold` — this lookup
+/// is not relied on for correctness, only for a friendlier error on garbage
+/// input.
+fn find_hold_for_validation(
+    db: &crate::db::Database,
+    request_key: &str,
+) -> Result<crate::db::ProviderReservation, (StatusCode, Json<ErrorResponse>)> {
+    db.get_provider_reservation(request_key).ok_or((
+        StatusCode::NOT_FOUND,
+        Json(ErrorResponse {
+            error: "provider hold not found".into(),
+        }),
+    ))
+}
+
+fn admin_hold_error_response(
+    error: crate::db::AdminHoldError,
+) -> (StatusCode, Json<ErrorResponse>) {
+    match error {
+        crate::db::AdminHoldError::NotFound => (
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: "provider hold not found".into(),
+            }),
+        ),
+        crate::db::AdminHoldError::Conflict(message) => {
+            (StatusCode::CONFLICT, Json(ErrorResponse { error: message }))
+        }
+    }
+}
+
+pub async fn settle_provider_hold(
+    State(state): State<Arc<AppState>>,
+    user: ClerkUser,
+    Path(request_key): Path<String>,
+    Json(req): Json<SettleHoldRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    authorize_admin(&state, &user).await?;
+    let db = state.db.as_ref().ok_or((
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(ErrorResponse {
+            error: "database unavailable".into(),
+        }),
+    ))?;
+    if req.reason.trim().is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "reason is required".into(),
+            }),
+        ));
+    }
+    let reservation = find_hold_for_validation(db, &request_key)?;
+    if req.amount_micro_usd < 0 || req.amount_micro_usd > reservation.reserved_micro_usd {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: format!(
+                    "amount_micro_usd must be between 0 and the reserved amount ({})",
+                    reservation.reserved_micro_usd
+                ),
+            }),
+        ));
+    }
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let (prior, updated) = db
+        .admin_settle_provider_hold(&request_key, req.amount_micro_usd, None, now_ms)
+        .map_err(admin_hold_error_response)?;
+    db.audit_log(
+        &user.user_id,
+        "admin",
+        "provider_hold_settle",
+        Some("provider_request_reservation"),
+        Some(&request_key),
+        Some(
+            &serde_json::json!({
+                "amount_micro_usd": req.amount_micro_usd,
+                "reason": req.reason,
+                "reserved_micro_usd": prior.reserved_micro_usd,
+                "prior_status": prior.status,
+            })
+            .to_string(),
+        ),
+        None,
+    );
+    tracing::warn!(
+        admin = %user.user_id,
+        request_key = %request_key,
+        amount_micro_usd = req.amount_micro_usd,
+        reason = %req.reason,
+        "admin manually settled a provider gateway hold"
+    );
+    Ok(Json(serde_json::json!({
+        "request_key": updated.request_key,
+        "status": updated.status,
+        "observed_micro_usd": updated.observed_micro_usd,
+    })))
+}
+
+pub async fn release_provider_hold(
+    State(state): State<Arc<AppState>>,
+    user: ClerkUser,
+    Path(request_key): Path<String>,
+    Json(req): Json<ReleaseHoldRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    authorize_admin(&state, &user).await?;
+    let db = state.db.as_ref().ok_or((
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(ErrorResponse {
+            error: "database unavailable".into(),
+        }),
+    ))?;
+    if req.reason.trim().is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "reason is required".into(),
+            }),
+        ));
+    }
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let (prior, updated) = db
+        .admin_release_provider_hold(&request_key, &req.reason, now_ms)
+        .map_err(admin_hold_error_response)?;
+    db.audit_log(
+        &user.user_id,
+        "admin",
+        "provider_hold_release",
+        Some("provider_request_reservation"),
+        Some(&request_key),
+        Some(
+            &serde_json::json!({
+                "reason": req.reason,
+                "reserved_micro_usd": prior.reserved_micro_usd,
+                "prior_status": prior.status,
+            })
+            .to_string(),
+        ),
+        None,
+    );
+    tracing::warn!(
+        admin = %user.user_id,
+        request_key = %request_key,
+        reason = %req.reason,
+        "admin manually released a provider gateway hold"
+    );
+    Ok(Json(serde_json::json!({
+        "request_key": updated.request_key,
+        "status": updated.status,
+    })))
+}
+
+#[cfg(test)]
+mod provider_holds_tests {
+    use super::*;
+    use crate::db::SpendAuthorization;
+    use crate::provider_gateway::GatewayCapability;
+
+    const NOW: i64 = 1_800_000_000_000;
+
+    /// Real `AppState` (own tempdir, own sqlite database), same shortcut
+    /// `agent_confirm::tests::test_state` uses. No `clerk_secret_key`, so
+    /// `authorize_admin`'s local-dev bypass applies and any `ClerkUser` is
+    /// treated as an admin -- fine for exercising the handlers' own
+    /// validation logic directly, without going through the router.
+    async fn test_state() -> (tempfile::TempDir, std::sync::Arc<AppState>) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".cortex")).unwrap();
+        let state = AppState::new(
+            dir.path().join(".cortex/ledger.jsonl"),
+            dir.path().to_path_buf(),
+            None,
+        )
+        .await;
+        (dir, state)
+    }
+
+    fn admin_user() -> ClerkUser {
+        ClerkUser {
+            user_id: "admin-1".into(),
+        }
+    }
+
+    fn reserve(db: &crate::db::Database, request_key: &str) {
+        let price_list_id = db.active_price_list().unwrap().id;
+        db.set_supplier_capacity("claude", 1_000_000, NOW).ok();
+        let authorization = SpendAuthorization {
+            id: format!("auth-{request_key}"),
+            user_id: "tenant-1".into(),
+            run_id: "run-1".into(),
+            attempt_id: "attempt-1".into(),
+            provider: "claude".into(),
+            model: "claude-sonnet-5".into(),
+            price_list_id,
+            max_micro_usd: 1_000_000,
+            expires_at_ms: NOW + 60_000,
+        };
+        db.create_spend_authorization(&authorization, NOW).unwrap();
+        let claims = GatewayCapability::new(
+            authorization.id,
+            authorization.user_id,
+            authorization.run_id,
+            authorization.attempt_id,
+            authorization.provider,
+            authorization.model,
+            authorization.expires_at_ms,
+        );
+        db.reserve_provider_request(&claims, request_key, "digest", 1_000, NOW)
+            .unwrap();
+    }
+
+    fn settle_req(amount_micro_usd: i64, reason: &str) -> SettleHoldRequest {
+        SettleHoldRequest {
+            amount_micro_usd,
+            reason: reason.to_string(),
+        }
+    }
+
+    fn release_req(reason: &str) -> ReleaseHoldRequest {
+        ReleaseHoldRequest {
+            reason: reason.to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn settle_rejects_empty_or_whitespace_reason_with_400() {
+        let (_dir, state) = test_state().await;
+        let db = state.db.as_ref().unwrap();
+        reserve(db, "chat:a");
+
+        for reason in ["", "   "] {
+            let result = settle_provider_hold(
+                State(state.clone()),
+                admin_user(),
+                Path("chat:a".into()),
+                Json(settle_req(500, reason)),
+            )
+            .await;
+            let err = result.unwrap_err();
+            assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        }
+    }
+
+    #[tokio::test]
+    async fn settle_rejects_out_of_range_amount_with_400() {
+        let (_dir, state) = test_state().await;
+        let db = state.db.as_ref().unwrap();
+        reserve(db, "chat:a");
+
+        let too_low = settle_provider_hold(
+            State(state.clone()),
+            admin_user(),
+            Path("chat:a".into()),
+            Json(settle_req(-1, "operator review")),
+        )
+        .await;
+        assert_eq!(too_low.unwrap_err().0, StatusCode::BAD_REQUEST);
+
+        let too_high = settle_provider_hold(
+            State(state.clone()),
+            admin_user(),
+            Path("chat:a".into()),
+            Json(settle_req(1_001, "operator review")),
+        )
+        .await;
+        assert_eq!(too_high.unwrap_err().0, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn settle_on_an_already_settled_row_is_409_unchanged_and_unaudited() {
+        let (_dir, state) = test_state().await;
+        let db = state.db.as_ref().unwrap();
+        reserve(db, "chat:a");
+        db.settle_provider_request("chat:a", 500, None, NOW + 1)
+            .unwrap();
+
+        let result = settle_provider_hold(
+            State(state.clone()),
+            admin_user(),
+            Path("chat:a".into()),
+            Json(settle_req(500, "operator review")),
+        )
+        .await;
+        assert_eq!(result.unwrap_err().0, StatusCode::CONFLICT);
+
+        let row = db.get_provider_reservation("chat:a").unwrap();
+        assert_eq!(row.status, "settled");
+        assert_eq!(row.observed_micro_usd, Some(500));
+
+        let entries = db.get_audit_log(50, 0);
+        assert!(
+            entries.iter().all(|e| e.action != "provider_hold_settle"),
+            "a conflicting settle attempt must not write an audit row"
+        );
+    }
+
+    #[tokio::test]
+    async fn release_writes_exactly_one_audit_row_with_actor_reason_and_amount() {
+        let (_dir, state) = test_state().await;
+        let db = state.db.as_ref().unwrap();
+        reserve(db, "chat:a");
+
+        let result = release_provider_hold(
+            State(state.clone()),
+            admin_user(),
+            Path("chat:a".into()),
+            Json(release_req("stuck after crash")),
+        )
+        .await;
+        assert!(result.is_ok());
+
+        let row = db.get_provider_reservation("chat:a").unwrap();
+        assert_eq!(row.status, "released");
+
+        let entries: Vec<_> = db
+            .get_audit_log(50, 0)
+            .into_iter()
+            .filter(|e| e.action == "provider_hold_release")
+            .collect();
+        assert_eq!(entries.len(), 1, "exactly one audit row for the release");
+        let entry = &entries[0];
+        assert_eq!(entry.user_id, "admin-1");
+        let details: serde_json::Value =
+            serde_json::from_str(entry.metadata.as_deref().unwrap()).unwrap();
+        assert_eq!(details["reason"], "stuck after crash");
+        assert_eq!(details["reserved_micro_usd"], 1_000);
+        assert_eq!(details["prior_status"], "reserved");
+    }
+}

@@ -503,6 +503,15 @@ pub fn build_cortex_router(state: Arc<AppState>) -> Router {
         .route("/api/admin/audit-log", get(admin::get_audit_log))
         .route("/api/admin/containers", get(admin::list_containers))
         .route("/api/admin/containers/stats", get(admin::container_stats))
+        .route("/api/admin/provider-holds", get(admin::get_provider_holds))
+        .route(
+            "/api/admin/provider-holds/{request_key}/settle",
+            post(admin::settle_provider_hold),
+        )
+        .route(
+            "/api/admin/provider-holds/{request_key}/release",
+            post(admin::release_provider_hold),
+        )
         .layer(middleware::from_fn_with_state(
             state.clone(),
             admin::require_admin_middleware,
