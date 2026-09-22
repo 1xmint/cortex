@@ -6,6 +6,7 @@ pub mod billing;
 pub mod byok;
 mod chat;
 mod chat_paid;
+mod chat_zen;
 pub mod clerk;
 mod context_api;
 // Public because tests/context_flow_integration_test.rs exercises it as a
@@ -433,6 +434,7 @@ pub fn build_cortex_router(state: Arc<AppState>) -> Router {
         )
         .route("/api/chat/suggestions", get(chat::chat_suggestions))
         .route("/api/chat/options", post(chat::chat_options))
+        .route("/api/chat/models", get(chat::chat_models))
         .route(
             "/api/conversations",
             post(conversations::create_conversation),

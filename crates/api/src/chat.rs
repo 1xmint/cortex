@@ -1,9 +1,11 @@
 use std::convert::Infallible;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use axum::extract::State;
 use axum::http::StatusCode;
-use axum::response::sse::{Event, KeepAlive, Sse};
+use axum::response::sse::{Event, KeepAlive, KeepAliveStream, Sse};
+use axum::response::{IntoResponse, Response};
 use axum::Json;
 use futures_core::Stream;
 use serde::Deserialize;
@@ -17,7 +19,14 @@ use crate::clerk::ClerkUser;
 use crate::routes::ErrorResponse;
 use crate::state::{AppState, StepEvent};
 
-fn step_event_to_sse(event: StepEvent) -> Result<Event, Infallible> {
+/// Both the Claude-tier path (below) and the Zen BYOK path
+/// (`chat_zen::chat`) build their SSE stream from `step_event_to_sse`, but
+/// each `async fn` gets its own anonymous `impl Stream` type -- boxing here
+/// is what lets `chat()` return either one from a single function signature.
+pub(crate) type BoxedSseStream =
+    KeepAliveStream<Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>>>;
+
+pub(crate) fn step_event_to_sse(event: StepEvent) -> Result<Event, Infallible> {
     let data = serde_json::to_string(&event).unwrap_or_default();
     Ok(Event::default().data(data))
 }
@@ -42,6 +51,11 @@ pub struct ChatRequest {
     pub conversation_id: Option<String>,
     #[serde(default)]
     pub routing_preferences: Option<RoutingPreferences>,
+    /// `"zen:<model>"` to route this turn to an OpenCode Zen model on the
+    /// customer's own key (see `chat_zen.rs`). Absent means exactly today's
+    /// Claude-tier behaviour -- this field changes nothing when it is `None`.
+    #[serde(default)]
+    pub model: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, serde::Serialize)]
@@ -127,14 +141,15 @@ pub async fn chat(
     State(state): State<Arc<AppState>>,
     user: ClerkUser,
     Json(req): Json<ChatRequest>,
-) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, (StatusCode, Json<ErrorResponse>)> {
+) -> Result<Sse<BoxedSseStream>, Response> {
     if req.message.len() > MAX_MESSAGE_LEN {
         return Err((
             StatusCode::PAYLOAD_TOO_LARGE,
             Json(ErrorResponse {
                 error: format!("message exceeds {MAX_MESSAGE_LEN} bytes"),
             }),
-        ));
+        )
+            .into_response());
     }
     if req.file_paths.len() > MAX_FILE_PATHS {
         return Err((
@@ -142,18 +157,33 @@ pub async fn chat(
             Json(ErrorResponse {
                 error: format!("too many file paths (max {MAX_FILE_PATHS})"),
             }),
-        ));
+        )
+            .into_response());
     }
     let _file_paths = crate::validate::sanitize_file_paths(&req.file_paths)
-        .map_err(|e| (StatusCode::BAD_REQUEST, Json(ErrorResponse { error: e })))?;
+        .map_err(|e| (StatusCode::BAD_REQUEST, Json(ErrorResponse { error: e })).into_response())?;
 
     if let Some(blocked) = crate::billing::check_chat_access(&state, &user.user_id) {
         return Err((StatusCode::PAYMENT_REQUIRED, Json(ErrorResponse {
             error: format!("Subscription required to access chat. Status: {blocked:?}. Go to Settings → Billing to subscribe."),
-        })));
+        })).into_response());
     }
 
     let intent = classify_intent(&req.message);
+
+    // Zen BYOK: a completely separate path from everything below (D3 in the
+    // BYOK plan) -- it never falls through to `ProviderPath::Cortex`, so
+    // Cortex never spends its own money when a customer has no Zen key.
+    if let Some(zen_model) = req
+        .model
+        .as_deref()
+        .and_then(|m| m.strip_prefix("zen:"))
+        .map(str::to_string)
+    {
+        let system_prompt = system_prompt_for_intent(intent).to_string();
+        return crate::chat_zen::chat(State(state), user, req, zen_model, system_prompt).await;
+    }
+
     let (tx, rx) = mpsc::channel::<StepEvent>(64);
 
     let model_tier = req
@@ -285,8 +315,80 @@ pub async fn chat(
     }
 
     let stream = ReceiverStream::new(rx).map(step_event_to_sse);
+    let boxed: Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>> = Box::pin(stream);
 
-    Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
+    Ok(Sse::new(boxed).keep_alive(KeepAlive::default()))
+}
+
+/// `GET /api/chat/models`: the Claude tiers (always available, billed to
+/// Cortex credits) plus the OpenCode Zen models (D4 in the BYOK plan),
+/// billed to the customer's own key. The server is the authority on whether
+/// a Zen model is actually usable -- `chat_zen::chat` re-checks the same key
+/// state and refuses even if a stale client sends a Zen model this response
+/// marked unavailable.
+pub async fn chat_models(
+    State(state): State<Arc<AppState>>,
+    user: ClerkUser,
+) -> Json<ModelsResponse> {
+    let mut models = Vec::new();
+    for tier in ["fast", "balanced", "powerful"] {
+        models.push(ModelEntry {
+            provider: "claude".into(),
+            model: crate::chat_paid::model_for_tier(Some(tier)).into(),
+            label: tier.into(),
+            billing: "credits".into(),
+            available: true,
+            unavailable_reason: None,
+        });
+    }
+
+    let byok_enabled = crate::byok::KekRing::enabled();
+    let key_status: Option<String> = if byok_enabled {
+        state
+            .db
+            .as_ref()
+            .and_then(|db| db.get_provider_key_row(&user.user_id, "zen"))
+            .map(|row| row.status)
+    } else {
+        None
+    };
+
+    for model in crate::supplier_zen::allowed_models() {
+        let (available, reason) = if !byok_enabled {
+            (false, Some("byok_disabled"))
+        } else {
+            match key_status.as_deref() {
+                Some("active") => (true, None),
+                Some("rejected") => (false, Some("key_rejected")),
+                _ => (false, Some("needs_key")),
+            }
+        };
+        models.push(ModelEntry {
+            provider: "zen".into(),
+            model: (*model).to_string(),
+            label: (*model).to_string(),
+            billing: "your_zen_key".into(),
+            available,
+            unavailable_reason: reason.map(str::to_string),
+        });
+    }
+
+    Json(ModelsResponse { models })
+}
+
+#[derive(serde::Serialize)]
+pub struct ModelEntry {
+    pub provider: String,
+    pub model: String,
+    pub label: String,
+    pub billing: String,
+    pub available: bool,
+    pub unavailable_reason: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+pub struct ModelsResponse {
+    pub models: Vec<ModelEntry>,
 }
 
 /// GET /api/chat/suggestions

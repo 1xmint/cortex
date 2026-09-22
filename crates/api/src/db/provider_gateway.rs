@@ -204,6 +204,47 @@ impl Database {
         read_reservation(&conn, request_key)
     }
 
+    /// Record one Zen BYOK reply for analytics only: `cost_type = 'byok'`,
+    /// `cost_micro_usd = 0` always, because the customer paid Zen directly
+    /// and Cortex paid nothing (D1/A1 in the BYOK plan). Deliberately writes
+    /// to `provider_spend` and nothing else on this path -- no
+    /// `provider_request_reservations` row, no `provider_spend_authorizations`
+    /// row, no `credit_transactions` row.
+    ///
+    /// `id` is `"byok:{reply_id}"`; `INSERT OR IGNORE` makes a retried insert
+    /// for the same reply idempotent rather than double-counted.
+    #[allow(clippy::too_many_arguments)]
+    pub fn insert_byok_usage(
+        &self,
+        reply_id: &str,
+        user_id: &str,
+        conversation_id: Option<&str>,
+        model: &str,
+        tokens_in: i64,
+        tokens_out: i64,
+        tokens_cached_in: i64,
+        now_ms: i64,
+    ) {
+        let conn = self.conn();
+        conn.execute(
+            "INSERT OR IGNORE INTO provider_spend
+                (id, user_id, run_id, step_id, provider, model, cost_type,
+                 tokens_in, tokens_out, tokens_cached_in, cost_micro_usd, created_at)
+             VALUES (?1, ?2, ?3, NULL, 'zen', ?4, 'byok', ?5, ?6, ?7, 0, ?8)",
+            params![
+                format!("byok:{reply_id}"),
+                user_id,
+                conversation_id,
+                model,
+                tokens_in,
+                tokens_out,
+                tokens_cached_in,
+                now_ms,
+            ],
+        )
+        .expect("insert byok provider_spend row");
+    }
+
     pub fn set_supplier_capacity(
         &self,
         provider: &str,

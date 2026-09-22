@@ -20,15 +20,6 @@
 //! else there is refused rather than silently downgraded, so nothing can
 //! spend past what the gateway reserved.
 
-// This module has no production caller yet: the Cortex-funded gateway path
-// that used to call it was removed (Zen is BYOK-only, never Cortex-funded),
-// and the BYOK chat path that will call it directly is `chat_zen.rs`, a
-// later step (M-D-0003). `ZenTransport::new` and `ZEN_BASE_URL` are dead in
-// both the lib and test builds — `mod tests` below exercises
-// `ZenTransport::with_base_url(..).forward(..)` directly, never `new()` —
-// so `expect` is satisfiable rather than a blanket `allow`.
-#![expect(dead_code, reason = "wired by chat_zen.rs in M-D-0003")]
-
 use std::future::Future;
 use std::time::Duration;
 
@@ -74,6 +65,14 @@ const ALLOWED_MODELS: &[&str] = &[
     "kimi-k2.6",
     "kimi-k2.5",
 ];
+
+/// The Zen `/chat/completions` models `chat_zen.rs` may offer and call.
+/// Exposed so the models picker (`GET /api/chat/models`) and the chat
+/// handler's pre-call allowlist check share this one list with the
+/// transport's own refusal in `forward` — no second place to keep in sync.
+pub(crate) fn allowed_models() -> &'static [&'static str] {
+    ALLOWED_MODELS
+}
 
 #[derive(Clone)]
 pub(crate) struct ZenTransport {
