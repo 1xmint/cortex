@@ -412,7 +412,7 @@ fn tool_uses(body: &Value) -> Vec<(String, String, Value)> {
 ///
 /// One charge per reply, not one per turn: every turn's observed cost is
 /// summed and settled in a single ledger line at the end (see the
-/// `deduct_credits_up_to` call below), even when a reply that used three
+/// `deduct_credits_up_to` call below), even for a reply that took three
 /// turns to answer. Before each turn this checks that the user's balance
 /// still covers a reservation and that the conversation has not spent its
 /// per-minute turn allowance (`CORTEX_CHAT_AGENT_TURN_CAP_PER_MINUTE`,
@@ -1344,8 +1344,9 @@ mod tests {
         let (_dir, db) = test_db();
         db.init_credit_balance("user-1", 1_000_000).unwrap();
         // The model calls a tool every turn but the last: the last turn is
-        // sent with no tools at all (see `send_paid_reply`), so a real model
-        // has nothing to call and must answer in text instead.
+        // sent with `tool_choice: none` (see `send_paid_reply`), so a real
+        // model still sees the tools but cannot call one and must answer in
+        // text instead.
         let mut responses: Vec<_> = (1..MAX_AGENT_TURNS)
             .map(|_| tool_use_response(10, 10, "toolu_1", "list_runs", serde_json::json!({})))
             .collect();
@@ -1379,7 +1380,7 @@ mod tests {
         assert_eq!(reply.tool_activity.len(), (MAX_AGENT_TURNS - 1) as usize);
         assert!(
             !reply.text.is_empty(),
-            "the final, tool-less turn must produce a text answer"
+            "the final turn, which cannot call a tool, must produce a text answer"
         );
 
         // The last turn's history contains tool_use/tool_result blocks, so
@@ -1759,7 +1760,7 @@ mod tests {
 
         let price_list = db.active_price_list().unwrap();
         let rate = price_list.model("claude", MODEL).unwrap();
-        let observed_micros = rate.cost_micros(500, 0, 500);
+        let observed_micros = rate.cost_micros(100_000, 0, 100_000);
         let expected_credits = ceil_div(observed_micros, price_list.micros_per_credit);
         assert!(
             expected_credits > 1,
@@ -1771,8 +1772,8 @@ mod tests {
             user_id: "user-1",
             leave_remaining: 1,
             response_text: "hello there",
-            input_tokens: 500,
-            output_tokens: 500,
+            input_tokens: 100_000,
+            output_tokens: 100_000,
         };
 
         // The turn-1 reservation cap is based on the balance at loop start
@@ -1917,11 +1918,8 @@ mod tests {
 
         let (result_a, result_b) = tokio::join!(fut_a, fut_b);
 
-        assert!(result_a.is_ok(), "first reply should succeed: {result_a:?}");
-        assert!(
-            result_b.is_ok(),
-            "second reply should succeed: {result_b:?}"
-        );
+        let reply_a = result_a.expect("first reply should succeed");
+        let reply_b = result_b.expect("second reply should succeed");
         assert_eq!(
             transport.max_in_flight.load(Ordering::SeqCst),
             1,
@@ -1931,9 +1929,15 @@ mod tests {
         let balance = db.get_credit_balance_row("user-1").unwrap();
         let total_charged =
             initial_balance - (balance.subscription_remaining + balance.pack_remaining);
-        assert!(
-            total_charged <= initial_balance,
-            "total charged ({total_charged}) must never exceed the starting balance ({initial_balance})"
+        assert_eq!(
+            total_charged,
+            per_reply_credits * 2,
+            "each reply should be charged exactly its own cost, with nothing left over or overspent"
+        );
+        assert_eq!(
+            reply_a.charged_credits + reply_b.charged_credits,
+            total_charged,
+            "the sum of what each reply reports charging must match the actual balance delta"
         );
     }
 }

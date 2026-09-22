@@ -1395,4 +1395,70 @@ mod tests {
             .is_err());
         assert_eq!(db.credit_ledger_totals(user), (0, 0));
     }
+
+    #[test]
+    fn deduct_credits_up_to_replay_of_the_same_key_charges_nothing_twice() {
+        // Same idempotency-key protection as `deduct_credits`: a retried
+        // final charge must not double-spend.
+        let db = test_db();
+        let user = subscriber(&db, 100);
+        let key = ChargeKey::for_chat_reply("reply-1");
+
+        let first = db
+            .deduct_credits_up_to(user, 30, "work", &key)
+            .expect("first charge");
+        assert_eq!(first, 30);
+
+        let second = db
+            .deduct_credits_up_to(user, 30, "work", &key)
+            .expect("replayed charge");
+        assert_eq!(second, 0, "a replayed key must charge nothing further");
+
+        let balance = db.get_credit_balance_row(user).expect("balance row");
+        assert_eq!(
+            balance.subscription_remaining, 70,
+            "the balance must reflect only the first charge"
+        );
+    }
+
+    #[test]
+    fn deduct_credits_up_to_draws_the_subscription_bucket_before_the_pack() {
+        let db = test_db();
+        let user = subscriber(&db, 20);
+        db.add_pack_credits(user, 50).expect("pack");
+
+        let charged = db
+            .deduct_credits_up_to(user, 40, "work", &ChargeKey::for_chat_reply("reply-2"))
+            .expect("charge");
+        assert_eq!(charged, 40, "enough credit exists across both buckets");
+
+        let balance = db.get_credit_balance_row(user).expect("balance row");
+        assert_eq!(
+            balance.subscription_remaining, 0,
+            "the expiring bucket is drained first"
+        );
+        assert_eq!(
+            balance.pack_remaining, 30,
+            "only the remainder after the subscription spills into the pack"
+        );
+    }
+
+    #[test]
+    fn deduct_credits_up_to_clamps_to_the_total_balance_instead_of_failing() {
+        let db = test_db();
+        let user = subscriber(&db, 10);
+        db.add_pack_credits(user, 5).expect("pack");
+
+        let charged = db
+            .deduct_credits_up_to(user, 1_000, "work", &ChargeKey::for_chat_reply("reply-3"))
+            .expect("charge");
+        assert_eq!(
+            charged, 15,
+            "the charge is clamped to whatever was actually available"
+        );
+
+        let balance = db.get_credit_balance_row(user).expect("balance row");
+        assert_eq!(balance.subscription_remaining, 0);
+        assert_eq!(balance.pack_remaining, 0);
+    }
 }
