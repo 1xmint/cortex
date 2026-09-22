@@ -47,6 +47,7 @@ pub mod soma;
 #[cfg(feature = "soma")]
 mod soma_bridge;
 pub mod soma_fence;
+mod spoken_confirm;
 pub mod state;
 pub mod storage;
 
