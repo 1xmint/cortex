@@ -230,7 +230,7 @@ pub fn decrypt(
     user_id: &str,
     provider: &str,
     encrypted: &EncryptedKey,
-) -> Result<String, ByokError> {
+) -> Result<ZenApiKey, ByokError> {
     let key_bytes = KekRing::load(encrypted.key_version)?;
     let key: &Key<Aes256Gcm> = &key_bytes.into();
     let cipher = Aes256Gcm::new(key);
@@ -254,7 +254,9 @@ pub fn decrypt(
         )
         .map_err(|_| ByokError::DecryptFailed)?;
 
-    String::from_utf8(plaintext).map_err(|_| ByokError::DecryptFailed)
+    String::from_utf8(plaintext)
+        .map(ZenApiKey::new)
+        .map_err(|_| ByokError::DecryptFailed)
 }
 
 /// Re-encrypt a row under the current KEK version if it is not already
@@ -287,13 +289,21 @@ pub fn validate_key_format(candidate: &str) -> Result<(), &'static str> {
 /// Bounded and idempotent: a row already at the current version is skipped,
 /// so running this at every startup costs nothing once a fleet has finished
 /// rotating. It does nothing (`current_version` is `None`) when BYOK is off.
+///
+/// A row that fails to decrypt or re-encrypt is left as-is (for the customer
+/// to re-enter their key) rather than failing the whole batch; the number of
+/// such rows is logged here — never the row's user, provider, or key
+/// material — so a stuck rotation is visible instead of silently skipped.
 pub fn rewrap_provider_keys(db: &crate::db::Database) -> Result<HashMap<String, usize>, ByokError> {
     let Some(current) = KekRing::current_version() else {
         return Ok(HashMap::new());
     };
     let rows = db.list_provider_key_rows_needing_rewrap(current);
     let mut rewrapped: HashMap<String, usize> = HashMap::new();
+    let mut skipped: usize = 0;
     for row in rows {
+        let old_version = row.key_version;
+        let old_nonce = row.nonce.clone();
         let encrypted = EncryptedKey {
             key_version: row.key_version,
             nonce: row.nonce.clone(),
@@ -301,29 +311,51 @@ pub fn rewrap_provider_keys(db: &crate::db::Database) -> Result<HashMap<String, 
         };
         let plaintext = match decrypt(&row.user_id, &row.provider, &encrypted) {
             Ok(p) => p,
-            Err(_) => continue, // unreadable under any KEK we have; leave it for the customer to re-enter
+            Err(_) => {
+                // Unreadable under any KEK we have; leave it for the
+                // customer to re-enter.
+                skipped += 1;
+                continue;
+            }
         };
-        if let Ok(fresh) = encrypt(&row.user_id, &row.provider, &plaintext) {
-            db.rewrap_provider_key_row(&row.user_id, &row.provider, &fresh);
-            *rewrapped.entry(row.provider.clone()).or_insert(0) += 1;
+        match encrypt(&row.user_id, &row.provider, plaintext.expose_secret()) {
+            Ok(fresh) => {
+                db.rewrap_provider_key_row(
+                    &row.user_id,
+                    &row.provider,
+                    old_version,
+                    &old_nonce,
+                    &fresh,
+                );
+                *rewrapped.entry(row.provider.clone()).or_insert(0) += 1;
+            }
+            Err(_) => skipped += 1,
         }
+    }
+    if skipped > 0 {
+        tracing::warn!(
+            skipped,
+            "BYOK rewrap: rows skipped (decrypt/encrypt failed)"
+        );
     }
     Ok(rewrapped)
 }
 
+// Environment variables are process-global, and cargo runs unit tests across
+// this crate's whole test binary (including `db::provider_keys::tests`) on
+// multiple threads by default — two tests racing to set different
+// `CORTEX_BYOK_KEK_*` vars would be flaky. One lock, shared by every test
+// module that touches these vars, so two locks in the same binary can't fail
+// to exclude each other.
+#[cfg(test)]
+pub(crate) static BYOK_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
-
-    // Environment variables are process-global, and cargo runs unit tests in
-    // this crate on multiple threads by default — two tests racing to set
-    // different `CORTEX_BYOK_KEK_*` vars would be flaky. Serialize the ones
-    // that touch env with this lock.
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn with_test_kek<T>(f: impl FnOnce() -> T) -> T {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = BYOK_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("CORTEX_BYOK_KEK_V1", STANDARD.encode([7u8; 32]));
         std::env::set_var("CORTEX_BYOK_KEK_CURRENT", "1");
         let result = f();
@@ -343,7 +375,21 @@ mod tests {
                 .windows(plaintext.len())
                 .any(|w| w == plaintext.as_bytes()));
             let dec = decrypt("user-a", "zen", &enc).expect("decrypt");
-            assert_eq!(dec, plaintext);
+            assert_eq!(dec.expose_secret(), plaintext);
+        });
+    }
+
+    #[test]
+    fn encrypting_twice_uses_a_fresh_nonce_and_ciphertext() {
+        with_test_kek(|| {
+            let plaintext = "zen-test-SECRETSECRET1234";
+            let first = encrypt("user-a", "zen", plaintext).expect("encrypt 1");
+            let second = encrypt("user-a", "zen", plaintext).expect("encrypt 2");
+            assert_ne!(first.nonce, second.nonce, "nonces must not repeat");
+            assert_ne!(
+                first.ciphertext, second.ciphertext,
+                "ciphertexts must differ across independent encryptions"
+            );
         });
     }
 
@@ -367,7 +413,7 @@ mod tests {
 
     #[test]
     fn no_kek_means_not_configured() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = BYOK_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::remove_var("CORTEX_BYOK_KEK_V1");
         std::env::remove_var("CORTEX_BYOK_KEK_CURRENT");
         assert!(!KekRing::enabled());
@@ -386,11 +432,11 @@ mod tests {
 
             assert!(should_rewrap(old.key_version, 2));
             let plaintext = decrypt("user-a", "zen", &old).expect("v1 key still readable");
-            let fresh = encrypt("user-a", "zen", &plaintext).expect("encrypt v2");
+            let fresh = encrypt("user-a", "zen", plaintext.expose_secret()).expect("encrypt v2");
             assert_eq!(fresh.key_version, 2);
             assert!(!should_rewrap(fresh.key_version, 2));
             let dec = decrypt("user-a", "zen", &fresh).expect("decrypt v2");
-            assert_eq!(dec, plaintext);
+            assert_eq!(dec.expose_secret(), plaintext.expose_secret());
         });
     }
 

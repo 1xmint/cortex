@@ -6,6 +6,8 @@
 //! runs as its own process, so these cannot leak into the library's unit
 //! tests or into other integration test binaries.
 
+use std::sync::Mutex;
+
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
 use base64::{engine::general_purpose::STANDARD, Engine};
@@ -13,6 +15,13 @@ use http_body_util::BodyExt;
 use tower::ServiceExt;
 
 use cortex_api::state::AppState;
+
+// These 4 tests run as separate `#[tokio::test]` tasks and all set or clear
+// process-global `CORTEX_BYOK_KEK_*` / `CORTEX_AUTH_DISABLED` env vars —
+// racing without a shared lock would be flaky. Each `#[tokio::test]` is its
+// own current-thread runtime, so holding a std `Mutex` guard across `.await`
+// here cannot deadlock another task's executor.
+static ENV_LOCK: Mutex<()> = Mutex::new(());
 
 fn set_test_kek() {
     std::env::set_var("CORTEX_BYOK_KEK_V1", STANDARD.encode([11u8; 32]));
@@ -72,7 +81,9 @@ async fn json_body(response: axum::response::Response) -> serde_json::Value {
 /// Save then list: the list response carries only `last4`, never the
 /// submitted key, and the key value appears nowhere in the response bytes.
 #[tokio::test]
+#[allow(clippy::await_holding_lock)] // guard held across .await is fine: each test is its own current-thread runtime
 async fn put_then_get_returns_only_last4() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     set_test_kek();
     let app = router().await;
 
@@ -106,7 +117,9 @@ async fn put_then_get_returns_only_last4() {
 
 /// PUT of an unsupported provider is 400. An over-long key is 400.
 #[tokio::test]
+#[allow(clippy::await_holding_lock)] // guard held across .await is fine: each test is its own current-thread runtime
 async fn put_rejects_bad_provider_and_bad_key() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     set_test_kek();
     let app = router().await;
 
@@ -133,7 +146,9 @@ async fn put_rejects_bad_provider_and_bad_key() {
 
 /// DELETE then GET is empty; DELETE again is 404.
 #[tokio::test]
+#[allow(clippy::await_holding_lock)] // guard held across .await is fine: each test is its own current-thread runtime
 async fn delete_then_get_is_empty_and_repeat_delete_is_404() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     set_test_kek();
     let app = router().await;
 
@@ -163,7 +178,9 @@ async fn delete_then_get_is_empty_and_repeat_delete_is_404() {
 /// row is written — confirmed by a follow-up GET that still shows nothing
 /// once a KEK is later configured for that check.
 #[tokio::test]
+#[allow(clippy::await_holding_lock)] // guard held across .await is fine: each test is its own current-thread runtime
 async fn missing_master_key_reports_feature_off_and_writes_nothing() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     clear_kek();
     let app = router().await;
 
@@ -187,5 +204,92 @@ async fn missing_master_key_reports_feature_off_and_writes_nothing() {
         0,
         "PUT must not have written a row while BYOK was off"
     );
+    clear_kek();
+}
+
+/// The submitted key must never reach a log line, in any of: a successful
+/// PUT, a PUT with a malformed body that still contains the key text (axum's
+/// default JSON rejection can otherwise echo the raw body), and a PUT whose
+/// key fails format validation (contains whitespace). Captures every
+/// `tracing` event at TRACE and below into a buffer and asserts the marker
+/// text is absent from all of it.
+#[tokio::test]
+#[allow(clippy::await_holding_lock)] // guard held across .await is fine: each test is its own current-thread runtime
+async fn logs_never_contain_a_submitted_key() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    set_test_kek();
+
+    let buf = std::sync::Arc::new(Mutex::new(Vec::<u8>::new()));
+
+    #[derive(Clone)]
+    struct BufWriter(std::sync::Arc<Mutex<Vec<u8>>>);
+    impl std::io::Write for BufWriter {
+        fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .extend_from_slice(data);
+            Ok(data.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let writer_buf = buf.clone();
+
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::TRACE)
+        .with_writer(move || BufWriter(writer_buf.clone()))
+        .finish();
+
+    let _dispatch_guard = tracing::subscriber::set_default(subscriber);
+
+    let app = router().await;
+
+    // A valid key.
+    let put_ok = send(
+        &app,
+        Method::PUT,
+        "/api/provider-keys/zen",
+        Some(serde_json::json!({ "api_key": "zen-test-SECRETSECRET1234" })),
+    )
+    .await;
+    assert_eq!(put_ok.status(), StatusCode::NO_CONTENT);
+
+    // Malformed JSON body that still contains the marker text.
+    let bad_json = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::PUT)
+                .uri("/api/provider-keys/zen")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    "{ this is not valid json but has SECRETSECRET in it",
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(bad_json.status(), StatusCode::BAD_REQUEST);
+
+    // A key that fails format validation (contains a space).
+    let put_bad_format = send(
+        &app,
+        Method::PUT,
+        "/api/provider-keys/zen",
+        Some(serde_json::json!({ "api_key": "has a space SECRETSECRET" })),
+    )
+    .await;
+    assert_eq!(put_bad_format.status(), StatusCode::BAD_REQUEST);
+
+    drop(_dispatch_guard);
+    let captured =
+        String::from_utf8_lossy(&buf.lock().unwrap_or_else(|e| e.into_inner())).into_owned();
+    assert!(
+        !captured.contains("SECRETSECRET"),
+        "submitted key leaked into logs: {captured}"
+    );
+
     clear_kek();
 }

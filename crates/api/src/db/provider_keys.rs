@@ -179,18 +179,32 @@ impl Database {
     /// `status`, `created_at` and `last_used_at` untouched — this is a key
     /// rotation, not a key change, so nothing about the row's history or
     /// display state should move.
-    pub fn rewrap_provider_key_row(&self, user_id: &str, provider: &str, fresh: &EncryptedKey) {
+    ///
+    /// Guarded by `old_version`/`old_nonce` matching the row this rewrap was
+    /// computed from: without it, a customer replacing their key between the
+    /// read and this write would have their new key overwritten with a fresh
+    /// encryption of the stale plaintext.
+    pub fn rewrap_provider_key_row(
+        &self,
+        user_id: &str,
+        provider: &str,
+        old_version: i64,
+        old_nonce: &[u8],
+        fresh: &EncryptedKey,
+    ) {
         let conn = self.conn();
         conn.execute(
             "UPDATE user_provider_keys
              SET key_version = ?3, nonce = ?4, ciphertext = ?5
-             WHERE user_id = ?1 AND provider = ?2",
+             WHERE user_id = ?1 AND provider = ?2 AND key_version = ?6 AND nonce = ?7",
             params![
                 user_id,
                 provider,
                 fresh.key_version,
                 fresh.nonce,
                 fresh.ciphertext,
+                old_version,
+                old_nonce,
             ],
         )
         .expect("rewrap user_provider_keys row");
@@ -200,11 +214,8 @@ impl Database {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::byok;
+    use crate::byok::{self, BYOK_ENV_LOCK};
     use base64::{engine::general_purpose::STANDARD, Engine};
-    use std::sync::Mutex;
-
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn test_db() -> Database {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -212,7 +223,10 @@ mod tests {
     }
 
     fn with_test_kek<T>(f: impl FnOnce() -> T) -> T {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // Shared with `byok::tests` — see `BYOK_ENV_LOCK`'s doc comment: two
+        // separate locks in the same test binary would not exclude each
+        // other and these both mutate the same process-global env vars.
+        let _guard = BYOK_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("CORTEX_BYOK_KEK_V1", STANDARD.encode([3u8; 32]));
         std::env::set_var("CORTEX_BYOK_KEK_CURRENT", "1");
         let result = f();
@@ -281,7 +295,7 @@ mod tests {
                 },
             )
             .unwrap();
-            assert_eq!(plaintext, "zen-test-SECRETSECRET1234");
+            assert_eq!(plaintext.expose_secret(), "zen-test-SECRETSECRET1234");
 
             // Second run is a no-op: nothing left below the current version.
             let rewrapped_again = byok::rewrap_provider_keys(&db).unwrap();

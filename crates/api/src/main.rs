@@ -195,6 +195,17 @@ async fn main() {
 
     let state = AppState::new(ledger_path, workspace_dir, clerk_secret_key).await;
 
+    // Rewrap any BYOK provider keys still under a retired KEK version.
+    // Idempotent and a no-op when BYOK is off (no `CORTEX_BYOK_KEK_CURRENT`)
+    // — never blocks startup on this. Logs only counts, never key material.
+    if let Some(db) = state.db.as_ref() {
+        match cortex_api::byok::rewrap_provider_keys(db) {
+            Ok(m) if !m.is_empty() => tracing::info!(?m, "rewrapped BYOK provider keys"),
+            Ok(_) => {}
+            Err(e) => tracing::warn!(%e, "BYOK rewrap failed"),
+        }
+    }
+
     // Start the scheduler loop
     let scheduler_tx = scheduler::spawn_scheduler(state.clone());
     state.set_scheduler_tx(scheduler_tx).await;
