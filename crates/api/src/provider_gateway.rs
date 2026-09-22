@@ -22,7 +22,10 @@ const CAPABILITY_VERSION: u32 = 1;
 /// carried in the capability and the request rather than being one hardcoded
 /// constant, so a new entry here (plus a supplier file and a transport arm)
 /// is the whole cost of a third supplier.
-pub(crate) const KNOWN_PROVIDERS: &[&str] = &["claude", "openai", "zen"];
+// OpenCode Zen is bring-your-own-key only and never has a Cortex-funded
+// authorization, so it is intentionally absent here: a Zen authorization can
+// never be created, on this or any other caller.
+pub(crate) const KNOWN_PROVIDERS: &[&str] = &["claude", "openai"];
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GatewayCapability {

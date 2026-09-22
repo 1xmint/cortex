@@ -7,11 +7,12 @@
 //!   machine and nothing is spent. This is what the proofs run against.
 //! - `live`: calls the supplier named in the verified capability, on Cortex's
 //!   own key for that supplier (`CORTEX_ANTHROPIC_SUPPLIER_KEY` for Claude,
-//!   `CORTEX_OPENAI_SUPPLIER_KEY` for OpenAI, `CORTEX_ZEN_SUPPLIER_KEY` for
-//!   OpenCode Zen). This spends real money, inside
+//!   `CORTEX_OPENAI_SUPPLIER_KEY` for OpenAI). This spends real money, inside
 //!   the same reservation and cap as the stub. Live mode is on as soon as at
 //!   least one supplier key is present; a request for a provider without a
 //!   funded key is refused the same way an unknown provider would be.
+//!   OpenCode Zen is bring-your-own-key only and never reaches this gateway:
+//!   Cortex never holds a Zen key of its own.
 //!
 //! Any other value, or none, leaves the listener unavailable.
 
@@ -51,7 +52,6 @@ enum GatewayMode {
 const SUPPLIER_KEY_ENV_VARS: &[(&str, &str)] = &[
     ("claude", "CORTEX_ANTHROPIC_SUPPLIER_KEY"),
     ("openai", "CORTEX_OPENAI_SUPPLIER_KEY"),
-    ("zen", "CORTEX_ZEN_SUPPLIER_KEY"),
 ];
 
 fn gateway_mode() -> Option<GatewayMode> {
@@ -89,20 +89,14 @@ pub(crate) fn issue_access(
     lease_deadline_ms: i64,
     now_ms: i64,
 ) -> Option<cortex_core::protocol::ProviderGatewayAccess> {
-    let mode = gateway_mode()?;
-    let zen_configured = matches!(
-        &mode,
-        GatewayMode::Live { supplier_keys } if supplier_keys.contains_key("zen")
-    );
+    gateway_mode()?;
     let allowed = match provider {
         cortex_core::provider::ProviderId::Claude | cortex_core::provider::ProviderId::Openai => {
             true
         }
-        // Zen only joins the gateway once it is actually funded and live:
-        // in stub mode, or live mode without a Zen key, a Zen request keeps
-        // whatever path it used before this supplier existed, the same as
-        // an unconfigured supplier is refused elsewhere in this module.
-        cortex_core::provider::ProviderId::Zen => zen_configured,
+        // Zen is BYOK; Cortex never funds it, so a run can never be issued a
+        // Zen capability against Cortex's own money.
+        cortex_core::provider::ProviderId::Zen => false,
         _ => false,
     };
     if !allowed {
@@ -270,7 +264,6 @@ pub(crate) enum GatewayTransport {
     Stub(StubTransport),
     Live(crate::supplier_anthropic::AnthropicTransport),
     LiveOpenAi(crate::supplier_openai::OpenAiTransport),
-    LiveZen(crate::supplier_zen::ZenTransport),
 }
 
 impl ProviderTransport for GatewayTransport {
@@ -283,7 +276,6 @@ impl ProviderTransport for GatewayTransport {
             GatewayTransport::Stub(t) => t.forward(supplier_key, request).await,
             GatewayTransport::Live(t) => t.forward(supplier_key, request).await,
             GatewayTransport::LiveOpenAi(t) => t.forward(supplier_key, request).await,
-            GatewayTransport::LiveZen(t) => t.forward(supplier_key, request).await,
         }
     }
 }
@@ -298,9 +290,7 @@ fn live_transport_for(provider: &str) -> Option<GatewayTransport> {
         "openai" => Some(GatewayTransport::LiveOpenAi(
             crate::supplier_openai::OpenAiTransport::new(),
         )),
-        "zen" => Some(GatewayTransport::LiveZen(
-            crate::supplier_zen::ZenTransport::new(),
-        )),
+        // Zen is BYOK-only and never reaches the gateway; see supplier_zen.rs.
         _ => None,
     }
 }
@@ -981,5 +971,93 @@ mod tests {
         assert!(body.contains(r#""index":2"#));
         assert!(body.contains(r#""stop_reason":"tool_use""#));
         assert_eq!(body.matches("event: content_block_stop\n").count(), 3);
+    }
+
+    #[test]
+    fn zen_never_gets_a_cortex_funded_authorization() {
+        // Zen is BYOK-only: Cortex never funds it, so `KNOWN_PROVIDERS` must
+        // not know it, even if an operator still has a Zen supplier key
+        // lying around in `CORTEX_ZEN_SUPPLIER_KEY`. This fails on current
+        // main, where `zen` is in `KNOWN_PROVIDERS`.
+        let fixture = Fixture::new();
+        let created = create_authorization_and_capability(
+            &fixture.db,
+            std::str::from_utf8(SIGNING_KEY).unwrap(),
+            "tenant-http",
+            "run-http",
+            "attempt-zen",
+            "zen",
+            "glm-5.2",
+            1_000_000,
+            1_000_000,
+            NOW + 60_000,
+            NOW,
+        );
+        assert!(created.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_zen_supplier_key_still_finds_no_live_transport() {
+        // Simulate an operator who never cleaned up their env: a "zen" entry
+        // still sits in the live `supplier_keys` map (as it would if
+        // `CORTEX_ZEN_SUPPLIER_KEY` were still set — this map is what
+        // `gateway_mode()` would have built from it). Even so, the request
+        // must be refused, because `live_transport_for` no longer has a
+        // "zen" arm.
+        //
+        // This is the discriminating case: on the old code, `SUPPLIER_KEY_ENV_VARS`
+        // had a `("zen", "CORTEX_ZEN_SUPPLIER_KEY")` entry and
+        // `live_transport_for("zen")` returned `Some(LiveZen(..))`, so with a
+        // "zen" entry present in `supplier_keys`, `handle_live_message` would
+        // find both a supplier key *and* a transport and go on to call
+        // `handle_message` — it would not stop here with this 503. An empty
+        // `supplier_keys` map would reach the same 503 on both old and new
+        // code (a false pass on revert), which is why this map is non-empty.
+        assert!(!SUPPLIER_KEY_ENV_VARS.iter().any(|(p, _)| *p == "zen"));
+        assert!(live_transport_for("zen").is_none());
+
+        let token = sign_capability(
+            SIGNING_KEY,
+            &GatewayCapability::new(
+                "auth-zen",
+                "tenant-http",
+                "run-zen",
+                "attempt-zen",
+                "zen",
+                "glm-5.2",
+                NOW + 60_000,
+            ),
+        )
+        .unwrap();
+        let fixture = Fixture::new();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            format!("Bearer {}", token.expose()).parse().unwrap(),
+        );
+        headers.insert("x-cortex-request-key", "http-zen-1".parse().unwrap());
+        let supplier_keys: std::collections::HashMap<String, String> =
+            std::collections::HashMap::from([("zen".to_string(), "k".repeat(32))]);
+        let response = handle_live_message(
+            &fixture.db,
+            SIGNING_KEY,
+            &supplier_keys,
+            &headers,
+            serde_json::json!({
+                "model": "glm-5.2",
+                "max_tokens": 100,
+                "messages": [{"role": "user", "content": "hi"}]
+            }),
+            NOW,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            String::from_utf8(body.to_vec()).unwrap(),
+            "gateway has no live transport for this provider"
+        );
     }
 }
