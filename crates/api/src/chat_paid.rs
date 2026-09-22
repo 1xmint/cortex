@@ -948,4 +948,236 @@ mod tests {
         );
         assert_eq!(reply.charged_credits, 1);
     }
+
+    fn text_response(input_tokens: i64, output_tokens: i64, text: &str) -> Result<TransportResponse, TransportFailure> {
+        FixedTransport::ok(input_tokens, output_tokens, text).response
+    }
+
+    fn tool_use_response(
+        input_tokens: i64,
+        output_tokens: i64,
+        tool_use_id: &str,
+        name: &str,
+        input: Value,
+    ) -> Result<TransportResponse, TransportFailure> {
+        Ok(TransportResponse {
+            body: serde_json::json!({
+                "id": "msg_test",
+                "type": "message",
+                "role": "assistant",
+                "model": MODEL,
+                "content": [{"type": "tool_use", "id": tool_use_id, "name": name, "input": input}],
+                "stop_reason": "tool_use",
+                "stop_sequence": null,
+                "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens}
+            }),
+            upstream_request_id: Some("upstream-1".into()),
+            usage: Some(ObservedUsage {
+                input_tokens,
+                cached_input_tokens: 0,
+                output_tokens,
+            }),
+        })
+    }
+
+    /// Returns one queued response per call; repeats the last one forever
+    /// once the queue is exhausted, so a test can hand it e.g.
+    /// [tool_use, tool_use, ..., final_text] or just [tool_use] to simulate
+    /// a model that never stops calling tools.
+    #[derive(Clone)]
+    struct SequenceTransport {
+        calls: Arc<AtomicUsize>,
+        responses: Arc<Vec<Result<TransportResponse, TransportFailure>>>,
+    }
+
+    impl SequenceTransport {
+        fn new(responses: Vec<Result<TransportResponse, TransportFailure>>) -> Self {
+            assert!(!responses.is_empty());
+            Self {
+                calls: Arc::new(AtomicUsize::new(0)),
+                responses: Arc::new(responses),
+            }
+        }
+
+        fn call_count(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+    }
+
+    impl ProviderTransport for SequenceTransport {
+        fn forward(
+            &self,
+            supplier_key: &str,
+            _request: &GatewayRequest,
+        ) -> impl Future<Output = Result<TransportResponse, TransportFailure>> + Send {
+            assert_eq!(supplier_key, SUPPLIER_KEY);
+            let i = self.calls.fetch_add(1, Ordering::SeqCst);
+            let idx = i.min(self.responses.len() - 1);
+            std::future::ready(self.responses[idx].clone())
+        }
+    }
+
+    fn big_limits() -> SpendLimits {
+        SpendLimits {
+            max_micro_usd: 1_000_000_000,
+            funded_micro_usd: 1_000_000_000,
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_use_turn_executes_and_bills_each_turn() {
+        let (_dir, db) = test_db();
+        db.init_credit_balance("user-1", 1000).unwrap();
+        let price_list = db.active_price_list().unwrap();
+        let rate = price_list.model("claude", MODEL).unwrap();
+        let per_turn_credits = ceil_div(rate.cost_micros(10, 0, 10), price_list.micros_per_credit);
+
+        let transport = SequenceTransport::new(vec![
+            tool_use_response(10, 10, "toolu_1", "list_runs", serde_json::json!({})),
+            text_response(10, 10, "here is your answer"),
+        ]);
+
+        let reply = send_paid_reply(
+            &db,
+            SIGNING_KEY,
+            SUPPLIER_KEY,
+            transport.clone(),
+            big_limits(),
+            "user-1",
+            Some("conv-tool-1"),
+            MODEL,
+            "system",
+            "how are my runs?",
+            "reply-tool-1",
+            NOW,
+        )
+        .await
+        .expect("reply should succeed");
+
+        assert_eq!(transport.call_count(), 2, "one turn per gateway call");
+        assert_eq!(reply.text, "here is your answer");
+        assert_eq!(reply.charged_credits, per_turn_credits * 2, "each turn bills separately");
+        assert_eq!(reply.tool_activity, vec![ToolActivity { tool_name: "list_runs".into(), ok: true }]);
+    }
+
+    #[tokio::test]
+    async fn loop_stops_at_turn_cap() {
+        let (_dir, db) = test_db();
+        db.init_credit_balance("user-1", 1_000_000).unwrap();
+        let transport = SequenceTransport::new(vec![tool_use_response(
+            10,
+            10,
+            "toolu_1",
+            "list_runs",
+            serde_json::json!({}),
+        )]);
+
+        let reply = send_paid_reply(
+            &db,
+            SIGNING_KEY,
+            SUPPLIER_KEY,
+            transport.clone(),
+            big_limits(),
+            "user-1",
+            Some("conv-tool-2"),
+            MODEL,
+            "system",
+            "keep checking",
+            "reply-tool-2",
+            NOW,
+        )
+        .await
+        .expect("reply should succeed even though it never got a final answer");
+
+        assert_eq!(transport.call_count(), MAX_AGENT_TURNS as usize);
+        assert_eq!(reply.tool_activity.len(), MAX_AGENT_TURNS as usize);
+    }
+
+    #[tokio::test]
+    async fn insufficient_credits_mid_loop_stops_without_charge() {
+        let (_dir, db) = test_db();
+        let price_list = db.active_price_list().unwrap();
+        let rate = price_list.model("claude", MODEL).unwrap();
+        let per_turn_credits = ceil_div(rate.cost_micros(10, 0, 10), price_list.micros_per_credit);
+        // Exactly enough for one turn; the balance check before turn 2 must
+        // see zero remaining and stop without a second charge.
+        db.init_credit_balance("user-1", per_turn_credits).unwrap();
+
+        let transport = SequenceTransport::new(vec![tool_use_response(
+            10,
+            10,
+            "toolu_1",
+            "list_runs",
+            serde_json::json!({}),
+        )]);
+
+        let reply = send_paid_reply(
+            &db,
+            SIGNING_KEY,
+            SUPPLIER_KEY,
+            transport.clone(),
+            big_limits(),
+            "user-1",
+            Some("conv-tool-3"),
+            MODEL,
+            "system",
+            "keep checking",
+            "reply-tool-3",
+            NOW,
+        )
+        .await
+        .expect("a partial answer, not an error, once at least one turn ran");
+
+        assert_eq!(transport.call_count(), 1, "no gateway call once credits are gone");
+        assert_eq!(reply.charged_credits, per_turn_credits, "only the turn that ran is charged");
+        assert!(
+            reply.text.contains("out of credits"),
+            "partial answer must say why it stopped: {}",
+            reply.text
+        );
+        let balance = db.get_credit_balance_row("user-1").unwrap();
+        assert_eq!(balance.subscription_remaining + balance.pack_remaining, 0);
+    }
+
+    #[tokio::test]
+    async fn per_minute_cap_stops_loop() {
+        let (_dir, db) = test_db();
+        db.init_credit_balance("user-1", 1_000_000).unwrap();
+        std::env::set_var("CORTEX_CHAT_AGENT_TURN_CAP_PER_MINUTE", "1");
+        reset_turn_windows_for_test();
+
+        let transport = SequenceTransport::new(vec![tool_use_response(
+            10,
+            10,
+            "toolu_1",
+            "list_runs",
+            serde_json::json!({}),
+        )]);
+
+        let reply = send_paid_reply(
+            &db,
+            SIGNING_KEY,
+            SUPPLIER_KEY,
+            transport.clone(),
+            big_limits(),
+            "user-1",
+            Some("conv-tool-4"),
+            MODEL,
+            "system",
+            "keep checking",
+            "reply-tool-4",
+            NOW,
+        )
+        .await;
+
+        std::env::remove_var("CORTEX_CHAT_AGENT_TURN_CAP_PER_MINUTE");
+        let reply = reply.expect("a partial answer once the cap is hit mid-loop");
+
+        assert_eq!(transport.call_count(), 1, "the second turn never reaches the gateway");
+        assert!(
+            reply.text.contains("too quickly"),
+            "partial answer must explain the rate limit: {}",
+            reply.text
+        );
+    }
 }
