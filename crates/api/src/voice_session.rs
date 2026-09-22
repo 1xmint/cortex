@@ -5574,8 +5574,14 @@ mod tests {
                 "cancelled"
             );
 
-            match events
-                .try_recv()
+            // `events` is fed by `subscribe_voice_events`'s own spawned
+            // forwarding task (broadcast -> mpsc), which may not have been
+            // polled yet at this point even though `resolve_spoken_outcome`
+            // above already published synchronously — so this awaits with a
+            // timeout instead of `try_recv`, which would race it.
+            match tokio::time::timeout(StdDuration::from_secs(5), events.recv())
+                .await
+                .expect("an event must arrive")
                 .expect("a ConfirmResolved event must be published")
             {
                 VoiceEvent::ConfirmResolved {
