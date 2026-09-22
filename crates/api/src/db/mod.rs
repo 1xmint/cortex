@@ -5729,6 +5729,22 @@ impl Database {
         provider: Option<&str>,
         model: Option<&str>,
     ) -> Message {
+        self.try_add_message(conversation_id, role, content, provider, model)
+            .expect("failed to insert message")
+    }
+
+    /// Same as `add_message`, but returns the `rusqlite::Error` instead of
+    /// panicking. The conversation may have been deleted between an earlier
+    /// existence check and this insert (e.g. by a concurrent delete), which
+    /// would otherwise panic the caller's task.
+    pub fn try_add_message(
+        &self,
+        conversation_id: &str,
+        role: &str,
+        content: &str,
+        provider: Option<&str>,
+        model: Option<&str>,
+    ) -> Result<Message, rusqlite::Error> {
         let conn = self.conn();
         let id = Uuid::new_v4().to_string();
         let now = Utc::now().to_rfc3339();
@@ -5736,7 +5752,7 @@ impl Database {
         conn.execute(
             "INSERT INTO messages (id, conversation_id, role, content, provider, model, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![id, conversation_id, role, content, provider, model, now],
-        ).expect("failed to insert message");
+        )?;
 
         conn.execute(
             "UPDATE conversations SET updated_at = ?1 WHERE id = ?2",
@@ -5744,7 +5760,7 @@ impl Database {
         )
         .ok();
 
-        Message {
+        Ok(Message {
             id,
             conversation_id: conversation_id.to_string(),
             role: role.to_string(),
@@ -5752,7 +5768,7 @@ impl Database {
             provider: provider.map(String::from),
             model: model.map(String::from),
             created_at: now,
-        }
+        })
     }
 
     // --- Cortex groups + task state ---
