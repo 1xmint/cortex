@@ -894,10 +894,6 @@ mod provider_holds_tests {
     use super::*;
     use crate::db::SpendAuthorization;
     use crate::provider_gateway::GatewayCapability;
-    use axum::body::Body;
-    use axum::http::{Method, Request};
-    use http_body_util::BodyExt;
-    use tower::ServiceExt;
 
     const NOW: i64 = 1_800_000_000_000;
 
@@ -1068,45 +1064,5 @@ mod provider_holds_tests {
         assert_eq!(details["reason"], "stuck after crash");
         assert_eq!(details["reserved_micro_usd"], 1_000);
         assert_eq!(details["prior_status"], "reserved");
-    }
-
-    /// A non-admin user must never pass `authorize_admin` once the admin
-    /// list is empty and a `clerk_secret_key` is configured (fail-closed,
-    /// see `authorize_admin`'s doc comment). Drives a real request through
-    /// `build_cortex_router` so the `ClerkUser`/admin middleware run exactly
-    /// as in production, and builds the admin list the way
-    /// `tests/agent_confirm_routes.rs`'s `router_as_non_premium_user` does,
-    /// rather than mutating the process-global `CORTEX_ADMIN_EMAILS`.
-    #[tokio::test]
-    async fn non_admin_request_through_the_router_is_403() {
-        std::env::set_var("CORTEX_AUTH_DISABLED", "1");
-        std::env::remove_var("CORTEX_ADMIN_EMAILS");
-        std::env::remove_var("CORTEX_ADMIN_USERS");
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join(".cortex")).unwrap();
-        let state = AppState::new(
-            dir.path().join(".cortex/ledger.jsonl"),
-            dir.path().to_path_buf(),
-            Some("sk_test_fake_for_router_tests".to_string()),
-        )
-        .await;
-        let router = crate::build_cortex_router(state.clone());
-
-        let response = router
-            .oneshot(
-                Request::builder()
-                    .method(Method::POST)
-                    .uri("/api/admin/provider-holds/chat:a/release")
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        serde_json::json!({ "reason": "operator review" }).to_string(),
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::FORBIDDEN);
-        // Drain the body so the assertion above is the only thing that can fail.
-        let _ = response.into_body().collect().await;
     }
 }

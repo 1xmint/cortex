@@ -3,6 +3,9 @@ cortex,GET,/api/admin/containers
 cortex,GET,/api/admin/containers/stats
 cortex,GET,/api/admin/decisions
 cortex,GET,/api/admin/pressure
+cortex,GET,/api/admin/provider-holds
+cortex,POST,/api/admin/provider-holds/{request_key}/release
+cortex,POST,/api/admin/provider-holds/{request_key}/settle
 cortex,GET,/api/admin/runs
 cortex,GET,/api/admin/runs/{id}
 cortex,GET,/api/admin/usage
