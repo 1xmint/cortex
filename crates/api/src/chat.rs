@@ -22,6 +22,15 @@ fn step_event_to_sse(event: StepEvent) -> Result<Event, Infallible> {
     Ok(Event::default().data(data))
 }
 
+/// Serializes a `StepEvent` exactly the way `step_event_to_sse` does for the
+/// `data:` line it sends the browser -- the same `serde_json::to_string`
+/// call, factored out so a wire-contract test can call it directly instead
+/// of reaching into the opaque `axum::response::sse::Event` it wraps.
+#[cfg(test)]
+pub(crate) fn step_event_wire_json(event: &StepEvent) -> String {
+    serde_json::to_string(event).unwrap_or_default()
+}
+
 #[derive(Deserialize)]
 pub struct ChatRequest {
     pub message: String,
@@ -424,4 +433,48 @@ async fn route_to_workspace(
         user_message,
         system_prompt.split('\n').next().unwrap_or(system_prompt)
     ))
+}
+
+/// Checks the server's real `StepEvent::ConfirmRequired` JSON against
+/// `cortex/src/test/fixtures/wire-events.json`, the fixture the browser's
+/// `wireContract.test.tsx` feeds through the real ingest code. The two
+/// crates can't share a Rust type across the language boundary, so this
+/// fixture is the only thing keeping them from drifting silently -- if this
+/// test fails, the server's wire JSON changed; update the `chat_confirm_required`
+/// entry in the fixture to match (and check the browser types/tests still
+/// accept it) rather than changing this test's expected shape.
+#[cfg(test)]
+mod wire_contract_tests {
+    use super::*;
+
+    const FIXTURE_JSON: &str = include_str!("../../../cortex/src/test/fixtures/wire-events.json");
+
+    #[test]
+    fn chat_confirm_required_matches_the_checked_in_fixture() {
+        let event = StepEvent::ConfirmRequired {
+            action_id: "fixture-action".to_string(),
+            nonce: "fixture-nonce".to_string(),
+            summary: "Fixture summary text".to_string(),
+            expires_at: 1_790_000_000,
+        };
+
+        let actual: serde_json::Value =
+            serde_json::from_str(&step_event_wire_json(&event)).unwrap();
+
+        let fixtures: serde_json::Value = serde_json::from_str(FIXTURE_JSON).unwrap();
+        let expected = fixtures.get("chat_confirm_required").unwrap_or_else(|| {
+            panic!(
+                "cortex/src/test/fixtures/wire-events.json is missing \"chat_confirm_required\" -- \
+                 add an entry with the server's ConfirmRequired JSON for the fixed inputs this test uses"
+            )
+        });
+
+        assert_eq!(
+            &actual, expected,
+            "StepEvent::ConfirmRequired's wire JSON no longer matches \
+             cortex/src/test/fixtures/wire-events.json's \"chat_confirm_required\" entry -- \
+             update that fixture entry to the new JSON (and update the browser side that \
+             consumes it, cortex/src/lib/wireContract.test.tsx) rather than changing this test"
+        );
+    }
 }

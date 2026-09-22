@@ -97,17 +97,24 @@ jobs:
       # the import graph from `App.tsx` and fails on a file nothing can reach.
       # Same rot, other shape: not a call to a route that isn't there, but a
       # finished screen wired to nothing. It found seven.
+      #
+      # 20 -> 26 with the six in `src/lib/wireContract.test.tsx`, which feeds
+      # `src/test/fixtures/wire-events.json` -- checked in Rust against the
+      # server's real `StepEvent`/`VoiceEvent` serializers -- through the
+      # browser's real chat-stream and live-voice ingest code, so the two
+      # sides of the wire can't drift the way `expires_at` did (server Unix
+      # seconds, browser expecting ms/ISO) without a test failing here.
       - name: Test Cortex
         run: |
           set -euo pipefail
           # NO_COLOR so the summary carries no escape codes between "Tests"
           # and the count. Stripping them afterwards is the same job done worse.
-          output=$(NO_COLOR=1 npm test 2>&1)
+          output=$(NO_COLOR=1 npm test 2>&1) || { echo "$output"; echo "::error::cortex tests failed"; exit 1; }
           echo "$output"
           passed=$(echo "$output" | grep -oE "Tests +[0-9]+ passed" | grep -oE "[0-9]+" | tail -1)
           echo "cortex tests passed: ${passed:-0}"
-          if [ "${passed:-0}" -lt 20 ]; then
-            echo "::error::expected at least 20 Cortex tests to run, saw ${passed:-0}"
+          if [ "${passed:-0}" -lt 26 ]; then
+            echo "::error::expected at least 26 Cortex tests to run, saw ${passed:-0}"
             exit 1
           fi
 

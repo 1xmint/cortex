@@ -1,0 +1,36 @@
+{
+  "chat_confirm_required": {
+    "type": "confirm_required",
+    "action_id": "fixture-action",
+    "nonce": "fixture-nonce",
+    "summary": "Fixture summary text",
+    "expires_at": 1790000000
+  },
+  "voice_confirm_required": {
+    "type": "confirm_required",
+    "action_id": "fixture-action",
+    "nonce": "fixture-nonce",
+    "summary": "Fixture summary text",
+    "expires_at": 1790000000
+  },
+  "voice_spoken_window": {
+    "type": "spoken_window",
+    "action_id": "fixture-action",
+    "deadline": 1790000045
+  },
+  "voice_confirm_resolved_confirmed": {
+    "type": "confirm_resolved",
+    "action_id": "fixture-action",
+    "status": "confirmed"
+  },
+  "voice_confirm_resolved_cancelled": {
+    "type": "confirm_resolved",
+    "action_id": "fixture-action",
+    "status": "cancelled"
+  },
+  "voice_message": {
+    "type": "voice_message",
+    "role": "assistant",
+    "content": "Fixture message content"
+  }
+}
