@@ -410,17 +410,20 @@ fn tool_uses(body: &Value) -> Vec<(String, String, Value)> {
 /// asks for between turns. Independent of the SSE plumbing so it can be
 /// tested directly against a stub transport and an in-memory database.
 ///
-/// Every turn is its own charge (see `send_one_turn`), so a reply that used
-/// three turns to answer shows up as three ledger lines, not one. Before
-/// each turn this checks that the user's balance still covers a reservation
-/// and that the conversation has not spent its per-minute turn allowance
-/// (`CORTEX_CHAT_AGENT_TURN_CAP_PER_MINUTE`, `turn_cap_per_minute`); either
-/// stops the loop and returns whatever text the last turn produced, with no
-/// charge for the turn that did not run.
+/// One charge per reply, not one per turn: every turn's observed cost is
+/// summed and settled in a single ledger line at the end (see the
+/// `deduct_credits_up_to` call below), even when a reply that used three
+/// turns to answer. Before each turn this checks that the user's balance
+/// still covers a reservation and that the conversation has not spent its
+/// per-minute turn allowance (`CORTEX_CHAT_AGENT_TURN_CAP_PER_MINUTE`,
+/// `turn_cap_per_minute`); either stops the loop and returns whatever text
+/// the last turn produced, with the turns that did run still charged once
+/// at the end.
 ///
-/// `reply_id` is the caller's uuid for this one reply; each turn's charge
-/// key is derived from it (`{reply_id}:turn{n}`), so replaying the whole
-/// call charges each turn at most once.
+/// `reply_id` is the caller's uuid for this one reply; each turn's
+/// reservation key is derived from it (`{reply_id}:turn{n}`) and the final
+/// charge's idempotency key is derived from it directly, so replaying the
+/// whole call charges the reply at most once.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn send_paid_reply<T: ProviderTransport + Clone>(
     db: &Database,
@@ -501,9 +504,23 @@ pub(crate) async fn send_paid_reply<T: ProviderTransport + Clone>(
         // preserve. Nothing left on turn 2+ is a graceful stop: earlier
         // turns already did billable work that must still be charged once,
         // at the end, and returned as a partial answer.
-        let balance = db
-            .get_credit_balance_row(user_id)
-            .ok_or(PaidReplyError::NoCredits)?;
+        let balance = match db.get_credit_balance_row(user_id) {
+            Some(balance) => balance,
+            None if turn == 1 => return Err(PaidReplyError::NoCredits),
+            None => {
+                tracing::info!(
+                    user_id,
+                    reply_id,
+                    turn,
+                    "chat: credit balance row disappeared mid-loop; stopping gracefully"
+                );
+                stopped_reason = Some(
+                    "\n\n(This answer may be incomplete: your credit balance could not be \
+                     read, so I stopped before finishing.)",
+                );
+                break;
+            }
+        };
         let credits_used_so_far = if total_observed_micro_usd > 0 {
             ceil_div(total_observed_micro_usd, price_list.micros_per_credit)
         } else {
@@ -1572,6 +1589,58 @@ mod tests {
         );
         let balance = db.get_credit_balance_row("user-1").unwrap();
         assert_eq!(balance.subscription_remaining + balance.pack_remaining, 0);
+    }
+
+    /// A generic (non-reservation, non-`NotEnoughCredits`) transport failure
+    /// on turn 2 — a timeout, a malformed response, anything the `Err(other)`
+    /// arm catches — must still return turn 1's work as a partial answer and
+    /// charge for it, the same as the other mid-loop stop reasons.
+    #[tokio::test]
+    async fn other_error_on_turn_two_returns_partial() {
+        let (_dir, db) = test_db();
+        db.init_credit_balance("user-1", 1_000_000).unwrap();
+        let price_list = db.active_price_list().unwrap();
+        let rate = price_list.model("claude", MODEL).unwrap();
+
+        let transport = SequenceTransport::new(vec![
+            tool_use_response(10, 10, "toolu_1", "list_runs", serde_json::json!({})),
+            Err(TransportFailure {
+                kind: TransportFailureKind::Rejected,
+                upstream_request_id: None,
+                message: "supplier had a bad day".into(),
+            }),
+        ]);
+
+        let reply = send_paid_reply(
+            &db,
+            SIGNING_KEY,
+            SUPPLIER_KEY,
+            transport.clone(),
+            big_limits(),
+            "user-1",
+            Some("conv-tool-other-err"),
+            MODEL,
+            "system",
+            "keep checking",
+            "reply-tool-other-err",
+            NOW,
+            20,
+            None,
+        )
+        .await
+        .expect("turn 1's work must still come back as a partial answer");
+
+        assert_eq!(transport.call_count(), 2, "turn 2 was attempted and failed");
+        assert!(
+            reply.text.contains("something went wrong partway"),
+            "partial answer must say why it stopped: {}",
+            reply.text
+        );
+        let expected_credits = ceil_div(rate.cost_micros(10, 0, 10), price_list.micros_per_credit);
+        assert_eq!(
+            reply.charged_credits, expected_credits,
+            "turn 1's work is still charged even though turn 2 failed"
+        );
     }
 
     #[tokio::test]
