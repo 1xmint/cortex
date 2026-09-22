@@ -98,6 +98,19 @@ describe('SpokenPromptEndDetector', () => {
     expect(detector.sample(0, 700)).toBe('ended');
   });
 
+  it('restarts the silence clock when the anchor re-arms, so silence from before does not count', () => {
+    const detector = new SpokenPromptEndDetector();
+    detector.onTranscript('Say yes, or tap Confirm on screen.');
+    expect(detector.sample(0, 0)).toBe('listening');
+    expect(detector.sample(0, 600)).toBe('listening');
+    detector.onTranscript(' and more');
+    expect(detector.sample(0, 650)).toBe('listening');
+    detector.onTranscript(' Say yes, or tap Confirm on screen.');
+    expect(detector.sample(0, 700)).toBe('listening'); // clock restarts here, not at 0
+    expect(detector.sample(0, 1399)).toBe('listening');
+    expect(detector.sample(0, 1400)).toBe('ended');
+  });
+
   it('matches the anchor text ending in an ellipsis, a curly quote, or a dash', () => {
     for (const suffix of ['…', '”', ' —']) {
       const detector = new SpokenPromptEndDetector();

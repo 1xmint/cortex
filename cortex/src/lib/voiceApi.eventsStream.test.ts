@@ -129,11 +129,8 @@ describe('openLiveVoiceEventsStream reconnect', () => {
   });
 
   it('asks the token getter for a fresh (non-cached) token on the auth retry', async () => {
-    const tokens = ['stale', 'fresh'];
-    setAuthTokenGetter(async (opts) => {
-      if (opts?.skipCache) return 'fresh';
-      return tokens.shift() ?? 'fresh';
-    });
+    // Like Clerk: the cached token is stale until the caller asks to skip the cache.
+    setAuthTokenGetter(async (opts) => (opts?.skipCache ? 'fresh' : 'stale'));
 
     let calls = 0;
     const authHeaders: Array<string | null> = [];
