@@ -1152,11 +1152,13 @@ fn handle_delegation_created(
 /// same reservation/charge path. Never panics and never hangs the
 /// delegation: every failure becomes a short spoken-friendly string instead
 /// of being propagated.
+///
+/// Resolves its transport/signing key/spend limits from `state`/env, then
+/// delegates to [`run_voice_delegation_with`] for the actual logic — kept
+/// separate so tests can exercise that logic with an injected fake
+/// transport instead of process-global env vars, matching `chat_paid.rs`'s
+/// own test conventions.
 async fn run_voice_delegation(state: &Arc<AppState>, user_id: &str, task_text: &str) -> String {
-    let task_text = task_text.trim();
-    if task_text.is_empty() {
-        return "I didn't catch a request to act on.".to_string();
-    }
     let Some(db) = state.db.as_ref() else {
         return "Cortex is temporarily unavailable.".to_string();
     };
@@ -1172,14 +1174,44 @@ async fn run_voice_delegation(state: &Arc<AppState>, user_id: &str, task_text: &
         return "Cortex is temporarily unavailable.".to_string();
     };
 
+    run_voice_delegation_with(
+        db,
+        &signing_key,
+        &supplier_key,
+        transport,
+        limits,
+        user_id,
+        task_text,
+    )
+    .await
+}
+
+/// The transport-injectable core of [`run_voice_delegation`]. An empty (or
+/// whitespace-only) `task_text` — the caption never accumulated anything
+/// usable before the delegation arrived — is answered without ever calling
+/// the agent loop, so there is no charge for it.
+async fn run_voice_delegation_with<T: crate::provider_gateway::ProviderTransport + Clone>(
+    db: &crate::db::Database,
+    signing_key: &str,
+    supplier_key: &str,
+    transport: T,
+    limits: SpendLimits,
+    user_id: &str,
+    task_text: &str,
+) -> String {
+    let task_text = task_text.trim();
+    if task_text.is_empty() {
+        return "I didn't catch that.".to_string();
+    }
+
     let reply_id = uuid::Uuid::new_v4().to_string();
     let now_ms = chrono::Utc::now().timestamp_millis();
     let turn_cap = crate::chat_paid::turn_cap_per_minute();
 
     match crate::chat_paid::send_paid_reply(
         db,
-        &signing_key,
-        &supplier_key,
+        signing_key,
+        supplier_key,
         transport,
         limits,
         user_id,
@@ -2732,5 +2764,264 @@ mod tests {
             after.terminal_reason.as_deref(),
             Some("server restarted during live session")
         );
+    }
+
+    mod delegation {
+        use std::future::Future;
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+        use crate::provider_gateway::{
+            GatewayRequest, ObservedUsage, ProviderTransport, TransportFailure,
+            TransportFailureKind, TransportResponse,
+        };
+
+        use super::*;
+
+        const SUPPLIER_KEY: &str = "delegation-test-supplier-key";
+        const DELEGATION_MODEL: &str = "claude-haiku-4-5";
+
+        #[derive(Clone)]
+        struct CountingTransport {
+            calls: Arc<AtomicUsize>,
+            response: Result<TransportResponse, TransportFailure>,
+        }
+
+        impl CountingTransport {
+            fn ok(text: &str) -> Self {
+                Self {
+                    calls: Arc::new(AtomicUsize::new(0)),
+                    response: Ok(TransportResponse {
+                        body: serde_json::json!({
+                            "id": "msg_test",
+                            "type": "message",
+                            "role": "assistant",
+                            "model": DELEGATION_MODEL,
+                            "content": [{"type": "text", "text": text}],
+                            "stop_reason": "end_turn",
+                            "stop_sequence": null,
+                            "usage": {"input_tokens": 10, "output_tokens": 10}
+                        }),
+                        upstream_request_id: Some("upstream-1".into()),
+                        usage: Some(ObservedUsage {
+                            input_tokens: 10,
+                            cached_input_tokens: 0,
+                            output_tokens: 10,
+                        }),
+                    }),
+                }
+            }
+
+            /// Never actually reached in the tests that use it — the point is
+            /// to prove it was *not* called (empty-transcript, insufficient
+            /// credits before any reservation).
+            fn unreachable() -> Self {
+                Self {
+                    calls: Arc::new(AtomicUsize::new(0)),
+                    response: Err(TransportFailure {
+                        kind: TransportFailureKind::Rejected,
+                        upstream_request_id: None,
+                        message: "should not have been called".into(),
+                    }),
+                }
+            }
+
+            fn call_count(&self) -> usize {
+                self.calls.load(AtomicOrdering::SeqCst)
+            }
+        }
+
+        impl ProviderTransport for CountingTransport {
+            fn forward(
+                &self,
+                supplier_key: &str,
+                _request: &GatewayRequest,
+            ) -> impl Future<Output = Result<TransportResponse, TransportFailure>> + Send
+            {
+                assert_eq!(supplier_key, SUPPLIER_KEY);
+                self.calls.fetch_add(1, AtomicOrdering::SeqCst);
+                std::future::ready(self.response.clone())
+            }
+        }
+
+        #[test]
+        fn accumulate_transcript_reads_delta_or_text() {
+            let mut pending = String::new();
+            accumulate_transcript(&mut pending, &serde_json::json!({"delta": "hello "}));
+            accumulate_transcript(&mut pending, &serde_json::json!({"text": "world"}));
+            accumulate_transcript(&mut pending, &serde_json::json!({"nothing_useful": true}));
+            assert_eq!(pending, "hello world");
+        }
+
+        #[tokio::test]
+        async fn empty_transcript_skips_the_agent_and_is_not_charged() {
+            let (_dir, state) = test_state_with_balance(1_000_000_000).await;
+            let db = state.db.as_ref().unwrap();
+            let before = db.get_credit_balance_row(USER);
+
+            let transport = CountingTransport::unreachable();
+            let answer = run_voice_delegation_with(
+                db,
+                SIGNING_KEY,
+                SUPPLIER_KEY,
+                transport.clone(),
+                ample_limits(),
+                USER,
+                "   ",
+            )
+            .await;
+
+            assert_eq!(answer, "I didn't catch that.");
+            assert_eq!(transport.call_count(), 0, "the agent must never be called");
+            assert_eq!(db.get_credit_balance_row(USER), before, "nothing charged");
+        }
+
+        #[tokio::test]
+        async fn a_delegation_runs_the_agent_and_returns_its_answer() {
+            let (_dir, state) = test_state_with_balance(1_000_000_000).await;
+            let db = state.db.as_ref().unwrap();
+
+            let transport = CountingTransport::ok("the answer is four");
+            let answer = run_voice_delegation_with(
+                db,
+                SIGNING_KEY,
+                SUPPLIER_KEY,
+                transport.clone(),
+                ample_limits(),
+                USER,
+                "what is two plus two",
+            )
+            .await;
+
+            assert_eq!(answer, "the answer is four");
+            assert_eq!(transport.call_count(), 1);
+        }
+
+        #[tokio::test]
+        async fn insufficient_credits_yields_spoken_failure_and_no_charge() {
+            let (_dir, state) = test_state_with_balance(0).await;
+            let db = state.db.as_ref().unwrap();
+            let before = db.get_credit_balance_row(USER);
+
+            let transport = CountingTransport::unreachable();
+            let answer = run_voice_delegation_with(
+                db,
+                SIGNING_KEY,
+                SUPPLIER_KEY,
+                transport.clone(),
+                ample_limits(),
+                USER,
+                "do something",
+            )
+            .await;
+
+            assert_eq!(answer, "You're out of credits for that request.");
+            assert_eq!(
+                transport.call_count(),
+                0,
+                "a zero balance must refuse before any provider call"
+            );
+            assert_eq!(db.get_credit_balance_row(USER), before, "nothing charged");
+        }
+
+        #[tokio::test]
+        async fn a_delegation_drains_the_transcript_and_answers_with_matching_id() {
+            // Exercises the real production path end to end: no gateway env
+            // vars are set in this test process, so `gateway_usable()`
+            // deterministically returns `None` and `run_voice_delegation`
+            // answers "Cortex is temporarily unavailable." — the point of
+            // this test is the plumbing around that call (transcript drain,
+            // matching delegation_id, busy flag released), not the agent's
+            // reply text, which `a_delegation_runs_the_agent_and_returns_its_answer`
+            // above already covers directly against a fake transport.
+            let (_dir, state) = test_state().await;
+            let busy = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let (tx, mut rx) = mpsc::channel::<Value>(8);
+            let mut pending_transcript = "what is the weather".to_string();
+
+            handle_delegation_created(
+                &serde_json::json!({"delegation": {"id": "deleg-1"}}),
+                &state,
+                USER,
+                &busy,
+                &mut pending_transcript,
+                &tx,
+            );
+
+            assert_eq!(pending_transcript, "", "the transcript must be drained");
+
+            let commentary = tokio::time::timeout(StdDuration::from_secs(5), rx.recv())
+                .await
+                .expect("commentary must arrive")
+                .expect("channel must not close");
+            assert_eq!(commentary["type"], "session.commentary.append");
+            assert_eq!(commentary["delegation_id"], "deleg-1");
+            assert_eq!(commentary["content"], "Cortex is temporarily unavailable.");
+            assert!(
+                !busy.load(std::sync::atomic::Ordering::SeqCst),
+                "busy flag must be released once the delegation completes"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_second_delegation_while_busy_is_refused() {
+            let (_dir, state) = test_state().await;
+            let busy = Arc::new(std::sync::atomic::AtomicBool::new(true));
+            let (tx, mut rx) = mpsc::channel::<Value>(8);
+            let mut pending_transcript = "some accumulated speech".to_string();
+
+            handle_delegation_created(
+                &serde_json::json!({"delegation": {"id": "deleg-2"}}),
+                &state,
+                USER,
+                &busy,
+                &mut pending_transcript,
+                &tx,
+            );
+
+            let commentary = tokio::time::timeout(StdDuration::from_secs(5), rx.recv())
+                .await
+                .expect("commentary must arrive")
+                .expect("channel must not close");
+            assert_eq!(commentary["delegation_id"], "deleg-2");
+            assert_eq!(commentary["content"], "Still working on the last request.");
+            assert_eq!(
+                pending_transcript, "some accumulated speech",
+                "a refused-while-busy delegation must not drain the transcript"
+            );
+            assert!(
+                busy.load(std::sync::atomic::Ordering::SeqCst),
+                "the still-running first delegation's busy flag must stay set"
+            );
+        }
+    }
+
+    mod confirm_tools {
+        use crate::agent_tools;
+
+        #[test]
+        fn confirm_risk_tools_are_excluded_from_voice_turns() {
+            let names: Vec<String> = agent_tools::tool_definitions_excluding_confirm()
+                .iter()
+                .map(|t| t["name"].as_str().unwrap().to_string())
+                .collect();
+            for tool in agent_tools::tool_definitions() {
+                let name = tool["name"].as_str().unwrap();
+                if agent_tools::is_confirm_risk(name) {
+                    assert!(
+                        !names.contains(&name.to_string()),
+                        "{name} is Risk::Confirm and must be withheld from voice turns"
+                    );
+                } else {
+                    assert!(
+                        names.contains(&name.to_string()),
+                        "{name} is not Risk::Confirm and must stay available to voice turns"
+                    );
+                }
+            }
+            assert!(
+                !agent_tools::tool_definitions().is_empty(),
+                "fixture sanity: there must be at least one tool"
+            );
+        }
     }
 }

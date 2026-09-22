@@ -1656,6 +1656,67 @@ mod tests {
         );
     }
 
+    /// A voice turn (`voice_turn: true`) never even offers `Risk::Confirm`
+    /// tools to the model — but if the model names one anyway (a stale
+    /// tool_use from before the delegation, or a model that hallucinates
+    /// one), it must be refused as a plain tool error rather than proposed
+    /// or run: no `agent_pending_actions` row, no `ConfirmRequired` event.
+    #[tokio::test]
+    async fn voice_turn_refuses_a_forced_confirm_tool_without_executing() {
+        let (_dir, db) = test_db();
+        db.init_credit_balance("user-1", 1000).unwrap();
+
+        let transport = SequenceTransport::new(vec![
+            tool_use_response(
+                10,
+                10,
+                "toolu_1",
+                "open_pr",
+                serde_json::json!({"run_id": "run-1"}),
+            ),
+            text_response(10, 10, "done"),
+        ]);
+        let (tx, mut rx) = mpsc::channel(8);
+
+        let reply = send_paid_reply(
+            &db,
+            SIGNING_KEY,
+            SUPPLIER_KEY,
+            transport.clone(),
+            big_limits(),
+            "user-1",
+            None,
+            MODEL,
+            "system",
+            "open a pr for my run",
+            "reply-voice-confirm",
+            NOW,
+            20,
+            Some(&tx),
+            true,
+        )
+        .await
+        .expect("reply should succeed — the tool is refused, not the whole turn");
+        drop(tx);
+
+        assert!(
+            reply.tool_activity.is_empty(),
+            "a refused tool call is not \"activity\""
+        );
+
+        let mut saw_confirm_required = false;
+        while let Some(event) = rx.recv().await {
+            if matches!(event, StepEvent::ConfirmRequired { .. }) {
+                saw_confirm_required = true;
+            }
+        }
+        assert!(
+            !saw_confirm_required,
+            "a voice turn must never stream ConfirmRequired for a withheld tool \
+             (the only path that would write an agent_pending_actions row)"
+        );
+    }
+
     /// `open_pr` with no `conversation_id` (or one that isn't the caller's
     /// own, e.g. another user's) is refused before any row is written —
     /// otherwise `agent_confirm::confirm_action` would later panic on the
