@@ -4,6 +4,7 @@ import type { FormEvent, KeyboardEvent } from 'react';
 import { useDictation } from '../../hooks/useDictation';
 import { useLiveVoiceToggle } from '../../hooks/useLiveVoiceToggle';
 import type { LiveVoiceSessionEvent } from '../../lib/voiceApi';
+import ModelPicker from './ModelPicker';
 
 const BUILTIN_PHRASES = [
   'create task',
@@ -87,6 +88,19 @@ interface ChatComposerProps {
   onVoiceSpokenWindow?: (event: { action_id: string; deadline: number }) => void;
   /** A voice session's `confirm_resolved` event: the action reached a final status. */
   onVoiceConfirmResolved?: (event: { action_id: string; status: string }) => void;
+  /**
+   * The model picker (Cortex credits vs. your Zen key). Uncontrolled when
+   * omitted -- the composer defaults to the Claude tier and never sends
+   * `model` on `/api/chat`, exactly today's behaviour. A caller that wants
+   * to read the selection (e.g. to pass it into `streamChat`'s `model`
+   * argument) can pass `onModelChange`.
+   */
+  selectedModel?: string;
+  onModelChange?: (model: string | undefined) => void;
+  /** Opens Settings → Model keys. Passed straight through to `ModelPicker`. */
+  onOpenModelSettings?: () => void;
+  /** The server's message from a 409 `zen_key_required` on the last turn. */
+  zenKeyError?: string | null;
 }
 
 export default function ChatComposer({
@@ -103,7 +117,20 @@ export default function ChatComposer({
   onVoiceConfirmRequired,
   onVoiceSpokenWindow,
   onVoiceConfirmResolved,
+  selectedModel,
+  onModelChange,
+  onOpenModelSettings,
+  zenKeyError,
 }: ChatComposerProps) {
+  const [uncontrolledModel, setUncontrolledModel] = useState<string | undefined>(undefined);
+  const currentModel = onModelChange ? selectedModel : uncontrolledModel;
+  const handleModelChange = useCallback((model: string | undefined) => {
+    if (onModelChange) {
+      onModelChange(model);
+    } else {
+      setUncontrolledModel(model);
+    }
+  }, [onModelChange]);
   const canSend = draft.trim().length > 0 && !disabled && !locked;
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   const [ghostText, setGhostText] = useState('');
@@ -283,7 +310,19 @@ export default function ChatComposer({
             {voiceError}
           </p>
         )}
-        <div className="flex items-center justify-end px-1 pb-1">
+        <div className="flex items-center justify-between px-1 pb-1">
+          {/* Only where the caller wires the choice into the send; a picker
+              whose choice goes nowhere would silently send on Claude. */}
+          {onModelChange ? (
+            <ModelPicker
+              selectedModel={currentModel}
+              onSelect={handleModelChange}
+              onOpenModelSettings={onOpenModelSettings}
+              zenKeyError={zenKeyError}
+            />
+          ) : (
+            <span />
+          )}
           {/* Action Buttons */}
           <div className="flex items-center gap-2">
             <button

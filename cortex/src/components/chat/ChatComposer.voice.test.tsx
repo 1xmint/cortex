@@ -167,7 +167,11 @@ describe('ChatComposer voice controls', () => {
     });
 
     expect(await screen.findByRole('alert')).toHaveTextContent(/microphone access was denied/i);
-    expect(fetchSpy).not.toHaveBeenCalled();
+    // The composer's model picker fetches /api/chat/models on mount regardless
+    // of voice state; what this test guards is that denied mic permission never
+    // triggers a voice-token request.
+    const voiceCalls = fetchSpy.mock.calls.filter(([input]) => !String(input).includes('/api/chat/models'));
+    expect(voiceCalls).toEqual([]);
   });
 
   it('waits for ICE gathering to complete and sends the gathered SDP, not the raw offer', async () => {
