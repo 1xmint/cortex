@@ -1227,14 +1227,9 @@ pub async fn estimate_run(
         )
     })?;
 
-    let projection = estimate_run_projection(
-        db,
-        &user.user_id,
-        &req.goal,
-        &req.file_paths,
-        &req.profile,
-    )
-    .map_err(|e| (StatusCode::BAD_REQUEST, Json(ErrorResponse { error: e })))?;
+    let projection =
+        estimate_run_projection(db, &user.user_id, &req.goal, &req.file_paths, &req.profile)
+            .map_err(|e| (StatusCode::BAD_REQUEST, Json(ErrorResponse { error: e })))?;
 
     Ok(Json(projection))
 }

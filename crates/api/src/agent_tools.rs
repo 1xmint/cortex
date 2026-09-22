@@ -156,7 +156,8 @@ pub fn catalogue() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "run_estimate",
-            description: "Estimate the cost and duration of a run for a goal, without executing it.",
+            description:
+                "Estimate the cost and duration of a run for a goal, without executing it.",
             schema: json!({
                 "type": "object",
                 "properties": {
@@ -174,7 +175,8 @@ pub fn catalogue() -> Vec<ToolSpec> {
         // against a real entry rather than an invented name.
         ToolSpec {
             name: "cancel_run",
-            description: "Cancel one of the requesting user's own in-progress runs. Not available yet.",
+            description:
+                "Cancel one of the requesting user's own in-progress runs. Not available yet.",
             schema: json!({
                 "type": "object",
                 "properties": {
@@ -230,7 +232,12 @@ fn limit_arg(input: &Value, key: &str, default: i64, max: i64) -> Result<i64, To
 /// Run one tool call for `user_id` and return its rendered, capped output —
 /// or the [`ToolError`] that stopped it from running. Never executes an
 /// unknown or `Confirm`-risk tool.
-pub fn execute(db: &Database, user_id: &str, name: &str, input: &Value) -> Result<String, ToolError> {
+pub fn execute(
+    db: &Database,
+    user_id: &str,
+    name: &str,
+    input: &Value,
+) -> Result<String, ToolError> {
     let spec = find(name).ok_or_else(|| ToolError::Unknown(name.to_string()))?;
     if spec.risk != Risk::Safe {
         return Err(ToolError::ConfirmRequired(name.to_string()));
@@ -245,7 +252,9 @@ pub fn execute(db: &Database, user_id: &str, name: &str, input: &Value) -> Resul
         "run_status" => {
             let run_id = str_arg(input, "run_id")?;
             if !db.verify_run_owner(&run_id, user_id) {
-                return Err(ToolError::NotFound(format!("no run '{run_id}' for this user")));
+                return Err(ToolError::NotFound(format!(
+                    "no run '{run_id}' for this user"
+                )));
             }
             db.list_user_runs_by_id(&run_id)
                 .ok_or_else(|| ToolError::NotFound(format!("no run '{run_id}' for this user")))?

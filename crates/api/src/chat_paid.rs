@@ -88,7 +88,10 @@ const TURN_WINDOW_MS: i64 = 60_000;
 fn try_acquire_turn_slot(key: &str, cap: u32, now_ms: i64) -> bool {
     let mut windows = TURN_WINDOWS.lock().unwrap_or_else(|e| e.into_inner());
     let window = windows.entry(key.to_string()).or_default();
-    while window.front().is_some_and(|t| now_ms - *t >= TURN_WINDOW_MS) {
+    while window
+        .front()
+        .is_some_and(|t| now_ms - *t >= TURN_WINDOW_MS)
+    {
         window.pop_front();
     }
     if window.len() as u32 >= cap {
@@ -100,7 +103,10 @@ fn try_acquire_turn_slot(key: &str, cap: u32, now_ms: i64) -> bool {
 
 #[cfg(test)]
 fn reset_turn_windows_for_test() {
-    TURN_WINDOWS.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    TURN_WINDOWS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
 }
 
 /// Round a micro-USD cost up to the nearest whole credit. `i64::div_ceil` is
@@ -412,7 +418,12 @@ pub(crate) async fn send_paid_reply<T: ProviderTransport + Clone>(
             if turn == 1 {
                 return Err(PaidReplyError::NoCredits);
             }
-            tracing::info!(user_id, reply_id, turn, "chat: out of credits mid-loop; stopping");
+            tracing::info!(
+                user_id,
+                reply_id,
+                turn,
+                "chat: out of credits mid-loop; stopping"
+            );
             stopped_reason = Some(
                 "\n\n(This answer may be incomplete: you're out of credits, so I stopped \
                  before finishing.)",
@@ -424,7 +435,12 @@ pub(crate) async fn send_paid_reply<T: ProviderTransport + Clone>(
             if turn == 1 {
                 return Err(PaidReplyError::TurnCapExceeded);
             }
-            tracing::info!(user_id, reply_id, turn, "chat: per-minute turn cap hit; stopping");
+            tracing::info!(
+                user_id,
+                reply_id,
+                turn,
+                "chat: per-minute turn cap hit; stopping"
+            );
             stopped_reason = Some(
                 "\n\n(This answer may be incomplete: this conversation is using tools too \
                  quickly right now, so I stopped before finishing. Please wait a moment and \
@@ -500,7 +516,11 @@ pub(crate) async fn send_paid_reply<T: ProviderTransport + Clone>(
         }));
 
         if turn == MAX_AGENT_TURNS {
-            tracing::info!(user_id, reply_id, "chat: turn cap reached with an open tool call");
+            tracing::info!(
+                user_id,
+                reply_id,
+                "chat: turn cap reached with an open tool call"
+            );
         }
     }
 
@@ -949,7 +969,11 @@ mod tests {
         assert_eq!(reply.charged_credits, 1);
     }
 
-    fn text_response(input_tokens: i64, output_tokens: i64, text: &str) -> Result<TransportResponse, TransportFailure> {
+    fn text_response(
+        input_tokens: i64,
+        output_tokens: i64,
+        text: &str,
+    ) -> Result<TransportResponse, TransportFailure> {
         FixedTransport::ok(input_tokens, output_tokens, text).response
     }
 
@@ -1056,8 +1080,18 @@ mod tests {
 
         assert_eq!(transport.call_count(), 2, "one turn per gateway call");
         assert_eq!(reply.text, "here is your answer");
-        assert_eq!(reply.charged_credits, per_turn_credits * 2, "each turn bills separately");
-        assert_eq!(reply.tool_activity, vec![ToolActivity { tool_name: "list_runs".into(), ok: true }]);
+        assert_eq!(
+            reply.charged_credits,
+            per_turn_credits * 2,
+            "each turn bills separately"
+        );
+        assert_eq!(
+            reply.tool_activity,
+            vec![ToolActivity {
+                tool_name: "list_runs".into(),
+                ok: true
+            }]
+        );
     }
 
     #[tokio::test]
@@ -1128,8 +1162,15 @@ mod tests {
         .await
         .expect("a partial answer, not an error, once at least one turn ran");
 
-        assert_eq!(transport.call_count(), 1, "no gateway call once credits are gone");
-        assert_eq!(reply.charged_credits, per_turn_credits, "only the turn that ran is charged");
+        assert_eq!(
+            transport.call_count(),
+            1,
+            "no gateway call once credits are gone"
+        );
+        assert_eq!(
+            reply.charged_credits, per_turn_credits,
+            "only the turn that ran is charged"
+        );
         assert!(
             reply.text.contains("out of credits"),
             "partial answer must say why it stopped: {}",
@@ -1173,7 +1214,11 @@ mod tests {
         std::env::remove_var("CORTEX_CHAT_AGENT_TURN_CAP_PER_MINUTE");
         let reply = reply.expect("a partial answer once the cap is hit mid-loop");
 
-        assert_eq!(transport.call_count(), 1, "the second turn never reaches the gateway");
+        assert_eq!(
+            transport.call_count(),
+            1,
+            "the second turn never reaches the gateway"
+        );
         assert!(
             reply.text.contains("too quickly"),
             "partial answer must explain the rate limit: {}",
