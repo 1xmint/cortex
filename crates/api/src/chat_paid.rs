@@ -487,6 +487,12 @@ pub(crate) async fn send_paid_reply<T: ProviderTransport + Clone>(
     // own, so we can tell the user their answer may be incomplete instead of
     // silently handing back whatever partial text the last turn produced.
     let mut stopped_reason: Option<&'static str> = None;
+    // One proposal per reply: once a `Risk::Confirm` tool has been proposed
+    // (a pending row written and `ConfirmRequired` streamed), the next turn
+    // is forced to be the last one — tool_choice: none — so the loop ends
+    // with the model's text instead of proposing (or re-proposing) another
+    // action it can't get a result back for this reply.
+    let mut confirm_proposed = false;
 
     for turn in 1..=MAX_AGENT_TURNS {
         // Stamped fresh every turn: a slow, multi-turn reply must not let
@@ -572,7 +578,7 @@ pub(crate) async fn send_paid_reply<T: ProviderTransport + Clone>(
         // result of — but the request still has to carry `tools` (see
         // `send_one_turn`'s doc comment on `last_turn`), just with
         // `tool_choice: none` forcing text instead of dropping the list.
-        let is_last_turn = turn == MAX_AGENT_TURNS;
+        let is_last_turn = turn == MAX_AGENT_TURNS || confirm_proposed;
 
         let turn_outcome = send_one_turn(
             db,
@@ -644,6 +650,109 @@ pub(crate) async fn send_paid_reply<T: ProviderTransport + Clone>(
 
         let mut tool_results = Vec::with_capacity(uses.len());
         for (tool_use_id, name, input) in uses {
+            // `open_pr` is the one `Risk::Confirm` tool wired up so far
+            // (`agent_tools::validate_confirm_tool`/`execute_confirmed`):
+            // instead of running it, or just refusing it, propose it — write
+            // a row to `agent_pending_actions` and tell the model (and, via
+            // `StepEvent::ConfirmRequired`, the client) that it's waiting on
+            // the user's own tap on `POST /api/agent/actions/{id}/confirm`.
+            // Every other tool, including the still-refused `cancel_run`,
+            // falls through to the unchanged path below.
+            if name == "open_pr" {
+                // A pending row's `conversation_id` is a `NOT NULL` foreign
+                // key that `agent_confirm::confirm_action` later writes an
+                // assistant message against (`Database::add_message`).
+                // Without this check a missing, unknown, or another user's
+                // `conversation_id` (`.unwrap_or_default()` used to paper
+                // over the missing case with `""`) would sail through here
+                // and only blow up later, at confirm time, as a foreign-key
+                // panic — so check ownership up front and refuse before any
+                // row is written, exactly like an invalid-argument tool call.
+                let owned_conversation =
+                    conversation_id.filter(|c| db.get_conversation(c, user_id).is_some());
+                let validated = match owned_conversation {
+                    Some(_) => agent_tools::validate_confirm_tool(db, user_id, &name, &input),
+                    None => Err(agent_tools::ToolError::InvalidArguments(
+                        "confirmable actions need a saved conversation".to_string(),
+                    )),
+                };
+                match validated {
+                    Ok(_summary) if confirm_proposed => {
+                        // One proposal per reply: a proposal already went
+                        // out this reply (the next turn was forced to be
+                        // the last one, see `is_last_turn` above), so a
+                        // second `open_pr` — a fake ignoring
+                        // `tool_choice: none`, in practice — does not get a
+                        // second pending row or a second
+                        // `StepEvent::ConfirmRequired`. Tell the model
+                        // plainly that this one was not proposed; the loop
+                        // ends after this turn either way.
+                        tool_results.push(serde_json::json!({
+                            "type": "tool_result",
+                            "tool_use_id": tool_use_id,
+                            "content": "Not proposed: only one action can wait for confirmation per reply. Ask the user to confirm or cancel the pending one first.",
+                            "is_error": true,
+                        }));
+                    }
+                    Ok(summary) => {
+                        let now = chrono::Utc::now().timestamp();
+                        let action = db.insert_pending_action(
+                            user_id,
+                            owned_conversation.expect("checked above"),
+                            &name,
+                            &input,
+                            &summary,
+                            now,
+                        );
+                        if let Some(tx) = tool_events {
+                            let _ = tx
+                                .send(StepEvent::ConfirmRequired {
+                                    action_id: action.id.clone(),
+                                    nonce: action.nonce.clone(),
+                                    summary: action.summary.clone(),
+                                    expires_at: action.expires_at,
+                                })
+                                .await;
+                        }
+                        // Proposing is not running: no `ToolActivity` entry
+                        // (and no "Checked open_pr." line via
+                        // `tool_activity_summary`) — the client's only signal
+                        // for a proposal is `StepEvent::ConfirmRequired`
+                        // above.
+                        tool_results.push(serde_json::json!({
+                            "type": "tool_result",
+                            "tool_use_id": tool_use_id,
+                            "content": "Waiting for the user's confirmation. This has not run yet.",
+                            "is_error": false,
+                        }));
+                        confirm_proposed = true;
+                    }
+                    Err(e) => {
+                        // No row written — refuse exactly like an
+                        // unconfirmable tool call would today.
+                        tool_activity.push(ToolActivity {
+                            tool_name: name.clone(),
+                            ok: false,
+                        });
+                        if let Some(tx) = tool_events {
+                            let _ = tx
+                                .send(StepEvent::ToolActivity {
+                                    step_id: "chat".into(),
+                                    tool_name: name.clone(),
+                                    ok: false,
+                                })
+                                .await;
+                        }
+                        tool_results.push(serde_json::json!({
+                            "type": "tool_result",
+                            "tool_use_id": tool_use_id,
+                            "content": e.message(),
+                            "is_error": true,
+                        }));
+                    }
+                }
+                continue;
+            }
             let (activity, content, is_error) =
                 match agent_tools::execute(db, user_id, &name, &input) {
                     Ok(rendered) => (
@@ -691,6 +800,12 @@ pub(crate) async fn send_paid_reply<T: ProviderTransport + Clone>(
                 reply_id,
                 "chat: turn cap reached with an open tool call"
             );
+        }
+        // The last turn (whether forced by a proposal above or by the turn
+        // cap) never gets a next turn to send this tool_result back on —
+        // there's nothing more for the loop to do.
+        if is_last_turn {
+            break;
         }
     }
 
@@ -1399,6 +1514,278 @@ mod tests {
                 .and_then(Value::as_array)
                 .is_some_and(|tools| !tools.is_empty()),
             "the last turn must still carry a non-empty tools list: {last_body}"
+        );
+    }
+
+    /// The `Risk::Confirm` `open_pr` tool never actually opens a PR from the
+    /// tool loop itself: asking for it only proposes an
+    /// `agent_pending_actions` row and streams `StepEvent::ConfirmRequired`.
+    /// The only place `agent_tools::execute_confirmed`
+    /// (`crate::routes::create_pr_core`'s caller) is ever invoked is
+    /// `agent_confirm::confirm_action`, which this test never calls — so the
+    /// pending row still reading back as `pending` (not `confirmed`) here is
+    /// direct proof the PR side effect did not run.
+    #[tokio::test]
+    async fn risky_tool_never_executes_without_confirm() {
+        let (_dir, db) = test_db();
+        db.init_credit_balance("user-1", 1000).unwrap();
+        let conversation = db.create_conversation("user-1", None);
+
+        let run_id = db
+            .create_run_with_steps_and_resource_leases(
+                "user-1",
+                "Ship a feature",
+                "auto",
+                &["src/lib.rs".to_string()],
+                None,
+                None,
+                Some(&conversation.id),
+                &[crate::db::ResourceLeaseRequest {
+                    resource_type: "path".to_string(),
+                    repo_key: "github:test/repo".to_string(),
+                    resource_key: "src/lib.rs".to_string(),
+                    mode: "write".to_string(),
+                    reason: Some("test".to_string()),
+                    metadata: serde_json::json!({}),
+                }],
+                &[],
+                &[],
+            )
+            .expect("run created with a write lease");
+        db.record_run_branch(&run_id, "cortex/run-open-pr");
+
+        // The fake repeats its last queued response forever (see
+        // `SequenceTransport`'s doc comment), so a one-item script would
+        // have the model ask for `open_pr` on every remaining turn. Give it
+        // a second, distinct response so the forced last turn (see
+        // `confirm_proposed` in `send_paid_reply`) can answer in text
+        // instead.
+        let transport = SequenceTransport::new(vec![
+            tool_use_response(
+                10,
+                10,
+                "toolu_1",
+                "open_pr",
+                serde_json::json!({"run_id": run_id}),
+            ),
+            text_response(10, 10, "waiting on you"),
+        ]);
+        let (tx, mut rx) = mpsc::channel(8);
+
+        let reply = send_paid_reply(
+            &db,
+            SIGNING_KEY,
+            SUPPLIER_KEY,
+            transport.clone(),
+            big_limits(),
+            "user-1",
+            Some(&conversation.id),
+            MODEL,
+            "system",
+            "open a pr for my run",
+            "reply-open-pr",
+            NOW,
+            20,
+            Some(&tx),
+        )
+        .await
+        .expect("reply should succeed even though the tool never ran");
+        drop(tx);
+
+        assert_eq!(
+            transport.call_count(),
+            2,
+            "the loop makes one more, forced-last-turn call after proposing"
+        );
+        assert!(
+            reply.tool_activity.is_empty(),
+            "proposing is not running: no ToolActivity entry (and no \"Checked open_pr.\" \
+             line), only the ConfirmRequired event below"
+        );
+
+        let mut confirm_action_id = None;
+        while let Some(event) = rx.recv().await {
+            if let StepEvent::ConfirmRequired { action_id, .. } = event {
+                confirm_action_id = Some(action_id);
+            }
+        }
+        let action_id =
+            confirm_action_id.expect("a ConfirmRequired event should have been streamed");
+
+        let pending = db
+            .get_pending_action(&action_id, "user-1")
+            .expect("the proposal was written to agent_pending_actions");
+        assert_eq!(pending.tool_name, "open_pr");
+        assert_eq!(
+            pending.status, "pending",
+            "still pending — nothing confirmed it, so execute_confirmed/create_pr_core never ran"
+        );
+    }
+
+    /// `open_pr` with no `conversation_id` (or one that isn't the caller's
+    /// own, e.g. another user's) is refused before any row is written —
+    /// otherwise `agent_confirm::confirm_action` would later panic on the
+    /// `messages.conversation_id` foreign key when it tried to save the
+    /// tool's result.
+    #[tokio::test]
+    async fn open_pr_without_owned_conversation_is_refused() {
+        let (_dir, db) = test_db();
+        db.init_credit_balance("user-1", 1000).unwrap();
+
+        // See the comment in `risky_tool_never_executes_without_confirm`:
+        // the fake repeats its last response forever, so a one-item script
+        // would have the model retry the refused `open_pr` on every turn.
+        let transport = SequenceTransport::new(vec![
+            tool_use_response(
+                10,
+                10,
+                "toolu_1",
+                "open_pr",
+                serde_json::json!({"run_id": "does-not-matter"}),
+            ),
+            text_response(10, 10, "waiting on you"),
+        ]);
+        let (tx, mut rx) = mpsc::channel(8);
+
+        let reply = send_paid_reply(
+            &db,
+            SIGNING_KEY,
+            SUPPLIER_KEY,
+            transport.clone(),
+            big_limits(),
+            "user-1",
+            None, // no saved conversation
+            MODEL,
+            "system",
+            "open a pr for my run",
+            "reply-no-conv",
+            NOW,
+            20,
+            Some(&tx),
+        )
+        .await
+        .expect("reply should still succeed — the tool call is refused, not the whole reply");
+        drop(tx);
+
+        assert_eq!(
+            reply.tool_activity,
+            vec![ToolActivity {
+                tool_name: "open_pr".into(),
+                ok: false
+            }]
+        );
+        while let Some(event) = rx.recv().await {
+            assert!(
+                !matches!(event, StepEvent::ConfirmRequired { .. }),
+                "a refused proposal must not stream ConfirmRequired"
+            );
+        }
+    }
+
+    /// One proposal per reply: even if the model keeps asking for `open_pr`
+    /// on every turn (a fake ignoring `tool_choice: none`, standing in for
+    /// a model that just won't take no for an answer), only the first ask
+    /// gets a pending row and a `ConfirmRequired` event — the turn right
+    /// after it is forced to be the last one, so the loop stops there.
+    #[tokio::test]
+    async fn one_proposal_per_reply() {
+        let (_dir, db) = test_db();
+        db.init_credit_balance("user-1", 1000).unwrap();
+        let conversation = db.create_conversation("user-1", None);
+
+        let run_id = db
+            .create_run_with_steps_and_resource_leases(
+                "user-1",
+                "Ship a feature",
+                "auto",
+                &["src/lib.rs".to_string()],
+                None,
+                None,
+                Some(&conversation.id),
+                &[crate::db::ResourceLeaseRequest {
+                    resource_type: "path".to_string(),
+                    repo_key: "github:test/repo".to_string(),
+                    resource_key: "src/lib.rs".to_string(),
+                    mode: "write".to_string(),
+                    reason: Some("test".to_string()),
+                    metadata: serde_json::json!({}),
+                }],
+                &[],
+                &[],
+            )
+            .expect("run created with a write lease");
+        db.record_run_branch(&run_id, "cortex/run-open-pr");
+
+        // Every turn asks for `open_pr` — `SequenceTransport` repeats its
+        // last queued response forever (see its doc comment), and this test
+        // only queues one, on purpose, to simulate a model that keeps
+        // calling the tool even on the forced last turn.
+        let transport = SequenceTransport::new(vec![tool_use_response(
+            10,
+            10,
+            "toolu_1",
+            "open_pr",
+            serde_json::json!({"run_id": run_id}),
+        )]);
+        let (tx, mut rx) = mpsc::channel(8);
+
+        let reply = send_paid_reply(
+            &db,
+            SIGNING_KEY,
+            SUPPLIER_KEY,
+            transport.clone(),
+            big_limits(),
+            "user-1",
+            Some(&conversation.id),
+            MODEL,
+            "system",
+            "open a pr for my run",
+            "reply-one-proposal",
+            NOW,
+            20,
+            Some(&tx),
+        )
+        .await
+        .expect("reply should succeed even though the tool never ran");
+        drop(tx);
+
+        assert_eq!(
+            transport.call_count(),
+            2,
+            "the loop stops after the forced last turn, even though it also asked for open_pr"
+        );
+        assert!(
+            reply.tool_activity.is_empty(),
+            "asking for open_pr, proposed or not, is never a ToolActivity entry"
+        );
+
+        let mut confirm_events = 0;
+        while let Some(event) = rx.recv().await {
+            if matches!(event, StepEvent::ConfirmRequired { .. }) {
+                confirm_events += 1;
+            }
+        }
+        assert_eq!(
+            confirm_events, 1,
+            "only the first ask writes a pending row and streams ConfirmRequired"
+        );
+
+        let pending_count: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM agent_pending_actions WHERE user_id = ?1 AND status = \
+                 'pending'",
+                rusqlite::params!["user-1"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(pending_count, 1, "exactly one pending row");
+
+        let second_body = transport.last_request_body();
+        assert_eq!(
+            second_body.get("tool_choice"),
+            Some(&serde_json::json!({"type": "none"})),
+            "the 2nd recorded request must set tool_choice: none: {second_body}"
         );
     }
 
