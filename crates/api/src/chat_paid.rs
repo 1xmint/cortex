@@ -1065,7 +1065,7 @@ pub(crate) async fn run(
 #[cfg(test)]
 mod tests {
     use std::future::Future;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
 
     use crate::provider_gateway::{
@@ -1171,7 +1171,7 @@ mod tests {
             20,
             None,
             false,
-None,
+            None,
         )
         .await
         .expect("reply should succeed");
@@ -1207,7 +1207,7 @@ None,
             20,
             None,
             false,
-None,
+            None,
         )
         .await
         .expect_err("supplier failure must not succeed");
@@ -1242,7 +1242,7 @@ None,
             20,
             None,
             false,
-None,
+            None,
         )
         .await
         .expect_err("zero balance must refuse");
@@ -1283,7 +1283,7 @@ None,
                 20,
                 None,
                 false,
-None,
+                None,
             )
             .await;
             if attempt == 0 {
@@ -1330,7 +1330,7 @@ None,
             20,
             None,
             false,
-None,
+            None,
         )
         .await
         .expect("reply should succeed");
@@ -1492,7 +1492,7 @@ None,
             20,
             None,
             false,
-None,
+            None,
         )
         .await
         .expect("reply should succeed");
@@ -1549,7 +1549,7 @@ None,
             20,
             None,
             false,
-None,
+            None,
         )
         .await
         .expect("reply should succeed even though it never got a final answer on its own");
@@ -1651,7 +1651,7 @@ None,
             20,
             Some(&tx),
             false,
-None,
+            None,
         )
         .await
         .expect("reply should succeed even though the tool never ran");
@@ -1725,7 +1725,7 @@ None,
             20,
             Some(&tx),
             true,
-None,
+            None,
         )
         .await
         .expect("reply should succeed — the tool is refused, not the whole turn");
@@ -1790,7 +1790,7 @@ None,
             20,
             Some(&tx),
             false,
-None,
+            None,
         )
         .await
         .expect("reply should still succeed — the tool call is refused, not the whole reply");
@@ -1874,7 +1874,7 @@ None,
             20,
             Some(&tx),
             false,
-None,
+            None,
         )
         .await
         .expect("reply should succeed even though the tool never ran");
@@ -1981,7 +1981,7 @@ None,
             20,
             None,
             false,
-None,
+            None,
         )
         .await
         .expect("probe reply should succeed");
@@ -2038,7 +2038,7 @@ None,
             20,
             None,
             false,
-None,
+            None,
         )
         .await
         .expect("turn 1's work must still come back as a partial answer");
@@ -2093,7 +2093,7 @@ None,
             20,
             None,
             false,
-None,
+            None,
         )
         .await
         .expect("a partial answer, not an error, once at least one turn ran");
@@ -2114,6 +2114,158 @@ None,
         );
         let balance = db.get_credit_balance_row("user-1").unwrap();
         assert_eq!(balance.subscription_remaining + balance.pack_remaining, 0);
+    }
+
+    /// Wraps another transport and flips a shared flag right after that
+    /// transport's call returns — the deterministic hook the cancel tests
+    /// below use to flip `cancel` exactly once the first turn's supplier
+    /// call has actually happened, instead of racing a timer against it.
+    #[derive(Clone)]
+    struct CancelAfterCallTransport<T> {
+        inner: T,
+        cancel: Arc<AtomicBool>,
+    }
+
+    impl<T: ProviderTransport + Clone + Send + Sync> ProviderTransport for CancelAfterCallTransport<T> {
+        fn forward(
+            &self,
+            supplier_key: &str,
+            request: &GatewayRequest,
+        ) -> impl Future<Output = Result<TransportResponse, TransportFailure>> + Send {
+            let fut = self.inner.forward(supplier_key, request);
+            let cancel = self.cancel.clone();
+            async move {
+                let result = fut.await;
+                cancel.store(true, Ordering::SeqCst);
+                result
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn cancel_set_after_the_first_turn_stops_before_a_second_and_charges_only_the_first() {
+        let (_dir, db) = test_db();
+        db.init_credit_balance("user-1", 1_000_000).unwrap();
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        // A model that never stops calling tools on its own — without the
+        // cancel, this loop would keep going well past turn 1.
+        let inner = SequenceTransport::new(vec![tool_use_response(
+            10,
+            10,
+            "toolu_1",
+            "list_runs",
+            serde_json::json!({}),
+        )]);
+        let transport = CancelAfterCallTransport {
+            inner: inner.clone(),
+            cancel: cancel.clone(),
+        };
+
+        let reply = send_paid_reply(
+            &db,
+            SIGNING_KEY,
+            SUPPLIER_KEY,
+            transport,
+            big_limits(),
+            "user-1",
+            Some("conv-cancel-1"),
+            MODEL,
+            "system",
+            "keep checking",
+            "reply-cancel-1",
+            NOW,
+            20,
+            None,
+            false,
+            Some(&cancel),
+        )
+        .await
+        .expect("turn 1's work must still come back as a partial answer, not an error");
+
+        assert_eq!(
+            inner.call_count(),
+            1,
+            "the loop must stop before a second supplier call once cancelled"
+        );
+        assert!(
+            reply.text.contains("cancelled"),
+            "partial answer must say why it stopped: {}",
+            reply.text
+        );
+
+        let price_list = db.active_price_list().unwrap();
+        let rate = price_list.model("claude", MODEL).unwrap();
+        let expected_credits = ceil_div(rate.cost_micros(10, 0, 10), price_list.micros_per_credit);
+        assert_eq!(
+            reply.charged_credits, expected_credits,
+            "only the turn that actually ran must be charged"
+        );
+
+        let reservation = db
+            .get_provider_reservation("chat:chat-reply:reply-cancel-1:turn1")
+            .unwrap();
+        assert_eq!(
+            reservation.status, "settled",
+            "the completed turn's reservation must be settled, not left dangling as 'reserved'"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_set_before_the_call_makes_no_supplier_call_and_leaves_balance_unchanged() {
+        let (_dir, db) = test_db();
+        db.init_credit_balance("user-1", 100).unwrap();
+        let before = db.get_credit_balance_row("user-1").unwrap();
+
+        // Already cancelled by the time send_paid_reply is called at all.
+        let cancel = Arc::new(AtomicBool::new(true));
+        let transport = SequenceTransport::new(vec![tool_use_response(
+            10,
+            10,
+            "toolu_1",
+            "list_runs",
+            serde_json::json!({}),
+        )]);
+
+        let reply = send_paid_reply(
+            &db,
+            SIGNING_KEY,
+            SUPPLIER_KEY,
+            transport.clone(),
+            big_limits(),
+            "user-1",
+            Some("conv-cancel-2"),
+            MODEL,
+            "system",
+            "hi",
+            "reply-cancel-2",
+            NOW,
+            20,
+            None,
+            false,
+            Some(&cancel),
+        )
+        .await
+        .expect("a cancel before turn 1 must return cleanly, not error or panic");
+
+        assert_eq!(
+            transport.call_count(),
+            0,
+            "no supplier call must happen once cancelled before turn 1"
+        );
+        assert_eq!(
+            reply.charged_credits, 0,
+            "nothing was reserved or charged for zero turns"
+        );
+        assert!(
+            reply.text.contains("cancelled"),
+            "text must explain why: {}",
+            reply.text
+        );
+
+        let after = db.get_credit_balance_row("user-1").unwrap();
+        assert_eq!(after.subscription_remaining, before.subscription_remaining);
+        assert_eq!(after.pack_remaining, before.pack_remaining);
     }
 
     /// A generic (non-reservation, non-`NotEnoughCredits`) transport failure
@@ -2152,7 +2304,7 @@ None,
             20,
             None,
             false,
-None,
+            None,
         )
         .await
         .expect("turn 1's work must still come back as a partial answer");
@@ -2200,7 +2352,7 @@ None,
             1,
             None,
             false,
-None,
+            None,
         )
         .await;
 
@@ -2337,7 +2489,7 @@ None,
             20,
             None,
             false,
-None,
+            None,
         )
         .await
         .expect("a shortfall at final-charge time must not discard the reply");
@@ -2437,7 +2589,7 @@ None,
             20,
             None,
             false,
-None,
+            None,
         );
         let fut_b = send_paid_reply(
             &db,
@@ -2455,7 +2607,7 @@ None,
             20,
             None,
             false,
-None,
+            None,
         );
 
         let (result_a, result_b) = tokio::join!(fut_a, fut_b);
