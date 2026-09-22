@@ -87,18 +87,25 @@ const TURN_WINDOW_MS: i64 = 60_000;
 /// against the window it was refused from.
 fn try_acquire_turn_slot(key: &str, cap: u32, now_ms: i64) -> bool {
     let mut windows = TURN_WINDOWS.lock().unwrap_or_else(|e| e.into_inner());
-    let window = windows.entry(key.to_string()).or_default();
+    // Remove-then-reinsert instead of `entry().or_default()`, so a key with
+    // an empty window (every timestamp aged out) does not sit in the map
+    // forever — a long-lived server otherwise accumulates one entry per
+    // distinct conversation/reply id it has ever seen.
+    let mut window = windows.remove(key).unwrap_or_default();
     while window
         .front()
         .is_some_and(|t| now_ms - *t >= TURN_WINDOW_MS)
     {
         window.pop_front();
     }
-    if window.len() as u32 >= cap {
-        return false;
+    let allowed = (window.len() as u32) < cap;
+    if allowed {
+        window.push_back(now_ms);
     }
-    window.push_back(now_ms);
-    true
+    if !window.is_empty() {
+        windows.insert(key.to_string(), window);
+    }
+    allowed
 }
 
 #[cfg(test)]
@@ -192,13 +199,17 @@ pub(crate) struct PaidReply {
     pub tool_activity: Vec<ToolActivity>,
 }
 
-/// One billed model turn: reserve, call the supplier, settle, and charge.
-/// Returns the raw response body and the credits this one turn cost.
+/// One model turn: reserve, call the supplier, and settle. Returns the raw
+/// response body and the observed micro-USD cost of this one turn — never
+/// charged here. Charging is one ledger write per whole reply (see
+/// `send_paid_reply`), because Josh's rule is "charge actual cost": a reply
+/// that took three turns to answer is still one line on the user's ledger,
+/// for the sum of what those three turns actually cost.
 ///
-/// `turn` is folded into the gateway's attempt id and the ledger's charge
-/// key (`{reply_id}:turn{n}`), so each turn is its own idempotency unit —
-/// replaying turn 2 never re-charges turn 1, and never re-charges turn 2
-/// either once it has settled.
+/// `turn` is folded into the gateway's attempt id (`{reply_id}:turn{n}`), so
+/// each turn is its own reservation and idempotency unit — replaying turn 2
+/// never re-reserves turn 1, and never re-reserves turn 2 either once it has
+/// settled.
 #[allow(clippy::too_many_arguments)]
 async fn send_one_turn<T: ProviderTransport + Clone>(
     db: &Database,
@@ -207,7 +218,6 @@ async fn send_one_turn<T: ProviderTransport + Clone>(
     transport: T,
     max_micro_usd: i64,
     funded_micro_usd: i64,
-    micros_per_credit: i64,
     user_id: &str,
     run_id: &str,
     provider: &str,
@@ -286,41 +296,26 @@ async fn send_one_turn<T: ProviderTransport + Clone>(
         ));
     };
 
-    let charged_credits = match outcome.reservation.observed_micro_usd {
-        Some(observed) if observed > 0 => {
-            let credits = ceil_div(observed, micros_per_credit);
-            if let Err(e) = db.deduct_credits(
-                user_id,
-                credits,
-                "Cortex-paid chat reply",
-                &ChargeKey::per_unit(format!("{reply_id}:turn{turn}")),
-            ) {
-                // The turn already succeeded and the user already has its
-                // output; failing the reply over a ledger write would
-                // double-punish them for Cortex's bug. The reservation is
-                // the source of truth for what was actually spent, so
-                // nothing is lost.
-                tracing::error!(user_id, reply_id, turn, error = %e, "chat: turn succeeded but charging credits failed");
-            }
-            credits
-        }
+    let observed_micro_usd = match outcome.reservation.observed_micro_usd {
+        Some(observed) if observed > 0 => observed,
         Some(_) => 0,
         None => {
             // No observed usage: never invent a price. The reservation
             // stays exactly as the gateway left it (reserved or
             // unresolved) for reconciliation; this module does not touch
-            // it further.
+            // it further, and this turn contributes nothing to the
+            // reply's eventual single charge.
             tracing::error!(
                 user_id,
                 reply_id,
                 turn,
-                "chat: turn succeeded with no observed usage; not charging"
+                "chat: turn succeeded with no observed usage; contributes nothing to the charge"
             );
             0
         }
     };
 
-    Ok((body, charged_credits))
+    Ok((body, observed_micro_usd))
 }
 
 /// Pull every `tool_use` block out of an assistant turn's content array.
@@ -372,7 +367,19 @@ pub(crate) async fn send_paid_reply<T: ProviderTransport + Clone>(
     system_prompt: &str,
     user_message: &str,
     reply_id: &str,
-    now_ms: i64,
+    // Unused now that every turn stamps its own `chrono::Utc::now()` for
+    // capability expiry and rate-limit windows (a fixed value shared across
+    // every turn of a slow, multi-turn reply would let later turns'
+    // capabilities and DB timestamps drift from real wall-clock time).
+    // Kept so every existing call site — production and test — still
+    // compiles unchanged; a future cleanup can drop it from the signature.
+    _now_ms: i64,
+    turn_cap_per_minute: u32,
+    // Live tool-activity events, sent as each tool call finishes rather
+    // than batched after the whole reply completes, so the UI can show
+    // "Checked your runs" while a slow multi-turn reply is still running.
+    // `None` in tests that don't care about the stream.
+    tool_events: Option<&mpsc::Sender<StepEvent>>,
 ) -> Result<PaidReply, PaidReplyError> {
     // Chat is paid by Cortex on the Anthropic path only (`ProviderPath::Cortex`);
     // a run that wants a different supplier goes through the HTTP gateway
@@ -387,16 +394,20 @@ pub(crate) async fn send_paid_reply<T: ProviderTransport + Clone>(
     let run_id = conversation_id
         .map(|c| format!("chat:{c}"))
         .unwrap_or_else(|| format!("chat:{reply_id}"));
-    // The per-minute cap is per conversation, not per reply: a conversation
-    // with no id (should not happen from the SSE entry point, but this
-    // function is also called directly in tests) falls back to the reply's
-    // own id, which only limits itself.
-    let turn_cap_key = conversation_id.unwrap_or(reply_id).to_string();
-    let turn_cap = turn_cap_per_minute();
+    // The per-minute cap is per (user, conversation): two users in the same
+    // conversation-less state (falling back to their own reply id) must
+    // never share a window, and a bare conversation id must not let one
+    // user's turns count against another's cap.
+    let turn_cap_key = format!("{user_id}:{}", conversation_id.unwrap_or(reply_id));
+    let turn_cap = turn_cap_per_minute;
 
     let tools = agent_tools::tool_definitions();
+    let no_tools: Vec<Value> = Vec::new();
     let mut messages = vec![serde_json::json!({"role": "user", "content": user_message})];
-    let mut charged_credits_total: i64 = 0;
+    // Summed across every turn and charged once at the very end (or once at
+    // the point of an early, partial stop) — see `send_one_turn`'s doc
+    // comment for why a reply is one ledger line, not one per turn.
+    let mut total_observed_micro_usd: i64 = 0;
     let mut tool_activity = Vec::new();
     let mut last_text = String::new();
     // Set when the loop stops early (turn > 1) instead of finishing on its
@@ -405,16 +416,32 @@ pub(crate) async fn send_paid_reply<T: ProviderTransport + Clone>(
     let mut stopped_reason: Option<&'static str> = None;
 
     for turn in 1..=MAX_AGENT_TURNS {
-        // Re-read the balance every turn: a prior turn in this same loop
-        // already spent some of it.
+        // Stamped fresh every turn: a slow, multi-turn reply must not let
+        // capability expiry, reservation timestamps, or the per-minute
+        // window all pin to the moment the reply started.
+        let now_ms = chrono::Utc::now().timestamp_millis();
+
+        // Read the balance unfiltered. It is not decremented until the
+        // single end-of-reply charge (see below), so what earlier turns in
+        // *this* loop already cost is subtracted here — as whole credits,
+        // rounded up the same way the final charge will round, so "credits
+        // used so far" mid-loop always matches what actually gets deducted
+        // at the end. Nothing left on turn 1 is a hard refusal — nothing
+        // has been reserved or charged yet, so there is nothing to
+        // preserve. Nothing left on turn 2+ is a graceful stop: earlier
+        // turns already did billable work that must still be charged once,
+        // at the end, and returned as a partial answer.
         let balance = db
             .get_credit_balance_row(user_id)
-            .filter(|b| b.subscription_remaining + b.pack_remaining > 0)
             .ok_or(PaidReplyError::NoCredits)?;
-        let balance_micro_usd = (balance.subscription_remaining + balance.pack_remaining)
-            .saturating_mul(price_list.micros_per_credit);
-        let max_micro_usd = limits.max_micro_usd.min(balance_micro_usd);
-        if max_micro_usd <= 0 {
+        let credits_used_so_far = if total_observed_micro_usd > 0 {
+            ceil_div(total_observed_micro_usd, price_list.micros_per_credit)
+        } else {
+            0
+        };
+        let remaining_credits =
+            balance.subscription_remaining + balance.pack_remaining - credits_used_so_far;
+        if remaining_credits <= 0 {
             if turn == 1 {
                 return Err(PaidReplyError::NoCredits);
             }
@@ -430,6 +457,9 @@ pub(crate) async fn send_paid_reply<T: ProviderTransport + Clone>(
             );
             break;
         }
+        let max_micro_usd = limits
+            .max_micro_usd
+            .min(remaining_credits.saturating_mul(price_list.micros_per_credit));
 
         if !try_acquire_turn_slot(&turn_cap_key, turn_cap, now_ms) {
             if turn == 1 {
@@ -449,27 +479,68 @@ pub(crate) async fn send_paid_reply<T: ProviderTransport + Clone>(
             break;
         }
 
-        let (body, charged) = send_one_turn(
+        // On the last turn there is no next turn to send tool results back
+        // on, so don't offer tools at all: the model has to answer in text
+        // with whatever it already knows, instead of asking for a tool call
+        // it will never see the result of.
+        let turn_tools: &[Value] = if turn == MAX_AGENT_TURNS {
+            &no_tools
+        } else {
+            &tools
+        };
+
+        let turn_outcome = send_one_turn(
             db,
             signing_key,
             supplier_key,
             transport.clone(),
             max_micro_usd,
             limits.funded_micro_usd,
-            price_list.micros_per_credit,
             user_id,
             &run_id,
             PROVIDER,
             model,
             system_prompt,
             &messages,
-            &tools,
+            turn_tools,
             reply_id,
             turn,
             now_ms,
         )
-        .await?;
-        charged_credits_total += charged;
+        .await;
+
+        let (body, observed_micro_usd) = match turn_outcome {
+            Ok(pair) => pair,
+            Err(e) if turn == 1 => return Err(e),
+            Err(PaidReplyError::NotEnoughCredits) => {
+                tracing::info!(
+                    user_id,
+                    reply_id,
+                    turn,
+                    "chat: reservation refused mid-loop; stopping"
+                );
+                stopped_reason = Some(
+                    "\n\n(This answer may be incomplete: you don't have enough credits left \
+                     for another turn, so I stopped before finishing.)",
+                );
+                break;
+            }
+            Err(other) => {
+                tracing::error!(
+                    user_id,
+                    reply_id,
+                    turn,
+                    error = ?other,
+                    "chat: turn failed mid-loop; stopping with a partial answer"
+                );
+                stopped_reason = Some(
+                    "\n\n(This answer may be incomplete: something went wrong partway \
+                     through, so I stopped early.)",
+                );
+                break;
+            }
+        };
+        total_observed_micro_usd += observed_micro_usd;
         last_text = extract_text(&body);
 
         let uses = tool_uses(&body);
@@ -487,22 +558,35 @@ pub(crate) async fn send_paid_reply<T: ProviderTransport + Clone>(
 
         let mut tool_results = Vec::with_capacity(uses.len());
         for (tool_use_id, name, input) in uses {
-            let (content, is_error) = match agent_tools::execute(db, user_id, &name, &input) {
-                Ok(rendered) => {
-                    tool_activity.push(ToolActivity {
-                        tool_name: name.clone(),
-                        ok: true,
-                    });
-                    (rendered, false)
-                }
-                Err(e) => {
-                    tool_activity.push(ToolActivity {
-                        tool_name: name.clone(),
-                        ok: false,
-                    });
-                    (e.message(), true)
-                }
-            };
+            let (activity, content, is_error) =
+                match agent_tools::execute(db, user_id, &name, &input) {
+                    Ok(rendered) => (
+                        ToolActivity {
+                            tool_name: name.clone(),
+                            ok: true,
+                        },
+                        rendered,
+                        false,
+                    ),
+                    Err(e) => (
+                        ToolActivity {
+                            tool_name: name.clone(),
+                            ok: false,
+                        },
+                        e.message(),
+                        true,
+                    ),
+                };
+            if let Some(tx) = tool_events {
+                let _ = tx
+                    .send(StepEvent::ToolActivity {
+                        step_id: "chat".into(),
+                        tool_name: activity.tool_name.clone(),
+                        ok: activity.ok,
+                    })
+                    .await;
+            }
+            tool_activity.push(activity);
             tool_results.push(serde_json::json!({
                 "type": "tool_result",
                 "tool_use_id": tool_use_id,
@@ -527,6 +611,26 @@ pub(crate) async fn send_paid_reply<T: ProviderTransport + Clone>(
     if let Some(reason) = stopped_reason {
         last_text.push_str(reason);
     }
+
+    // One ledger line per reply, for the sum of what every turn actually
+    // cost — including a reply that stopped early, so the turns that did
+    // run are never given away for free.
+    let charged_credits_total = if total_observed_micro_usd > 0 {
+        let credits = ceil_div(total_observed_micro_usd, price_list.micros_per_credit);
+        db.deduct_credits(
+            user_id,
+            credits,
+            "Cortex-paid chat reply",
+            &ChargeKey::for_chat_reply(reply_id),
+        )
+        .map_err(|e| {
+            tracing::error!(user_id, reply_id, error = %e, "chat: failed to charge for reply");
+            PaidReplyError::Unavailable
+        })?;
+        credits
+    } else {
+        0
+    };
 
     Ok(PaidReply {
         text: last_text,
@@ -634,6 +738,7 @@ pub(crate) async fn run(
 
     let reply_id = uuid::Uuid::new_v4().to_string();
     let now_ms = chrono::Utc::now().timestamp_millis();
+    let turn_cap = turn_cap_per_minute();
 
     match send_paid_reply(
         db,
@@ -648,6 +753,8 @@ pub(crate) async fn run(
         &user_message,
         &reply_id,
         now_ms,
+        turn_cap,
+        Some(&tx),
     )
     .await
     {
@@ -658,15 +765,11 @@ pub(crate) async fn run(
                 %reply_id,
                 "cortex-paid chat reply charged"
             );
-            for activity in &reply.tool_activity {
-                let _ = tx
-                    .send(StepEvent::ToolActivity {
-                        step_id: "chat".into(),
-                        tool_name: activity.tool_name.clone(),
-                        ok: activity.ok,
-                    })
-                    .await;
-            }
+            // Tool activity was already streamed live, turn by turn, inside
+            // `send_paid_reply` (via the `tool_events` sender above) — not
+            // replayed here, so the UI sees "Checked your runs" while a
+            // slow multi-turn reply is still in progress rather than only
+            // once it finishes.
             let _ = tx
                 .send(StepEvent::Output {
                     step_id: "chat".into(),
@@ -681,7 +784,10 @@ pub(crate) async fn run(
                 .await;
             if let Some(cid) = &conversation_id {
                 if let Some(summary) = tool_activity_summary(&reply.tool_activity) {
-                    db.add_message(cid, "tool", &summary, Some("cortex"), None);
+                    // Saved as "assistant", not "tool": the frontend has no
+                    // renderer for a "tool" role and shows it as if the
+                    // user had said it after a page reload.
+                    db.add_message(cid, "assistant", &summary, Some("cortex"), None);
                 }
                 if !reply.text.is_empty() {
                     db.add_message(cid, "assistant", &reply.text, Some("cortex"), None);
@@ -805,6 +911,8 @@ mod tests {
             "hi",
             "reply-1",
             NOW,
+            20,
+            None,
         )
         .await
         .expect("reply should succeed");
@@ -837,6 +945,8 @@ mod tests {
             "hi",
             "reply-2",
             NOW,
+            20,
+            None,
         )
         .await
         .expect_err("supplier failure must not succeed");
@@ -868,6 +978,8 @@ mod tests {
             "hi",
             "reply-3",
             NOW,
+            20,
+            None,
         )
         .await
         .expect_err("zero balance must refuse");
@@ -905,6 +1017,8 @@ mod tests {
                 "hi",
                 "reply-4",
                 NOW,
+                20,
+                None,
             )
             .await;
             if attempt == 0 {
@@ -948,6 +1062,8 @@ mod tests {
             "hi",
             "reply-5",
             NOW,
+            20,
+            None,
         )
         .await
         .expect("reply should succeed");
@@ -1054,7 +1170,11 @@ mod tests {
         db.init_credit_balance("user-1", 1000).unwrap();
         let price_list = db.active_price_list().unwrap();
         let rate = price_list.model("claude", MODEL).unwrap();
-        let per_turn_credits = ceil_div(rate.cost_micros(10, 0, 10), price_list.micros_per_credit);
+        let per_turn_micro = rate.cost_micros(10, 0, 10);
+        // One ledger line for the whole reply, for the ceiling of the sum of
+        // every turn's observed cost — not one line (and one separate
+        // rounding-up) per turn.
+        let expected_credits = ceil_div(per_turn_micro * 2, price_list.micros_per_credit);
 
         let transport = SequenceTransport::new(vec![
             tool_use_response(10, 10, "toolu_1", "list_runs", serde_json::json!({})),
@@ -1074,16 +1194,20 @@ mod tests {
             "how are my runs?",
             "reply-tool-1",
             NOW,
+            20,
+            None,
         )
         .await
         .expect("reply should succeed");
 
         assert_eq!(transport.call_count(), 2, "one turn per gateway call");
         assert_eq!(reply.text, "here is your answer");
+        assert_eq!(reply.charged_credits, expected_credits);
+        let balance = db.get_credit_balance_row("user-1").unwrap();
         assert_eq!(
-            reply.charged_credits,
-            per_turn_credits * 2,
-            "each turn bills separately"
+            balance.subscription_remaining,
+            1000 - expected_credits,
+            "the ledger reflects one deduction for the whole reply"
         );
         assert_eq!(
             reply.tool_activity,
@@ -1098,13 +1222,18 @@ mod tests {
     async fn loop_stops_at_turn_cap() {
         let (_dir, db) = test_db();
         db.init_credit_balance("user-1", 1_000_000).unwrap();
-        let transport = SequenceTransport::new(vec![tool_use_response(
+        // The model calls a tool every turn but the last: the last turn is
+        // sent with no tools at all (see `send_paid_reply`), so a real model
+        // has nothing to call and must answer in text instead.
+        let mut responses: Vec<_> = (1..MAX_AGENT_TURNS)
+            .map(|_| tool_use_response(10, 10, "toolu_1", "list_runs", serde_json::json!({})))
+            .collect();
+        responses.push(text_response(
             10,
             10,
-            "toolu_1",
-            "list_runs",
-            serde_json::json!({}),
-        )]);
+            "here's what I found before running out of turns",
+        ));
+        let transport = SequenceTransport::new(responses);
 
         let reply = send_paid_reply(
             &db,
@@ -1119,12 +1248,122 @@ mod tests {
             "keep checking",
             "reply-tool-2",
             NOW,
+            20,
+            None,
         )
         .await
-        .expect("reply should succeed even though it never got a final answer");
+        .expect("reply should succeed even though it never got a final answer on its own");
 
         assert_eq!(transport.call_count(), MAX_AGENT_TURNS as usize);
-        assert_eq!(reply.tool_activity.len(), MAX_AGENT_TURNS as usize);
+        assert_eq!(reply.tool_activity.len(), (MAX_AGENT_TURNS - 1) as usize);
+        assert!(
+            !reply.text.is_empty(),
+            "the final, tool-less turn must produce a text answer"
+        );
+    }
+
+    /// A turn's reservation is refused when its worst-case cost would push
+    /// this turn's own authorization over `SpendLimits.max_micro_usd` — an
+    /// operator cap, independent of the user's balance. Tunes that cap to
+    /// sit exactly at turn 1's reserved cost: turn 1 (a short user message)
+    /// fits, turn 2 (the same messages plus the appended tool_use/
+    /// tool_result turn) does not, since its serialized body is strictly
+    /// larger.
+    #[tokio::test]
+    async fn reservation_refused_on_turn_two_returns_partial() {
+        let (_dir, db) = test_db();
+        db.init_credit_balance("user-1", 1_000_000).unwrap();
+        let price_list = db.active_price_list().unwrap();
+        let rate = price_list.model("claude", MODEL).unwrap();
+
+        fn ceiling_per_thousand(n: i64, rate: i64) -> i64 {
+            (n * rate + 999) / 1_000
+        }
+        fn reserved_cost(body: &Value, rate: &crate::pricing::ModelPrice) -> i64 {
+            let bytes = serde_json::to_vec(body).unwrap().len() as i64;
+            ceiling_per_thousand(bytes, rate.input_micros_per_1k)
+                + ceiling_per_thousand(MAX_OUTPUT_TOKENS, rate.output_micros_per_1k)
+        }
+
+        let tools = agent_tools::tool_definitions();
+        let user_message = "keep checking";
+        let tool_use_id = "toolu_1";
+        let tool_name = "not_a_real_tool";
+
+        let turn1_messages = serde_json::json!([{"role": "user", "content": user_message}]);
+        let turn1_body = serde_json::json!({
+            "model": MODEL, "max_tokens": MAX_OUTPUT_TOKENS, "system": "system",
+            "messages": turn1_messages, "stream": false, "tools": tools,
+        });
+        let turn1_reserved = reserved_cost(&turn1_body, rate);
+
+        let assistant_content = serde_json::json!([{"type": "tool_use", "id": tool_use_id, "name": tool_name, "input": {}}]);
+        let tool_results = serde_json::json!([{
+            "type": "tool_result",
+            "tool_use_id": tool_use_id,
+            "content": "unknown tool: not_a_real_tool",
+            "is_error": true,
+        }]);
+        let turn2_messages = serde_json::json!([
+            {"role": "user", "content": user_message},
+            {"role": "assistant", "content": assistant_content},
+            {"role": "user", "content": tool_results},
+        ]);
+        let turn2_body = serde_json::json!({
+            "model": MODEL, "max_tokens": MAX_OUTPUT_TOKENS, "system": "system",
+            "messages": turn2_messages, "stream": false, "tools": tools,
+        });
+        let turn2_reserved = reserved_cost(&turn2_body, rate);
+        assert!(
+            turn2_reserved > turn1_reserved,
+            "turn 2's body must cost more to reserve than turn 1's for this test to prove anything"
+        );
+
+        let limits = SpendLimits {
+            max_micro_usd: turn1_reserved,
+            funded_micro_usd: 1_000_000_000,
+        };
+        let transport = SequenceTransport::new(vec![tool_use_response(
+            10,
+            10,
+            tool_use_id,
+            tool_name,
+            serde_json::json!({}),
+        )]);
+
+        let reply = send_paid_reply(
+            &db,
+            SIGNING_KEY,
+            SUPPLIER_KEY,
+            transport.clone(),
+            limits,
+            "user-1",
+            Some("conv-tool-5"),
+            MODEL,
+            "system",
+            user_message,
+            "reply-tool-5",
+            NOW,
+            20,
+            None,
+        )
+        .await
+        .expect("turn 1's work must still come back as a partial answer");
+
+        assert_eq!(
+            transport.call_count(),
+            1,
+            "turn 2's reservation is refused before any second gateway call"
+        );
+        assert!(
+            reply.text.contains("enough credits left for another turn"),
+            "partial answer must say why it stopped: {}",
+            reply.text
+        );
+        let expected_credits = ceil_div(rate.cost_micros(10, 0, 10), price_list.micros_per_credit);
+        assert_eq!(reply.charged_credits, expected_credits);
+        let balance = db.get_credit_balance_row("user-1").unwrap();
+        assert_eq!(balance.subscription_remaining, 1_000_000 - expected_credits);
     }
 
     #[tokio::test]
@@ -1158,6 +1397,8 @@ mod tests {
             "keep checking",
             "reply-tool-3",
             NOW,
+            20,
+            None,
         )
         .await
         .expect("a partial answer, not an error, once at least one turn ran");
@@ -1184,7 +1425,6 @@ mod tests {
     async fn per_minute_cap_stops_loop() {
         let (_dir, db) = test_db();
         db.init_credit_balance("user-1", 1_000_000).unwrap();
-        std::env::set_var("CORTEX_CHAT_AGENT_TURN_CAP_PER_MINUTE", "1");
         reset_turn_windows_for_test();
 
         let transport = SequenceTransport::new(vec![tool_use_response(
@@ -1208,10 +1448,11 @@ mod tests {
             "keep checking",
             "reply-tool-4",
             NOW,
+            1,
+            None,
         )
         .await;
 
-        std::env::remove_var("CORTEX_CHAT_AGENT_TURN_CAP_PER_MINUTE");
         let reply = reply.expect("a partial answer once the cap is hit mid-loop");
 
         assert_eq!(
