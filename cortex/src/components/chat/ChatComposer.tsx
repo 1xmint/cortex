@@ -311,12 +311,18 @@ export default function ChatComposer({
           </p>
         )}
         <div className="flex items-center justify-between px-1 pb-1">
-          <ModelPicker
-            selectedModel={currentModel}
-            onSelect={handleModelChange}
-            onOpenModelSettings={onOpenModelSettings}
-            zenKeyError={zenKeyError}
-          />
+          {/* Only where the caller wires the choice into the send; a picker
+              whose choice goes nowhere would silently send on Claude. */}
+          {onModelChange ? (
+            <ModelPicker
+              selectedModel={currentModel}
+              onSelect={handleModelChange}
+              onOpenModelSettings={onOpenModelSettings}
+              zenKeyError={zenKeyError}
+            />
+          ) : (
+            <span />
+          )}
           {/* Action Buttons */}
           <div className="flex items-center gap-2">
             <button
