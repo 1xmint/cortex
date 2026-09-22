@@ -53,6 +53,8 @@ const ALLOWED_MODELS: &[&str] = &[
     "deepseek-v4-flash-vision-exp",
     "glm-5.3-flash",
     "glm-5.3",
+    "glm-5.2",
+    "glm-5.1",
     "glm-5",
     "minimax-m3",
     "minimax-m2.7",
@@ -524,6 +526,7 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(failure.kind, TransportFailureKind::NotSent);
+        assert!(failure.message.contains("bypass the reservation bound"));
     }
 
     #[tokio::test]
@@ -535,6 +538,7 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(failure.kind, TransportFailureKind::NotSent);
+        assert!(failure.message.contains("bypass the reservation bound"));
     }
 
     #[tokio::test]
