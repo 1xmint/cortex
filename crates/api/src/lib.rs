@@ -30,6 +30,7 @@ pub mod provider_gateway;
 mod provider_gateway_http;
 mod supplier_anthropic;
 mod supplier_openai;
+mod supplier_zen;
 pub mod verification_dispatcher;
 pub mod verification_driver;
 mod voice;

@@ -7,7 +7,8 @@
 //!   machine and nothing is spent. This is what the proofs run against.
 //! - `live`: calls the supplier named in the verified capability, on Cortex's
 //!   own key for that supplier (`CORTEX_ANTHROPIC_SUPPLIER_KEY` for Claude,
-//!   `CORTEX_OPENAI_SUPPLIER_KEY` for OpenAI). This spends real money, inside
+//!   `CORTEX_OPENAI_SUPPLIER_KEY` for OpenAI, `CORTEX_ZEN_SUPPLIER_KEY` for
+//!   OpenCode Zen). This spends real money, inside
 //!   the same reservation and cap as the stub. Live mode is on as soon as at
 //!   least one supplier key is present; a request for a provider without a
 //!   funded key is refused the same way an unknown provider would be.
@@ -50,6 +51,7 @@ enum GatewayMode {
 const SUPPLIER_KEY_ENV_VARS: &[(&str, &str)] = &[
     ("claude", "CORTEX_ANTHROPIC_SUPPLIER_KEY"),
     ("openai", "CORTEX_OPENAI_SUPPLIER_KEY"),
+    ("zen", "CORTEX_ZEN_SUPPLIER_KEY"),
 ];
 
 fn gateway_mode() -> Option<GatewayMode> {
@@ -90,7 +92,9 @@ pub(crate) fn issue_access(
     if gateway_mode().is_none()
         || !matches!(
             provider,
-            cortex_core::provider::ProviderId::Claude | cortex_core::provider::ProviderId::Openai
+            cortex_core::provider::ProviderId::Claude
+                | cortex_core::provider::ProviderId::Openai
+                | cortex_core::provider::ProviderId::Zen
         )
     {
         return None;
@@ -257,6 +261,7 @@ pub(crate) enum GatewayTransport {
     Stub(StubTransport),
     Live(crate::supplier_anthropic::AnthropicTransport),
     LiveOpenAi(crate::supplier_openai::OpenAiTransport),
+    LiveZen(crate::supplier_zen::ZenTransport),
 }
 
 impl ProviderTransport for GatewayTransport {
@@ -269,6 +274,7 @@ impl ProviderTransport for GatewayTransport {
             GatewayTransport::Stub(t) => t.forward(supplier_key, request).await,
             GatewayTransport::Live(t) => t.forward(supplier_key, request).await,
             GatewayTransport::LiveOpenAi(t) => t.forward(supplier_key, request).await,
+            GatewayTransport::LiveZen(t) => t.forward(supplier_key, request).await,
         }
     }
 }
@@ -282,6 +288,9 @@ fn live_transport_for(provider: &str) -> Option<GatewayTransport> {
         )),
         "openai" => Some(GatewayTransport::LiveOpenAi(
             crate::supplier_openai::OpenAiTransport::new(),
+        )),
+        "zen" => Some(GatewayTransport::LiveZen(
+            crate::supplier_zen::ZenTransport::new(),
         )),
         _ => None,
     }

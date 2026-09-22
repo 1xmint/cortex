@@ -501,6 +501,94 @@ pub fn seed_models() -> Vec<ModelPrice> {
             1_000_000,
             "fast",
         ),
+        // OpenCode Zen (https://opencode.ai/docs/zen, "Pricing" table) and
+        // https://opencode.ai/zen/v1/models for exact model ids, both read
+        // 2026-09-21. This slice covers only the `/chat/completions` family
+        // (DeepSeek, GLM, Kimi, MiniMax); Zen's Claude/GPT/Gemini/Grok
+        // aliases are priced under their own provider rows already above and
+        // are not reachable through the Zen supplier. Every row here is a
+        // paid, non-free, non-training-data model from the explicit
+        // allowlist in `supplier_zen.rs`; nothing else may settle at this
+        // price list, and a model missing here cannot be reserved against at
+        // all (`GatewayError::MissingRate`) regardless of what the allowlist
+        // in `supplier_zen.rs` separately refuses.
+        //
+        // Rates are the published per-1M-token price divided by 1,000 (so
+        // $0.14/1M input becomes 140 micros/1k). `cache_read_bp` is the
+        // published cached-read price as basis points of the input price.
+        // None of these models publishes a context-length breakpoint tier
+        // (unlike, on the same page, Claude/Gemini/Grok/GPT rows) so there is
+        // no tiered pricing to apply here.
+        //
+        // `context_window` is not published by Zen for this family; each row
+        // uses a deliberately conservative estimate of the underlying open
+        // model's known public context length as of 2026-09-21, so the
+        // gateway's bound check errs toward rejecting an oversized request
+        // rather than admitting one Zen might refuse anyway.
+        m(
+            "zen",
+            "deepseek-v4.1-flash",
+            300,
+            1_200,
+            200,
+            128_000,
+            "fast",
+        ),
+        m(
+            "zen",
+            "deepseek-v4-pro",
+            1_740,
+            3_480,
+            833,
+            128_000,
+            "frontier",
+        ),
+        m("zen", "deepseek-v4-flash", 140, 280, 2_000, 128_000, "fast"),
+        m(
+            "zen",
+            "deepseek-v4-flash-vision-exp",
+            140,
+            280,
+            2_000,
+            128_000,
+            "fast",
+        ),
+        m("zen", "glm-5.3-flash", 150, 500, 2_000, 128_000, "fast"),
+        m("zen", "glm-5.3", 1_400, 4_400, 1_857, 128_000, "balanced"),
+        m("zen", "glm-5.2", 1_400, 4_400, 1_857, 128_000, "balanced"),
+        m("zen", "glm-5.1", 1_400, 4_400, 1_857, 128_000, "balanced"),
+        m("zen", "glm-5", 1_000, 3_200, 2_000, 128_000, "balanced"),
+        m("zen", "minimax-m3", 300, 1_200, 2_000, 200_000, "balanced"),
+        m(
+            "zen",
+            "minimax-m2.7",
+            300,
+            1_200,
+            2_000,
+            200_000,
+            "balanced",
+        ),
+        m(
+            "zen",
+            "minimax-m2.5",
+            300,
+            1_200,
+            2_000,
+            200_000,
+            "balanced",
+        ),
+        m("zen", "kimi-k3", 3_000, 15_000, 1_000, 256_000, "frontier"),
+        m(
+            "zen",
+            "kimi-k2.7-code",
+            950,
+            4_000,
+            2_000,
+            256_000,
+            "balanced",
+        ),
+        m("zen", "kimi-k2.6", 950, 4_000, 1_684, 256_000, "balanced"),
+        m("zen", "kimi-k2.5", 600, 3_000, 1_667, 256_000, "balanced"),
     ]
 }
 
