@@ -30,7 +30,7 @@
 
 use std::convert::Infallible;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -51,6 +51,7 @@ use crate::clerk::ClerkUser;
 use crate::provider_gateway::GatewayCapability;
 use crate::provider_gateway_http::{self, SpendLimits};
 use crate::routes::ErrorResponse;
+use crate::spoken_confirm;
 use crate::state::AppState;
 use crate::voice::ceil_div;
 
@@ -186,22 +187,38 @@ pub struct VoiceSessionHandle {
     /// `store_pending_confirm` right alongside publishing
     /// `VoiceEvent::ConfirmRequired`. A newer proposal replaces the slot
     /// rather than queuing, matching the one-proposal-per-reply rule
-    /// `chat_paid::send_paid_reply` already enforces server-side. Not read
-    /// by anything yet — the spoken matcher that consults it lands in part
-    /// 2 of the spoken-confirm plan.
+    /// `chat_paid::send_paid_reply` already enforces server-side.
+    /// `armed_at`/`deadline` are set by `POST .../prompt-ended`
+    /// (`prompt_ended_with`, below) once the client reports the spoken
+    /// prompt finished; a fresh proposal (a new call into
+    /// `store_pending_confirm`) always clears them, resetting the window.
     pending_confirm: std::sync::Mutex<Option<PendingConfirm>>,
+    /// The pure spoken-confirm state machine (`spoken_confirm::Matcher`) for
+    /// this session's currently-armed action, if any. Armed alongside
+    /// `pending_confirm` and opened (`prompt_ended`) by
+    /// `POST .../prompt-ended`. Not fed any transcript yet — that wiring
+    /// lands in part 2b of the spoken-confirm plan; this field exists now so
+    /// that slice only has to feed it, not build it.
+    #[allow(dead_code)] // Read by the transcript wiring in part 2b.
+    spoken_matcher: std::sync::Mutex<spoken_confirm::Matcher>,
 }
 
 /// What the "pending confirm" slot on a [`VoiceSessionHandle`] holds: enough
-/// for the (not-yet-written) spoken matcher to know which action a spoken
-/// "yes" resolves — never `nonce`, which stays confined to
-/// `VoiceEvent::ConfirmRequired` on the event stream.
+/// for the spoken matcher to know which action a spoken "yes" resolves, plus
+/// the wall-clock window `prompt_ended_with` opened for it — never `nonce`,
+/// which stays confined to `VoiceEvent::ConfirmRequired` on the event
+/// stream.
 #[derive(Debug, Clone)]
 pub(crate) struct PendingConfirm {
-    #[allow(dead_code)] // Read by the spoken matcher, wired in part 2.
     pub action_id: String,
-    #[allow(dead_code)] // Read by the spoken matcher, wired in part 2.
+    #[allow(dead_code)] // Read by the spoken matcher, wired in part 2b.
     pub summary: String,
+    /// When `POST .../prompt-ended` opened the spoken window for this
+    /// action, as a Unix timestamp (seconds). `None` until that happens.
+    pub armed_at: Option<i64>,
+    /// `armed_at + 45s` — also the `deadline` published on
+    /// `VoiceEvent::SpokenWindow`.
+    pub deadline: Option<i64>,
 }
 
 /// How many events a lagging subscriber can fall behind before older ones
@@ -505,6 +522,7 @@ pub(crate) async fn start_session(
                 close_tx,
                 events_tx,
                 pending_confirm: std::sync::Mutex::new(None),
+                spoken_matcher: std::sync::Mutex::new(spoken_confirm::Matcher::new()),
             },
         );
     }
@@ -729,6 +747,7 @@ async fn start_live_session(
                 close_tx,
                 events_tx,
                 pending_confirm: std::sync::Mutex::new(None),
+                spoken_matcher: std::sync::Mutex::new(spoken_confirm::Matcher::new()),
             },
         );
     }
@@ -1309,7 +1328,19 @@ fn store_pending_confirm(state: &Arc<AppState>, session_id: &str, action_id: &st
             .unwrap_or_else(|e| e.into_inner()) = Some(PendingConfirm {
             action_id: action_id.to_string(),
             summary: summary.to_string(),
+            armed_at: None,
+            deadline: None,
         });
+        // A new proposal always resets the spoken window: re-arming here
+        // replaces whatever the matcher was doing for the prior action
+        // (including an already-open window), matching the pending-confirm
+        // slot it now goes with. The window itself opens only once
+        // `POST .../prompt-ended` calls `prompt_ended` for this action.
+        handle
+            .spoken_matcher
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .arm(action_id.to_string(), Instant::now());
     }
 }
 
@@ -2097,6 +2128,131 @@ pub async fn live_session_events(
     Path(session_id): Path<String>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, (StatusCode, Json<ErrorResponse>)> {
     live_session_events_with(&state, &user.user_id, &session_id).await
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct PromptEndedRequest {
+    pub action_id: String,
+}
+
+/// How long a spoken confirm window stays open once `prompt_ended_with`
+/// opens it — matches `spoken_confirm::WINDOW`, which is private to that
+/// module, so this is its own copy rather than an import.
+const SPOKEN_WINDOW_SECS: i64 = 45;
+
+fn stale_action_response() -> (StatusCode, Json<ErrorResponse>) {
+    (
+        StatusCode::CONFLICT,
+        Json(ErrorResponse {
+            error: "not the current pending action".into(),
+        }),
+    )
+}
+
+/// `POST /api/voice/live/sessions/{id}/prompt-ended` — the client reports
+/// that it finished speaking the confirm prompt for `action_id`, opening the
+/// 45s window the spoken matcher (`spoken_confirm::Matcher`) gives a "yes"
+/// or "no" to arrive in. Owner only, same 404 shape as
+/// `GET .../events` (`subscribe_voice_events`) for both an unknown session
+/// and someone else's: [`LiveSessionError::NotFound`].
+///
+/// `action_id` must be the session's current pending-confirm slot, and the
+/// `agent_pending_actions` row it names must still be `pending` in the
+/// database — trusting only the in-memory slot would let a stale or
+/// already-resolved action re-open a window, since that slot is never
+/// cleared on tap, cancel, expiry, or void. Either mismatch is a 409 that
+/// changes nothing.
+pub(crate) async fn prompt_ended_with(
+    state: &Arc<AppState>,
+    user_id: &str,
+    session_id: &str,
+    action_id: &str,
+    now: i64,
+) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
+    {
+        let sessions = state
+            .voice_sessions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        sessions
+            .get(session_id)
+            .filter(|handle| handle.user_id == user_id)
+            .ok_or(LiveSessionError::NotFound)
+            .map_err(LiveSessionError::into_response)?;
+    }
+
+    let db = state.db.as_ref().ok_or_else(|| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: "database not available".into(),
+            }),
+        )
+    })?;
+    let row_still_pending = db
+        .get_pending_action(action_id, user_id)
+        .map(|row| row.status == "pending")
+        .unwrap_or(false);
+
+    let deadline = now + SPOKEN_WINDOW_SECS;
+    let armed = {
+        let sessions = state
+            .voice_sessions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let Some(handle) = sessions.get(session_id) else {
+            return Err(LiveSessionError::NotFound.into_response());
+        };
+
+        let mut pending = handle
+            .pending_confirm
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let matches_current = pending.as_ref().is_some_and(|p| p.action_id == action_id);
+
+        if !matches_current || !row_still_pending {
+            false
+        } else {
+            if let Some(slot) = pending.as_mut() {
+                slot.armed_at = Some(now);
+                slot.deadline = Some(deadline);
+            }
+            drop(pending);
+            handle
+                .spoken_matcher
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .prompt_ended(Instant::now());
+            true
+        }
+    };
+
+    if !armed {
+        return Err(stale_action_response());
+    }
+
+    publish_voice_event(
+        state,
+        session_id,
+        VoiceEvent::SpokenWindow {
+            action_id: action_id.to_string(),
+            deadline,
+        },
+    );
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// `POST /api/voice/live/sessions/{id}/prompt-ended` HTTP shell — see
+/// [`prompt_ended_with`] for the actual work.
+pub async fn prompt_ended(
+    State(state): State<Arc<AppState>>,
+    user: ClerkUser,
+    Path(session_id): Path<String>,
+    Json(req): Json<PromptEndedRequest>,
+) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
+    let now = chrono::Utc::now().timestamp();
+    prompt_ended_with(&state, &user.user_id, &session_id, &req.action_id, now).await
 }
 
 /// Registers the fake OpenAI Live endpoints this module's tests run against
@@ -3634,6 +3790,7 @@ mod tests {
                     close_tx,
                     events_tx,
                     pending_confirm: std::sync::Mutex::new(None),
+                    spoken_matcher: std::sync::Mutex::new(spoken_confirm::Matcher::new()),
                 },
             );
         }
@@ -4425,6 +4582,7 @@ mod tests {
                     close_tx,
                     events_tx,
                     pending_confirm: std::sync::Mutex::new(None),
+                    spoken_matcher: std::sync::Mutex::new(spoken_confirm::Matcher::new()),
                 },
             );
         }
@@ -4555,6 +4713,7 @@ mod tests {
                     close_tx,
                     events_tx,
                     pending_confirm: std::sync::Mutex::new(None),
+                    spoken_matcher: std::sync::Mutex::new(spoken_confirm::Matcher::new()),
                 },
             );
 
@@ -4586,6 +4745,164 @@ mod tests {
                 }
             }
             assert!(ended, "the stream must end once the subscriber lags");
+        }
+    }
+
+    mod prompt_ended_route {
+        use super::*;
+
+        /// Inserts both the session and a real `agent_pending_actions` row,
+        /// returning the row's real (server-minted) id so tests can use it
+        /// as `action_id` throughout — `insert_pending_action` never lets a
+        /// caller choose the id.
+        fn insert_session_and_action(
+            state: &Arc<AppState>,
+            session_id: &str,
+            owner_id: &str,
+        ) -> String {
+            let (close_tx, _close_rx) = mpsc::channel(1);
+            let (events_tx, _) = broadcast::channel(VOICE_EVENTS_CAPACITY);
+            state.voice_sessions.lock().unwrap().insert(
+                session_id.to_string(),
+                VoiceSessionHandle {
+                    user_id: owner_id.to_string(),
+                    close_tx,
+                    events_tx,
+                    pending_confirm: std::sync::Mutex::new(None),
+                    spoken_matcher: std::sync::Mutex::new(spoken_confirm::Matcher::new()),
+                },
+            );
+            let db = state.db.as_ref().expect("db configured");
+            let action = db.insert_pending_action(
+                owner_id,
+                "conv-1",
+                "open_pr",
+                &serde_json::json!({"run_id": "r1"}),
+                "Open a pull request for run r1",
+                chrono::Utc::now().timestamp(),
+            );
+            store_pending_confirm(
+                state,
+                session_id,
+                &action.id,
+                "Open a pull request for run r1",
+            );
+            action.id
+        }
+
+        #[tokio::test]
+        async fn non_owner_gets_404() {
+            let (_dir, state) = test_state().await;
+            let action_id = insert_session_and_action(&state, "sess-1", "someone-else");
+
+            let err = prompt_ended_with(
+                &state,
+                USER,
+                "sess-1",
+                &action_id,
+                chrono::Utc::now().timestamp(),
+            )
+            .await
+            .expect_err("a non-owner must be refused");
+            assert_eq!(err.0, StatusCode::NOT_FOUND);
+        }
+
+        #[tokio::test]
+        async fn unknown_session_gets_404_with_identical_body_to_non_owner() {
+            let (_dir, state) = test_state().await;
+            let action_id = insert_session_and_action(&state, "sess-1", "someone-else");
+            let now = chrono::Utc::now().timestamp();
+
+            let non_owner = prompt_ended_with(&state, USER, "sess-1", &action_id, now)
+                .await
+                .expect_err("a non-owner must be refused");
+            let unknown = prompt_ended_with(&state, USER, "no-such-session", &action_id, now)
+                .await
+                .expect_err("an unknown session id must be refused");
+
+            assert_eq!(non_owner.0, unknown.0);
+            assert_eq!(non_owner.1 .0.error, unknown.1 .0.error);
+        }
+
+        #[tokio::test]
+        async fn stale_action_id_gets_409() {
+            let (_dir, state) = test_state().await;
+            let action_id = insert_session_and_action(&state, "sess-1", USER);
+
+            let err = prompt_ended_with(
+                &state,
+                USER,
+                "sess-1",
+                &format!("{action_id}-not-it"),
+                chrono::Utc::now().timestamp(),
+            )
+            .await
+            .expect_err("an action_id that is not the current pending slot must be refused");
+            assert_eq!(err.0, StatusCode::CONFLICT);
+        }
+
+        #[tokio::test]
+        async fn current_action_gets_204_and_a_spoken_window_event_with_a_45s_deadline() {
+            let (_dir, state) = test_state().await;
+            let action_id = insert_session_and_action(&state, "sess-1", USER);
+            let mut rx = subscribe_voice_events(&state, USER, "sess-1")
+                .unwrap_or_else(|_| panic!("the owner must be able to subscribe"));
+
+            let now = chrono::Utc::now().timestamp();
+            let status = prompt_ended_with(&state, USER, "sess-1", &action_id, now)
+                .await
+                .unwrap_or_else(|_| panic!("the current pending action must arm"));
+            assert_eq!(status, StatusCode::NO_CONTENT);
+
+            let event = tokio::time::timeout(StdDuration::from_secs(5), rx.recv())
+                .await
+                .expect("an event must arrive")
+                .expect("the channel must not close");
+            match event {
+                VoiceEvent::SpokenWindow {
+                    action_id: got_id,
+                    deadline,
+                } => {
+                    assert_eq!(got_id, action_id);
+                    assert!(
+                        (now + 44..=now + 46).contains(&deadline),
+                        "deadline {deadline} must be about 45s after now ({now})"
+                    );
+                }
+                other => panic!("expected SpokenWindow, got {other:?}"),
+            }
+        }
+
+        #[tokio::test]
+        async fn a_new_proposal_after_arming_clears_the_window() {
+            let (_dir, state) = test_state().await;
+            let action_id = insert_session_and_action(&state, "sess-1", USER);
+
+            let now = chrono::Utc::now().timestamp();
+            prompt_ended_with(&state, USER, "sess-1", &action_id, now)
+                .await
+                .unwrap_or_else(|_| panic!("arms the window"));
+
+            {
+                let sessions = state.voice_sessions.lock().unwrap();
+                let handle = sessions.get("sess-1").unwrap();
+                let pending = handle.pending_confirm.lock().unwrap();
+                assert!(pending.as_ref().unwrap().deadline.is_some());
+            }
+
+            // A new proposal on the same session replaces the slot and
+            // clears the window.
+            store_pending_confirm(&state, "sess-1", "action-2", "second proposal");
+
+            let sessions = state.voice_sessions.lock().unwrap();
+            let handle = sessions.get("sess-1").unwrap();
+            let pending = handle.pending_confirm.lock().unwrap();
+            let slot = pending.as_ref().expect("a new slot must be set");
+            assert_eq!(slot.action_id, "action-2");
+            assert!(
+                slot.deadline.is_none(),
+                "a new proposal must reset the spoken window"
+            );
         }
     }
 }

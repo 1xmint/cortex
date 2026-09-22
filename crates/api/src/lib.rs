@@ -402,6 +402,10 @@ pub fn build_cortex_router(state: Arc<AppState>) -> Router {
             "/api/voice/live/sessions/{id}/events",
             get(voice_session::live_session_events),
         )
+        .route(
+            "/api/voice/live/sessions/{id}/prompt-ended",
+            post(voice_session::prompt_ended),
+        )
         .route("/api/runs", get(routes::list_runs).post(routes::create_run))
         .route("/api/runs/estimate", post(routes::estimate_run))
         .route("/api/runs/{id}", get(routes::get_run))
