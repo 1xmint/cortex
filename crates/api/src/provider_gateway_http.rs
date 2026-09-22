@@ -7,7 +7,8 @@
 //!   machine and nothing is spent. This is what the proofs run against.
 //! - `live`: calls the supplier named in the verified capability, on Cortex's
 //!   own key for that supplier (`CORTEX_ANTHROPIC_SUPPLIER_KEY` for Claude,
-//!   `CORTEX_OPENAI_SUPPLIER_KEY` for OpenAI). This spends real money, inside
+//!   `CORTEX_OPENAI_SUPPLIER_KEY` for OpenAI, `CORTEX_ZEN_SUPPLIER_KEY` for
+//!   OpenCode Zen). This spends real money, inside
 //!   the same reservation and cap as the stub. Live mode is on as soon as at
 //!   least one supplier key is present; a request for a provider without a
 //!   funded key is refused the same way an unknown provider would be.
@@ -50,6 +51,7 @@ enum GatewayMode {
 const SUPPLIER_KEY_ENV_VARS: &[(&str, &str)] = &[
     ("claude", "CORTEX_ANTHROPIC_SUPPLIER_KEY"),
     ("openai", "CORTEX_OPENAI_SUPPLIER_KEY"),
+    ("zen", "CORTEX_ZEN_SUPPLIER_KEY"),
 ];
 
 fn gateway_mode() -> Option<GatewayMode> {
@@ -87,12 +89,23 @@ pub(crate) fn issue_access(
     lease_deadline_ms: i64,
     now_ms: i64,
 ) -> Option<cortex_core::protocol::ProviderGatewayAccess> {
-    if gateway_mode().is_none()
-        || !matches!(
-            provider,
-            cortex_core::provider::ProviderId::Claude | cortex_core::provider::ProviderId::Openai
-        )
-    {
+    let mode = gateway_mode()?;
+    let zen_configured = matches!(
+        &mode,
+        GatewayMode::Live { supplier_keys } if supplier_keys.contains_key("zen")
+    );
+    let allowed = match provider {
+        cortex_core::provider::ProviderId::Claude | cortex_core::provider::ProviderId::Openai => {
+            true
+        }
+        // Zen only joins the gateway once it is actually funded and live:
+        // in stub mode, or live mode without a Zen key, a Zen request keeps
+        // whatever path it used before this supplier existed, the same as
+        // an unconfigured supplier is refused elsewhere in this module.
+        cortex_core::provider::ProviderId::Zen => zen_configured,
+        _ => false,
+    };
+    if !allowed {
         return None;
     }
     let provider_label = cortex_core::egress::provider_grant_name(provider);
@@ -257,6 +270,7 @@ pub(crate) enum GatewayTransport {
     Stub(StubTransport),
     Live(crate::supplier_anthropic::AnthropicTransport),
     LiveOpenAi(crate::supplier_openai::OpenAiTransport),
+    LiveZen(crate::supplier_zen::ZenTransport),
 }
 
 impl ProviderTransport for GatewayTransport {
@@ -269,6 +283,7 @@ impl ProviderTransport for GatewayTransport {
             GatewayTransport::Stub(t) => t.forward(supplier_key, request).await,
             GatewayTransport::Live(t) => t.forward(supplier_key, request).await,
             GatewayTransport::LiveOpenAi(t) => t.forward(supplier_key, request).await,
+            GatewayTransport::LiveZen(t) => t.forward(supplier_key, request).await,
         }
     }
 }
@@ -282,6 +297,9 @@ fn live_transport_for(provider: &str) -> Option<GatewayTransport> {
         )),
         "openai" => Some(GatewayTransport::LiveOpenAi(
             crate::supplier_openai::OpenAiTransport::new(),
+        )),
+        "zen" => Some(GatewayTransport::LiveZen(
+            crate::supplier_zen::ZenTransport::new(),
         )),
         _ => None,
     }
