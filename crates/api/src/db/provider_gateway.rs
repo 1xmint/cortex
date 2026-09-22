@@ -95,6 +95,109 @@ fn read_reservation(conn: &Connection, request_key: &str) -> Option<ProviderRese
     .ok()
 }
 
+/// Error from an admin-initiated hold action: distinguishes an unknown
+/// `request_key` (404) from a row that cannot be resolved right now
+/// (409), so callers never need to parse the message to pick a status code.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AdminHoldError {
+    NotFound,
+    Conflict(String),
+}
+
+impl std::fmt::Display for AdminHoldError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AdminHoldError::NotFound => write!(f, "provider hold not found"),
+            AdminHoldError::Conflict(message) => write!(f, "{message}"),
+        }
+    }
+}
+
+/// Shared reconciliation write path for `settle_provider_request` and
+/// `admin_settle_provider_hold`. Takes ownership of an already-open
+/// transaction and commits it itself on every path that writes anything
+/// (including the "recorded as mismatch" error paths, which persist their
+/// write and still return `Err`); the no-op replay path writes nothing and
+/// lets the transaction drop, which rolls back trivially. Callers that need
+/// a check-then-act guarantee must do their own status check against this
+/// same transaction (via `read_reservation(&tx, ...)`) before calling this.
+fn settle_within_tx(
+    tx: rusqlite::Transaction<'_>,
+    request_key: &str,
+    observed_micro_usd: i64,
+    upstream_request_id: Option<&str>,
+    now_ms: i64,
+) -> Result<ProviderReservation, String> {
+    let Some(current) = read_reservation(&tx, request_key) else {
+        return Err("reservation does not exist".into());
+    };
+    if current.status == "settled" && current.observed_micro_usd == Some(observed_micro_usd) {
+        let mut replay = current;
+        replay.replayed = true;
+        return Ok(replay);
+    }
+    if current.status == "settled" || current.status == "released" {
+        tx.execute(
+            "UPDATE provider_request_reservations
+             SET status = 'mismatch', terminal_reason = ?1, reconciled_at = ?2
+             WHERE request_key = ?3",
+            params![
+                format!(
+                    "contradictory reconciliation: existing {:?}, observed {observed_micro_usd}",
+                    current.observed_micro_usd
+                ),
+                now_ms,
+                request_key
+            ],
+        )
+        .map_err(|e| format!("failed to record reconciliation mismatch: {e}"))?;
+        tx.commit()
+            .map_err(|e| format!("failed to commit reconciliation mismatch: {e}"))?;
+        return Err("contradictory reconciliation recorded as mismatch".into());
+    }
+    if observed_micro_usd > current.reserved_micro_usd {
+        tx.execute(
+            "UPDATE provider_request_reservations
+             SET status = 'mismatch', observed_micro_usd = ?1,
+                 upstream_request_id = COALESCE(upstream_request_id, ?2),
+                 terminal_reason = 'observed cost exceeded reservation', reconciled_at = ?3
+             WHERE request_key = ?4",
+            params![observed_micro_usd, upstream_request_id, now_ms, request_key],
+        )
+        .map_err(|e| format!("failed to record over-reservation mismatch: {e}"))?;
+        tx.commit()
+            .map_err(|e| format!("failed to commit over-reservation mismatch: {e}"))?;
+        return Err("observed supplier cost exceeded the durable reservation".into());
+    }
+
+    tx.execute(
+        "UPDATE provider_request_reservations
+         SET status = 'settled', observed_micro_usd = ?1,
+             upstream_request_id = COALESCE(upstream_request_id, ?2),
+             terminal_reason = NULL, reconciled_at = ?3
+         WHERE request_key = ?4 AND status IN ('reserved', 'unresolved')",
+        params![observed_micro_usd, upstream_request_id, now_ms, request_key],
+    )
+    .map_err(|e| format!("failed to settle supplier reservation: {e}"))?;
+
+    tx.execute(
+        "INSERT OR IGNORE INTO provider_spend
+            (id, user_id, run_id, step_id, provider, model, cost_type,
+             tokens_in, tokens_out, tokens_cached_in, cost_micro_usd, created_at)
+         SELECT 'gateway:' || id, user_id, run_id, attempt_id, provider, model,
+                'gateway_observed', 0, 0, 0, ?1, ?2
+         FROM provider_request_reservations WHERE request_key = ?3",
+        params![observed_micro_usd, now_ms, request_key],
+    )
+    .map_err(|e| format!("failed to record observed provider spend: {e}"))?;
+
+    let updated = read_reservation(&tx, request_key)
+        .ok_or_else(|| "settled reservation could not be read".to_string())?;
+    tx.commit()
+        .map_err(|e| format!("failed to commit provider reconciliation: {e}"))?;
+    Ok(updated)
+}
+
 impl Database {
     pub fn get_provider_reservation(&self, request_key: &str) -> Option<ProviderReservation> {
         let conn = self.conn();
@@ -402,9 +505,6 @@ impl Database {
             )
             .map_err(|e| format!("failed to sweep stale reservations: {e}"))?;
         drop(conn);
-        if swept > 0 {
-            self.warn_if_holds_over_threshold(now_ms);
-        }
         Ok(swept)
     }
 
@@ -431,9 +531,6 @@ impl Database {
             )
             .map_err(|e| format!("failed to sweep stale voice reservations: {e}"))?;
         drop(conn);
-        if swept > 0 {
-            self.warn_if_holds_over_threshold(now_ms);
-        }
         Ok(swept)
     }
 
@@ -468,72 +565,103 @@ impl Database {
         let tx = conn
             .transaction()
             .map_err(|e| format!("failed to begin reconciliation transaction: {e}"))?;
-        let Some(current) = read_reservation(&tx, request_key) else {
-            return Err("reservation does not exist".into());
+        settle_within_tx(
+            tx,
+            request_key,
+            observed_micro_usd,
+            upstream_request_id,
+            now_ms,
+        )
+    }
+
+    /// Same reconciliation as `settle_provider_request`, but for a manual
+    /// admin settle: the "is this row still resolvable" check and the write
+    /// happen inside one transaction, so a gateway settlement landing between
+    /// a separate check-then-act pair can never flip the row to `mismatch`
+    /// out from under the admin, or have a stale request replayed and
+    /// audited as the admin's own action. Returns the row as it was
+    /// immediately before the admin's write (for the audit record) and as it
+    /// is after.
+    pub fn admin_settle_provider_hold(
+        &self,
+        request_key: &str,
+        observed_micro_usd: i64,
+        upstream_request_id: Option<&str>,
+        now_ms: i64,
+    ) -> Result<(ProviderReservation, ProviderReservation), AdminHoldError> {
+        if observed_micro_usd < 0 {
+            return Err(AdminHoldError::Conflict(
+                "observed supplier cost cannot be negative".into(),
+            ));
+        }
+        let mut conn = self.conn();
+        let tx = conn.transaction().map_err(|e| {
+            AdminHoldError::Conflict(format!("failed to begin reconciliation transaction: {e}"))
+        })?;
+        let Some(prior) = read_reservation(&tx, request_key) else {
+            return Err(AdminHoldError::NotFound);
         };
-        if current.status == "settled" && current.observed_micro_usd == Some(observed_micro_usd) {
-            let mut replay = current;
-            replay.replayed = true;
-            return Ok(replay);
+        if prior.status != "reserved" && prior.status != "unresolved" {
+            return Err(AdminHoldError::Conflict(format!(
+                "provider hold is already terminal (status: {})",
+                prior.status
+            )));
         }
-        if current.status == "settled" || current.status == "released" {
-            tx.execute(
-                "UPDATE provider_request_reservations
-                 SET status = 'mismatch', terminal_reason = ?1, reconciled_at = ?2
-                 WHERE request_key = ?3",
-                params![
-                    format!(
-                        "contradictory reconciliation: existing {:?}, observed {observed_micro_usd}",
-                        current.observed_micro_usd
-                    ),
-                    now_ms,
-                    request_key
-                ],
-            )
-            .map_err(|e| format!("failed to record reconciliation mismatch: {e}"))?;
-            tx.commit()
-                .map_err(|e| format!("failed to commit reconciliation mismatch: {e}"))?;
-            return Err("contradictory reconciliation recorded as mismatch".into());
-        }
-        if observed_micro_usd > current.reserved_micro_usd {
-            tx.execute(
-                "UPDATE provider_request_reservations
-                 SET status = 'mismatch', observed_micro_usd = ?1,
-                     upstream_request_id = COALESCE(upstream_request_id, ?2),
-                     terminal_reason = 'observed cost exceeded reservation', reconciled_at = ?3
-                 WHERE request_key = ?4",
-                params![observed_micro_usd, upstream_request_id, now_ms, request_key],
-            )
-            .map_err(|e| format!("failed to record over-reservation mismatch: {e}"))?;
-            tx.commit()
-                .map_err(|e| format!("failed to commit over-reservation mismatch: {e}"))?;
-            return Err("observed supplier cost exceeded the durable reservation".into());
-        }
-
-        tx.execute(
-            "UPDATE provider_request_reservations
-             SET status = 'settled', observed_micro_usd = ?1,
-                 upstream_request_id = COALESCE(upstream_request_id, ?2),
-                 terminal_reason = NULL, reconciled_at = ?3
-             WHERE request_key = ?4 AND status IN ('reserved', 'unresolved')",
-            params![observed_micro_usd, upstream_request_id, now_ms, request_key],
+        let updated = settle_within_tx(
+            tx,
+            request_key,
+            observed_micro_usd,
+            upstream_request_id,
+            now_ms,
         )
-        .map_err(|e| format!("failed to settle supplier reservation: {e}"))?;
+        .map_err(AdminHoldError::Conflict)?;
+        Ok((prior, updated))
+    }
 
-        tx.execute(
-            "INSERT OR IGNORE INTO provider_spend
-                (id, user_id, run_id, step_id, provider, model, cost_type,
-                 tokens_in, tokens_out, tokens_cached_in, cost_micro_usd, created_at)
-             SELECT 'gateway:' || id, user_id, run_id, attempt_id, provider, model,
-                    'gateway_observed', 0, 0, 0, ?1, ?2
-             FROM provider_request_reservations WHERE request_key = ?3",
-            params![observed_micro_usd, now_ms, request_key],
-        )
-        .map_err(|e| format!("failed to record observed provider spend: {e}"))?;
+    /// Same one-transaction treatment as `admin_settle_provider_hold`, for a
+    /// manual admin release: the resolvability check and the write happen
+    /// inside one transaction, and nothing is written unless the release
+    /// actually applied. Returns the row as it was immediately before the
+    /// admin's write (for the audit record) and as it is after.
+    pub fn admin_release_provider_hold(
+        &self,
+        request_key: &str,
+        reason: &str,
+        now_ms: i64,
+    ) -> Result<(ProviderReservation, ProviderReservation), AdminHoldError> {
+        let mut conn = self.conn();
+        let tx = conn.transaction().map_err(|e| {
+            AdminHoldError::Conflict(format!("failed to begin release transaction: {e}"))
+        })?;
+        let Some(prior) = read_reservation(&tx, request_key) else {
+            return Err(AdminHoldError::NotFound);
+        };
+        if prior.status != "reserved" && prior.status != "unresolved" {
+            return Err(AdminHoldError::Conflict(format!(
+                "provider hold is already terminal (status: {})",
+                prior.status
+            )));
+        }
+        let changed = tx
+            .execute(
+                "UPDATE provider_request_reservations
+                 SET status = 'released', terminal_reason = ?1, reconciled_at = ?2
+                 WHERE request_key = ?3 AND status IN ('reserved', 'unresolved')",
+                params![reason, now_ms, request_key],
+            )
+            .map_err(|e| {
+                AdminHoldError::Conflict(format!("failed to release supplier reservation: {e}"))
+            })?;
+        let updated = read_reservation(&tx, request_key).ok_or(AdminHoldError::NotFound)?;
+        if changed == 0 || updated.status != "released" {
+            return Err(AdminHoldError::Conflict(format!(
+                "provider hold release did not apply (status: {})",
+                updated.status
+            )));
+        }
         tx.commit()
-            .map_err(|e| format!("failed to commit provider reconciliation: {e}"))?;
-        read_reservation(&conn, request_key)
-            .ok_or_else(|| "settled reservation could not be read".to_string())
+            .map_err(|e| AdminHoldError::Conflict(format!("failed to commit release: {e}")))?;
+        Ok((prior, updated))
     }
 
     /// Sum of `reserved` + `unresolved` exposure across all providers,
@@ -706,6 +834,18 @@ mod tests {
     /// A funded provider with an active spend authorization, ready for
     /// `reserve_provider_request`.
     fn fixture(db: &Database, max_micro_usd: i64, funded_micro_usd: i64) -> GatewayCapability {
+        fixture_with_expiry(db, max_micro_usd, funded_micro_usd, NOW + 60_000)
+    }
+
+    /// Same as `fixture`, but with a caller-chosen `expires_at_ms`, for tests
+    /// that reserve well after `NOW` and need an authorization that is still
+    /// active at that later timestamp.
+    fn fixture_with_expiry(
+        db: &Database,
+        max_micro_usd: i64,
+        funded_micro_usd: i64,
+        expires_at_ms: i64,
+    ) -> GatewayCapability {
         let price_list_id = db.active_price_list().unwrap().id;
         db.set_supplier_capacity(PROVIDER, funded_micro_usd, NOW)
             .unwrap();
@@ -718,7 +858,7 @@ mod tests {
             model: MODEL.into(),
             price_list_id,
             max_micro_usd,
-            expires_at_ms: NOW + 60_000,
+            expires_at_ms,
         };
         db.create_spend_authorization(&authorization, NOW).unwrap();
         GatewayCapability::new(
@@ -742,17 +882,35 @@ mod tests {
     #[test]
     fn sweep_marks_old_chat_reserved_rows_unresolved_and_leaves_fresh_rows_alone() {
         let db = test_db();
-        let claims = fixture(&db, 1_000_000, 1_000_000);
+        // Sweeping happens well after any of these reservations are made, so
+        // the authorization must still be active that far out.
+        let claims = fixture_with_expiry(
+            &db,
+            1_000_000,
+            1_000_000,
+            NOW + 2 * STALE_RESERVATION_AGE_MS,
+        );
 
         // Created well before the staleness cutoff: orphaned by a restart.
         reserve(&db, &claims, "chat:old", NOW);
-        // Created just now (relative to the sweep's `now_ms`): still could be
-        // a genuinely in-flight request, must not be touched.
-        reserve(&db, &claims, "chat:fresh", NOW);
+        // Created at the moment the sweep's cutoff will land on: not older
+        // than the cutoff (the sweep's comparison is strict `<`), so it must
+        // survive.
+        reserve(&db, &claims, "chat:fresh", NOW + STALE_RESERVATION_AGE_MS);
+        // A second row created at that exact same cutoff instant, kept
+        // distinct from `chat:fresh` so the boundary condition itself is
+        // asserted on its own, not just incidentally via the "fresh" row.
+        reserve(
+            &db,
+            &claims,
+            "chat:at-cutoff",
+            NOW + STALE_RESERVATION_AGE_MS,
+        );
         // Voice rows are swept separately and must never be touched here.
         reserve(&db, &claims, "voice:old", NOW);
 
-        let sweep_now = NOW + STALE_RESERVATION_AGE_MS + 1;
+        // Cutoff lands exactly on the "fresh" rows' `created_at`.
+        let sweep_now = NOW + 2 * STALE_RESERVATION_AGE_MS;
         let swept = db.sweep_stale_reservations(sweep_now).unwrap();
         assert_eq!(swept, 1, "only the old, non-voice row should be swept");
 
@@ -764,6 +922,12 @@ mod tests {
         assert_eq!(
             fresh.status, "reserved",
             "a row younger than the staleness cutoff must be left alone"
+        );
+
+        let at_cutoff = db.get_provider_reservation("chat:at-cutoff").unwrap();
+        assert_eq!(
+            at_cutoff.status, "reserved",
+            "a row created exactly at the cutoff is not yet older than it, and must be left alone"
         );
 
         let voice = db.get_provider_reservation("voice:old").unwrap();

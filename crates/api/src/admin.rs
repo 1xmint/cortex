@@ -732,35 +732,40 @@ pub struct ReleaseHoldRequest {
     pub reason: String,
 }
 
-/// Only a `reserved` or `unresolved` row may be manually settled or
-/// released; a terminal row (`settled`, `released`, `mismatch`) is left
-/// alone and reported as a conflict. This check happens here, before
-/// touching `settle_provider_request`/`release_provider_request`, because
-/// `settle_provider_request` will itself flip a `settled`/`released` row to
-/// `mismatch` if called with a different amount — exactly the overwrite this
-/// endpoint must never trigger.
-fn require_resolvable_hold(
+/// A hold's amount must be checked against its current reserved amount
+/// before settling; this reads the row outside any transaction purely to
+/// validate the request shape early (empty reason, out-of-range amount)
+/// with a 400 rather than a 409. The actual "is this row still resolvable"
+/// check happens again, atomically with the write, in
+/// `admin_settle_provider_hold`/`admin_release_provider_hold` — this lookup
+/// is not relied on for correctness, only for a friendlier error on garbage
+/// input.
+fn find_hold_for_validation(
     db: &crate::db::Database,
     request_key: &str,
 ) -> Result<crate::db::ProviderReservation, (StatusCode, Json<ErrorResponse>)> {
-    let reservation = db.get_provider_reservation(request_key).ok_or((
+    db.get_provider_reservation(request_key).ok_or((
         StatusCode::NOT_FOUND,
         Json(ErrorResponse {
             error: "provider hold not found".into(),
         }),
-    ))?;
-    if reservation.status != "reserved" && reservation.status != "unresolved" {
-        return Err((
-            StatusCode::CONFLICT,
+    ))
+}
+
+fn admin_hold_error_response(
+    error: crate::db::AdminHoldError,
+) -> (StatusCode, Json<ErrorResponse>) {
+    match error {
+        crate::db::AdminHoldError::NotFound => (
+            StatusCode::NOT_FOUND,
             Json(ErrorResponse {
-                error: format!(
-                    "provider hold is already terminal (status: {})",
-                    reservation.status
-                ),
+                error: "provider hold not found".into(),
             }),
-        ));
+        ),
+        crate::db::AdminHoldError::Conflict(message) => {
+            (StatusCode::CONFLICT, Json(ErrorResponse { error: message }))
+        }
     }
-    Ok(reservation)
 }
 
 pub async fn settle_provider_hold(
@@ -784,7 +789,7 @@ pub async fn settle_provider_hold(
             }),
         ));
     }
-    let reservation = require_resolvable_hold(db, &request_key)?;
+    let reservation = find_hold_for_validation(db, &request_key)?;
     if req.amount_micro_usd < 0 || req.amount_micro_usd > reservation.reserved_micro_usd {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -797,9 +802,9 @@ pub async fn settle_provider_hold(
         ));
     }
     let now_ms = chrono::Utc::now().timestamp_millis();
-    let updated = db
-        .settle_provider_request(&request_key, req.amount_micro_usd, None, now_ms)
-        .map_err(|e| (StatusCode::CONFLICT, Json(ErrorResponse { error: e })))?;
+    let (prior, updated) = db
+        .admin_settle_provider_hold(&request_key, req.amount_micro_usd, None, now_ms)
+        .map_err(admin_hold_error_response)?;
     db.audit_log(
         &user.user_id,
         "admin",
@@ -810,6 +815,8 @@ pub async fn settle_provider_hold(
             &serde_json::json!({
                 "amount_micro_usd": req.amount_micro_usd,
                 "reason": req.reason,
+                "reserved_micro_usd": prior.reserved_micro_usd,
+                "prior_status": prior.status,
             })
             .to_string(),
         ),
@@ -850,18 +857,24 @@ pub async fn release_provider_hold(
             }),
         ));
     }
-    require_resolvable_hold(db, &request_key)?;
     let now_ms = chrono::Utc::now().timestamp_millis();
-    let updated = db
-        .release_provider_request(&request_key, &req.reason, now_ms)
-        .map_err(|e| (StatusCode::CONFLICT, Json(ErrorResponse { error: e })))?;
+    let (prior, updated) = db
+        .admin_release_provider_hold(&request_key, &req.reason, now_ms)
+        .map_err(admin_hold_error_response)?;
     db.audit_log(
         &user.user_id,
         "admin",
         "provider_hold_release",
         Some("provider_request_reservation"),
         Some(&request_key),
-        Some(&serde_json::json!({ "reason": req.reason }).to_string()),
+        Some(
+            &serde_json::json!({
+                "reason": req.reason,
+                "reserved_micro_usd": prior.reserved_micro_usd,
+                "prior_status": prior.status,
+            })
+            .to_string(),
+        ),
         None,
     );
     tracing::warn!(
@@ -881,11 +894,18 @@ mod provider_holds_tests {
     use super::*;
     use crate::db::SpendAuthorization;
     use crate::provider_gateway::GatewayCapability;
+    use axum::body::Body;
+    use axum::http::{Method, Request};
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
 
     const NOW: i64 = 1_800_000_000_000;
 
     /// Real `AppState` (own tempdir, own sqlite database), same shortcut
-    /// `agent_confirm::tests::test_state` uses.
+    /// `agent_confirm::tests::test_state` uses. No `clerk_secret_key`, so
+    /// `authorize_admin`'s local-dev bypass applies and any `ClerkUser` is
+    /// treated as an admin -- fine for exercising the handlers' own
+    /// validation logic directly, without going through the router.
     async fn test_state() -> (tempfile::TempDir, std::sync::Arc<AppState>) {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join(".cortex")).unwrap();
@@ -896,6 +916,12 @@ mod provider_holds_tests {
         )
         .await;
         (dir, state)
+    }
+
+    fn admin_user() -> ClerkUser {
+        ClerkUser {
+            user_id: "admin-1".into(),
+        }
     }
 
     fn reserve(db: &crate::db::Database, request_key: &str) {
@@ -926,58 +952,161 @@ mod provider_holds_tests {
             .unwrap();
     }
 
-    /// A non-admin user must never pass `authorize_admin` once
-    /// `CORTEX_ADMIN_EMAILS` names someone else. Mutates process env, so this
-    /// test owns and restores the var itself.
+    fn settle_req(amount_micro_usd: i64, reason: &str) -> SettleHoldRequest {
+        SettleHoldRequest {
+            amount_micro_usd,
+            reason: reason.to_string(),
+        }
+    }
+
+    fn release_req(reason: &str) -> ReleaseHoldRequest {
+        ReleaseHoldRequest {
+            reason: reason.to_string(),
+        }
+    }
+
     #[tokio::test]
-    async fn non_admin_user_is_refused() {
+    async fn settle_rejects_empty_or_whitespace_reason_with_400() {
         let (_dir, state) = test_state().await;
-        std::env::set_var("CORTEX_ADMIN_EMAILS", "admin@example.com");
-        let user = ClerkUser {
-            user_id: "not-an-admin".into(),
-        };
-        let result = authorize_admin(&state, &user).await;
-        std::env::remove_var("CORTEX_ADMIN_EMAILS");
+        let db = state.db.as_ref().unwrap();
+        reserve(db, "chat:a");
+
+        for reason in ["", "   "] {
+            let result = settle_provider_hold(
+                State(state.clone()),
+                admin_user(),
+                Path("chat:a".into()),
+                Json(settle_req(500, reason)),
+            )
+            .await;
+            let err = result.unwrap_err();
+            assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        }
+    }
+
+    #[tokio::test]
+    async fn settle_rejects_out_of_range_amount_with_400() {
+        let (_dir, state) = test_state().await;
+        let db = state.db.as_ref().unwrap();
+        reserve(db, "chat:a");
+
+        let too_low = settle_provider_hold(
+            State(state.clone()),
+            admin_user(),
+            Path("chat:a".into()),
+            Json(settle_req(-1, "operator review")),
+        )
+        .await;
+        assert_eq!(too_low.unwrap_err().0, StatusCode::BAD_REQUEST);
+
+        let too_high = settle_provider_hold(
+            State(state.clone()),
+            admin_user(),
+            Path("chat:a".into()),
+            Json(settle_req(1_001, "operator review")),
+        )
+        .await;
+        assert_eq!(too_high.unwrap_err().0, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn settle_on_an_already_settled_row_is_409_unchanged_and_unaudited() {
+        let (_dir, state) = test_state().await;
+        let db = state.db.as_ref().unwrap();
+        reserve(db, "chat:a");
+        db.settle_provider_request("chat:a", 500, None, NOW + 1)
+            .unwrap();
+
+        let result = settle_provider_hold(
+            State(state.clone()),
+            admin_user(),
+            Path("chat:a".into()),
+            Json(settle_req(500, "operator review")),
+        )
+        .await;
+        assert_eq!(result.unwrap_err().0, StatusCode::CONFLICT);
+
+        let row = db.get_provider_reservation("chat:a").unwrap();
+        assert_eq!(row.status, "settled");
+        assert_eq!(row.observed_micro_usd, Some(500));
+
+        let entries = db.get_audit_log(50, 0);
         assert!(
-            result.is_err(),
-            "a user absent from the admin list must be refused"
+            entries.iter().all(|e| e.action != "provider_hold_settle"),
+            "a conflicting settle attempt must not write an audit row"
         );
-        assert_eq!(result.unwrap_err().0, StatusCode::FORBIDDEN);
     }
 
-    #[test]
-    fn require_resolvable_hold_allows_reserved_and_unresolved() {
-        let db = crate::db::Database::open(&tempfile::tempdir().unwrap().keep().join("t.sqlite"));
-        reserve(&db, "chat:reserved");
-        assert!(require_resolvable_hold(&db, "chat:reserved").is_ok());
+    #[tokio::test]
+    async fn release_writes_exactly_one_audit_row_with_actor_reason_and_amount() {
+        let (_dir, state) = test_state().await;
+        let db = state.db.as_ref().unwrap();
+        reserve(db, "chat:a");
 
-        reserve(&db, "chat:unresolved");
-        db.mark_provider_request_unresolved("chat:unresolved", None, "timeout", NOW + 1)
+        let result = release_provider_hold(
+            State(state.clone()),
+            admin_user(),
+            Path("chat:a".into()),
+            Json(release_req("stuck after crash")),
+        )
+        .await;
+        assert!(result.is_ok());
+
+        let row = db.get_provider_reservation("chat:a").unwrap();
+        assert_eq!(row.status, "released");
+
+        let entries: Vec<_> = db
+            .get_audit_log(50, 0)
+            .into_iter()
+            .filter(|e| e.action == "provider_hold_release")
+            .collect();
+        assert_eq!(entries.len(), 1, "exactly one audit row for the release");
+        let entry = &entries[0];
+        assert_eq!(entry.user_id, "admin-1");
+        let details: serde_json::Value =
+            serde_json::from_str(entry.metadata.as_deref().unwrap()).unwrap();
+        assert_eq!(details["reason"], "stuck after crash");
+        assert_eq!(details["reserved_micro_usd"], 1_000);
+        assert_eq!(details["prior_status"], "reserved");
+    }
+
+    /// A non-admin user must never pass `authorize_admin` once the admin
+    /// list is empty and a `clerk_secret_key` is configured (fail-closed,
+    /// see `authorize_admin`'s doc comment). Drives a real request through
+    /// `build_cortex_router` so the `ClerkUser`/admin middleware run exactly
+    /// as in production, and builds the admin list the way
+    /// `tests/agent_confirm_routes.rs`'s `router_as_non_premium_user` does,
+    /// rather than mutating the process-global `CORTEX_ADMIN_EMAILS`.
+    #[tokio::test]
+    async fn non_admin_request_through_the_router_is_403() {
+        std::env::set_var("CORTEX_AUTH_DISABLED", "1");
+        std::env::remove_var("CORTEX_ADMIN_EMAILS");
+        std::env::remove_var("CORTEX_ADMIN_USERS");
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".cortex")).unwrap();
+        let state = AppState::new(
+            dir.path().join(".cortex/ledger.jsonl"),
+            dir.path().to_path_buf(),
+            Some("sk_test_fake_for_router_tests".to_string()),
+        )
+        .await;
+        let router = crate::build_cortex_router(state.clone());
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/admin/provider-holds/chat:a/release")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "reason": "operator review" }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
             .unwrap();
-        assert!(require_resolvable_hold(&db, "chat:unresolved").is_ok());
-    }
-
-    #[test]
-    fn require_resolvable_hold_refuses_settled_and_mismatch_rows_with_409() {
-        let db = crate::db::Database::open(&tempfile::tempdir().unwrap().keep().join("t.sqlite"));
-
-        reserve(&db, "chat:settled");
-        db.settle_provider_request("chat:settled", 500, None, NOW + 1)
-            .unwrap();
-        let err = require_resolvable_hold(&db, "chat:settled").unwrap_err();
-        assert_eq!(err.0, StatusCode::CONFLICT);
-
-        reserve(&db, "chat:mismatch");
-        // Observed cost above the reservation flips the row to 'mismatch'.
-        let _ = db.settle_provider_request("chat:mismatch", 5_000, None, NOW + 1);
-        let err = require_resolvable_hold(&db, "chat:mismatch").unwrap_err();
-        assert_eq!(err.0, StatusCode::CONFLICT);
-    }
-
-    #[test]
-    fn require_resolvable_hold_404s_an_unknown_request_key() {
-        let db = crate::db::Database::open(&tempfile::tempdir().unwrap().keep().join("t.sqlite"));
-        let err = require_resolvable_hold(&db, "chat:never-existed").unwrap_err();
-        assert_eq!(err.0, StatusCode::NOT_FOUND);
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        // Drain the body so the assertion above is the only thing that can fail.
+        let _ = response.into_body().collect().await;
     }
 }
