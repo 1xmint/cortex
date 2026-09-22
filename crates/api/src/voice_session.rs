@@ -1421,16 +1421,17 @@ async fn run_voice_delegation_with<T: crate::provider_gateway::ProviderTransport
     // back), the tool-activity summary and answer after, in that order. A
     // session with no linked conversation (`conversation_id: None`) saves
     // nothing, matching M-D-0013 behavior. Each save is guarded by a fresh
-    // `get_conversation` check: the conversation can be deleted out from
-    // under a long-running delegation (mid-call), and
-    // `Database::add_message` panics on the resulting foreign-key failure
-    // rather than erroring — a panic here would also kill the spoken
-    // answer, since it never reaches `tx.send` back in
-    // `handle_delegation_created`. Guarding keeps that panic from ever
-    // happening instead of catching it after the fact.
+    // `get_conversation` check, but the conversation can still be deleted
+    // out from under a long-running delegation between that check and the
+    // insert below, so we use `try_add_message` and just log any failure
+    // rather than let a foreign-key error panic this task — a panic here
+    // would also kill the spoken answer, since it never reaches `tx.send`
+    // back in `handle_delegation_created`.
     if let Some(cid) = conversation_id {
         if db.get_conversation(cid, user_id).is_some() {
-            db.add_message(cid, "user", task_text, None, None);
+            if let Err(err) = db.try_add_message(cid, "user", task_text, None, None) {
+                tracing::warn!(%err, conversation_id = cid, "voice: failed to save user turn");
+            }
         }
     }
 
@@ -1480,10 +1481,18 @@ async fn run_voice_delegation_with<T: crate::provider_gateway::ProviderTransport
                 if let Some(summary) =
                     crate::chat_paid::tool_activity_summary(&paid_reply.tool_activity)
                 {
-                    db.add_message(cid, "assistant", &summary, Some("cortex"), None);
+                    if let Err(err) =
+                        db.try_add_message(cid, "assistant", &summary, Some("cortex"), None)
+                    {
+                        tracing::warn!(%err, conversation_id = cid, "voice: failed to save tool-activity summary");
+                    }
                 }
                 if !paid_reply.text.is_empty() {
-                    db.add_message(cid, "assistant", &paid_reply.text, Some("cortex"), None);
+                    if let Err(err) =
+                        db.try_add_message(cid, "assistant", &paid_reply.text, Some("cortex"), None)
+                    {
+                        tracing::warn!(%err, conversation_id = cid, "voice: failed to save assistant reply");
+                    }
                 }
             }
         }
@@ -3177,10 +3186,11 @@ mod tests {
         )
         .await;
 
-        let Err((status, _)) = result else {
+        let Err((status, Json(body))) = result else {
             panic!("a foreign conversation id must be refused");
         };
         assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body.error, "No such conversation.");
         assert_eq!(
             db.get_credit_balance_row(USER),
             balance_before,
@@ -3211,10 +3221,11 @@ mod tests {
         )
         .await;
 
-        let Err((status, _)) = result else {
+        let Err((status, Json(body))) = result else {
             panic!("a conversation id that does not exist must be refused");
         };
         assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body.error, "No such conversation.");
         assert_eq!(db.get_credit_balance_row(USER), balance_before);
         assert!(state.voice_sessions.lock().unwrap().is_empty());
     }
