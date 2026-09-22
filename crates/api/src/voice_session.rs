@@ -181,6 +181,27 @@ pub struct VoiceSessionHandle {
     /// stream ending — when the handle is removed from
     /// `state.voice_sessions` at session end.
     events_tx: broadcast::Sender<VoiceEvent>,
+    /// The most recent `Risk::Confirm` proposal a voice delegation in this
+    /// session made, if any is still outstanding — set by
+    /// `store_pending_confirm` right alongside publishing
+    /// `VoiceEvent::ConfirmRequired`. A newer proposal replaces the slot
+    /// rather than queuing, matching the one-proposal-per-reply rule
+    /// `chat_paid::send_paid_reply` already enforces server-side. Not read
+    /// by anything yet — the spoken matcher that consults it lands in part
+    /// 2 of the spoken-confirm plan.
+    pending_confirm: std::sync::Mutex<Option<PendingConfirm>>,
+}
+
+/// What the "pending confirm" slot on a [`VoiceSessionHandle`] holds: enough
+/// for the (not-yet-written) spoken matcher to know which action a spoken
+/// "yes" resolves — never `nonce`, which stays confined to
+/// `VoiceEvent::ConfirmRequired` on the event stream.
+#[derive(Debug, Clone)]
+pub(crate) struct PendingConfirm {
+    #[allow(dead_code)] // Read by the spoken matcher, wired in part 2.
+    pub action_id: String,
+    #[allow(dead_code)] // Read by the spoken matcher, wired in part 2.
+    pub summary: String,
 }
 
 /// How many events a lagging subscriber can fall behind before older ones
@@ -192,7 +213,13 @@ const VOICE_EVENTS_CAPACITY: usize = 32;
 /// Everything the voice live-session event stream can send. Tagged JSON
 /// (`"type"`, snake_case) so the UI can discriminate without a second
 /// field.
-#[derive(Debug, Clone, Serialize, PartialEq)]
+///
+/// `Debug` is hand-written below, not derived: a derived impl would print
+/// `ConfirmRequired`'s `nonce` field verbatim, and `nonce` must never show
+/// up anywhere outside the event's own JSON to the one client that needs it
+/// — not in logs, and `Debug` output is exactly the kind of thing that ends
+/// up in a `tracing::debug!`/`{:?}` log line by accident.
+#[derive(Clone, Serialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum VoiceEvent {
     /// A delegation's user text or assistant answer was produced. Emitted
@@ -206,12 +233,6 @@ pub enum VoiceEvent {
     /// this stream, since it is what proves the confirm/cancel call back
     /// to `POST /api/agent/actions/{action_id}/confirm` came from the
     /// user who saw the proposal.
-    ///
-    /// Voice turns withhold `Risk::Confirm` tools today (`voice_turn:
-    /// true` in `chat_paid::send_paid_reply`), so nothing in production
-    /// emits this yet; `push_test_event` (test-only, below) is how the
-    /// tests exercise it ahead of that wiring landing.
-    #[allow(dead_code)]
     ConfirmRequired {
         action_id: String,
         nonce: String,
@@ -229,6 +250,44 @@ pub enum VoiceEvent {
     /// emits it.
     #[allow(dead_code)]
     ConfirmResolved { action_id: String, status: String },
+}
+
+impl std::fmt::Debug for VoiceEvent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            VoiceEvent::VoiceMessage { role, content } => f
+                .debug_struct("VoiceMessage")
+                .field("role", role)
+                .field("content", content)
+                .finish(),
+            // `nonce` redacted — see the type's own doc comment above.
+            VoiceEvent::ConfirmRequired {
+                action_id,
+                nonce: _,
+                summary,
+                expires_at,
+            } => f
+                .debug_struct("ConfirmRequired")
+                .field("action_id", action_id)
+                .field("nonce", &"<redacted>")
+                .field("summary", summary)
+                .field("expires_at", expires_at)
+                .finish(),
+            VoiceEvent::SpokenWindow {
+                action_id,
+                deadline,
+            } => f
+                .debug_struct("SpokenWindow")
+                .field("action_id", action_id)
+                .field("deadline", deadline)
+                .finish(),
+            VoiceEvent::ConfirmResolved { action_id, status } => f
+                .debug_struct("ConfirmResolved")
+                .field("action_id", action_id)
+                .field("status", status)
+                .finish(),
+        }
+    }
 }
 
 fn error_message(text: &str) -> String {
@@ -445,6 +504,7 @@ pub(crate) async fn start_session(
                 user_id: user_id.to_string(),
                 close_tx,
                 events_tx,
+                pending_confirm: std::sync::Mutex::new(None),
             },
         );
     }
@@ -668,6 +728,7 @@ async fn start_live_session(
                 user_id: user_id.to_string(),
                 close_tx,
                 events_tx,
+                pending_confirm: std::sync::Mutex::new(None),
             },
         );
     }
@@ -1208,6 +1269,49 @@ fn commentary_event(delegation_id: &str, content: &str) -> Value {
     })
 }
 
+/// The fixed server template spoken (well — sent as commentary for GPT-Live
+/// to paraphrase aloud) when a voice delegation proposes a `Risk::Confirm`
+/// tool. Never the model's own words: the model never sees the tool's
+/// proposal summary rendered this way, and the `nonce` that proves a later
+/// confirm/cancel call came from the user who heard this prompt must never
+/// appear here, or anywhere else sent to OpenAI or written to logs — only
+/// `VoiceEvent::ConfirmRequired` (this session's own event stream) carries
+/// it.
+///
+/// `summary` is truncated on a char boundary, not the assembled prompt as a
+/// whole, so the fixed wording around it — in particular "Say yes, or tap
+/// Confirm on screen." — always survives intact even when the summary is
+/// long; the total is still at most [`COMMENTARY_CHAR_CAP`] characters
+/// either way.
+fn spoken_confirm_prompt(summary: &str) -> String {
+    const PREFIX: &str = "I need your OK to ";
+    const SUFFIX: &str = ". Say yes, or tap Confirm on screen.";
+    let budget =
+        COMMENTARY_CHAR_CAP.saturating_sub(PREFIX.chars().count() + SUFFIX.chars().count());
+    let summary: String = summary.chars().take(budget).collect();
+    format!("{PREFIX}{summary}{SUFFIX}")
+}
+
+/// Replace the "pending confirm" slot on `session_id`'s `VoiceSessionHandle`
+/// (if the session is still open) with this proposal, discarding any
+/// earlier one. Never stores `nonce` — `VoiceEvent::ConfirmRequired` is the
+/// one place that reaches the client.
+fn store_pending_confirm(state: &Arc<AppState>, session_id: &str, action_id: &str, summary: &str) {
+    let sessions = state
+        .voice_sessions
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if let Some(handle) = sessions.get(session_id) {
+        *handle
+            .pending_confirm
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(PendingConfirm {
+            action_id: action_id.to_string(),
+            summary: summary.to_string(),
+        });
+    }
+}
+
 /// Releases `delegation_busy` when dropped — including when the spawned
 /// delegation task panics, since dropping still runs during the unwind. The
 /// old code stored `false` as the last line of the spawned task's async
@@ -1300,6 +1404,7 @@ fn handle_delegation_created(
         let _busy_guard = BusyGuard(busy);
         let answer = run_voice_delegation(
             &state,
+            &session_id,
             &user_id,
             conversation_id.as_deref(),
             &task_text,
@@ -1358,6 +1463,7 @@ pub(crate) fn push_test_event(state: &Arc<AppState>, session_id: &str, event: Vo
 /// own test conventions.
 async fn run_voice_delegation(
     state: &Arc<AppState>,
+    session_id: &str,
     user_id: &str,
     conversation_id: Option<&str>,
     task_text: &str,
@@ -1379,6 +1485,8 @@ async fn run_voice_delegation(
     };
 
     run_voice_delegation_with(
+        state,
+        session_id,
         db,
         &signing_key,
         &supplier_key,
@@ -1396,7 +1504,10 @@ async fn run_voice_delegation(
 /// whitespace-only) `task_text` — the caption never accumulated anything
 /// usable before the delegation arrived — is answered without ever calling
 /// the agent loop, so there is no charge for it.
+#[allow(clippy::too_many_arguments)]
 async fn run_voice_delegation_with<T: crate::provider_gateway::ProviderTransport + Clone>(
+    state: &Arc<AppState>,
+    session_id: &str,
     db: &crate::db::Database,
     signing_key: &str,
     supplier_key: &str,
@@ -1435,6 +1546,49 @@ async fn run_voice_delegation_with<T: crate::provider_gateway::ProviderTransport
         }
     }
 
+    // Forwards any `StepEvent::ConfirmRequired` the paid-reply loop streams
+    // (`chat_paid.rs`) to this session's own event stream, and remembers the
+    // proposal in the session's "pending confirm" slot — see
+    // `VoiceEvent::ConfirmRequired` and `VoiceSessionHandle::pending_confirm`.
+    // A drain task rather than a post-hoc scan of `rx` because
+    // `send_paid_reply` awaits each `tx.send` on a *bounded* channel; nothing
+    // reading it concurrently would deadlock the reply the moment the loop
+    // proposes anything. `confirm_summary` carries the last proposal's
+    // summary out so the caller can build the fixed spoken-prompt commentary
+    // (see `spoken_confirm_prompt`, below) instead of the model's own text.
+    let (tool_events_tx, mut tool_events_rx) = mpsc::channel::<crate::state::StepEvent>(8);
+    let confirm_summary: Arc<std::sync::Mutex<Option<String>>> =
+        Arc::new(std::sync::Mutex::new(None));
+    let drain_state = state.clone();
+    let drain_session_id = session_id.to_string();
+    let drain_confirm_summary = confirm_summary.clone();
+    let drain_task = tokio::spawn(async move {
+        while let Some(event) = tool_events_rx.recv().await {
+            if let crate::state::StepEvent::ConfirmRequired {
+                action_id,
+                nonce,
+                summary,
+                expires_at,
+            } = event
+            {
+                store_pending_confirm(&drain_state, &drain_session_id, &action_id, &summary);
+                publish_voice_event(
+                    &drain_state,
+                    &drain_session_id,
+                    VoiceEvent::ConfirmRequired {
+                        action_id,
+                        nonce,
+                        summary: summary.clone(),
+                        expires_at,
+                    },
+                );
+                *drain_confirm_summary
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()) = Some(summary);
+            }
+        }
+    });
+
     let reply = crate::chat_paid::send_paid_reply(
         db,
         signing_key,
@@ -1449,24 +1603,38 @@ async fn run_voice_delegation_with<T: crate::provider_gateway::ProviderTransport
         &reply_id,
         now_ms,
         turn_cap,
-        None,
+        Some(&tool_events_tx),
         crate::chat_paid::VoiceConfirm::Spoken,
         Some(cancel.as_ref()),
     )
     .await;
+    // Dropping the sender lets `drain_task` see the channel close and
+    // return; without this the `await` below would hang forever.
+    drop(tool_events_tx);
+    let _ = drain_task.await;
 
-    let answer = match &reply {
-        Ok(paid_reply) if paid_reply.text.trim().is_empty() => "Done.".to_string(),
-        Ok(paid_reply) => paid_reply.text.clone(),
-        Err(crate::chat_paid::PaidReplyError::NoCredits)
-        | Err(crate::chat_paid::PaidReplyError::NotEnoughCredits) => {
+    let proposed_summary = confirm_summary
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take();
+
+    let answer = match (&proposed_summary, &reply) {
+        // A proposal was made this turn: the commentary sent toward OpenAI
+        // must be the fixed server template (never the model's own text,
+        // which could contain the nonce or anything else it decided to
+        // say) — see the module doc on `spoken_confirm_prompt`.
+        (Some(summary), Ok(_)) => spoken_confirm_prompt(summary),
+        (_, Ok(paid_reply)) if paid_reply.text.trim().is_empty() => "Done.".to_string(),
+        (_, Ok(paid_reply)) => paid_reply.text.clone(),
+        (_, Err(crate::chat_paid::PaidReplyError::NoCredits))
+        | (_, Err(crate::chat_paid::PaidReplyError::NotEnoughCredits)) => {
             "You're out of credits for that request.".to_string()
         }
-        Err(crate::chat_paid::PaidReplyError::TurnCapExceeded) => {
+        (_, Err(crate::chat_paid::PaidReplyError::TurnCapExceeded)) => {
             "This conversation is using tools too quickly right now. Please try again shortly."
                 .to_string()
         }
-        Err(_) => "Sorry, I couldn't complete that just now.".to_string(),
+        (_, Err(_)) => "Sorry, I couldn't complete that just now.".to_string(),
     };
 
     // Only a genuine successful reply is worth persisting: none of the
@@ -1847,7 +2015,7 @@ pub async fn live_session_close(
         .map_err(LiveSessionError::into_response)
 }
 
-fn step_voice_event_to_sse(event: VoiceEvent) -> Result<Event, Infallible> {
+fn voice_event_to_sse(event: VoiceEvent) -> Result<Event, Infallible> {
     let data = serde_json::to_string(&event).unwrap_or_default();
     Ok(Event::default().data(data))
 }
@@ -1862,8 +2030,7 @@ fn step_voice_event_to_sse(event: VoiceEvent) -> Result<Event, Infallible> {
 /// Subscribes to the session's `events_tx` (created with the session,
 /// dropped with its `VoiceSessionHandle` at session end) and forwards onto
 /// a fresh `mpsc` channel/`ReceiverStream`, matching `chat::chat`'s own
-/// stream shape, rather than streaming the `broadcast::Receiver` directly.
-/// Ownership check plus subscribe, forwarded onto a fresh `mpsc` channel —
+/// stream shape, rather than streaming the `broadcast::Receiver` directly —
 /// the part of [`live_session_events_with`] worth testing without going
 /// through the `Sse`/`Event` wire format. `pub(crate)` (not private) so the
 /// tests below, in this same module, can drive it directly.
@@ -1894,9 +2061,11 @@ pub(crate) fn subscribe_voice_events(
                         break;
                     }
                 }
-                // A slow subscriber missed some events; keep going rather
-                // than ending the stream over it.
-                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                // A slow subscriber missed events it can never get back —
+                // rather than silently resuming mid-stream (and risking a
+                // client that never learns it missed a `ConfirmRequired`),
+                // end the stream so the client's reconnect starts clean.
+                Err(broadcast::error::RecvError::Lagged(_)) => break,
                 // The session ended: `VoiceSessionHandle` (and its
                 // `events_tx`) was dropped from `state.voice_sessions`.
                 Err(broadcast::error::RecvError::Closed) => break,
@@ -1913,7 +2082,7 @@ async fn live_session_events_with(
     session_id: &str,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, (StatusCode, Json<ErrorResponse>)> {
     let rx = subscribe_voice_events(state, user_id, session_id)?;
-    let stream = tokio_stream::StreamExt::map(ReceiverStream::new(rx), step_voice_event_to_sse);
+    let stream = tokio_stream::StreamExt::map(ReceiverStream::new(rx), voice_event_to_sse);
     Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
 }
 
@@ -3440,6 +3609,8 @@ mod tests {
             let transport = CountingTransport::unreachable();
             let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let answer = run_voice_delegation_with(
+                &state,
+                "sess-1",
                 db,
                 SIGNING_KEY,
                 SUPPLIER_KEY,
@@ -3466,6 +3637,8 @@ mod tests {
             let transport = CountingTransport::ok("the answer is four");
             let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let answer = run_voice_delegation_with(
+                &state,
+                "sess-1",
                 db,
                 SIGNING_KEY,
                 SUPPLIER_KEY,
@@ -3502,6 +3675,8 @@ mod tests {
             let transport = CountingTransport::ok("the answer is four");
             let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let answer = run_voice_delegation_with(
+                &state,
+                "sess-1",
                 db,
                 SIGNING_KEY,
                 SUPPLIER_KEY,
@@ -3539,6 +3714,8 @@ mod tests {
             let transport = CountingTransport::ok("the answer is four");
             let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let answer = run_voice_delegation_with(
+                &state,
+                "sess-1",
                 db,
                 SIGNING_KEY,
                 SUPPLIER_KEY,
@@ -3571,6 +3748,8 @@ mod tests {
             let transport = CountingTransport::unreachable();
             let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let answer = run_voice_delegation_with(
+                &state,
+                "sess-1",
                 db,
                 SIGNING_KEY,
                 SUPPLIER_KEY,
@@ -3601,6 +3780,8 @@ mod tests {
             let transport = CountingTransport::unreachable();
             let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let answer = run_voice_delegation_with(
+                &state,
+                "sess-1",
                 db,
                 SIGNING_KEY,
                 SUPPLIER_KEY,
@@ -3637,6 +3818,8 @@ mod tests {
             let transport = CountingTransport::ok("the answer is four");
             let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let answer = run_voice_delegation_with(
+                &state,
+                "sess-1",
                 db,
                 SIGNING_KEY,
                 SUPPLIER_KEY,
@@ -3672,6 +3855,8 @@ mod tests {
             ]);
             let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let answer = run_voice_delegation_with(
+                &state,
+                "sess-1",
                 db,
                 SIGNING_KEY,
                 SUPPLIER_KEY,
@@ -3885,6 +4070,7 @@ mod tests {
                     user_id: owner_id.to_string(),
                     close_tx,
                     events_tx,
+                    pending_confirm: std::sync::Mutex::new(None),
                 },
             );
         }
