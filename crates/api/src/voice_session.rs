@@ -1054,23 +1054,35 @@ async fn run_billing_loop(
 }
 
 /// A safe character cap for `session.commentary.append`'s 500-token limit
-/// (https://developers.openai.com/api/docs/guides/live-migration): English
-/// text tokenizes at roughly 4 characters/token, so 500 tokens is normally
-/// well over 1000 characters — capping at 1200 characters leaves headroom
-/// even for token-dense text without ever needing an actual tokenizer here.
-const COMMENTARY_CHAR_CAP: usize = 1200;
+/// (https://developers.openai.com/api/docs/guides/live-migration). English
+/// text tokenizes at roughly 4 characters/token, but token-dense text
+/// (UUID-heavy strings, non-Latin scripts) can run as low as 1-3
+/// characters/token — capping at 1200 characters was not safe against that
+/// case. 450 characters stays under the 500-token limit even at 1
+/// character/token, with the system prompt also asking the model to answer
+/// in under 60 words as a second line of defense.
+const COMMENTARY_CHAR_CAP: usize = 450;
 
 /// The system prompt the delegated agent turn runs under. Short and
 /// spoken-first: the text comes back as `session.commentary.append`, which
 /// GPT-Live paraphrases aloud rather than reading verbatim, so it does not
 /// need to be conversational itself — just accurate and short.
-const VOICE_DELEGATION_SYSTEM_PROMPT: &str = "You are Cortex's coding agent, answering a request that came in over a live voice call. Keep answers short and to the point; they will be read aloud.";
+const VOICE_DELEGATION_SYSTEM_PROMPT: &str = "You are Cortex's coding agent, answering a request that came in over a live voice call. Keep answers short and to the point; they will be read aloud. Answer in under 60 words.";
 
 /// Append a `session.input_transcript.delta`'s text to the accumulator that
 /// becomes the next delegation's task text. The event's own shape is not
 /// pinned down by the docs beyond "append to captions"; this reads the
 /// common `delta`/`text` fields defensively and drops the event if neither
 /// is present rather than guessing.
+/// Caption text accumulates here between delegations; a caller who never
+/// stops talking (or a delegation that never arrives) must not let this grow
+/// without bound, so it is kept a sliding window of the most recent
+/// [`PENDING_TRANSCRIPT_CHAR_CAP`] characters — the task text a delegation
+/// actually needs is what was said most recently, not everything said since
+/// the session started. Trimming always lands on a char boundary (never
+/// splits a multi-byte UTF-8 character) by walking back from the cut point.
+const PENDING_TRANSCRIPT_CHAR_CAP: usize = 2000;
+
 fn accumulate_transcript(pending_transcript: &mut String, event: &Value) {
     let delta = event
         .get("delta")
@@ -1078,6 +1090,14 @@ fn accumulate_transcript(pending_transcript: &mut String, event: &Value) {
         .or_else(|| event.get("text").and_then(Value::as_str));
     if let Some(delta) = delta {
         pending_transcript.push_str(delta);
+    }
+    if pending_transcript.len() > PENDING_TRANSCRIPT_CHAR_CAP {
+        let excess = pending_transcript.len() - PENDING_TRANSCRIPT_CHAR_CAP;
+        let mut cut = excess;
+        while !pending_transcript.is_char_boundary(cut) {
+            cut += 1;
+        }
+        pending_transcript.drain(..cut);
     }
 }
 
@@ -2850,6 +2870,30 @@ mod tests {
             accumulate_transcript(&mut pending, &serde_json::json!({"text": "world"}));
             accumulate_transcript(&mut pending, &serde_json::json!({"nothing_useful": true}));
             assert_eq!(pending, "hello world");
+        }
+
+        #[test]
+        fn accumulate_transcript_keeps_only_a_sliding_window_and_stays_on_char_boundaries() {
+            // A multi-byte character (3 bytes each in UTF-8) repeated well
+            // past the cap, appended in chunks so the cut point does not
+            // land on a chunk boundary by luck.
+            let mut pending = String::new();
+            for _ in 0..900 {
+                accumulate_transcript(&mut pending, &serde_json::json!({"delta": "语言"}));
+            }
+            // 900 * "语言" is 5400 bytes, well past the 2000-byte cap.
+            assert!(
+                pending.len() <= PENDING_TRANSCRIPT_CHAR_CAP,
+                "the transcript must be trimmed to the cap in bytes: was {}",
+                pending.len()
+            );
+            // No panic above means every trim landed on a char boundary
+            // (String::drain panics otherwise); also confirm the tail is
+            // exactly what was most recently appended.
+            assert!(
+                pending.ends_with('言'),
+                "the most recent text must survive trimming"
+            );
         }
 
         #[tokio::test]
