@@ -405,6 +405,24 @@ fn tool_uses(body: &Value) -> Vec<(String, String, Value)> {
         .unwrap_or_default()
 }
 
+/// Whether a reply is allowed to offer, and act on, `Risk::Confirm` agent
+/// tools (`open_pr`, `cancel_run`).
+///
+/// - `Off`: today's chat behavior — the full tool list, confirm tools
+///   included, confirmed the usual way (a tap on `POST
+///   /api/agent/actions/{id}/confirm`).
+/// - `Spoken`: a live-voice turn that *may* also accept a spoken "yes"
+///   (`spoken_confirm::Matcher`) in addition to a tap, once the proposal has
+///   an owned `conversation_id` to write the pending row against. Without an
+///   owned conversation, `send_paid_reply` still withholds `Risk::Confirm`
+///   tools entirely (there would be nowhere to attach the confirmation), the
+///   same as the old `voice_turn: true` behavior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VoiceConfirm {
+    Off,
+    Spoken,
+}
+
 /// Run the tool loop: reserve, call the supplier, settle, and charge for up
 /// to [`MAX_AGENT_TURNS`] turns, executing any `tool_use` blocks the model
 /// asks for between turns. Independent of the SSE plumbing so it can be
@@ -450,13 +468,8 @@ pub(crate) async fn send_paid_reply<T: ProviderTransport + Clone>(
     // "Checked your runs" while a slow multi-turn reply is still running.
     // `None` in tests that don't care about the stream.
     tool_events: Option<&mpsc::Sender<StepEvent>>,
-    // A live-voice delegation turn: `Risk::Confirm` tools (`open_pr`,
-    // `cancel_run`) are withheld from the model's tool list entirely, and if
-    // the model names one anyway it is refused with a voice-appropriate
-    // message instead of being proposed or run — there is no spoken
-    // confirmation flow yet (see `voice_session::handle_delegation_created`).
-    // Text chat always passes `false`.
-    voice_turn: bool,
+    // See [`VoiceConfirm`]. Text chat always passes `VoiceConfirm::Off`.
+    voice_confirm: VoiceConfirm,
     // Cooperative stop: checked once per turn, right next to the balance
     // check below, rather than the caller hard-aborting our task. An abort
     // could land mid supplier call (leaving a `chat-reply:*` reservation
@@ -490,7 +503,15 @@ pub(crate) async fn send_paid_reply<T: ProviderTransport + Clone>(
     let turn_cap_key = format!("{user_id}:{}", conversation_id.unwrap_or(reply_id));
     let turn_cap = turn_cap_per_minute;
 
-    let tools = if voice_turn {
+    // `Spoken` still withholds `Risk::Confirm` tools when there is no
+    // `conversation_id` this user owns to write a pending row against — the
+    // same as the old `voice_turn: true` behavior. `Off` (chat, and a
+    // `Spoken` turn with an owned conversation) offers the full list.
+    let confirm_withheld = voice_confirm == VoiceConfirm::Spoken
+        && !conversation_id
+            .map(|c| db.get_conversation(c, user_id).is_some())
+            .unwrap_or(false);
+    let tools = if confirm_withheld {
         agent_tools::tool_definitions_excluding_confirm()
     } else {
         agent_tools::tool_definitions()
@@ -688,7 +709,7 @@ pub(crate) async fn send_paid_reply<T: ProviderTransport + Clone>(
             // anyway — refuse it here, before the `open_pr` proposal path or
             // `execute`'s own (chat-worded) `ConfirmRequired` message, with
             // the voice-appropriate wording. Nothing is proposed or run.
-            if voice_turn && agent_tools::is_confirm_risk(&name) {
+            if confirm_withheld && agent_tools::is_confirm_risk(&name) {
                 tool_results.push(serde_json::json!({
                     "type": "tool_result",
                     "tool_use_id": tool_use_id,
@@ -1010,7 +1031,7 @@ pub(crate) async fn run(
         now_ms,
         turn_cap,
         Some(&tx),
-        false,
+        VoiceConfirm::Off,
         None,
     )
     .await
@@ -1170,7 +1191,7 @@ mod tests {
             NOW,
             20,
             None,
-            false,
+            VoiceConfirm::Off,
             None,
         )
         .await
@@ -1206,7 +1227,7 @@ mod tests {
             NOW,
             20,
             None,
-            false,
+            VoiceConfirm::Off,
             None,
         )
         .await
@@ -1241,7 +1262,7 @@ mod tests {
             NOW,
             20,
             None,
-            false,
+            VoiceConfirm::Off,
             None,
         )
         .await
@@ -1282,7 +1303,7 @@ mod tests {
                 NOW,
                 20,
                 None,
-                false,
+                VoiceConfirm::Off,
                 None,
             )
             .await;
@@ -1329,7 +1350,7 @@ mod tests {
             NOW,
             20,
             None,
-            false,
+            VoiceConfirm::Off,
             None,
         )
         .await
@@ -1491,7 +1512,7 @@ mod tests {
             NOW,
             20,
             None,
-            false,
+            VoiceConfirm::Off,
             None,
         )
         .await
@@ -1548,7 +1569,7 @@ mod tests {
             NOW,
             20,
             None,
-            false,
+            VoiceConfirm::Off,
             None,
         )
         .await
@@ -1650,7 +1671,7 @@ mod tests {
             NOW,
             20,
             Some(&tx),
-            false,
+            VoiceConfirm::Off,
             None,
         )
         .await
@@ -1724,7 +1745,7 @@ mod tests {
             NOW,
             20,
             Some(&tx),
-            true,
+            VoiceConfirm::Spoken,
             None,
         )
         .await
@@ -1789,7 +1810,7 @@ mod tests {
             NOW,
             20,
             Some(&tx),
-            false,
+            VoiceConfirm::Off,
             None,
         )
         .await
@@ -1873,7 +1894,7 @@ mod tests {
             NOW,
             20,
             Some(&tx),
-            false,
+            VoiceConfirm::Off,
             None,
         )
         .await
@@ -1980,7 +2001,7 @@ mod tests {
             NOW,
             20,
             None,
-            false,
+            VoiceConfirm::Off,
             None,
         )
         .await
@@ -2037,7 +2058,7 @@ mod tests {
             NOW,
             20,
             None,
-            false,
+            VoiceConfirm::Off,
             None,
         )
         .await
@@ -2092,7 +2113,7 @@ mod tests {
             NOW,
             20,
             None,
-            false,
+            VoiceConfirm::Off,
             None,
         )
         .await
@@ -2177,7 +2198,7 @@ mod tests {
             NOW,
             20,
             None,
-            false,
+            VoiceConfirm::Off,
             Some(&cancel),
         )
         .await
@@ -2242,7 +2263,7 @@ mod tests {
             NOW,
             20,
             None,
-            false,
+            VoiceConfirm::Off,
             Some(&cancel),
         )
         .await
@@ -2303,7 +2324,7 @@ mod tests {
             NOW,
             20,
             None,
-            false,
+            VoiceConfirm::Off,
             None,
         )
         .await
@@ -2351,7 +2372,7 @@ mod tests {
             NOW,
             1,
             None,
-            false,
+            VoiceConfirm::Off,
             None,
         )
         .await;
@@ -2488,7 +2509,7 @@ mod tests {
             NOW,
             20,
             None,
-            false,
+            VoiceConfirm::Off,
             None,
         )
         .await
@@ -2588,7 +2609,7 @@ mod tests {
             NOW,
             20,
             None,
-            false,
+            VoiceConfirm::Off,
             None,
         );
         let fut_b = send_paid_reply(
@@ -2606,7 +2627,7 @@ mod tests {
             NOW,
             20,
             None,
-            false,
+            VoiceConfirm::Off,
             None,
         );
 

@@ -1450,7 +1450,7 @@ async fn run_voice_delegation_with<T: crate::provider_gateway::ProviderTransport
         now_ms,
         turn_cap,
         None,
-        true,
+        crate::chat_paid::VoiceConfirm::Spoken,
         Some(cancel.as_ref()),
     )
     .await;
