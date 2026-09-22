@@ -19,9 +19,10 @@ export type LiveVoiceStatus = 'idle' | 'connecting' | 'active';
  */
 function sessionClosedMessage(reason: unknown, closeRequestedByUs: boolean): string | null {
   if (reason === 'close_requested') {
-    return closeRequestedByUs ? null : 'Live voice ended: your credits ran out.';
+    return closeRequestedByUs ? null : 'Live voice ended: you reached your credit or session limit.';
   }
   if (reason === 'expired') return 'Live voice ended: the session reached its time limit.';
+  if (reason === 'content') return 'Live voice ended by a safety filter.';
   const label = typeof reason === 'string' && reason ? reason.replace(/_/g, ' ') : 'the connection ended';
   return `Live voice ended. ${label}.`;
 }
@@ -132,8 +133,8 @@ export function useLiveVoiceToggle() {
    * fired -- there is no separate "already closing" flag to fall out of
    * sync with it.
    *
-   * `useBeacon` is for the tab-closing paths (`pagehide`/`beforeunload`),
-   * where a normal `fetch` can be aborted mid-flight by the navigation; a
+   * `useBeacon` is for the tab-closing path (`pagehide`), where a normal
+   * `fetch` can be aborted mid-flight by the navigation; a
    * `keepalive` fetch is allowed to outlive the page. It reads whatever
    * token is currently cached in `tokenRef` rather than asking Clerk again,
    * since there is no guarantee anything async gets to finish once
@@ -362,7 +363,7 @@ export function useLiveVoiceToggle() {
   }, [status]);
 
   useEffect(() => {
-    const handlePageHide = () => {
+    const handlePageHide = (event: PageTransitionEvent) => {
       closeRequestedRef.current = true;
       // `session.close` is synchronous and needs no auth, so it goes out
       // first, over the data channel, even if the keepalive DELETE below
@@ -376,14 +377,33 @@ export function useLiveVoiceToggle() {
         }
       }
       sendClose(true);
+      // `event.persisted` means the page is going into the back/forward
+      // cache instead of unloading -- the tab (and this hook's state) can
+      // come back on a `pageshow`. The RTCPeerConnection and mic track do
+      // not survive bfcache regardless, so tear them down here too and
+      // reset to idle, rather than leaving the UI showing a session that
+      // no longer exists once the page is restored.
+      if (event.persisted) {
+        releaseLocal();
+        setStatus('idle');
+      }
     };
     // `pagehide` only -- not `beforeunload`, which also fires when the
     // browser is merely asking whether to leave (e.g. a "Leave site?"
     // prompt the user then cancels), which would end the call for a tab
     // that never actually closed.
     window.addEventListener('pagehide', handlePageHide);
+    // A page restored from bfcache resumes with whatever React state it
+    // was frozen with; `handlePageHide` above already tore down the
+    // connection and set `idle` when `persisted` was true, but this is a
+    // second, defensive pass in case restoration raced that reset.
+    const handlePageShow = (event: PageTransitionEvent) => {
+      if (event.persisted) setStatus('idle');
+    };
+    window.addEventListener('pageshow', handlePageShow);
     return () => {
       window.removeEventListener('pagehide', handlePageHide);
+      window.removeEventListener('pageshow', handlePageShow);
       // A plain unmount (in-app navigation) keeps the tab alive, so the
       // regular DELETE path is reliable here -- no need for the beacon.
       cancelledRef.current = true;

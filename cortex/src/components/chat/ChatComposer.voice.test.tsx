@@ -62,7 +62,12 @@ class FakePeerConnection {
   }
   createOffer = vi.fn(async () => ({ type: 'offer', sdp: 'fake-offer-sdp' }));
   setLocalDescription = vi.fn(async () => {
-    this.localDescription = { sdp: 'gathered-sdp' };
+    // Real `localDescription` picks up the SDP as gathered so far the
+    // moment `setLocalDescription` resolves -- it does not yet have every
+    // candidate. A test asserting the final `gathered-sdp` only appears
+    // after `completeIceGathering()` catches a hook that reads this too
+    // early instead of waiting on `iceGatheringState`.
+    this.localDescription = { sdp: 'partial-sdp' };
   });
   setRemoteDescription = vi.fn(async () => undefined);
   close = vi.fn();
@@ -78,6 +83,7 @@ class FakePeerConnection {
   }
   completeIceGathering() {
     this.iceGatheringState = 'complete';
+    if (this.localDescription) this.localDescription = { sdp: 'gathered-sdp' };
     this.emit('icegatheringstatechange');
   }
 }
@@ -173,7 +179,7 @@ describe('ChatComposer voice controls', () => {
       globalThis as unknown as { RTCPeerConnection: new () => FakePeerConnection }
     ).RTCPeerConnection = ManualIceFakePeerConnection;
     let postBody = '';
-    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
       const url = String(input);
       const method = init?.method ?? 'GET';
       if (url.includes('/api/voice/live/sessions') && method === 'POST') {
@@ -198,7 +204,15 @@ describe('ChatComposer voice controls', () => {
       await Promise.resolve();
     });
     expect(lastPeerConnection?.iceGatheringState).toBe('gathering');
+    expect(lastPeerConnection?.localDescription?.sdp).toBe('partial-sdp');
     expect(screen.getByLabelText('Live voice')).toHaveAttribute('aria-pressed', 'false');
+    // Nothing should have been posted yet -- if `waitForIceGatheringComplete`
+    // were removed, the POST would already have gone out with `partial-sdp`
+    // at this point.
+    const postCallsBeforeGathering = fetchSpy.mock.calls.filter(
+      ([url, init]) => String(url).includes('/api/voice/live/sessions') && (init?.method ?? 'GET') === 'POST',
+    );
+    expect(postCallsBeforeGathering.length).toBe(0);
 
     await act(async () => {
       lastPeerConnection?.completeIceGathering();
@@ -540,6 +554,44 @@ describe('ChatComposer voice controls', () => {
     expect(screen.getByLabelText('Live voice')).toHaveAttribute('aria-pressed', 'true');
   });
 
+  it('a bfcache pagehide (persisted) tears down the connection and resets to idle', async () => {
+    installFakeMediaDevices();
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
+      const url = String(input);
+      const method = init?.method ?? 'GET';
+      if (url.includes('/api/voice/live/sessions') && method === 'POST') {
+        return jsonResponse({ session_id: 'sess-bfcache', sdp: 'fake-answer-sdp' });
+      }
+      if (url.includes('/api/voice/live/sessions/') && method === 'DELETE') {
+        return jsonResponse({});
+      }
+      return jsonResponse({}, 404);
+    });
+
+    render(<ChatComposer draft="" onDraftChange={noop} onSend={noop} />);
+    await act(async () => {
+      fireEvent.click(screen.getByLabelText('Live voice'));
+    });
+    await waitFor(() => expect(screen.getByLabelText('Live voice')).toHaveAttribute('aria-pressed', 'true'));
+
+    const pc = lastPeerConnection;
+    await act(async () => {
+      const pageHideEvent = new Event('pagehide') as PageTransitionEvent;
+      Object.defineProperty(pageHideEvent, 'persisted', { value: true });
+      window.dispatchEvent(pageHideEvent);
+    });
+
+    // A page going into bfcache still sends the same beacon as a normal
+    // pagehide, but also tears down the (unrecoverable) connection locally
+    // and resets the UI to idle rather than leaving it showing a live
+    // session that no longer exists.
+    expect(pc?.close).toHaveBeenCalled();
+    expect(screen.getByLabelText('Live voice')).toHaveAttribute('aria-pressed', 'false');
+    const deleteCalls = fetchSpy.mock.calls.filter(([, init]) => (init?.method ?? 'GET') === 'DELETE');
+    expect(deleteCalls.length).toBe(1);
+    expect(deleteCalls[0][1]?.keepalive).toBe(true);
+  });
+
   it('refreshes the auth token every ~30s so the pagehide DELETE carries a fresh one', async () => {
     vi.useFakeTimers();
     try {
@@ -665,10 +717,38 @@ describe('ChatComposer voice controls', () => {
       lastPeerConnection?.lastDataChannel?.emitMessage({ type: 'session.closed', reason: 'close_requested' });
     });
 
-    expect(await screen.findByRole('alert')).toHaveTextContent(/credits ran out/i);
+    expect(await screen.findByRole('alert')).toHaveTextContent(/credit or session limit/i);
     await waitFor(() => expect(screen.getByLabelText('Live voice')).toHaveAttribute('aria-pressed', 'false'));
     const deleteCalls = fetchSpy.mock.calls.filter(([, init]) => (init?.method ?? 'GET') === 'DELETE');
     expect(deleteCalls.length).toBe(1);
+  });
+
+  it('a session.closed with reason content shows the safety-filter message', async () => {
+    installFakeMediaDevices();
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
+      const url = String(input);
+      const method = init?.method ?? 'GET';
+      if (url.includes('/api/voice/live/sessions') && method === 'POST') {
+        return jsonResponse({ session_id: 'sess-8d', sdp: 'fake-answer-sdp' });
+      }
+      if (url.includes('/api/voice/live/sessions/') && method === 'DELETE') {
+        return jsonResponse({});
+      }
+      return jsonResponse({}, 404);
+    });
+
+    render(<ChatComposer draft="" onDraftChange={noop} onSend={noop} />);
+    await act(async () => {
+      fireEvent.click(screen.getByLabelText('Live voice'));
+    });
+    await waitFor(() => expect(screen.getByLabelText('Live voice')).toHaveAttribute('aria-pressed', 'true'));
+
+    act(() => {
+      lastPeerConnection?.lastDataChannel?.emitMessage({ type: 'session.closed', reason: 'content' });
+    });
+
+    const alert = await screen.findByRole('alert');
+    expect(alert).toHaveTextContent(/safety filter/i);
   });
 
   it('a session.closed with reason expired shows the time-limit message, not the credits message', async () => {
@@ -730,6 +810,50 @@ describe('ChatComposer voice controls', () => {
     });
 
     expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+  });
+
+  it('starting again after a toggle-off clears the close-requested flag, so a later credits close still alerts', async () => {
+    installFakeMediaDevices();
+    let sessionCounter = 0;
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
+      const url = String(input);
+      const method = init?.method ?? 'GET';
+      if (url.includes('/api/voice/live/sessions') && method === 'POST') {
+        sessionCounter += 1;
+        return jsonResponse({ session_id: `sess-restart-${sessionCounter}`, sdp: 'fake-answer-sdp' });
+      }
+      if (url.includes('/api/voice/live/sessions/') && method === 'DELETE') {
+        return jsonResponse({});
+      }
+      return jsonResponse({}, 404);
+    });
+
+    render(<ChatComposer draft="" onDraftChange={noop} onSend={noop} />);
+
+    // Start, then a user-requested toggle-off -- this sets
+    // `closeRequestedRef` to true.
+    await act(async () => {
+      fireEvent.click(screen.getByLabelText('Live voice'));
+    });
+    await waitFor(() => expect(screen.getByLabelText('Live voice')).toHaveAttribute('aria-pressed', 'true'));
+    await act(async () => {
+      fireEvent.click(screen.getByLabelText('Live voice'));
+    });
+    await waitFor(() => expect(screen.getByLabelText('Live voice')).toHaveAttribute('aria-pressed', 'false'));
+
+    // Start again -- if `start()` did not reset `closeRequestedRef` back to
+    // false, a server-initiated close on this new session would be
+    // mistaken for the toggle-off that just happened and stay silent.
+    await act(async () => {
+      fireEvent.click(screen.getByLabelText('Live voice'));
+    });
+    await waitFor(() => expect(screen.getByLabelText('Live voice')).toHaveAttribute('aria-pressed', 'true'));
+
+    act(() => {
+      lastPeerConnection?.lastDataChannel?.emitMessage({ type: 'session.closed', reason: 'close_requested' });
+    });
+
+    expect(await screen.findByRole('alert')).toHaveTextContent(/credit or session limit/i);
   });
 
   it('a user-requested toggle-off shows no error', async () => {
@@ -843,6 +967,71 @@ describe('ChatComposer voice controls', () => {
       expect(screen.getByLabelText('Live voice')).toHaveAttribute('aria-pressed', 'false');
       deleteCalls = fetchSpy.mock.calls.filter(([, init]) => (init?.method ?? 'GET') === 'DELETE');
       expect(deleteCalls.length).toBe(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('clears the disconnect timer on recovery -- a stale timer from the first drop must not fire for a later one', async () => {
+    vi.useFakeTimers();
+    try {
+      installFakeMediaDevices();
+      const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
+        const url = String(input);
+        const method = init?.method ?? 'GET';
+        if (url.includes('/api/voice/live/sessions') && method === 'POST') {
+          return jsonResponse({ session_id: 'sess-fail-3', sdp: 'fake-answer-sdp' });
+        }
+        if (url.includes('/api/voice/live/sessions/') && method === 'DELETE') {
+          return jsonResponse({});
+        }
+        return jsonResponse({}, 404);
+      });
+
+      render(<ChatComposer draft="" onDraftChange={noop} onSend={noop} />);
+      await act(async () => {
+        fireEvent.click(screen.getByLabelText('Live voice'));
+        await vi.runOnlyPendingTimersAsync();
+      });
+      expect(screen.getByLabelText('Live voice')).toHaveAttribute('aria-pressed', 'true');
+
+      // First drop at t=0 arms a 5s timer with deadline t=5000.
+      act(() => {
+        if (lastPeerConnection) lastPeerConnection.connectionState = 'disconnected';
+        lastPeerConnection?.emit('connectionstatechange');
+      });
+      // Recovers late, just before the original deadline -- if recovery
+      // does not clear that timer, it is still pending and due at t=5000.
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(4000);
+      });
+      act(() => {
+        if (lastPeerConnection) lastPeerConnection.connectionState = 'connected';
+        lastPeerConnection?.emit('connectionstatechange');
+      });
+
+      // Drops again within 1s of the recovery (at t=4500), arming its own
+      // fresh 5s timer with a deadline of t=9500 -- far past the point
+      // this test checks below.
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(500);
+      });
+      act(() => {
+        if (lastPeerConnection) lastPeerConnection.connectionState = 'disconnected';
+        lastPeerConnection?.emit('connectionstatechange');
+      });
+
+      // Advance to t=6000 -- 1s past the ORIGINAL t=5000 deadline, well
+      // short of the fresh timer's t=9500 one. A correct implementation is
+      // still counting down the fresh timer here, so the session stays
+      // active; a stale, uncleared first timer would instead have fired at
+      // t=5000 (while still disconnected) and ended it already.
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(1500);
+      });
+      expect(screen.getByLabelText('Live voice')).toHaveAttribute('aria-pressed', 'true');
+      const deleteCalls = fetchSpy.mock.calls.filter(([, init]) => (init?.method ?? 'GET') === 'DELETE');
+      expect(deleteCalls.length).toBe(0);
     } finally {
       vi.useRealTimers();
     }
