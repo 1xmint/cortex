@@ -34,6 +34,9 @@ function createId(prefix: string) {
   return `${prefix}-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`;
 }
 
+/** Terminal statuses a `confirm_resolved` event's `status` can validly carry. */
+const RESOLVED_STATUSES = new Set<ConfirmActionStatus>(['confirmed', 'cancelled', 'expired']);
+
 interface ConfirmRequiredFields {
   action_id: string;
   nonce: string;
@@ -426,6 +429,41 @@ export function useChatSession({
   const handleVoiceConfirmRequired = useCallback((event: ConfirmRequiredFields) => {
     const confirmMessage = buildConfirmMessage(event, 'cortex');
     setMessages((cur) => withConfirmMessageAppended(cur, confirmMessage));
+  }, []);
+
+  /**
+   * A `spoken_window` event: the spoken prompt finished playing and the
+   * server opened its 45s "say yes" window for `action_id` -- the matching
+   * card (if still pending) shows a countdown to `deadline` alongside its
+   * regular controls.
+   */
+  const handleVoiceSpokenWindow = useCallback((event: { action_id: string; deadline: string }) => {
+    setMessages((cur) =>
+      cur.map((m) => {
+        if (!m.confirmAction || m.confirmAction.actionId !== event.action_id) return m;
+        if (m.confirmAction.status !== 'pending') return m;
+        return { ...m, confirmAction: { ...m.confirmAction, spokenWindowDeadline: event.deadline } };
+      }),
+    );
+  }, []);
+
+  /**
+   * A `confirm_resolved` event: the action for `action_id` was confirmed,
+   * cancelled, or failed by whatever means (a spoken "yes", a tap on another
+   * device, expiry) -- resolves the matching card through the exact same
+   * status-setting path a tap confirm/cancel here already uses.
+   */
+  const handleVoiceConfirmResolved = useCallback((event: { action_id: string; status: string }) => {
+    const status = RESOLVED_STATUSES.has(event.status as ConfirmActionStatus)
+      ? (event.status as ConfirmActionStatus)
+      : 'unavailable';
+    setMessages((cur) =>
+      cur.map((m) => {
+        if (!m.confirmAction || m.confirmAction.actionId !== event.action_id) return m;
+        if (m.confirmAction.status !== 'pending') return m;
+        return { ...m, confirmAction: { ...m.confirmAction, status } };
+      }),
+    );
   }, []);
 
   const renameConversation = useCallback(async (title: string) => {
@@ -996,5 +1034,7 @@ export function useChatSession({
     ensureConversationId,
     appendVoiceMessage,
     handleVoiceConfirmRequired,
+    handleVoiceSpokenWindow,
+    handleVoiceConfirmResolved,
   };
 }

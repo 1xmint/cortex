@@ -83,6 +83,10 @@ interface ChatComposerProps {
   onVoiceMessage?: (role: 'user' | 'assistant', content: string) => void;
   /** A voice session's `confirm_required` event -- same card as a typed one. */
   onVoiceConfirmRequired?: (event: { action_id: string; nonce: string; summary: string; expires_at: string }) => void;
+  /** A voice session's `spoken_window` event: the say-yes countdown opened. */
+  onVoiceSpokenWindow?: (event: { action_id: string; deadline: string }) => void;
+  /** A voice session's `confirm_resolved` event: the action reached a final status. */
+  onVoiceConfirmResolved?: (event: { action_id: string; status: string }) => void;
 }
 
 export default function ChatComposer({
@@ -97,6 +101,8 @@ export default function ChatComposer({
   onLiveVoiceStart,
   onVoiceMessage,
   onVoiceConfirmRequired,
+  onVoiceSpokenWindow,
+  onVoiceConfirmResolved,
 }: ChatComposerProps) {
   const canSend = draft.trim().length > 0 && !disabled && !locked;
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
@@ -131,9 +137,14 @@ export default function ChatComposer({
       });
       return;
     }
-    // `spoken_window` / `confirm_resolved`: accepted and typed, not built
-    // here -- the server does not emit them yet.
-  }, [onVoiceMessage, onVoiceConfirmRequired]);
+    if (event.type === 'spoken_window') {
+      onVoiceSpokenWindow?.({ action_id: event.action_id, deadline: event.deadline });
+      return;
+    }
+    if (event.type === 'confirm_resolved') {
+      onVoiceConfirmResolved?.({ action_id: event.action_id, status: event.status });
+    }
+  }, [onVoiceMessage, onVoiceConfirmRequired, onVoiceSpokenWindow, onVoiceConfirmResolved]);
 
   const liveVoice = useLiveVoiceToggle({
     getConversationId: onLiveVoiceStart,

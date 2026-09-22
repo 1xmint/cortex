@@ -109,4 +109,38 @@ describe('ConfirmActionCard', () => {
     );
     expect(screen.getByText('Replaced')).toBeInTheDocument();
   });
+
+  it('shows a "Say yes" countdown chip once a spoken window opens, then "Tap to confirm"', () => {
+    vi.useFakeTimers();
+    const request = makeRequest({
+      spokenWindowDeadline: new Date(Date.now() + 45_000).toISOString(),
+    });
+    render(<ConfirmActionCard request={request} onStatusChange={vi.fn()} />);
+
+    expect(screen.getByText('Say yes 0:45')).toBeInTheDocument();
+
+    act(() => {
+      vi.advanceTimersByTime(45_500);
+    });
+
+    expect(screen.getByText('Tap to confirm')).toBeInTheDocument();
+    // The regular 5-minute expiry countdown and its buttons stay in place.
+    expect(screen.getByRole('button', { name: /confirm:/i })).toBeInTheDocument();
+  });
+
+  it('has no spoken-window chip until a spoken_window event arrives', () => {
+    render(<ConfirmActionCard request={makeRequest()} onStatusChange={vi.fn()} />);
+    expect(screen.queryByText(/Say yes/)).not.toBeInTheDocument();
+    expect(screen.queryByText('Tap to confirm')).not.toBeInTheDocument();
+  });
+
+  it('reuses the resolved-state rendering on confirm_resolved for the spoken path', () => {
+    const request = makeRequest({
+      status: 'confirmed',
+      spokenWindowDeadline: new Date(Date.now() + 45_000).toISOString(),
+    });
+    render(<ConfirmActionCard request={request} onStatusChange={vi.fn()} />);
+    expect(screen.getByText(/Confirmed: Delete 3 stale branches/)).toBeInTheDocument();
+    expect(screen.queryByText(/Say yes/)).not.toBeInTheDocument();
+  });
 });

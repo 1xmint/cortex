@@ -31,6 +31,9 @@ function formatCountdown(totalSeconds: number): string {
 export default function ConfirmActionCard({ request, onStatusChange }: ConfirmActionCardProps) {
   const [remaining, setRemaining] = useState(() => secondsRemaining(request.expiresAt));
   const [isSubmitting, setIsSubmitting] = useState(false);
+  const [spokenRemaining, setSpokenRemaining] = useState(() =>
+    request.spokenWindowDeadline ? secondsRemaining(request.spokenWindowDeadline) : null,
+  );
   const inFlightRef = useRef(false);
 
   // Recompute a fresh countdown whenever a new pending request takes over
@@ -53,6 +56,26 @@ export default function ConfirmActionCard({ request, onStatusChange }: ConfirmAc
     return () => window.clearInterval(interval);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [request.status, request.expiresAt, request.messageId]);
+
+  // The "Say yes" window: opened by a `spoken_window` event, counts down to
+  // its own (much shorter) deadline, then falls back to the regular
+  // tap-to-confirm controls -- it does not resolve the card on its own,
+  // since the server is the one that decides whether a spoken "yes" landed
+  // in time (via `confirm_resolved`).
+  useEffect(() => {
+    if (request.status !== 'pending' || !request.spokenWindowDeadline) {
+      setSpokenRemaining(null);
+      return;
+    }
+    const deadline = request.spokenWindowDeadline;
+    setSpokenRemaining(secondsRemaining(deadline));
+    const interval = window.setInterval(() => {
+      const next = secondsRemaining(deadline);
+      setSpokenRemaining(next);
+      if (next <= 0) window.clearInterval(interval);
+    }, 1000);
+    return () => window.clearInterval(interval);
+  }, [request.status, request.spokenWindowDeadline]);
 
   async function handleDecision(decision: 'confirm' | 'cancel') {
     if (inFlightRef.current || request.status !== 'pending') return;
@@ -90,6 +113,13 @@ export default function ConfirmActionCard({ request, onStatusChange }: ConfirmAc
   }
 
   const isExpiring = remaining <= 10;
+  // `spokenRemaining` is null until a `spoken_window` event arrives; once it
+  // does, the chip counts down to its deadline and then reads "Tap to
+  // confirm" -- the fallback for whenever a spoken "yes" doesn't land in
+  // time, right alongside the Confirm/Cancel buttons that were there all
+  // along.
+  const spokenWindowActive = spokenRemaining !== null;
+  const spokenWindowExpired = spokenWindowActive && spokenRemaining <= 0;
 
   return (
     <div className="mt-3 rounded-2xl border border-white/8 bg-black/20 p-4">
@@ -108,10 +138,24 @@ export default function ConfirmActionCard({ request, onStatusChange }: ConfirmAc
           {formatCountdown(remaining)}
         </span>
       </div>
+      {spokenWindowActive && (
+        <div className="mt-2">
+          <span
+            className="inline-flex items-center rounded-full border border-[var(--accent)]/30 bg-[var(--accent)]/10 px-2.5 py-1 text-[11px] tabular-nums text-[var(--accent)]"
+            aria-hidden="true"
+          >
+            {spokenWindowExpired ? 'Tap to confirm' : `Say yes ${formatCountdown(spokenRemaining)}`}
+          </span>
+        </div>
+      )}
       {/* A visible countdown chip updates every second above; this text keeps
           screen readers informed without re-announcing each tick. */}
       <span className="sr-only" role="status">
-        {isExpiring ? `Expiring in ${remaining} seconds` : 'Awaiting confirmation'}
+        {spokenWindowActive && !spokenWindowExpired
+          ? `Say yes to confirm, ${spokenRemaining} seconds left`
+          : isExpiring
+            ? `Expiring in ${remaining} seconds`
+            : 'Awaiting confirmation'}
       </span>
 
       <div className="mt-3 flex flex-wrap gap-2">
