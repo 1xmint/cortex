@@ -405,6 +405,25 @@ fn tool_uses(body: &Value) -> Vec<(String, String, Value)> {
         .unwrap_or_default()
 }
 
+/// Whether a reply is allowed to offer, and act on, `Risk::Confirm` agent
+/// tools (`open_pr`, `cancel_run`).
+///
+/// - `Off`: today's chat behavior — the full tool list, confirm tools
+///   included, confirmed the usual way (a tap on `POST
+///   /api/agent/actions/{id}/confirm`).
+/// - `Spoken`: a live-voice turn that allows `Risk::Confirm` proposals once
+///   the reply has an owned `conversation_id` to write the pending row
+///   against — approved by a tap, same as `Off`. Spoken approval (a matched
+///   spoken "yes") comes in part 2. Without an owned conversation,
+///   `send_paid_reply` still withholds `Risk::Confirm` tools entirely (there
+///   would be nowhere to attach the confirmation), the same as the old
+///   `voice_turn: true` behavior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VoiceConfirm {
+    Off,
+    Spoken,
+}
+
 /// Run the tool loop: reserve, call the supplier, settle, and charge for up
 /// to [`MAX_AGENT_TURNS`] turns, executing any `tool_use` blocks the model
 /// asks for between turns. Independent of the SSE plumbing so it can be
@@ -450,13 +469,8 @@ pub(crate) async fn send_paid_reply<T: ProviderTransport + Clone>(
     // "Checked your runs" while a slow multi-turn reply is still running.
     // `None` in tests that don't care about the stream.
     tool_events: Option<&mpsc::Sender<StepEvent>>,
-    // A live-voice delegation turn: `Risk::Confirm` tools (`open_pr`,
-    // `cancel_run`) are withheld from the model's tool list entirely, and if
-    // the model names one anyway it is refused with a voice-appropriate
-    // message instead of being proposed or run — there is no spoken
-    // confirmation flow yet (see `voice_session::handle_delegation_created`).
-    // Text chat always passes `false`.
-    voice_turn: bool,
+    // See [`VoiceConfirm`]. Text chat always passes `VoiceConfirm::Off`.
+    voice_confirm: VoiceConfirm,
     // Cooperative stop: checked once per turn, right next to the balance
     // check below, rather than the caller hard-aborting our task. An abort
     // could land mid supplier call (leaving a `chat-reply:*` reservation
@@ -490,7 +504,15 @@ pub(crate) async fn send_paid_reply<T: ProviderTransport + Clone>(
     let turn_cap_key = format!("{user_id}:{}", conversation_id.unwrap_or(reply_id));
     let turn_cap = turn_cap_per_minute;
 
-    let tools = if voice_turn {
+    // `Spoken` still withholds `Risk::Confirm` tools when there is no
+    // `conversation_id` this user owns to write a pending row against — the
+    // same as the old `voice_turn: true` behavior. `Off` (chat, and a
+    // `Spoken` turn with an owned conversation) offers the full list.
+    let confirm_withheld = voice_confirm == VoiceConfirm::Spoken
+        && !conversation_id
+            .map(|c| db.get_conversation(c, user_id).is_some())
+            .unwrap_or(false);
+    let tools = if confirm_withheld {
         agent_tools::tool_definitions_excluding_confirm()
     } else {
         agent_tools::tool_definitions()
@@ -688,7 +710,7 @@ pub(crate) async fn send_paid_reply<T: ProviderTransport + Clone>(
             // anyway — refuse it here, before the `open_pr` proposal path or
             // `execute`'s own (chat-worded) `ConfirmRequired` message, with
             // the voice-appropriate wording. Nothing is proposed or run.
-            if voice_turn && agent_tools::is_confirm_risk(&name) {
+            if confirm_withheld && agent_tools::is_confirm_risk(&name) {
                 tool_results.push(serde_json::json!({
                     "type": "tool_result",
                     "tool_use_id": tool_use_id,
@@ -1010,7 +1032,7 @@ pub(crate) async fn run(
         now_ms,
         turn_cap,
         Some(&tx),
-        false,
+        VoiceConfirm::Off,
         None,
     )
     .await
@@ -1170,7 +1192,7 @@ mod tests {
             NOW,
             20,
             None,
-            false,
+            VoiceConfirm::Off,
             None,
         )
         .await
@@ -1206,7 +1228,7 @@ mod tests {
             NOW,
             20,
             None,
-            false,
+            VoiceConfirm::Off,
             None,
         )
         .await
@@ -1241,7 +1263,7 @@ mod tests {
             NOW,
             20,
             None,
-            false,
+            VoiceConfirm::Off,
             None,
         )
         .await
@@ -1282,7 +1304,7 @@ mod tests {
                 NOW,
                 20,
                 None,
-                false,
+                VoiceConfirm::Off,
                 None,
             )
             .await;
@@ -1329,7 +1351,7 @@ mod tests {
             NOW,
             20,
             None,
-            false,
+            VoiceConfirm::Off,
             None,
         )
         .await
@@ -1491,7 +1513,7 @@ mod tests {
             NOW,
             20,
             None,
-            false,
+            VoiceConfirm::Off,
             None,
         )
         .await
@@ -1548,7 +1570,7 @@ mod tests {
             NOW,
             20,
             None,
-            false,
+            VoiceConfirm::Off,
             None,
         )
         .await
@@ -1650,7 +1672,7 @@ mod tests {
             NOW,
             20,
             Some(&tx),
-            false,
+            VoiceConfirm::Off,
             None,
         )
         .await
@@ -1687,11 +1709,12 @@ mod tests {
         );
     }
 
-    /// A voice turn (`voice_turn: true`) never even offers `Risk::Confirm`
-    /// tools to the model — but if the model names one anyway (a stale
-    /// tool_use from before the delegation, or a model that hallucinates
-    /// one), it must be refused as a plain tool error rather than proposed
-    /// or run: no `agent_pending_actions` row, no `ConfirmRequired` event.
+    /// A `Spoken` turn with no owned conversation never even offers
+    /// `Risk::Confirm` tools to the model — but if the model names one
+    /// anyway (a stale tool_use from before the delegation, or a model that
+    /// hallucinates one), it must be refused as a plain tool error rather
+    /// than proposed or run: no `agent_pending_actions` row, no
+    /// `ConfirmRequired` event.
     #[tokio::test]
     async fn voice_turn_refuses_a_forced_confirm_tool_without_executing() {
         let (_dir, db) = test_db();
@@ -1724,7 +1747,7 @@ mod tests {
             NOW,
             20,
             Some(&tx),
-            true,
+            VoiceConfirm::Spoken,
             None,
         )
         .await
@@ -1789,7 +1812,7 @@ mod tests {
             NOW,
             20,
             Some(&tx),
-            false,
+            VoiceConfirm::Off,
             None,
         )
         .await
@@ -1803,6 +1826,191 @@ mod tests {
                 ok: false
             }]
         );
+        while let Some(event) = rx.recv().await {
+            assert!(
+                !matches!(event, StepEvent::ConfirmRequired { .. }),
+                "a refused proposal must not stream ConfirmRequired"
+            );
+        }
+    }
+
+    /// A `Spoken` turn whose `conversation_id` names a conversation the
+    /// caller does not own (it belongs to another user) must behave exactly
+    /// like the no-conversation case: `Risk::Confirm` tools are withheld
+    /// from the very first request, and a model that names one anyway gets
+    /// the same voice-appropriate refusal, not the `open_pr`-specific one.
+    #[tokio::test]
+    async fn spoken_with_another_users_conversation_withholds_confirm_tools() {
+        let (_dir, db) = test_db();
+        db.init_credit_balance("user-1", 1000).unwrap();
+        db.init_credit_balance("user-2", 1000).unwrap();
+        let other_conversation = db.create_conversation("user-2", None);
+
+        let transport = SequenceTransport::new(vec![
+            tool_use_response(
+                10,
+                10,
+                "toolu_1",
+                "open_pr",
+                serde_json::json!({"run_id": "does-not-matter"}),
+            ),
+            text_response(10, 10, "waiting on you"),
+        ]);
+        let (tx, mut rx) = mpsc::channel(8);
+
+        let reply = send_paid_reply(
+            &db,
+            SIGNING_KEY,
+            SUPPLIER_KEY,
+            transport.clone(),
+            big_limits(),
+            "user-1",
+            Some(&other_conversation.id),
+            MODEL,
+            "system",
+            "open a pr for my run",
+            "reply-other-users-conv",
+            NOW,
+            20,
+            Some(&tx),
+            VoiceConfirm::Spoken,
+            None,
+        )
+        .await
+        .expect("reply should succeed — the tool is refused, not the whole turn");
+        drop(tx);
+
+        let first_body = transport.request_body_at(0);
+        let tool_names: Vec<String> = first_body
+            .get("tools")
+            .and_then(Value::as_array)
+            .expect("first request must carry a tools list")
+            .iter()
+            .filter_map(|t| t.get("name").and_then(Value::as_str))
+            .map(String::from)
+            .collect();
+        assert!(
+            !tool_names.contains(&"open_pr".to_string()),
+            "tools must not offer open_pr for an unowned conversation: {tool_names:?}"
+        );
+        assert!(
+            !tool_names.contains(&"cancel_run".to_string()),
+            "tools must not offer cancel_run for an unowned conversation: {tool_names:?}"
+        );
+
+        assert!(
+            reply.tool_activity.is_empty(),
+            "a refused tool call is not \"activity\""
+        );
+
+        let second_body = transport.request_body_at(1);
+        let refusal_text = second_body
+            .get("messages")
+            .and_then(Value::as_array)
+            .and_then(|messages| messages.last())
+            .and_then(|m| m.get("content"))
+            .and_then(Value::as_array)
+            .and_then(|blocks| blocks.first())
+            .and_then(|b| b.get("content"))
+            .and_then(Value::as_str)
+            .expect("the tool_result content must be a plain refusal string");
+        assert_eq!(
+            refusal_text,
+            "That needs confirmation in the chat; voice confirmation is not available yet.",
+        );
+
+        while let Some(event) = rx.recv().await {
+            assert!(
+                !matches!(event, StepEvent::ConfirmRequired { .. }),
+                "a refused proposal must not stream ConfirmRequired"
+            );
+        }
+    }
+
+    /// Same as `spoken_with_another_users_conversation_withholds_confirm_tools`,
+    /// but for a conversation that did belong to the caller and was then
+    /// deleted — `get_conversation` no longer finds it, so it must be
+    /// treated the same as never having owned one at all.
+    #[tokio::test]
+    async fn spoken_with_deleted_conversation_withholds_confirm_tools() {
+        let (_dir, db) = test_db();
+        db.init_credit_balance("user-1", 1000).unwrap();
+        let conversation = db.create_conversation("user-1", None);
+        assert!(db.delete_conversation(&conversation.id, "user-1"));
+
+        let transport = SequenceTransport::new(vec![
+            tool_use_response(
+                10,
+                10,
+                "toolu_1",
+                "open_pr",
+                serde_json::json!({"run_id": "does-not-matter"}),
+            ),
+            text_response(10, 10, "waiting on you"),
+        ]);
+        let (tx, mut rx) = mpsc::channel(8);
+
+        let reply = send_paid_reply(
+            &db,
+            SIGNING_KEY,
+            SUPPLIER_KEY,
+            transport.clone(),
+            big_limits(),
+            "user-1",
+            Some(&conversation.id),
+            MODEL,
+            "system",
+            "open a pr for my run",
+            "reply-deleted-conv",
+            NOW,
+            20,
+            Some(&tx),
+            VoiceConfirm::Spoken,
+            None,
+        )
+        .await
+        .expect("reply should succeed — the tool is refused, not the whole turn");
+        drop(tx);
+
+        let first_body = transport.request_body_at(0);
+        let tool_names: Vec<String> = first_body
+            .get("tools")
+            .and_then(Value::as_array)
+            .expect("first request must carry a tools list")
+            .iter()
+            .filter_map(|t| t.get("name").and_then(Value::as_str))
+            .map(String::from)
+            .collect();
+        assert!(
+            !tool_names.contains(&"open_pr".to_string()),
+            "tools must not offer open_pr for a deleted conversation: {tool_names:?}"
+        );
+        assert!(
+            !tool_names.contains(&"cancel_run".to_string()),
+            "tools must not offer cancel_run for a deleted conversation: {tool_names:?}"
+        );
+
+        assert!(
+            reply.tool_activity.is_empty(),
+            "a refused tool call is not \"activity\""
+        );
+
+        let second_body = transport.request_body_at(1);
+        let refusal_text = second_body
+            .get("messages")
+            .and_then(Value::as_array)
+            .and_then(|messages| messages.last())
+            .and_then(|m| m.get("content"))
+            .and_then(Value::as_array)
+            .and_then(|blocks| blocks.first())
+            .and_then(|b| b.get("content"))
+            .and_then(Value::as_str)
+            .expect("the tool_result content must be a plain refusal string");
+        assert_eq!(
+            refusal_text,
+            "That needs confirmation in the chat; voice confirmation is not available yet.",
+        );
+
         while let Some(event) = rx.recv().await {
             assert!(
                 !matches!(event, StepEvent::ConfirmRequired { .. }),
@@ -1873,7 +2081,7 @@ mod tests {
             NOW,
             20,
             Some(&tx),
-            false,
+            VoiceConfirm::Off,
             None,
         )
         .await
@@ -1980,7 +2188,7 @@ mod tests {
             NOW,
             20,
             None,
-            false,
+            VoiceConfirm::Off,
             None,
         )
         .await
@@ -2037,7 +2245,7 @@ mod tests {
             NOW,
             20,
             None,
-            false,
+            VoiceConfirm::Off,
             None,
         )
         .await
@@ -2092,7 +2300,7 @@ mod tests {
             NOW,
             20,
             None,
-            false,
+            VoiceConfirm::Off,
             None,
         )
         .await
@@ -2177,7 +2385,7 @@ mod tests {
             NOW,
             20,
             None,
-            false,
+            VoiceConfirm::Off,
             Some(&cancel),
         )
         .await
@@ -2242,7 +2450,7 @@ mod tests {
             NOW,
             20,
             None,
-            false,
+            VoiceConfirm::Off,
             Some(&cancel),
         )
         .await
@@ -2303,7 +2511,7 @@ mod tests {
             NOW,
             20,
             None,
-            false,
+            VoiceConfirm::Off,
             None,
         )
         .await
@@ -2351,7 +2559,7 @@ mod tests {
             NOW,
             1,
             None,
-            false,
+            VoiceConfirm::Off,
             None,
         )
         .await;
@@ -2488,7 +2696,7 @@ mod tests {
             NOW,
             20,
             None,
-            false,
+            VoiceConfirm::Off,
             None,
         )
         .await
@@ -2588,7 +2796,7 @@ mod tests {
             NOW,
             20,
             None,
-            false,
+            VoiceConfirm::Off,
             None,
         );
         let fut_b = send_paid_reply(
@@ -2606,7 +2814,7 @@ mod tests {
             NOW,
             20,
             None,
-            false,
+            VoiceConfirm::Off,
             None,
         );
 
