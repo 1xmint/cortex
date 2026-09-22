@@ -474,6 +474,9 @@ function CortexShell() {
     updateApproval,
     updateConfirmActionStatus,
     renameConversation,
+    ensureConversationId,
+    appendVoiceMessage,
+    handleVoiceConfirmRequired,
   } = useChatSession({
     activeConversationId,
     userId: userId ?? 'local',
@@ -975,6 +978,9 @@ function CortexShell() {
             onSubscribe={() => handleOpenSettings('billing')}
             onApprovalAction={updateApproval}
             onConfirmActionStatusChange={updateConfirmActionStatus}
+            onLiveVoiceStart={ensureConversationId}
+            onVoiceMessage={appendVoiceMessage}
+            onVoiceConfirmRequired={handleVoiceConfirmRequired}
           />
 
           <div className="hidden lg:flex">

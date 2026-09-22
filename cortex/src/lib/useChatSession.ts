@@ -34,6 +34,53 @@ function createId(prefix: string) {
   return `${prefix}-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`;
 }
 
+interface ConfirmRequiredFields {
+  action_id: string;
+  nonce: string;
+  summary: string;
+  expires_at: string;
+}
+
+/**
+ * Builds the `ConfirmActionCard` message for a `confirm_required` event --
+ * shared by the chat stream's own event and the live voice events stream,
+ * since a voice-proposed risky action confirms through the exact same
+ * tap-to-confirm flow (`confirmAgentAction`/`cancelAgentAction`) as a typed
+ * one.
+ */
+function buildConfirmMessage(event: ConfirmRequiredFields, provider?: string): ChatMessage {
+  const confirmMessage: ChatMessage = {
+    id: createId('confirm'),
+    role: 'assistant',
+    content: '',
+    createdAt: new Date().toISOString(),
+    provider,
+    providerLabel: formatProviderLabel(provider),
+    confirmAction: {
+      messageId: '',
+      actionId: event.action_id,
+      nonce: event.nonce,
+      summary: event.summary,
+      expiresAt: event.expires_at,
+      status: 'pending',
+    },
+  };
+  confirmMessage.confirmAction!.messageId = confirmMessage.id;
+  return confirmMessage;
+}
+
+/** A newer confirm_required in this conversation replaces any still-pending card from an earlier one. */
+function withConfirmMessageAppended(messages: ChatMessage[], confirmMessage: ChatMessage): ChatMessage[] {
+  return [
+    ...messages.map((m) =>
+      m.confirmAction && m.confirmAction.status === 'pending'
+        ? { ...m, confirmAction: { ...m.confirmAction, status: 'replaced' as const } }
+        : m,
+    ),
+    confirmMessage,
+  ];
+}
+
 // Human-readable labels for the paid chat agent's read-only tool catalogue
 // (see crates/api/src/agent_tools.rs), used to render `tool_activity` events.
 const TOOL_ACTIVITY_LABELS: Record<string, string> = {
@@ -334,6 +381,51 @@ export function useChatSession({
         return { ...m, confirmAction: { ...m.confirmAction, status } };
       }),
     );
+  }, []);
+
+  /**
+   * Resolves the open conversation for live voice to attach to, creating one
+   * first -- the same call `sendMessage` uses for a new chat -- when none is
+   * open yet. Voice turns saved server-side (via the session's
+   * `conversation_id`) land in this conversation the next time it is
+   * refetched, and `appendVoiceMessage`/`handleVoiceConfirmRequired` below
+   * mirror them into `messages` locally in the meantime -- a later refetch
+   * (switching away and back) replaces `messages` wholesale from the server,
+   * so nothing here needs to dedupe against it.
+   */
+  const ensureConversationId = useCallback(async (): Promise<string | null> => {
+    const existing = activeConversationIdRef.current;
+    if (existing) return existing;
+    try {
+      const created = await createConversation(userId);
+      activeConversationIdRef.current = created.id;
+      skipNextConversationLoadRef.current = created.id;
+      onConversationCreated(created.id);
+      onConversationsChanged();
+      return created.id;
+    } catch {
+      // Voice can still proceed without a conversation to save turns to.
+      return null;
+    }
+  }, [onConversationCreated, onConversationsChanged, userId]);
+
+  /** A `voice_message` event: shows a voice turn the same way a typed one appears. */
+  const appendVoiceMessage = useCallback((role: 'user' | 'assistant', content: string) => {
+    const message: ChatMessage = {
+      id: createId('voice'),
+      role,
+      content,
+      createdAt: new Date().toISOString(),
+      provider: role === 'assistant' ? 'cortex' : undefined,
+      providerLabel: role === 'assistant' ? formatProviderLabel('cortex') : undefined,
+    };
+    setMessages((cur) => [...cur, message]);
+  }, []);
+
+  /** A voice session's `confirm_required` event: same card, same tap-to-confirm flow. */
+  const handleVoiceConfirmRequired = useCallback((event: ConfirmRequiredFields) => {
+    const confirmMessage = buildConfirmMessage(event, 'cortex');
+    setMessages((cur) => withConfirmMessageAppended(cur, confirmMessage));
   }, []);
 
   const renameConversation = useCallback(async (title: string) => {
@@ -663,33 +755,16 @@ export function useChatSession({
 
               case 'confirm_required': {
                 if (!event.action_id || !event.nonce || !event.summary || !event.expires_at) break;
-                const confirmMessage: ChatMessage = {
-                  id: createId('confirm'),
-                  role: 'assistant',
-                  content: '',
-                  createdAt: new Date().toISOString(),
-                  provider: assistantProvider,
-                  providerLabel: formatProviderLabel(assistantProvider),
-                  confirmAction: {
-                    messageId: '',
-                    actionId: event.action_id,
+                const confirmMessage = buildConfirmMessage(
+                  {
+                    action_id: event.action_id,
                     nonce: event.nonce,
                     summary: event.summary,
-                    expiresAt: event.expires_at,
-                    status: 'pending',
+                    expires_at: event.expires_at,
                   },
-                };
-                confirmMessage.confirmAction!.messageId = confirmMessage.id;
-                setMessages((cur) => [
-                  // A newer confirm_required in this conversation replaces any
-                  // still-pending card from an earlier one.
-                  ...cur.map((m) =>
-                    m.confirmAction && m.confirmAction.status === 'pending'
-                      ? { ...m, confirmAction: { ...m.confirmAction, status: 'replaced' as const } }
-                      : m,
-                  ),
-                  confirmMessage,
-                ]);
+                  assistantProvider,
+                );
+                setMessages((cur) => withConfirmMessageAppended(cur, confirmMessage));
                 break;
               }
 
@@ -918,5 +993,8 @@ export function useChatSession({
     updateApproval,
     updateConfirmActionStatus,
     renameConversation,
+    ensureConversationId,
+    appendVoiceMessage,
+    handleVoiceConfirmRequired,
   };
 }
