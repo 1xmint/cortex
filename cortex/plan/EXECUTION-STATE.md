@@ -3049,3 +3049,29 @@ latest recorded `production` deployment at `7a44a890`, no repository-level
 Actions secrets, and only the two Tailscale connection secrets in the
 `production` environment. In particular, there is still no recorded provider
 credential to make the live-model checkpoint runnable.
+
+## 2026-09-22 live voice drives the agent (M-D-0013 to M-D-0015)
+
+Goal (Josh): a dictation button and, to its right, a continuous live-voice
+toggle next to the chat box, with live voice able to use tools. Both buttons
+already exist in `ChatComposer.tsx`. Cortex's own Claude runs the tools through
+the gateway, charged in credits at actual cost; gpt-live-1 only listens and
+speaks.
+
+- **M-D-0013 (this PR):** sessions are created with client delegation. OpenAI's
+  `session.delegation.created` carries no request text, so the server keeps the
+  user's words from `session.input_transcript.delta` and hands them to the same
+  paid agent loop chat uses. The answer goes back as `session.commentary.append`
+  (the voice paraphrases it). Confirm-risk tools are withheld from voice turns
+  until M-D-0014. One delegation at a time per session. Voice turns are not
+  saved to a conversation: voice sessions have no conversation id yet.
+- **M-D-0014:** server-checked spoken yes. It must start after the prompt's
+  speech ends (the client reports this; GPT-Live has no end-of-speech event),
+  within 45 s, as a strict bare yes, with one pending action, used once; a new
+  proposal voids the old one. The card always shows the exact action, because
+  the voice paraphrases.
+- **M-D-0015:** voice-mode confirm card with a countdown.
+- Then more Confirm tools: start a run, resolve an approval.
+
+Unconfirmed: the text field name inside `session.input_transcript.delta`
+(the parser accepts `delta` or `text`).

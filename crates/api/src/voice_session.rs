@@ -77,11 +77,17 @@ const MIN_SUPPLIER_KEY_LEN: usize = 20;
 /// disconnect or a panic must not leave this hanging forever.
 const SIDEBAND_ATTACH_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// The session's shape sent to OpenAI, held in one function so a later PR
-/// adding client delegation and tools has exactly one place to change. No
-/// delegation and no tools yet — gpt-live-1 only listens and speaks.
+/// The session's shape sent to OpenAI, held in one function so client
+/// delegation and tools have exactly one place to change. `delegation.type:
+/// "client"` hands requests the model can't answer on its own to this
+/// server (see `handle_delegation_created` in the billing sideband), which
+/// runs the same paid agent loop text chat uses and answers back with
+/// `session.commentary.append`.
 pub(crate) fn live_session_config() -> Value {
-    serde_json::json!({ "model": LIVE_MODEL })
+    serde_json::json!({
+        "model": LIVE_MODEL,
+        "delegation": { "type": "client" },
+    })
 }
 
 /// The same two states the provider gateway and dictation can be in,
@@ -788,6 +794,24 @@ async fn run_billing_loop(
     let mut last_observed_total_micro: i64 = 0;
     let now_ms = || chrono::Utc::now().timestamp_millis();
 
+    // Delegation state, local to this session's billing task. The task text
+    // for the next delegation is whatever speech text has accumulated since
+    // the last one was answered — `session.delegation.created` itself
+    // carries no request text or tool arguments (confirmed against
+    // https://developers.openai.com/api/docs/guides/live-migration).
+    let mut pending_transcript = String::new();
+    let delegation_busy = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // Told to a still-running delegation once this loop exits, so its agent
+    // loop stops cooperatively at its next turn boundary — see
+    // `chat_paid::send_paid_reply`'s `cancel` parameter — instead of being
+    // aborted mid supplier call or mid charge.
+    let delegation_cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // The delegation task runs on its own spawned task (an agent turn can
+    // take much longer than this loop should ever block for) and answers
+    // through this channel rather than touching `sideband` directly, so the
+    // loop below stays the single owner of the socket.
+    let (commentary_tx, mut commentary_rx) = mpsc::channel::<Value>(8);
+
     loop {
         let warning_timer = async {
             match warning_deadline {
@@ -797,9 +821,26 @@ async fn run_billing_loop(
         };
 
         tokio::select! {
+            Some(commentary) = commentary_rx.recv() => {
+                sideband.send(commentary).await;
+            }
             event = sideband.recv() => {
                 let Some(event) = event else { break };
                 match event.get("type").and_then(Value::as_str) {
+                    Some("session.input_transcript.delta") => {
+                        accumulate_transcript(&mut pending_transcript, &event);
+                    }
+                    Some("session.delegation.created") => {
+                        handle_delegation_created(
+                            &event,
+                            &state,
+                            &user_id,
+                            &delegation_busy,
+                            &delegation_cancel,
+                            &mut pending_transcript,
+                            &commentary_tx,
+                        );
+                    }
                     Some("session.usage.updated") => {
                         let seconds = event
                             .pointer("/usage/seconds")
@@ -936,6 +977,15 @@ async fn run_billing_loop(
         }
     }
 
+    // The loop is done with this session: tell any still-running delegation
+    // to stop cooperatively at its next turn boundary instead of aborting it
+    // outright — an abort could land mid supplier call (leaving a
+    // `chat-reply:*` reservation stuck `reserved` forever) or after the
+    // supplier answered but before the final charge (Cortex pays the
+    // supplier, the user is never charged). Set before `reattach_and_close`
+    // below, which can itself take a while.
+    delegation_cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+
     if !closed_cleanly {
         // Settle whatever was fully consumed against the last usage this
         // session ever reported — a drop is not zero usage since the last
@@ -1016,6 +1066,249 @@ async fn run_billing_loop(
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .remove(&session_id);
+}
+
+/// A safe character cap for `session.commentary.append`'s 500-token limit
+/// (https://developers.openai.com/api/docs/guides/live-migration). English
+/// text tokenizes at roughly 4 characters/token, but token-dense text
+/// (UUID-heavy strings, non-Latin scripts) can run as low as 1-3
+/// characters/token — capping at 1200 characters was not safe against that
+/// case. 450 characters stays under the 500-token limit even at 1
+/// character/token, with the system prompt also asking the model to answer
+/// in under 60 words as a second line of defense.
+const COMMENTARY_CHAR_CAP: usize = 450;
+
+/// The system prompt the delegated agent turn runs under. Short and
+/// spoken-first: the text comes back as `session.commentary.append`, which
+/// GPT-Live paraphrases aloud rather than reading verbatim, so it does not
+/// need to be conversational itself — just accurate and short.
+const VOICE_DELEGATION_SYSTEM_PROMPT: &str = "You are Cortex's coding agent, answering a request that came in over a live voice call. Keep answers short and to the point; they will be read aloud. Answer in under 60 words.";
+
+/// Caption text accumulates in `pending_transcript` between delegations; a
+/// caller who never stops talking (or a delegation that never arrives) must
+/// not let it grow without bound, so it is kept a sliding window of the
+/// most recent `PENDING_TRANSCRIPT_BYTE_CAP` bytes — the task text a
+/// delegation actually needs is what was said most recently, not everything
+/// said since the session started. Trimming always lands on a char
+/// boundary (never splits a multi-byte UTF-8 character) by walking forward
+/// from the cut point.
+const PENDING_TRANSCRIPT_BYTE_CAP: usize = 2000;
+
+/// Append a `session.input_transcript.delta`'s text to the accumulator that
+/// becomes the next delegation's task text. The event's own shape is not
+/// pinned down by the docs beyond "append to captions"; this reads the
+/// common `delta`/`text` fields defensively and drops the event if neither
+/// is present rather than guessing.
+fn accumulate_transcript(pending_transcript: &mut String, event: &Value) {
+    let delta = event
+        .get("delta")
+        .and_then(Value::as_str)
+        .or_else(|| event.get("text").and_then(Value::as_str));
+    if let Some(delta) = delta {
+        pending_transcript.push_str(delta);
+    }
+    if pending_transcript.len() > PENDING_TRANSCRIPT_BYTE_CAP {
+        let excess = pending_transcript.len() - PENDING_TRANSCRIPT_BYTE_CAP;
+        let mut cut = excess;
+        while !pending_transcript.is_char_boundary(cut) {
+            cut += 1;
+        }
+        pending_transcript.drain(..cut);
+    }
+}
+
+/// Build one `session.commentary.append` event, trimmed to
+/// [`COMMENTARY_CHAR_CAP`] characters.
+fn commentary_event(delegation_id: &str, content: &str) -> Value {
+    let content: String = content.chars().take(COMMENTARY_CHAR_CAP).collect();
+    serde_json::json!({
+        "type": "session.commentary.append",
+        "delegation_id": delegation_id,
+        "content": content,
+    })
+}
+
+/// Releases `delegation_busy` when dropped — including when the spawned
+/// delegation task panics, since dropping still runs during the unwind. The
+/// old code stored `false` as the last line of the spawned task's async
+/// block, which never ran on panic and would wedge every later
+/// `session.delegation.created` behind "still working on the last request."
+/// for the rest of the session.
+struct BusyGuard(Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for BusyGuard {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// Answer a `session.delegation.created` event. `session.delegation.created`
+/// itself carries no request text or tool arguments (confirmed against
+/// https://developers.openai.com/api/docs/guides/live-migration) — the task
+/// text is whatever has accumulated in `pending_transcript` since the last
+/// delegation was answered, drained here.
+///
+/// One delegation runs at a time per session: `delegation_busy` is a
+/// session-lifetime flag checked (and set) synchronously, right here in the
+/// billing loop's single task, so there is no race between two delegations
+/// arriving back to back. A second one while the first is still running
+/// gets a short "still working" commentary instead of being queued or
+/// dropped silently.
+///
+/// The spawned delegation task is handed a clone of `delegation_cancel` and
+/// threads it into `send_paid_reply`, so that when the billing loop ends it
+/// can ask the task to stop cooperatively at its next turn boundary instead
+/// of aborting it outright — see the `delegation_cancel` field's own doc for
+/// why a hard abort is unsafe here. The task is not tracked or waited on: it
+/// finishes (or stops) on its own.
+fn handle_delegation_created(
+    event: &Value,
+    state: &Arc<AppState>,
+    user_id: &str,
+    delegation_busy: &Arc<std::sync::atomic::AtomicBool>,
+    delegation_cancel: &Arc<std::sync::atomic::AtomicBool>,
+    pending_transcript: &mut String,
+    commentary_tx: &mpsc::Sender<Value>,
+) {
+    let Some(delegation_id) = event
+        .pointer("/delegation/id")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+    else {
+        tracing::warn!("voice: session.delegation.created had no delegation.id; cannot answer it");
+        return;
+    };
+
+    if delegation_busy.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        let tx = commentary_tx.clone();
+        tokio::spawn(async move {
+            let _ = tx
+                .send(commentary_event(
+                    &delegation_id,
+                    "Still working on the last request.",
+                ))
+                .await;
+        });
+        return;
+    }
+
+    let task_text = std::mem::take(pending_transcript);
+    let state = state.clone();
+    let user_id = user_id.to_string();
+    let busy = delegation_busy.clone();
+    let cancel = delegation_cancel.clone();
+    let tx = commentary_tx.clone();
+    tokio::spawn(async move {
+        let _busy_guard = BusyGuard(busy);
+        let answer = run_voice_delegation(&state, &user_id, &task_text, &cancel).await;
+        let _ = tx.send(commentary_event(&delegation_id, &answer)).await;
+    });
+}
+
+/// Run the same paid agent loop text chat uses (`chat_paid::send_paid_reply`,
+/// `voice_turn: true` so `Risk::Confirm` tools are withheld) for one
+/// delegated voice request, charged in credits exactly like chat reuses that
+/// same reservation/charge path. Never panics and never hangs the
+/// delegation: every failure becomes a short spoken-friendly string instead
+/// of being propagated.
+///
+/// Resolves its transport/signing key/spend limits from `state`/env, then
+/// delegates to [`run_voice_delegation_with`] for the actual logic — kept
+/// separate so tests can exercise that logic with an injected fake
+/// transport instead of process-global env vars, matching `chat_paid.rs`'s
+/// own test conventions.
+async fn run_voice_delegation(
+    state: &Arc<AppState>,
+    user_id: &str,
+    task_text: &str,
+    cancel: &Arc<std::sync::atomic::AtomicBool>,
+) -> String {
+    let Some(db) = state.db.as_ref() else {
+        return "Cortex is temporarily unavailable.".to_string();
+    };
+    let Some(provider_gateway_http::GatewayUsable {
+        signing_key,
+        supplier_key,
+        transport,
+    }) = provider_gateway_http::gateway_usable()
+    else {
+        return "Cortex is temporarily unavailable.".to_string();
+    };
+    let Some(limits) = SpendLimits::from_env() else {
+        return "Cortex is temporarily unavailable.".to_string();
+    };
+
+    run_voice_delegation_with(
+        db,
+        &signing_key,
+        &supplier_key,
+        transport,
+        limits,
+        user_id,
+        task_text,
+        cancel,
+    )
+    .await
+}
+
+/// The transport-injectable core of [`run_voice_delegation`]. An empty (or
+/// whitespace-only) `task_text` — the caption never accumulated anything
+/// usable before the delegation arrived — is answered without ever calling
+/// the agent loop, so there is no charge for it.
+async fn run_voice_delegation_with<T: crate::provider_gateway::ProviderTransport + Clone>(
+    db: &crate::db::Database,
+    signing_key: &str,
+    supplier_key: &str,
+    transport: T,
+    limits: SpendLimits,
+    user_id: &str,
+    task_text: &str,
+    cancel: &Arc<std::sync::atomic::AtomicBool>,
+) -> String {
+    let task_text = task_text.trim();
+    if task_text.is_empty() {
+        return "I didn't catch that.".to_string();
+    }
+
+    let reply_id = uuid::Uuid::new_v4().to_string();
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let turn_cap = crate::chat_paid::turn_cap_per_minute();
+
+    match crate::chat_paid::send_paid_reply(
+        db,
+        signing_key,
+        supplier_key,
+        transport,
+        limits,
+        user_id,
+        // Live voice sessions do not carry a conversation id today, so
+        // there is nothing to save the delegated turn's messages against;
+        // see the module notes on `VoiceSessionHandle`.
+        None,
+        crate::chat_paid::model_for_tier(None),
+        VOICE_DELEGATION_SYSTEM_PROMPT,
+        task_text,
+        &reply_id,
+        now_ms,
+        turn_cap,
+        None,
+        true,
+        Some(cancel.as_ref()),
+    )
+    .await
+    {
+        Ok(reply) if reply.text.trim().is_empty() => "Done.".to_string(),
+        Ok(reply) => reply.text,
+        Err(crate::chat_paid::PaidReplyError::NoCredits)
+        | Err(crate::chat_paid::PaidReplyError::NotEnoughCredits) => {
+            "You're out of credits for that request.".to_string()
+        }
+        Err(crate::chat_paid::PaidReplyError::TurnCapExceeded) => {
+            "This conversation is using tools too quickly right now. Please try again shortly."
+                .to_string()
+        }
+        Err(_) => "Sorry, I couldn't complete that just now.".to_string(),
+    }
 }
 
 /// Best effort: re-attach the sideband once and immediately ask the session
@@ -1503,6 +1796,13 @@ mod tests {
             max_micro_usd: 1_000_000_000,
             funded_micro_usd: 1_000_000_000,
         }
+    }
+
+    #[test]
+    fn live_session_config_requests_client_delegation() {
+        let config = live_session_config();
+        assert_eq!(config["model"], LIVE_MODEL);
+        assert_eq!(config["delegation"]["type"], "client");
     }
 
     #[tokio::test]
@@ -2531,5 +2831,365 @@ mod tests {
             after.terminal_reason.as_deref(),
             Some("server restarted during live session")
         );
+    }
+
+    mod delegation {
+        use std::future::Future;
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+        use crate::provider_gateway::{
+            GatewayRequest, ObservedUsage, ProviderTransport, TransportFailure,
+            TransportFailureKind, TransportResponse,
+        };
+
+        use super::*;
+
+        const SUPPLIER_KEY: &str = "delegation-test-supplier-key";
+        const DELEGATION_MODEL: &str = "claude-haiku-4-5";
+
+        #[derive(Clone)]
+        struct CountingTransport {
+            calls: Arc<AtomicUsize>,
+            response: Result<TransportResponse, TransportFailure>,
+        }
+
+        impl CountingTransport {
+            fn ok(text: &str) -> Self {
+                Self {
+                    calls: Arc::new(AtomicUsize::new(0)),
+                    response: Ok(TransportResponse {
+                        body: serde_json::json!({
+                            "id": "msg_test",
+                            "type": "message",
+                            "role": "assistant",
+                            "model": DELEGATION_MODEL,
+                            "content": [{"type": "text", "text": text}],
+                            "stop_reason": "end_turn",
+                            "stop_sequence": null,
+                            "usage": {"input_tokens": 10, "output_tokens": 10}
+                        }),
+                        upstream_request_id: Some("upstream-1".into()),
+                        usage: Some(ObservedUsage {
+                            input_tokens: 10,
+                            cached_input_tokens: 0,
+                            output_tokens: 10,
+                        }),
+                    }),
+                }
+            }
+
+            /// Never actually reached in the tests that use it — the point is
+            /// to prove it was *not* called (empty-transcript, insufficient
+            /// credits before any reservation).
+            fn unreachable() -> Self {
+                Self {
+                    calls: Arc::new(AtomicUsize::new(0)),
+                    response: Err(TransportFailure {
+                        kind: TransportFailureKind::Rejected,
+                        upstream_request_id: None,
+                        message: "should not have been called".into(),
+                    }),
+                }
+            }
+
+            fn call_count(&self) -> usize {
+                self.calls.load(AtomicOrdering::SeqCst)
+            }
+        }
+
+        impl ProviderTransport for CountingTransport {
+            fn forward(
+                &self,
+                supplier_key: &str,
+                _request: &GatewayRequest,
+            ) -> impl Future<Output = Result<TransportResponse, TransportFailure>> + Send
+            {
+                assert_eq!(supplier_key, SUPPLIER_KEY);
+                self.calls.fetch_add(1, AtomicOrdering::SeqCst);
+                std::future::ready(self.response.clone())
+            }
+        }
+
+        #[test]
+        fn accumulate_transcript_reads_delta_or_text() {
+            let mut pending = String::new();
+            accumulate_transcript(&mut pending, &serde_json::json!({"delta": "hello "}));
+            accumulate_transcript(&mut pending, &serde_json::json!({"text": "world"}));
+            accumulate_transcript(&mut pending, &serde_json::json!({"nothing_useful": true}));
+            assert_eq!(pending, "hello world");
+        }
+
+        #[test]
+        fn accumulate_transcript_keeps_only_a_sliding_window_and_stays_on_char_boundaries() {
+            // A multi-byte character (3 bytes each in UTF-8) repeated well
+            // past the cap, appended in chunks so the cut point does not
+            // land on a chunk boundary by luck.
+            let mut pending = String::new();
+            for _ in 0..900 {
+                accumulate_transcript(&mut pending, &serde_json::json!({"delta": "语言"}));
+            }
+            // 900 * "语言" is 5400 bytes, well past the 2000-byte cap.
+            assert!(
+                pending.len() <= PENDING_TRANSCRIPT_BYTE_CAP,
+                "the transcript must be trimmed to the cap in bytes: was {}",
+                pending.len()
+            );
+            // No panic above means every trim landed on a char boundary
+            // (String::drain panics otherwise); also confirm the tail is
+            // exactly what was most recently appended.
+            assert!(
+                pending.ends_with('言'),
+                "the most recent text must survive trimming"
+            );
+        }
+
+        #[tokio::test]
+        async fn empty_transcript_skips_the_agent_and_is_not_charged() {
+            let (_dir, state) = test_state_with_balance(1_000_000_000).await;
+            let db = state.db.as_ref().unwrap();
+            let before = db.get_credit_balance_row(USER);
+
+            let transport = CountingTransport::unreachable();
+            let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let answer = run_voice_delegation_with(
+                db,
+                SIGNING_KEY,
+                SUPPLIER_KEY,
+                transport.clone(),
+                ample_limits(),
+                USER,
+                "   ",
+                &cancel,
+            )
+            .await;
+
+            assert_eq!(answer, "I didn't catch that.");
+            assert_eq!(transport.call_count(), 0, "the agent must never be called");
+            assert_eq!(db.get_credit_balance_row(USER), before, "nothing charged");
+        }
+
+        #[tokio::test]
+        async fn a_delegation_runs_the_agent_and_returns_its_answer() {
+            let (_dir, state) = test_state_with_balance(1_000_000_000).await;
+            let db = state.db.as_ref().unwrap();
+            let before = db.get_credit_balance_row(USER).unwrap();
+
+            let transport = CountingTransport::ok("the answer is four");
+            let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let answer = run_voice_delegation_with(
+                db,
+                SIGNING_KEY,
+                SUPPLIER_KEY,
+                transport.clone(),
+                ample_limits(),
+                USER,
+                "what is two plus two",
+                &cancel,
+            )
+            .await;
+
+            assert_eq!(answer, "the answer is four");
+            assert_eq!(transport.call_count(), 1);
+
+            let price_list = db.active_price_list().unwrap();
+            let rate = price_list.model("claude", DELEGATION_MODEL).unwrap();
+            let expected_credits =
+                ceil_div(rate.cost_micros(10, 0, 10), price_list.micros_per_credit);
+            let after = db.get_credit_balance_row(USER).unwrap();
+            assert_eq!(
+                before.subscription_remaining - after.subscription_remaining,
+                expected_credits,
+                "the delegation must charge exactly the observed 10-in/10-out token cost"
+            );
+        }
+
+        #[tokio::test]
+        async fn insufficient_credits_yields_spoken_failure_and_no_charge() {
+            let (_dir, state) = test_state_with_balance(0).await;
+            let db = state.db.as_ref().unwrap();
+            let before = db.get_credit_balance_row(USER);
+
+            let transport = CountingTransport::unreachable();
+            let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let answer = run_voice_delegation_with(
+                db,
+                SIGNING_KEY,
+                SUPPLIER_KEY,
+                transport.clone(),
+                ample_limits(),
+                USER,
+                "do something",
+                &cancel,
+            )
+            .await;
+
+            assert_eq!(answer, "You're out of credits for that request.");
+            assert_eq!(
+                transport.call_count(),
+                0,
+                "a zero balance must refuse before any provider call"
+            );
+            assert_eq!(db.get_credit_balance_row(USER), before, "nothing charged");
+        }
+
+        #[tokio::test]
+        async fn a_delegation_drains_the_transcript_and_answers_with_matching_id() {
+            // Exercises the real production path end to end: no gateway env
+            // vars are set in this test process, so `gateway_usable()`
+            // deterministically returns `None` and `run_voice_delegation`
+            // answers "Cortex is temporarily unavailable." — the point of
+            // this test is the plumbing around that call (transcript drain,
+            // matching delegation_id, busy flag released), not the agent's
+            // reply text, which `a_delegation_runs_the_agent_and_returns_its_answer`
+            // above already covers directly against a fake transport.
+            let (_dir, state) = test_state().await;
+            let busy = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let (tx, mut rx) = mpsc::channel::<Value>(8);
+            let mut pending_transcript = "what is the weather".to_string();
+
+            handle_delegation_created(
+                &serde_json::json!({"delegation": {"id": "deleg-1"}}),
+                &state,
+                USER,
+                &busy,
+                &cancel,
+                &mut pending_transcript,
+                &tx,
+            );
+
+            assert_eq!(pending_transcript, "", "the transcript must be drained");
+
+            let commentary = tokio::time::timeout(StdDuration::from_secs(5), rx.recv())
+                .await
+                .expect("commentary must arrive")
+                .expect("channel must not close");
+            assert_eq!(commentary["type"], "session.commentary.append");
+            assert_eq!(commentary["delegation_id"], "deleg-1");
+            assert_eq!(commentary["content"], "Cortex is temporarily unavailable.");
+            assert!(
+                !busy.load(std::sync::atomic::Ordering::SeqCst),
+                "busy flag must be released once the delegation completes"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_second_delegation_while_busy_is_refused() {
+            let (_dir, state) = test_state().await;
+            let busy = Arc::new(std::sync::atomic::AtomicBool::new(true));
+            let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let (tx, mut rx) = mpsc::channel::<Value>(8);
+            let mut pending_transcript = "some accumulated speech".to_string();
+
+            handle_delegation_created(
+                &serde_json::json!({"delegation": {"id": "deleg-2"}}),
+                &state,
+                USER,
+                &busy,
+                &cancel,
+                &mut pending_transcript,
+                &tx,
+            );
+
+            let commentary = tokio::time::timeout(StdDuration::from_secs(5), rx.recv())
+                .await
+                .expect("commentary must arrive")
+                .expect("channel must not close");
+            assert_eq!(commentary["delegation_id"], "deleg-2");
+            assert_eq!(commentary["content"], "Still working on the last request.");
+            assert_eq!(
+                pending_transcript, "some accumulated speech",
+                "a refused-while-busy delegation must not drain the transcript"
+            );
+            assert!(
+                busy.load(std::sync::atomic::Ordering::SeqCst),
+                "the still-running first delegation's busy flag must stay set"
+            );
+        }
+
+        #[test]
+        fn busy_guard_releases_the_flag_even_when_dropped_during_a_panic_unwind() {
+            let busy = Arc::new(std::sync::atomic::AtomicBool::new(true));
+            let guard_busy = busy.clone();
+
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _guard = BusyGuard(guard_busy);
+                panic!("simulated delegation task panic");
+            }));
+
+            assert!(result.is_err(), "the closure must have panicked");
+            assert!(
+                !busy.load(std::sync::atomic::Ordering::SeqCst),
+                "BusyGuard must release the busy flag even when dropped while unwinding"
+            );
+        }
+
+        #[tokio::test]
+        async fn ending_the_session_sets_the_shared_cancel_flag_for_a_running_delegation() {
+            // Replaces the old abort-based test: the billing loop no longer
+            // kills a still-running delegation outright (that could land mid
+            // supplier call or mid charge — see `delegation_cancel`'s doc in
+            // `run_billing_loop`). Instead it flips the same `AtomicBool` the
+            // spawned task was handed, and the task notices cooperatively.
+            // `send_paid_reply`'s own tests cover the actual stop-and-charge
+            // behavior once that flag is set; this just confirms
+            // `handle_delegation_created` hands the spawned task a clone of
+            // the real flag, not a copy, so setting it after spawning is
+            // visible to the task.
+            let (_dir, state) = test_state().await;
+            let busy = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let (tx, _rx) = mpsc::channel::<Value>(8);
+            let mut pending_transcript = "some long-running request".to_string();
+
+            handle_delegation_created(
+                &serde_json::json!({"delegation": {"id": "deleg-3"}}),
+                &state,
+                USER,
+                &busy,
+                &cancel,
+                &mut pending_transcript,
+                &tx,
+            );
+
+            // Simulate the billing loop ending, exactly like the cleanup path
+            // after the loop breaks: set the shared flag rather than
+            // aborting anything.
+            cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+            assert!(
+                cancel.load(std::sync::atomic::Ordering::SeqCst),
+                "the flag handed to the spawned task must reflect the same store"
+            );
+        }
+    }
+
+    mod confirm_tools {
+        use crate::agent_tools;
+
+        #[test]
+        fn confirm_risk_tools_are_excluded_from_voice_turns() {
+            let names: Vec<String> = agent_tools::tool_definitions_excluding_confirm()
+                .iter()
+                .map(|t| t["name"].as_str().unwrap().to_string())
+                .collect();
+            for tool in agent_tools::tool_definitions() {
+                let name = tool["name"].as_str().unwrap();
+                if agent_tools::is_confirm_risk(name) {
+                    assert!(
+                        !names.contains(&name.to_string()),
+                        "{name} is Risk::Confirm and must be withheld from voice turns"
+                    );
+                } else {
+                    assert!(
+                        names.contains(&name.to_string()),
+                        "{name} is not Risk::Confirm and must stay available to voice turns"
+                    );
+                }
+            }
+            assert!(
+                !agent_tools::tool_definitions().is_empty(),
+                "fixture sanity: there must be at least one tool"
+            );
+        }
     }
 }

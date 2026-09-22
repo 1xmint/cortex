@@ -63,7 +63,7 @@ const MAX_AGENT_TURNS: u32 = 8;
 ///
 /// `CORTEX_CHAT_AGENT_TURN_CAP_PER_MINUTE` — default 20 if unset or
 /// unparseable.
-fn turn_cap_per_minute() -> u32 {
+pub(crate) fn turn_cap_per_minute() -> u32 {
     std::env::var("CORTEX_CHAT_AGENT_TURN_CAP_PER_MINUTE")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -450,6 +450,21 @@ pub(crate) async fn send_paid_reply<T: ProviderTransport + Clone>(
     // "Checked your runs" while a slow multi-turn reply is still running.
     // `None` in tests that don't care about the stream.
     tool_events: Option<&mpsc::Sender<StepEvent>>,
+    // A live-voice delegation turn: `Risk::Confirm` tools (`open_pr`,
+    // `cancel_run`) are withheld from the model's tool list entirely, and if
+    // the model names one anyway it is refused with a voice-appropriate
+    // message instead of being proposed or run — there is no spoken
+    // confirmation flow yet (see `voice_session::handle_delegation_created`).
+    // Text chat always passes `false`.
+    voice_turn: bool,
+    // Cooperative stop: checked once per turn, right next to the balance
+    // check below, rather than the caller hard-aborting our task. An abort
+    // could land mid supplier call (leaving a `chat-reply:*` reservation
+    // stuck `reserved` forever) or after the supplier answered but before
+    // the final charge (Cortex pays the supplier, the user is never
+    // charged) — see `voice_session`'s `delegation_cancel` for the caller
+    // that needs this. `None` (every chat call site) means never cancel.
+    cancel: Option<&std::sync::atomic::AtomicBool>,
 ) -> Result<PaidReply, PaidReplyError> {
     // Chat is paid by Cortex on the Anthropic path only (`ProviderPath::Cortex`);
     // a run that wants a different supplier goes through the HTTP gateway
@@ -475,7 +490,11 @@ pub(crate) async fn send_paid_reply<T: ProviderTransport + Clone>(
     let turn_cap_key = format!("{user_id}:{}", conversation_id.unwrap_or(reply_id));
     let turn_cap = turn_cap_per_minute;
 
-    let tools = agent_tools::tool_definitions();
+    let tools = if voice_turn {
+        agent_tools::tool_definitions_excluding_confirm()
+    } else {
+        agent_tools::tool_definitions()
+    };
     let mut messages = vec![serde_json::json!({"role": "user", "content": user_message})];
     // Summed across every turn and charged once at the very end (or once at
     // the point of an early, partial stop) — see `send_one_turn`'s doc
@@ -527,6 +546,20 @@ pub(crate) async fn send_paid_reply<T: ProviderTransport + Clone>(
                 break;
             }
         };
+
+        // Checked right next to the balance so a cancelled request stops at
+        // the same turn boundary a graceful "ran out mid-loop" stop would:
+        // whatever turns already ran are still charged once, below, and
+        // nothing here forces an early return that would skip that charge.
+        if cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::SeqCst)) {
+            tracing::info!(user_id, reply_id, turn, "chat: cancelled; stopping");
+            stopped_reason = Some(
+                "\n\n(This answer may be incomplete: this request was cancelled, so I stopped \
+                 before finishing.)",
+            );
+            break;
+        }
+
         let credits_used_so_far = if total_observed_micro_usd > 0 {
             ceil_div(total_observed_micro_usd, price_list.micros_per_credit)
         } else {
@@ -650,6 +683,20 @@ pub(crate) async fn send_paid_reply<T: ProviderTransport + Clone>(
 
         let mut tool_results = Vec::with_capacity(uses.len());
         for (tool_use_id, name, input) in uses {
+            // A voice turn never gets a `Risk::Confirm` tool in its `tools`
+            // list (see `tools` above), but the model can still name one
+            // anyway — refuse it here, before the `open_pr` proposal path or
+            // `execute`'s own (chat-worded) `ConfirmRequired` message, with
+            // the voice-appropriate wording. Nothing is proposed or run.
+            if voice_turn && agent_tools::is_confirm_risk(&name) {
+                tool_results.push(serde_json::json!({
+                    "type": "tool_result",
+                    "tool_use_id": tool_use_id,
+                    "content": "That needs confirmation in the chat; voice confirmation is not available yet.",
+                    "is_error": true,
+                }));
+                continue;
+            }
             // `open_pr` is the one `Risk::Confirm` tool wired up so far
             // (`agent_tools::validate_confirm_tool`/`execute_confirmed`):
             // instead of running it, or just refusing it, propose it — write
@@ -963,6 +1010,8 @@ pub(crate) async fn run(
         now_ms,
         turn_cap,
         Some(&tx),
+        false,
+        None,
     )
     .await
     {
@@ -1016,7 +1065,7 @@ pub(crate) async fn run(
 #[cfg(test)]
 mod tests {
     use std::future::Future;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
 
     use crate::provider_gateway::{
@@ -1121,6 +1170,8 @@ mod tests {
             NOW,
             20,
             None,
+            false,
+            None,
         )
         .await
         .expect("reply should succeed");
@@ -1155,6 +1206,8 @@ mod tests {
             NOW,
             20,
             None,
+            false,
+            None,
         )
         .await
         .expect_err("supplier failure must not succeed");
@@ -1187,6 +1240,8 @@ mod tests {
             "reply-3",
             NOW,
             20,
+            None,
+            false,
             None,
         )
         .await
@@ -1226,6 +1281,8 @@ mod tests {
                 "reply-4",
                 NOW,
                 20,
+                None,
+                false,
                 None,
             )
             .await;
@@ -1271,6 +1328,8 @@ mod tests {
             "reply-5",
             NOW,
             20,
+            None,
+            false,
             None,
         )
         .await
@@ -1432,6 +1491,8 @@ mod tests {
             NOW,
             20,
             None,
+            false,
+            None,
         )
         .await
         .expect("reply should succeed");
@@ -1486,6 +1547,8 @@ mod tests {
             "reply-tool-2",
             NOW,
             20,
+            None,
+            false,
             None,
         )
         .await
@@ -1587,6 +1650,8 @@ mod tests {
             NOW,
             20,
             Some(&tx),
+            false,
+            None,
         )
         .await
         .expect("reply should succeed even though the tool never ran");
@@ -1619,6 +1684,68 @@ mod tests {
         assert_eq!(
             pending.status, "pending",
             "still pending — nothing confirmed it, so execute_confirmed/create_pr_core never ran"
+        );
+    }
+
+    /// A voice turn (`voice_turn: true`) never even offers `Risk::Confirm`
+    /// tools to the model — but if the model names one anyway (a stale
+    /// tool_use from before the delegation, or a model that hallucinates
+    /// one), it must be refused as a plain tool error rather than proposed
+    /// or run: no `agent_pending_actions` row, no `ConfirmRequired` event.
+    #[tokio::test]
+    async fn voice_turn_refuses_a_forced_confirm_tool_without_executing() {
+        let (_dir, db) = test_db();
+        db.init_credit_balance("user-1", 1000).unwrap();
+
+        let transport = SequenceTransport::new(vec![
+            tool_use_response(
+                10,
+                10,
+                "toolu_1",
+                "open_pr",
+                serde_json::json!({"run_id": "run-1"}),
+            ),
+            text_response(10, 10, "done"),
+        ]);
+        let (tx, mut rx) = mpsc::channel(8);
+
+        let reply = send_paid_reply(
+            &db,
+            SIGNING_KEY,
+            SUPPLIER_KEY,
+            transport.clone(),
+            big_limits(),
+            "user-1",
+            None,
+            MODEL,
+            "system",
+            "open a pr for my run",
+            "reply-voice-confirm",
+            NOW,
+            20,
+            Some(&tx),
+            true,
+            None,
+        )
+        .await
+        .expect("reply should succeed — the tool is refused, not the whole turn");
+        drop(tx);
+
+        assert!(
+            reply.tool_activity.is_empty(),
+            "a refused tool call is not \"activity\""
+        );
+
+        let mut saw_confirm_required = false;
+        while let Some(event) = rx.recv().await {
+            if matches!(event, StepEvent::ConfirmRequired { .. }) {
+                saw_confirm_required = true;
+            }
+        }
+        assert!(
+            !saw_confirm_required,
+            "a voice turn must never stream ConfirmRequired for a withheld tool \
+             (the only path that would write an agent_pending_actions row)"
         );
     }
 
@@ -1662,6 +1789,8 @@ mod tests {
             NOW,
             20,
             Some(&tx),
+            false,
+            None,
         )
         .await
         .expect("reply should still succeed — the tool call is refused, not the whole reply");
@@ -1744,6 +1873,8 @@ mod tests {
             NOW,
             20,
             Some(&tx),
+            false,
+            None,
         )
         .await
         .expect("reply should succeed even though the tool never ran");
@@ -1849,6 +1980,8 @@ mod tests {
             NOW,
             20,
             None,
+            false,
+            None,
         )
         .await
         .expect("probe reply should succeed");
@@ -1904,6 +2037,8 @@ mod tests {
             NOW,
             20,
             None,
+            false,
+            None,
         )
         .await
         .expect("turn 1's work must still come back as a partial answer");
@@ -1957,6 +2092,8 @@ mod tests {
             NOW,
             20,
             None,
+            false,
+            None,
         )
         .await
         .expect("a partial answer, not an error, once at least one turn ran");
@@ -1977,6 +2114,158 @@ mod tests {
         );
         let balance = db.get_credit_balance_row("user-1").unwrap();
         assert_eq!(balance.subscription_remaining + balance.pack_remaining, 0);
+    }
+
+    /// Wraps another transport and flips a shared flag right after that
+    /// transport's call returns — the deterministic hook the cancel tests
+    /// below use to flip `cancel` exactly once the first turn's supplier
+    /// call has actually happened, instead of racing a timer against it.
+    #[derive(Clone)]
+    struct CancelAfterCallTransport<T> {
+        inner: T,
+        cancel: Arc<AtomicBool>,
+    }
+
+    impl<T: ProviderTransport + Clone + Send + Sync> ProviderTransport for CancelAfterCallTransport<T> {
+        fn forward(
+            &self,
+            supplier_key: &str,
+            request: &GatewayRequest,
+        ) -> impl Future<Output = Result<TransportResponse, TransportFailure>> + Send {
+            let fut = self.inner.forward(supplier_key, request);
+            let cancel = self.cancel.clone();
+            async move {
+                let result = fut.await;
+                cancel.store(true, Ordering::SeqCst);
+                result
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn cancel_set_after_the_first_turn_stops_before_a_second_and_charges_only_the_first() {
+        let (_dir, db) = test_db();
+        db.init_credit_balance("user-1", 1_000_000).unwrap();
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        // A model that never stops calling tools on its own — without the
+        // cancel, this loop would keep going well past turn 1.
+        let inner = SequenceTransport::new(vec![tool_use_response(
+            10,
+            10,
+            "toolu_1",
+            "list_runs",
+            serde_json::json!({}),
+        )]);
+        let transport = CancelAfterCallTransport {
+            inner: inner.clone(),
+            cancel: cancel.clone(),
+        };
+
+        let reply = send_paid_reply(
+            &db,
+            SIGNING_KEY,
+            SUPPLIER_KEY,
+            transport,
+            big_limits(),
+            "user-1",
+            Some("conv-cancel-1"),
+            MODEL,
+            "system",
+            "keep checking",
+            "reply-cancel-1",
+            NOW,
+            20,
+            None,
+            false,
+            Some(&cancel),
+        )
+        .await
+        .expect("turn 1's work must still come back as a partial answer, not an error");
+
+        assert_eq!(
+            inner.call_count(),
+            1,
+            "the loop must stop before a second supplier call once cancelled"
+        );
+        assert!(
+            reply.text.contains("cancelled"),
+            "partial answer must say why it stopped: {}",
+            reply.text
+        );
+
+        let price_list = db.active_price_list().unwrap();
+        let rate = price_list.model("claude", MODEL).unwrap();
+        let expected_credits = ceil_div(rate.cost_micros(10, 0, 10), price_list.micros_per_credit);
+        assert_eq!(
+            reply.charged_credits, expected_credits,
+            "only the turn that actually ran must be charged"
+        );
+
+        let reservation = db
+            .get_provider_reservation("chat:chat-reply:reply-cancel-1:turn1")
+            .unwrap();
+        assert_eq!(
+            reservation.status, "settled",
+            "the completed turn's reservation must be settled, not left dangling as 'reserved'"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_set_before_the_call_makes_no_supplier_call_and_leaves_balance_unchanged() {
+        let (_dir, db) = test_db();
+        db.init_credit_balance("user-1", 100).unwrap();
+        let before = db.get_credit_balance_row("user-1").unwrap();
+
+        // Already cancelled by the time send_paid_reply is called at all.
+        let cancel = Arc::new(AtomicBool::new(true));
+        let transport = SequenceTransport::new(vec![tool_use_response(
+            10,
+            10,
+            "toolu_1",
+            "list_runs",
+            serde_json::json!({}),
+        )]);
+
+        let reply = send_paid_reply(
+            &db,
+            SIGNING_KEY,
+            SUPPLIER_KEY,
+            transport.clone(),
+            big_limits(),
+            "user-1",
+            Some("conv-cancel-2"),
+            MODEL,
+            "system",
+            "hi",
+            "reply-cancel-2",
+            NOW,
+            20,
+            None,
+            false,
+            Some(&cancel),
+        )
+        .await
+        .expect("a cancel before turn 1 must return cleanly, not error or panic");
+
+        assert_eq!(
+            transport.call_count(),
+            0,
+            "no supplier call must happen once cancelled before turn 1"
+        );
+        assert_eq!(
+            reply.charged_credits, 0,
+            "nothing was reserved or charged for zero turns"
+        );
+        assert!(
+            reply.text.contains("cancelled"),
+            "text must explain why: {}",
+            reply.text
+        );
+
+        let after = db.get_credit_balance_row("user-1").unwrap();
+        assert_eq!(after.subscription_remaining, before.subscription_remaining);
+        assert_eq!(after.pack_remaining, before.pack_remaining);
     }
 
     /// A generic (non-reservation, non-`NotEnoughCredits`) transport failure
@@ -2013,6 +2302,8 @@ mod tests {
             "reply-tool-other-err",
             NOW,
             20,
+            None,
+            false,
             None,
         )
         .await
@@ -2059,6 +2350,8 @@ mod tests {
             "reply-tool-4",
             NOW,
             1,
+            None,
+            false,
             None,
         )
         .await;
@@ -2195,6 +2488,8 @@ mod tests {
             NOW,
             20,
             None,
+            false,
+            None,
         )
         .await
         .expect("a shortfall at final-charge time must not discard the reply");
@@ -2293,6 +2588,8 @@ mod tests {
             NOW,
             20,
             None,
+            false,
+            None,
         );
         let fut_b = send_paid_reply(
             &db,
@@ -2308,6 +2605,8 @@ mod tests {
             "reply-b",
             NOW,
             20,
+            None,
+            false,
             None,
         );
 

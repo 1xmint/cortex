@@ -244,6 +244,32 @@ pub fn tool_definitions() -> Vec<Value> {
         .collect()
 }
 
+/// Same as [`tool_definitions`], minus every [`Risk::Confirm`] tool. There is
+/// no spoken confirmation flow yet, so a live-voice turn must never be
+/// offered a tool it cannot actually get confirmed — see
+/// `voice_session::handle_delegation_created` and [`is_confirm_risk`].
+pub fn tool_definitions_excluding_confirm() -> Vec<Value> {
+    catalogue()
+        .into_iter()
+        .filter(|t| t.risk != Risk::Confirm)
+        .map(|t| {
+            json!({
+                "name": t.name,
+                "description": t.description,
+                "input_schema": t.schema,
+            })
+        })
+        .collect()
+}
+
+/// Whether `name` names a catalogue tool whose risk is [`Risk::Confirm`].
+/// Unknown names are `false` — [`execute`]'s own `ToolError::Unknown` path
+/// already covers those; this is only for telling a withheld-but-still-named
+/// Confirm tool apart from a plain unknown one.
+pub fn is_confirm_risk(name: &str) -> bool {
+    find(name).is_some_and(|t| t.risk == Risk::Confirm)
+}
+
 fn str_arg(input: &Value, key: &str) -> Result<String, ToolError> {
     input
         .get(key)
