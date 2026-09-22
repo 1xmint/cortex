@@ -1053,12 +1053,19 @@ async fn run_billing_loop(
                         // moved on to `Resolved`, so `route_delegation` alone
                         // would no longer catch it and would delegate it as
                         // a brand-new paid request.
-                        let swallow =
-                            should_swallow_delegation(swallow_delegation_until.take(), Instant::now());
+                        // Only when nothing new was said since the tick
+                        // cleared `pending_transcript`: a late "yes"
+                        // delegation has no new words, but a fresh request
+                        // spoken right after the yes does, and must run.
+                        let swallow = should_swallow_delegation(
+                            swallow_delegation_until.take(),
+                            &pending_transcript,
+                            Instant::now(),
+                        );
                         if swallow {
                             // Consumed outright: no `send_paid_reply`, no
-                            // reservation. `pending_transcript` was already
-                            // cleared when the tick resolved it.
+                            // reservation.
+                            pending_transcript.clear();
                         } else {
                             match route_delegation(&state, &session_id) {
                                 DelegationRouting::ConsumedBySpokenMatcher(outcome) => {
@@ -1556,8 +1563,15 @@ fn route_delegation(state: &Arc<AppState>, session_id: &str) -> DelegationRoutin
 /// [`run_billing_loop`] for why that late delegation can still arrive.
 /// `swallow_until` is `None` when no tick resolution is pending (the common
 /// case), or when it has already been consumed by an earlier delegation.
-fn should_swallow_delegation(swallow_until: Option<Instant>, now: Instant) -> bool {
-    swallow_until.is_some_and(|deadline| now <= deadline)
+/// `pending_transcript` is what was said since the tick cleared it: a late
+/// "yes" delegation carries no new words, while a fresh request spoken right
+/// after the yes does, and must be delegated, never swallowed.
+fn should_swallow_delegation(
+    swallow_until: Option<Instant>,
+    pending_transcript: &str,
+    now: Instant,
+) -> bool {
+    pending_transcript.trim().is_empty() && swallow_until.is_some_and(|deadline| now <= deadline)
 }
 
 /// Hands a terminal [`spoken_confirm::Outcome`] off to its own spawned task
@@ -5567,14 +5581,17 @@ mod tests {
             rx.try_recv()
                 .expect("a spoken result must be sent as commentary");
 
-            // Give any wrongly-spawned delegation task a beat to publish,
-            // then confirm nothing did: no `send_paid_reply`/
-            // `handle_delegation_created` turn ever ran for this "yes".
-            tokio::task::yield_now().await;
-            assert!(
-                matches!(events.try_recv(), Err(mpsc::error::TryRecvError::Empty)),
-                "a consumed spoken yes must never reach handle_delegation_created/send_paid_reply"
-            );
+            // Drain what was published: the ConfirmResolved for this yes is
+            // expected, but a user VoiceMessage would mean a
+            // `handle_delegation_created` turn ran for it.
+            while let Ok(Some(event)) =
+                tokio::time::timeout(Duration::from_millis(200), events.recv()).await
+            {
+                assert!(
+                    !matches!(&event, VoiceEvent::VoiceMessage { role, .. } if role == "user"),
+                    "a consumed spoken yes must never reach handle_delegation_created/send_paid_reply"
+                );
+            }
         }
 
         /// b. A second proposal on the same conversation voids the first
@@ -5803,9 +5820,19 @@ mod tests {
                 Path(action_id.clone()),
                 Json(crate::agent_confirm::ActionNonceRequest { nonce }),
             )
-            .await
-            .unwrap_or_else(|_| panic!("the tap route's own gate must still accept this row"));
-            assert_eq!(response.0.status, "confirmed");
+            .await;
+            // The gate refusing would be 404 (not found) or 409 (expired,
+            // resolved, tampered). Past the gate the test tool itself fails
+            // (no real run to open a PR for), which is 422 — still proof the
+            // tap was accepted.
+            match response {
+                Ok(json) => assert_eq!(json.0.status, "confirmed"),
+                Err((code, _)) => assert_eq!(
+                    code,
+                    axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+                    "the tap route's own gate must still accept this row"
+                ),
+            }
             assert_eq!(
                 db.get_pending_action(&action_id, USER).unwrap().status,
                 "confirmed"
@@ -5889,20 +5916,24 @@ mod tests {
             let deadline = t0 + Duration::from_secs(3);
 
             assert!(
-                should_swallow_delegation(Some(deadline), t0),
+                should_swallow_delegation(Some(deadline), "", t0),
                 "a delegation arriving right after the tick resolved must be swallowed"
             );
             assert!(
-                should_swallow_delegation(Some(deadline), deadline),
+                should_swallow_delegation(Some(deadline), "", deadline),
                 "a delegation arriving exactly at the deadline must still be swallowed"
             );
             assert!(
-                !should_swallow_delegation(Some(deadline), deadline + Duration::from_millis(1)),
+                !should_swallow_delegation(Some(deadline), "", deadline + Duration::from_millis(1)),
                 "a delegation arriving after the deadline must not be swallowed"
             );
             assert!(
-                !should_swallow_delegation(None, t0),
+                !should_swallow_delegation(None, "", t0),
                 "no pending tick resolution means nothing to swallow"
+            );
+            assert!(
+                !should_swallow_delegation(Some(deadline), "now run the tests", t0),
+                "a new request spoken right after the yes must be delegated, not swallowed"
             );
         }
 
