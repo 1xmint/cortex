@@ -234,15 +234,16 @@ async fn acquire_zen_user_permit(user_id: &str) -> ZenUserPermit {
 }
 
 /// Parses the status code out of `supplier_zen.rs`'s fixed
-/// `"zen returned {status}: ..."` message shape. Returns `None` for any
-/// other message (a `NotSent`/`Timeout` failure never reached that format),
-/// which is treated as the generic "did not answer" case below.
+/// `"zen returned {status}: ..."` message shape, where `{status}` is an
+/// `http::StatusCode` and so displays as e.g. `"401 Unauthorized"` -- only
+/// the first whitespace-separated token is the numeric code. Returns `None`
+/// for any other message (a `NotSent`/`Timeout` failure never reached that
+/// format), which is treated as the generic "did not answer" case below.
 fn status_from_message(message: &str) -> Option<u16> {
     message
         .strip_prefix("zen returned ")?
-        .split(':')
+        .split_whitespace()
         .next()?
-        .trim()
         .parse()
         .ok()
 }
@@ -785,6 +786,83 @@ mod tests {
             .get_provider_key_row("user-6", "zen")
             .unwrap();
         assert_eq!(row.status, "rejected");
+    }
+
+    // --- status_from_message must parse `StatusCode`'s Display form
+    // ("401 Unauthorized", not a bare number), or every status-specific
+    // message below silently falls back to the generic one. ---
+
+    async fn failure_message_for(
+        user_id: &str,
+        status: StatusCode,
+        body: serde_json::Value,
+    ) -> String {
+        let (url, _seen) = fake_zen(status, body).await;
+        let (_dir, state) = test_state().await;
+        state.db.as_ref().unwrap().upsert_provider_key(
+            user_id,
+            "zen",
+            &stub_encrypted_key(),
+            "1234",
+            1_800_000_000_000,
+        );
+
+        let (tx, rx) = mpsc::channel::<StepEvent>(64);
+        let key = ZenApiKey::new("zen-secret-CUSTKEY1234".into());
+        run(
+            state.clone(),
+            user_id.into(),
+            None,
+            MODEL.into(),
+            "system".into(),
+            "hi".into(),
+            key,
+            tx,
+            ZenTransport::with_base_url(url),
+        )
+        .await;
+
+        let events = collect(rx).await;
+        failed_text(&events).expect("failure must fail the turn")
+    }
+
+    #[tokio::test]
+    async fn a_402_from_zen_reports_the_customer_is_out_of_balance() {
+        let message = failure_message_for(
+            "user-402",
+            StatusCode::PAYMENT_REQUIRED,
+            serde_json::json!({"error": {"message": "insufficient balance"}}),
+        )
+        .await;
+        assert_eq!(
+            message,
+            "Your Zen account is out of balance. Top up at opencode.ai."
+        );
+    }
+
+    #[tokio::test]
+    async fn a_429_from_zen_reports_rate_limiting() {
+        let message = failure_message_for(
+            "user-429",
+            StatusCode::TOO_MANY_REQUESTS,
+            serde_json::json!({"error": {"message": "slow down"}}),
+        )
+        .await;
+        assert_eq!(message, "Zen is rate-limiting your key.");
+    }
+
+    #[tokio::test]
+    async fn a_500_from_zen_reports_the_generic_no_answer_message() {
+        let message = failure_message_for(
+            "user-500",
+            StatusCode::INTERNAL_SERVER_ERROR,
+            serde_json::json!({"error": {"message": "boom"}}),
+        )
+        .await;
+        assert_eq!(
+            message,
+            "Zen did not answer. Nothing was charged by Cortex."
+        );
     }
 
     // --- 7: a model outside the allowlist -> 400, before any KEK/db work. ---
