@@ -69,6 +69,11 @@ pub enum ConfirmAndExecuteError {
     Expired,
     AlreadyResolved,
     ArgsTampered,
+    /// The row's stored `args_json` failed to parse. Should be unreachable
+    /// in practice (the row is only ever written from already-serialized
+    /// JSON), but if it ever happens this is a server bug, not a client
+    /// error — 500, not 422.
+    InvalidStoredArgs(String),
     /// `execute_confirmed` itself refused or failed.
     ToolFailed(String),
 }
@@ -108,6 +113,10 @@ impl ConfirmAndExecuteError {
                             .into(),
                 }),
             ),
+            Self::InvalidStoredArgs(message) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse { error: message }),
+            ),
             Self::ToolFailed(message) => (
                 StatusCode::UNPROCESSABLE_ENTITY,
                 Json(ErrorResponse { error: message }),
@@ -135,7 +144,7 @@ async fn confirm_and_execute(
     let action = db.confirm_pending_action(action_id, user_id, nonce, now)?;
 
     let input: serde_json::Value = serde_json::from_str(&action.args_json).map_err(|e| {
-        ConfirmAndExecuteError::ToolFailed(format!(
+        ConfirmAndExecuteError::InvalidStoredArgs(format!(
             "stored action arguments are not valid JSON: {e}"
         ))
     })?;
@@ -183,6 +192,11 @@ async fn confirm_and_execute(
 /// Not called from any route yet — the transcript-driven wiring lands in
 /// part 2b of the spoken-confirm plan. Exercised directly by the tests
 /// below in the meantime.
+///
+/// This function does not itself gate on premium: the tap route
+/// (`confirm_action`) gets that for free from the `PremiumUser` extractor.
+/// Whatever caller wires this in for part 2b must enforce that same premium
+/// check before reaching here.
 #[allow(dead_code)] // Wired to the transcript matcher in part 2b.
 async fn confirm_and_execute_spoken(
     state: &Arc<AppState>,

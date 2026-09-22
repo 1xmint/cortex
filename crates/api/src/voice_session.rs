@@ -2191,7 +2191,7 @@ pub(crate) async fn prompt_ended_with(
     })?;
     let row_still_pending = db
         .get_pending_action(action_id, user_id)
-        .map(|row| row.status == "pending")
+        .map(|row| row.status == "pending" && row.expires_at > now)
         .unwrap_or(false);
 
     let deadline = now + SPOKEN_WINDOW_SECS;
@@ -2213,17 +2213,22 @@ pub(crate) async fn prompt_ended_with(
         if !matches_current || !row_still_pending {
             false
         } else {
-            if let Some(slot) = pending.as_mut() {
-                slot.armed_at = Some(now);
-                slot.deadline = Some(deadline);
-            }
-            drop(pending);
-            handle
+            // Only the matcher knows whether it actually opened a fresh
+            // window (vs. one already open, or already resolved) — trust
+            // its answer before touching the slot's deadline or publishing
+            // anything, so a stale/duplicate report changes no state.
+            let opened = handle
                 .spoken_matcher
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .prompt_ended(Instant::now());
-            true
+            if opened {
+                if let Some(slot) = pending.as_mut() {
+                    slot.armed_at = Some(now);
+                    slot.deadline = Some(deadline);
+                }
+            }
+            opened
         }
     };
 
@@ -4790,6 +4795,47 @@ mod tests {
             action.id
         }
 
+        /// Same as [`insert_session_and_action`] but lets the test control
+        /// the pending-action row's `created_at` (and therefore, via
+        /// `PENDING_ACTION_TTL_SECS`, its `expires_at`) directly — so a test
+        /// can insert an already-expired row without waiting for real time
+        /// to pass.
+        fn insert_session_and_action_created_at(
+            state: &Arc<AppState>,
+            session_id: &str,
+            owner_id: &str,
+            created_at: i64,
+        ) -> String {
+            let (close_tx, _close_rx) = mpsc::channel(1);
+            let (events_tx, _) = broadcast::channel(VOICE_EVENTS_CAPACITY);
+            state.voice_sessions.lock().unwrap().insert(
+                session_id.to_string(),
+                VoiceSessionHandle {
+                    user_id: owner_id.to_string(),
+                    close_tx,
+                    events_tx,
+                    pending_confirm: std::sync::Mutex::new(None),
+                    spoken_matcher: std::sync::Mutex::new(spoken_confirm::Matcher::new()),
+                },
+            );
+            let db = state.db.as_ref().expect("db configured");
+            let action = db.insert_pending_action(
+                owner_id,
+                "conv-1",
+                "open_pr",
+                &serde_json::json!({"run_id": "r1"}),
+                "Open a pull request for run r1",
+                created_at,
+            );
+            store_pending_confirm(
+                state,
+                session_id,
+                &action.id,
+                "Open a pull request for run r1",
+            );
+            action.id
+        }
+
         #[tokio::test]
         async fn non_owner_gets_404() {
             let (_dir, state) = test_state().await;
@@ -4902,6 +4948,138 @@ mod tests {
             assert!(
                 slot.deadline.is_none(),
                 "a new proposal must reset the spoken window"
+            );
+            assert!(
+                !handle.spoken_matcher.lock().unwrap().is_window_open(),
+                "a new proposal must re-arm the matcher, not leave its old window open"
+            );
+        }
+
+        /// A row resolved (confirmed or cancelled) out from under the
+        /// matcher — e.g. the user tapped the card instead — must not let a
+        /// late prompt-ended report open a window for it.
+        #[tokio::test]
+        async fn resolved_row_gets_409_with_no_state_change() {
+            type Resolver = fn(&crate::db::Database, &str, &str, &str, i64);
+            let resolvers: [Resolver; 2] = [
+                |db, id, user, nonce, now| {
+                    db.confirm_pending_action(id, user, nonce, now)
+                        .expect("confirm the row directly via the db helper");
+                },
+                |db, id, user, nonce, now| {
+                    assert!(
+                        db.cancel_pending_action(id, user, nonce, now),
+                        "cancel the row directly via the db helper"
+                    );
+                },
+            ];
+            for resolve in resolvers {
+                let (_dir, state) = test_state().await;
+                let action_id = insert_session_and_action(&state, "sess-1", USER);
+                let mut rx = subscribe_voice_events(&state, USER, "sess-1")
+                    .unwrap_or_else(|_| panic!("the owner must be able to subscribe"));
+
+                let now = chrono::Utc::now().timestamp();
+                {
+                    let db = state.db.as_ref().expect("db configured");
+                    let nonce = db
+                        .get_pending_action(&action_id, USER)
+                        .expect("row must exist")
+                        .nonce;
+                    resolve(db, &action_id, USER, &nonce, now);
+                }
+
+                let err = prompt_ended_with(&state, USER, "sess-1", &action_id, now)
+                    .await
+                    .expect_err("a resolved row must not open a window");
+                assert_eq!(err.0, StatusCode::CONFLICT);
+
+                let sessions = state.voice_sessions.lock().unwrap();
+                let handle = sessions.get("sess-1").unwrap();
+                let pending = handle.pending_confirm.lock().unwrap();
+                assert!(
+                    pending.as_ref().unwrap().deadline.is_none(),
+                    "the slot's deadline must stay None"
+                );
+                drop(pending);
+                drop(sessions);
+
+                assert!(
+                    matches!(rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)),
+                    "no SpokenWindow event must be published"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn expired_row_gets_409_with_no_state_change() {
+            let (_dir, state) = test_state().await;
+            let now = chrono::Utc::now().timestamp();
+            // Insert the row far enough in the past that it is already
+            // expired relative to `now` (`created_at + PENDING_ACTION_TTL_SECS
+            // < now`).
+            let created_at = now - crate::db::PENDING_ACTION_TTL_SECS - 1;
+            let action_id =
+                insert_session_and_action_created_at(&state, "sess-1", USER, created_at);
+            let mut rx = subscribe_voice_events(&state, USER, "sess-1")
+                .unwrap_or_else(|_| panic!("the owner must be able to subscribe"));
+
+            let err = prompt_ended_with(&state, USER, "sess-1", &action_id, now)
+                .await
+                .expect_err("an expired row must not open a window");
+            assert_eq!(err.0, StatusCode::CONFLICT);
+
+            let sessions = state.voice_sessions.lock().unwrap();
+            let handle = sessions.get("sess-1").unwrap();
+            let pending = handle.pending_confirm.lock().unwrap();
+            assert!(
+                pending.as_ref().unwrap().deadline.is_none(),
+                "the slot's deadline must stay None"
+            );
+            drop(pending);
+            drop(sessions);
+
+            assert!(
+                matches!(rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)),
+                "no SpokenWindow event must be published"
+            );
+        }
+
+        #[tokio::test]
+        async fn second_prompt_ended_for_same_action_gets_409_with_unchanged_deadline() {
+            let (_dir, state) = test_state().await;
+            let action_id = insert_session_and_action(&state, "sess-1", USER);
+
+            let now = chrono::Utc::now().timestamp();
+            let status = prompt_ended_with(&state, USER, "sess-1", &action_id, now)
+                .await
+                .unwrap_or_else(|_| panic!("the first report must arm the window"));
+            assert_eq!(status, StatusCode::NO_CONTENT);
+
+            let first_deadline = {
+                let sessions = state.voice_sessions.lock().unwrap();
+                let handle = sessions.get("sess-1").unwrap();
+                let pending = handle.pending_confirm.lock().unwrap();
+                pending
+                    .as_ref()
+                    .unwrap()
+                    .deadline
+                    .expect("the first call must set a deadline")
+            };
+
+            let later = now + 5;
+            let err = prompt_ended_with(&state, USER, "sess-1", &action_id, later)
+                .await
+                .expect_err("a second report for the same action must be refused");
+            assert_eq!(err.0, StatusCode::CONFLICT);
+
+            let sessions = state.voice_sessions.lock().unwrap();
+            let handle = sessions.get("sess-1").unwrap();
+            let pending = handle.pending_confirm.lock().unwrap();
+            assert_eq!(
+                pending.as_ref().unwrap().deadline,
+                Some(first_deadline),
+                "the deadline must be unchanged from the first call"
             );
         }
     }
