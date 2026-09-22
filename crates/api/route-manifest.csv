@@ -21,6 +21,7 @@ cortex,POST,/api/billing/referral/validate
 cortex,POST,/api/chat
 cortex,POST,/api/chat/options
 cortex,GET,/api/chat/suggestions
+cortex,GET,/api/chat/models
 cortex,GET,/api/context/health
 cortex,GET,/api/context/impact
 cortex,GET,/api/context/runs/{run_id}/artifacts
