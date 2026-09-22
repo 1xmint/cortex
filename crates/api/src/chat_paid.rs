@@ -457,6 +457,14 @@ pub(crate) async fn send_paid_reply<T: ProviderTransport + Clone>(
     // confirmation flow yet (see `voice_session::handle_delegation_created`).
     // Text chat always passes `false`.
     voice_turn: bool,
+    // Cooperative stop: checked once per turn, right next to the balance
+    // check below, rather than the caller hard-aborting our task. An abort
+    // could land mid supplier call (leaving a `chat-reply:*` reservation
+    // stuck `reserved` forever) or after the supplier answered but before
+    // the final charge (Cortex pays the supplier, the user is never
+    // charged) — see `voice_session`'s `delegation_cancel` for the caller
+    // that needs this. `None` (every chat call site) means never cancel.
+    cancel: Option<&std::sync::atomic::AtomicBool>,
 ) -> Result<PaidReply, PaidReplyError> {
     // Chat is paid by Cortex on the Anthropic path only (`ProviderPath::Cortex`);
     // a run that wants a different supplier goes through the HTTP gateway
@@ -538,6 +546,20 @@ pub(crate) async fn send_paid_reply<T: ProviderTransport + Clone>(
                 break;
             }
         };
+
+        // Checked right next to the balance so a cancelled request stops at
+        // the same turn boundary a graceful "ran out mid-loop" stop would:
+        // whatever turns already ran are still charged once, below, and
+        // nothing here forces an early return that would skip that charge.
+        if cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::SeqCst)) {
+            tracing::info!(user_id, reply_id, turn, "chat: cancelled; stopping");
+            stopped_reason = Some(
+                "\n\n(This answer may be incomplete: this request was cancelled, so I stopped \
+                 before finishing.)",
+            );
+            break;
+        }
+
         let credits_used_so_far = if total_observed_micro_usd > 0 {
             ceil_div(total_observed_micro_usd, price_list.micros_per_credit)
         } else {
@@ -989,6 +1011,7 @@ pub(crate) async fn run(
         turn_cap,
         Some(&tx),
         false,
+        None,
     )
     .await
     {
@@ -1148,6 +1171,7 @@ mod tests {
             20,
             None,
             false,
+None,
         )
         .await
         .expect("reply should succeed");
@@ -1183,6 +1207,7 @@ mod tests {
             20,
             None,
             false,
+None,
         )
         .await
         .expect_err("supplier failure must not succeed");
@@ -1217,6 +1242,7 @@ mod tests {
             20,
             None,
             false,
+None,
         )
         .await
         .expect_err("zero balance must refuse");
@@ -1257,6 +1283,7 @@ mod tests {
                 20,
                 None,
                 false,
+None,
             )
             .await;
             if attempt == 0 {
@@ -1303,6 +1330,7 @@ mod tests {
             20,
             None,
             false,
+None,
         )
         .await
         .expect("reply should succeed");
@@ -1464,6 +1492,7 @@ mod tests {
             20,
             None,
             false,
+None,
         )
         .await
         .expect("reply should succeed");
@@ -1520,6 +1549,7 @@ mod tests {
             20,
             None,
             false,
+None,
         )
         .await
         .expect("reply should succeed even though it never got a final answer on its own");
@@ -1621,6 +1651,7 @@ mod tests {
             20,
             Some(&tx),
             false,
+None,
         )
         .await
         .expect("reply should succeed even though the tool never ran");
@@ -1694,6 +1725,7 @@ mod tests {
             20,
             Some(&tx),
             true,
+None,
         )
         .await
         .expect("reply should succeed — the tool is refused, not the whole turn");
@@ -1758,6 +1790,7 @@ mod tests {
             20,
             Some(&tx),
             false,
+None,
         )
         .await
         .expect("reply should still succeed — the tool call is refused, not the whole reply");
@@ -1841,6 +1874,7 @@ mod tests {
             20,
             Some(&tx),
             false,
+None,
         )
         .await
         .expect("reply should succeed even though the tool never ran");
@@ -1947,6 +1981,7 @@ mod tests {
             20,
             None,
             false,
+None,
         )
         .await
         .expect("probe reply should succeed");
@@ -2003,6 +2038,7 @@ mod tests {
             20,
             None,
             false,
+None,
         )
         .await
         .expect("turn 1's work must still come back as a partial answer");
@@ -2057,6 +2093,7 @@ mod tests {
             20,
             None,
             false,
+None,
         )
         .await
         .expect("a partial answer, not an error, once at least one turn ran");
@@ -2115,6 +2152,7 @@ mod tests {
             20,
             None,
             false,
+None,
         )
         .await
         .expect("turn 1's work must still come back as a partial answer");
@@ -2162,6 +2200,7 @@ mod tests {
             1,
             None,
             false,
+None,
         )
         .await;
 
@@ -2298,6 +2337,7 @@ mod tests {
             20,
             None,
             false,
+None,
         )
         .await
         .expect("a shortfall at final-charge time must not discard the reply");
@@ -2397,6 +2437,7 @@ mod tests {
             20,
             None,
             false,
+None,
         );
         let fut_b = send_paid_reply(
             &db,
@@ -2414,6 +2455,7 @@ mod tests {
             20,
             None,
             false,
+None,
         );
 
         let (result_a, result_b) = tokio::join!(fut_a, fut_b);

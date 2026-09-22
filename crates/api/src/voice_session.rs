@@ -801,11 +801,11 @@ async fn run_billing_loop(
     // https://developers.openai.com/api/docs/guides/live-migration).
     let mut pending_transcript = String::new();
     let delegation_busy = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    // The currently-running delegation's `JoinHandle`, if any — aborted once
-    // this loop exits so a delegation's agent turn never keeps running (and
-    // billing) after the voice session it was answering for is gone.
-    let delegation_task: Arc<std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>> =
-        Arc::new(std::sync::Mutex::new(None));
+    // Told to a still-running delegation once this loop exits, so its agent
+    // loop stops cooperatively at its next turn boundary — see
+    // `chat_paid::send_paid_reply`'s `cancel` parameter — instead of being
+    // aborted mid supplier call or mid charge.
+    let delegation_cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     // The delegation task runs on its own spawned task (an agent turn can
     // take much longer than this loop should ever block for) and answers
     // through this channel rather than touching `sideband` directly, so the
@@ -836,7 +836,7 @@ async fn run_billing_loop(
                             &state,
                             &user_id,
                             &delegation_busy,
-                            &delegation_task,
+                            &delegation_cancel,
                             &mut pending_transcript,
                             &commentary_tx,
                         );
@@ -977,6 +977,15 @@ async fn run_billing_loop(
         }
     }
 
+    // The loop is done with this session: tell any still-running delegation
+    // to stop cooperatively at its next turn boundary instead of aborting it
+    // outright — an abort could land mid supplier call (leaving a
+    // `chat-reply:*` reservation stuck `reserved` forever) or after the
+    // supplier answered but before the final charge (Cortex pays the
+    // supplier, the user is never charged). Set before `reattach_and_close`
+    // below, which can itself take a while.
+    delegation_cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+
     if !closed_cleanly {
         // Settle whatever was fully consumed against the last usage this
         // session ever reported — a drop is not zero usage since the last
@@ -1051,17 +1060,6 @@ async fn run_billing_loop(
         reattach_and_close(&ws_base, &session_id, &supplier_key).await;
     }
 
-    // The loop is done with this session; a delegation still running its
-    // agent turn must not outlive it, so abort it here rather than let it
-    // keep going (and keep billing) unattended.
-    if let Some(handle) = delegation_task
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .take()
-    {
-        handle.abort();
-    }
-
     guard.disarm();
     state
         .voice_sessions
@@ -1086,20 +1084,21 @@ const COMMENTARY_CHAR_CAP: usize = 450;
 /// need to be conversational itself — just accurate and short.
 const VOICE_DELEGATION_SYSTEM_PROMPT: &str = "You are Cortex's coding agent, answering a request that came in over a live voice call. Keep answers short and to the point; they will be read aloud. Answer in under 60 words.";
 
+/// Caption text accumulates in `pending_transcript` between delegations; a
+/// caller who never stops talking (or a delegation that never arrives) must
+/// not let it grow without bound, so it is kept a sliding window of the
+/// most recent `PENDING_TRANSCRIPT_BYTE_CAP` bytes — the task text a
+/// delegation actually needs is what was said most recently, not everything
+/// said since the session started. Trimming always lands on a char
+/// boundary (never splits a multi-byte UTF-8 character) by walking forward
+/// from the cut point.
+const PENDING_TRANSCRIPT_BYTE_CAP: usize = 2000;
+
 /// Append a `session.input_transcript.delta`'s text to the accumulator that
 /// becomes the next delegation's task text. The event's own shape is not
 /// pinned down by the docs beyond "append to captions"; this reads the
 /// common `delta`/`text` fields defensively and drops the event if neither
 /// is present rather than guessing.
-/// Caption text accumulates here between delegations; a caller who never
-/// stops talking (or a delegation that never arrives) must not let this grow
-/// without bound, so it is kept a sliding window of the most recent
-/// [`PENDING_TRANSCRIPT_CHAR_CAP`] characters — the task text a delegation
-/// actually needs is what was said most recently, not everything said since
-/// the session started. Trimming always lands on a char boundary (never
-/// splits a multi-byte UTF-8 character) by walking back from the cut point.
-const PENDING_TRANSCRIPT_CHAR_CAP: usize = 2000;
-
 fn accumulate_transcript(pending_transcript: &mut String, event: &Value) {
     let delta = event
         .get("delta")
@@ -1108,8 +1107,8 @@ fn accumulate_transcript(pending_transcript: &mut String, event: &Value) {
     if let Some(delta) = delta {
         pending_transcript.push_str(delta);
     }
-    if pending_transcript.len() > PENDING_TRANSCRIPT_CHAR_CAP {
-        let excess = pending_transcript.len() - PENDING_TRANSCRIPT_CHAR_CAP;
+    if pending_transcript.len() > PENDING_TRANSCRIPT_BYTE_CAP {
+        let excess = pending_transcript.len() - PENDING_TRANSCRIPT_BYTE_CAP;
         let mut cut = excess;
         while !pending_transcript.is_char_boundary(cut) {
             cut += 1;
@@ -1129,12 +1128,6 @@ fn commentary_event(delegation_id: &str, content: &str) -> Value {
     })
 }
 
-/// Answer a `session.delegation.created` event. `session.delegation.created`
-/// itself carries no request text or tool arguments (confirmed against
-/// https://developers.openai.com/api/docs/guides/live-migration) — the task
-/// text is whatever has accumulated in `pending_transcript` since the last
-/// delegation was answered, drained here.
-///
 /// Releases `delegation_busy` when dropped — including when the spawned
 /// delegation task panics, since dropping still runs during the unwind. The
 /// old code stored `false` as the last line of the spawned task's async
@@ -1149,6 +1142,12 @@ impl Drop for BusyGuard {
     }
 }
 
+/// Answer a `session.delegation.created` event. `session.delegation.created`
+/// itself carries no request text or tool arguments (confirmed against
+/// https://developers.openai.com/api/docs/guides/live-migration) — the task
+/// text is whatever has accumulated in `pending_transcript` since the last
+/// delegation was answered, drained here.
+///
 /// One delegation runs at a time per session: `delegation_busy` is a
 /// session-lifetime flag checked (and set) synchronously, right here in the
 /// billing loop's single task, so there is no race between two delegations
@@ -1156,16 +1155,18 @@ impl Drop for BusyGuard {
 /// gets a short "still working" commentary instead of being queued or
 /// dropped silently.
 ///
-/// The spawned delegation task's handle is stashed in `delegation_task` so
-/// the billing loop can abort it when the session ends — without this, a
-/// delegation still running an agent turn would keep going (and keep
-/// billing) after the session it was answering for is gone.
+/// The spawned delegation task is handed a clone of `delegation_cancel` and
+/// threads it into `send_paid_reply`, so that when the billing loop ends it
+/// can ask the task to stop cooperatively at its next turn boundary instead
+/// of aborting it outright — see the `delegation_cancel` field's own doc for
+/// why a hard abort is unsafe here. The task is not tracked or waited on: it
+/// finishes (or stops) on its own.
 fn handle_delegation_created(
     event: &Value,
     state: &Arc<AppState>,
     user_id: &str,
     delegation_busy: &Arc<std::sync::atomic::AtomicBool>,
-    delegation_task: &Arc<std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    delegation_cancel: &Arc<std::sync::atomic::AtomicBool>,
     pending_transcript: &mut String,
     commentary_tx: &mpsc::Sender<Value>,
 ) {
@@ -1195,13 +1196,13 @@ fn handle_delegation_created(
     let state = state.clone();
     let user_id = user_id.to_string();
     let busy = delegation_busy.clone();
+    let cancel = delegation_cancel.clone();
     let tx = commentary_tx.clone();
-    let handle = tokio::spawn(async move {
+    tokio::spawn(async move {
         let _busy_guard = BusyGuard(busy);
-        let answer = run_voice_delegation(&state, &user_id, &task_text).await;
+        let answer = run_voice_delegation(&state, &user_id, &task_text, &cancel).await;
         let _ = tx.send(commentary_event(&delegation_id, &answer)).await;
     });
-    *delegation_task.lock().unwrap_or_else(|e| e.into_inner()) = Some(handle);
 }
 
 /// Run the same paid agent loop text chat uses (`chat_paid::send_paid_reply`,
@@ -1216,7 +1217,12 @@ fn handle_delegation_created(
 /// separate so tests can exercise that logic with an injected fake
 /// transport instead of process-global env vars, matching `chat_paid.rs`'s
 /// own test conventions.
-async fn run_voice_delegation(state: &Arc<AppState>, user_id: &str, task_text: &str) -> String {
+async fn run_voice_delegation(
+    state: &Arc<AppState>,
+    user_id: &str,
+    task_text: &str,
+    cancel: &Arc<std::sync::atomic::AtomicBool>,
+) -> String {
     let Some(db) = state.db.as_ref() else {
         return "Cortex is temporarily unavailable.".to_string();
     };
@@ -1240,6 +1246,7 @@ async fn run_voice_delegation(state: &Arc<AppState>, user_id: &str, task_text: &
         limits,
         user_id,
         task_text,
+        cancel,
     )
     .await
 }
@@ -1256,6 +1263,7 @@ async fn run_voice_delegation_with<T: crate::provider_gateway::ProviderTransport
     limits: SpendLimits,
     user_id: &str,
     task_text: &str,
+    cancel: &Arc<std::sync::atomic::AtomicBool>,
 ) -> String {
     let task_text = task_text.trim();
     if task_text.is_empty() {
@@ -1285,6 +1293,7 @@ async fn run_voice_delegation_with<T: crate::provider_gateway::ProviderTransport
         turn_cap,
         None,
         true,
+        Some(cancel.as_ref()),
     )
     .await
     {
@@ -2921,7 +2930,7 @@ mod tests {
             }
             // 900 * "语言" is 5400 bytes, well past the 2000-byte cap.
             assert!(
-                pending.len() <= PENDING_TRANSCRIPT_CHAR_CAP,
+                pending.len() <= PENDING_TRANSCRIPT_BYTE_CAP,
                 "the transcript must be trimmed to the cap in bytes: was {}",
                 pending.len()
             );
@@ -2941,6 +2950,7 @@ mod tests {
             let before = db.get_credit_balance_row(USER);
 
             let transport = CountingTransport::unreachable();
+            let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let answer = run_voice_delegation_with(
                 db,
                 SIGNING_KEY,
@@ -2949,6 +2959,7 @@ mod tests {
                 ample_limits(),
                 USER,
                 "   ",
+                &cancel,
             )
             .await;
 
@@ -2964,6 +2975,7 @@ mod tests {
             let before = db.get_credit_balance_row(USER).unwrap();
 
             let transport = CountingTransport::ok("the answer is four");
+            let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let answer = run_voice_delegation_with(
                 db,
                 SIGNING_KEY,
@@ -2972,6 +2984,7 @@ mod tests {
                 ample_limits(),
                 USER,
                 "what is two plus two",
+                &cancel,
             )
             .await;
 
@@ -2997,6 +3010,7 @@ mod tests {
             let before = db.get_credit_balance_row(USER);
 
             let transport = CountingTransport::unreachable();
+            let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let answer = run_voice_delegation_with(
                 db,
                 SIGNING_KEY,
@@ -3005,6 +3019,7 @@ mod tests {
                 ample_limits(),
                 USER,
                 "do something",
+                &cancel,
             )
             .await;
 
@@ -3029,7 +3044,7 @@ mod tests {
             // above already covers directly against a fake transport.
             let (_dir, state) = test_state().await;
             let busy = Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let task = Arc::new(std::sync::Mutex::new(None));
+            let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let (tx, mut rx) = mpsc::channel::<Value>(8);
             let mut pending_transcript = "what is the weather".to_string();
 
@@ -3038,7 +3053,7 @@ mod tests {
                 &state,
                 USER,
                 &busy,
-                &task,
+                &cancel,
                 &mut pending_transcript,
                 &tx,
             );
@@ -3062,7 +3077,7 @@ mod tests {
         async fn a_second_delegation_while_busy_is_refused() {
             let (_dir, state) = test_state().await;
             let busy = Arc::new(std::sync::atomic::AtomicBool::new(true));
-            let task = Arc::new(std::sync::Mutex::new(None));
+            let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let (tx, mut rx) = mpsc::channel::<Value>(8);
             let mut pending_transcript = "some accumulated speech".to_string();
 
@@ -3071,7 +3086,7 @@ mod tests {
                 &state,
                 USER,
                 &busy,
-                &task,
+                &cancel,
                 &mut pending_transcript,
                 &tx,
             );
@@ -3110,11 +3125,20 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn delegation_task_is_aborted_when_the_session_ends() {
+        async fn ending_the_session_sets_the_shared_cancel_flag_for_a_running_delegation() {
+            // Replaces the old abort-based test: the billing loop no longer
+            // kills a still-running delegation outright (that could land mid
+            // supplier call or mid charge — see `delegation_cancel`'s doc in
+            // `run_billing_loop`). Instead it flips the same `AtomicBool` the
+            // spawned task was handed, and the task notices cooperatively.
+            // `send_paid_reply`'s own tests cover the actual stop-and-charge
+            // behavior once that flag is set; this just confirms
+            // `handle_delegation_created` hands the spawned task a clone of
+            // the real flag, not a copy, so setting it after spawning is
+            // visible to the task.
             let (_dir, state) = test_state().await;
             let busy = Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let task: Arc<std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>> =
-                Arc::new(std::sync::Mutex::new(None));
+            let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let (tx, _rx) = mpsc::channel::<Value>(8);
             let mut pending_transcript = "some long-running request".to_string();
 
@@ -3123,24 +3147,18 @@ mod tests {
                 &state,
                 USER,
                 &busy,
-                &task,
+                &cancel,
                 &mut pending_transcript,
                 &tx,
             );
 
-            // Simulate the billing loop ending: take and abort the handle,
-            // exactly like the cleanup path after the loop breaks.
-            let handle = task
-                .lock()
-                .unwrap()
-                .take()
-                .expect("a delegation task must have been spawned");
-            handle.abort();
-
-            let joined = handle.await;
+            // Simulate the billing loop ending, exactly like the cleanup path
+            // after the loop breaks: set the shared flag rather than
+            // aborting anything.
+            cancel.store(true, std::sync::atomic::Ordering::SeqCst);
             assert!(
-                joined.is_err_and(|e| e.is_cancelled()),
-                "the delegation task must report cancelled once aborted"
+                cancel.load(std::sync::atomic::Ordering::SeqCst),
+                "the flag handed to the spawned task must reflect the same store"
             );
         }
     }
