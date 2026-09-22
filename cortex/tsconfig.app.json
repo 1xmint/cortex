@@ -13,6 +13,11 @@
        test files, which is tidier and a good deal more machinery. */
     "types": ["vite/client", "node"],
     "skipLibCheck": true,
+    /* `src/lib/wireContract.test.tsx` imports
+       `src/test/fixtures/wire-events.json` directly, typed, so a shape
+       change in the server's wire JSON breaks this build instead of only
+       a hand-copied fixture. */
+    "resolveJsonModule": true,
 
     /* Bundler mode */
     "moduleResolution": "bundler",

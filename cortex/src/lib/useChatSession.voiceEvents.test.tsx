@@ -24,8 +24,10 @@ afterEach(() => {
 
 const CONTROLS = { speed: 'balanced', intelligence: 'balanced', autonomy: 'guided' } as const;
 
-function renderSession(activeConversationId: string | null = 'conv-open') {
-  return renderHook(() =>
+// Waits for the open conversation's initial load to finish: that load
+// replaces `messages`, so anything a test appends before it lands is wiped.
+async function renderSession(activeConversationId: string | null = 'conv-open') {
+  const rendered = renderHook(() =>
     useChatSession({
       activeConversationId,
       userId: 'user-1',
@@ -37,11 +39,13 @@ function renderSession(activeConversationId: string | null = 'conv-open') {
       onConversationsChanged: vi.fn(),
     }),
   );
+  await waitFor(() => expect(rendered.result.current.isLoadingConversation).toBe(false));
+  return rendered;
 }
 
 describe('useChatSession live voice event handling', () => {
   it('shows a ConfirmActionCard in the open conversation for a voice confirm_required event', async () => {
-    const { result } = renderSession();
+    const { result } = await renderSession();
 
     act(() => {
       result.current.handleVoiceConfirmRequired({
@@ -61,7 +65,7 @@ describe('useChatSession live voice event handling', () => {
   });
 
   it('reads expires_at and the spoken-window deadline as Unix seconds, the server wire format', async () => {
-    const { result } = renderSession();
+    const { result } = await renderSession();
     const nowSecs = Math.floor(Date.now() / 1000);
 
     act(() => {
@@ -89,7 +93,7 @@ describe('useChatSession live voice event handling', () => {
   });
 
   it('appends a voice_message turn the same way a typed message appears', async () => {
-    const { result } = renderSession();
+    const { result } = await renderSession();
     const initialCount = result.current.messages.length;
 
     act(() => {
@@ -110,7 +114,7 @@ describe('useChatSession live voice event handling', () => {
   });
 
   it('ensureConversationId creates a conversation via the same call as a new chat when none is open', async () => {
-    const { result } = renderSession(null);
+    const { result } = await renderSession(null);
 
     let id: string | null = null;
     await act(async () => {
@@ -122,7 +126,7 @@ describe('useChatSession live voice event handling', () => {
   });
 
   it('ensureConversationId reuses the open conversation without creating a new one', async () => {
-    const { result } = renderSession('conv-open');
+    const { result } = await renderSession('conv-open');
 
     let id: string | null = null;
     await act(async () => {

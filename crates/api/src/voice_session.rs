@@ -2435,6 +2435,15 @@ fn voice_event_to_sse(event: VoiceEvent) -> Result<Event, Infallible> {
     Ok(Event::default().data(data))
 }
 
+/// Serializes a `VoiceEvent` exactly the way `voice_event_to_sse` does for
+/// the `data:` line it sends the browser -- the same `serde_json::to_string`
+/// call, factored out so a wire-contract test can call it directly instead
+/// of reaching into the opaque `axum::response::sse::Event` it wraps.
+#[cfg(test)]
+pub(crate) fn voice_event_wire_json(event: &VoiceEvent) -> String {
+    serde_json::to_string(event).unwrap_or_default()
+}
+
 /// `GET /api/voice/live/sessions/{id}/events` — the UI's own stream for
 /// what is happening in a live voice session, since no chat SSE stream is
 /// open while live voice runs. Owner only: an unknown session id and a
@@ -5978,6 +5987,123 @@ mod tests {
 
             let commentary = rx.try_recv().expect("a spoken result must be sent");
             assert_eq!(commentary["delegation_id"], "deleg-77");
+        }
+    }
+
+    /// Checks the server's real `VoiceEvent` JSON against
+    /// `cortex/src/test/fixtures/wire-events.json`, the fixture the browser's
+    /// `wireContract.test.tsx` feeds through the real ingest code. The two
+    /// crates can't share a Rust type across the language boundary, so this
+    /// fixture is the only thing keeping them from drifting silently -- if
+    /// one of these tests fails, the server's wire JSON changed; update the
+    /// matching entry in the fixture (and check the browser types/tests
+    /// still accept it) rather than changing this test's expected shape.
+    mod wire_contract {
+        use super::*;
+
+        const FIXTURE_JSON: &str =
+            include_str!("../../../cortex/src/test/fixtures/wire-events.json");
+
+        fn fixtures() -> serde_json::Map<String, Value> {
+            let parsed: Value = serde_json::from_str(FIXTURE_JSON).unwrap();
+            parsed.as_object().cloned().unwrap()
+        }
+
+        fn expect_fixture(fixtures: &serde_json::Map<String, Value>, key: &str) -> Value {
+            fixtures.get(key).cloned().unwrap_or_else(|| {
+                panic!(
+                    "cortex/src/test/fixtures/wire-events.json is missing \"{key}\" -- add an \
+                     entry with the server's JSON for the fixed inputs this test uses"
+                )
+            })
+        }
+
+        fn assert_matches_fixture(
+            event: &VoiceEvent,
+            fixtures: &serde_json::Map<String, Value>,
+            key: &str,
+        ) {
+            let actual: Value = serde_json::from_str(&voice_event_wire_json(event)).unwrap();
+            let expected = expect_fixture(fixtures, key);
+            assert_eq!(
+                actual, expected,
+                "VoiceEvent's wire JSON no longer matches cortex/src/test/fixtures/wire-events.json's \
+                 \"{key}\" entry -- update that fixture entry to the new JSON (and update the browser \
+                 side that consumes it, cortex/src/lib/wireContract.test.tsx) rather than changing this test"
+            );
+        }
+
+        #[test]
+        fn voice_confirm_required_matches_the_checked_in_fixture() {
+            let event = VoiceEvent::ConfirmRequired {
+                action_id: "fixture-action".to_string(),
+                nonce: "fixture-nonce".to_string(),
+                summary: "Fixture summary text".to_string(),
+                expires_at: 1_790_000_000,
+            };
+            assert_matches_fixture(&event, &fixtures(), "voice_confirm_required");
+        }
+
+        #[test]
+        fn voice_spoken_window_matches_the_checked_in_fixture() {
+            let event = VoiceEvent::SpokenWindow {
+                action_id: "fixture-action".to_string(),
+                deadline: 1_790_000_045,
+            };
+            assert_matches_fixture(&event, &fixtures(), "voice_spoken_window");
+        }
+
+        #[test]
+        fn voice_confirm_resolved_confirmed_matches_the_checked_in_fixture() {
+            let event = VoiceEvent::ConfirmResolved {
+                action_id: "fixture-action".to_string(),
+                status: "confirmed".to_string(),
+            };
+            assert_matches_fixture(&event, &fixtures(), "voice_confirm_resolved_confirmed");
+        }
+
+        #[test]
+        fn voice_confirm_resolved_cancelled_matches_the_checked_in_fixture() {
+            let event = VoiceEvent::ConfirmResolved {
+                action_id: "fixture-action".to_string(),
+                status: "cancelled".to_string(),
+            };
+            assert_matches_fixture(&event, &fixtures(), "voice_confirm_resolved_cancelled");
+        }
+
+        #[test]
+        fn voice_message_matches_the_checked_in_fixture() {
+            let event = VoiceEvent::VoiceMessage {
+                role: "assistant".to_string(),
+                content: "Fixture message content".to_string(),
+            };
+            assert_matches_fixture(&event, &fixtures(), "voice_message");
+        }
+
+        /// Every key in the fixture must be covered by one of the tests
+        /// above (or `chat.rs`'s `chat_confirm_required` test) -- a stray
+        /// key would sit there unchecked forever, silently drifting from
+        /// whatever it was meant to document.
+        #[test]
+        fn fixture_has_no_untested_keys() {
+            let known: std::collections::HashSet<&str> = [
+                "chat_confirm_required",
+                "voice_confirm_required",
+                "voice_spoken_window",
+                "voice_confirm_resolved_confirmed",
+                "voice_confirm_resolved_cancelled",
+                "voice_message",
+            ]
+            .into_iter()
+            .collect();
+
+            for key in fixtures().keys() {
+                assert!(
+                    known.contains(key.as_str()),
+                    "cortex/src/test/fixtures/wire-events.json has an entry \"{key}\" that no Rust \
+                     wire-contract test covers -- add a test for it or remove the entry"
+                );
+            }
         }
     }
 }
