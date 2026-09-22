@@ -283,6 +283,12 @@ async fn send_one_turn<T: ProviderTransport + Clone>(
     system_prompt: &str,
     messages: &[Value],
     tools: &[Value],
+    // Anthropic rejects a request whose history contains `tool_use`/
+    // `tool_result` blocks unless `tools` is also present on that request,
+    // so the last turn still gets the full tool list — it just also gets
+    // `tool_choice: {"type": "none"}` so the model has to answer in text
+    // instead of asking for a call it will never see the result of.
+    last_turn: bool,
     reply_id: &str,
     turn: u32,
     now_ms: i64,
@@ -314,6 +320,9 @@ async fn send_one_turn<T: ProviderTransport + Clone>(
     });
     if !tools.is_empty() {
         body["tools"] = Value::Array(tools.to_vec());
+        if last_turn {
+            body["tool_choice"] = serde_json::json!({"type": "none"});
+        }
     }
     let request = GatewayRequest {
         request_key: format!("chat:{attempt_id}"),
@@ -464,7 +473,6 @@ pub(crate) async fn send_paid_reply<T: ProviderTransport + Clone>(
     let turn_cap = turn_cap_per_minute;
 
     let tools = agent_tools::tool_definitions();
-    let no_tools: Vec<Value> = Vec::new();
     let mut messages = vec![serde_json::json!({"role": "user", "content": user_message})];
     // Summed across every turn and charged once at the very end (or once at
     // the point of an early, partial stop) — see `send_one_turn`'s doc
@@ -542,14 +550,12 @@ pub(crate) async fn send_paid_reply<T: ProviderTransport + Clone>(
         }
 
         // On the last turn there is no next turn to send tool results back
-        // on, so don't offer tools at all: the model has to answer in text
-        // with whatever it already knows, instead of asking for a tool call
-        // it will never see the result of.
-        let turn_tools: &[Value] = if turn == MAX_AGENT_TURNS {
-            &no_tools
-        } else {
-            &tools
-        };
+        // on, so the model must answer in text with whatever it already
+        // knows instead of asking for a tool call it will never see the
+        // result of — but the request still has to carry `tools` (see
+        // `send_one_turn`'s doc comment on `last_turn`), just with
+        // `tool_choice: none` forcing text instead of dropping the list.
+        let is_last_turn = turn == MAX_AGENT_TURNS;
 
         let turn_outcome = send_one_turn(
             db,
@@ -564,7 +570,8 @@ pub(crate) async fn send_paid_reply<T: ProviderTransport + Clone>(
             model,
             system_prompt,
             &messages,
-            turn_tools,
+            &tools,
+            is_last_turn,
             reply_id,
             turn,
             now_ms,
@@ -1197,6 +1204,11 @@ mod tests {
     struct SequenceTransport {
         calls: Arc<AtomicUsize>,
         responses: Arc<Vec<Result<TransportResponse, TransportFailure>>>,
+        // Every request body this transport has been asked to forward, in
+        // call order, so a test can inspect exactly what was sent on a
+        // given turn (e.g. whether `tools`/`tool_choice` were set) without
+        // hand-replicating the gateway's own byte-cost math.
+        request_bodies: Arc<Mutex<Vec<Value>>>,
     }
 
     impl SequenceTransport {
@@ -1205,11 +1217,30 @@ mod tests {
             Self {
                 calls: Arc::new(AtomicUsize::new(0)),
                 responses: Arc::new(responses),
+                request_bodies: Arc::new(Mutex::new(Vec::new())),
             }
         }
 
         fn call_count(&self) -> usize {
             self.calls.load(Ordering::SeqCst)
+        }
+
+        fn last_request_body(&self) -> Value {
+            self.request_bodies
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .last()
+                .cloned()
+                .expect("at least one request must have been recorded")
+        }
+
+        fn request_body_at(&self, index: usize) -> Value {
+            self.request_bodies
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(index)
+                .cloned()
+                .unwrap_or_else(|| panic!("no request recorded at index {index}"))
         }
     }
 
@@ -1217,9 +1248,13 @@ mod tests {
         fn forward(
             &self,
             supplier_key: &str,
-            _request: &GatewayRequest,
+            request: &GatewayRequest,
         ) -> impl Future<Output = Result<TransportResponse, TransportFailure>> + Send {
             assert_eq!(supplier_key, SUPPLIER_KEY);
+            self.request_bodies
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(request.body.clone());
             let i = self.calls.fetch_add(1, Ordering::SeqCst);
             let idx = i.min(self.responses.len() - 1);
             std::future::ready(self.responses[idx].clone())
@@ -1329,6 +1364,24 @@ mod tests {
             !reply.text.is_empty(),
             "the final, tool-less turn must produce a text answer"
         );
+
+        // The last turn's history contains tool_use/tool_result blocks, so
+        // Anthropic requires `tools` to still be present — it's
+        // `tool_choice: none` that stops the model from calling one, not an
+        // absent tool list.
+        let last_body = transport.last_request_body();
+        assert_eq!(
+            last_body.get("tool_choice"),
+            Some(&serde_json::json!({"type": "none"})),
+            "the last turn must set tool_choice: none: {last_body}"
+        );
+        assert!(
+            last_body
+                .get("tools")
+                .and_then(Value::as_array)
+                .is_some_and(|tools| !tools.is_empty()),
+            "the last turn must still carry a non-empty tools list: {last_body}"
+        );
     }
 
     /// A turn's reservation is refused when its worst-case cost would push
@@ -1345,13 +1398,18 @@ mod tests {
         let price_list = db.active_price_list().unwrap();
         let rate = price_list.model("claude", MODEL).unwrap();
 
-        fn ceiling_per_thousand(n: i64, rate: i64) -> i64 {
-            (n * rate + 999) / 1_000
-        }
+        // Compute each turn's reservation with the gateway's own function
+        // rather than hand-replicating its byte-cost math, so this test
+        // tracks `upper_bound_cost` instead of silently drifting from it.
         fn reserved_cost(body: &Value, rate: &crate::pricing::ModelPrice) -> i64 {
             let bytes = serde_json::to_vec(body).unwrap().len() as i64;
-            ceiling_per_thousand(bytes, rate.input_micros_per_1k)
-                + ceiling_per_thousand(MAX_OUTPUT_TOKENS, rate.output_micros_per_1k)
+            crate::provider_gateway::upper_bound_cost(
+                bytes,
+                MAX_OUTPUT_TOKENS,
+                rate.input_micros_per_1k,
+                rate.output_micros_per_1k,
+            )
+            .unwrap()
         }
 
         let tools = agent_tools::tool_definitions();
@@ -1359,11 +1417,37 @@ mod tests {
         let tool_use_id = "toolu_1";
         let tool_name = "not_a_real_tool";
 
-        let turn1_messages = serde_json::json!([{"role": "user", "content": user_message}]);
-        let turn1_body = serde_json::json!({
-            "model": MODEL, "max_tokens": MAX_OUTPUT_TOKENS, "system": "system",
-            "messages": turn1_messages, "stream": false, "tools": tools,
-        });
+        // Recorded from the actual turn-1 request rather than constructed
+        // by hand, so this test's notion of "turn 1's body" cannot drift
+        // from what `send_one_turn` really sends. Uses its own user/balance
+        // so probing does not spend any of "user-1"'s credits below.
+        db.init_credit_balance("probe-user", 1_000_000).unwrap();
+        let probe = SequenceTransport::new(vec![tool_use_response(
+            10,
+            10,
+            tool_use_id,
+            tool_name,
+            serde_json::json!({}),
+        )]);
+        send_paid_reply(
+            &db,
+            SIGNING_KEY,
+            SUPPLIER_KEY,
+            probe.clone(),
+            big_limits(),
+            "probe-user",
+            Some("conv-tool-5-probe"),
+            MODEL,
+            "system",
+            user_message,
+            "reply-tool-5-probe",
+            NOW,
+            20,
+            None,
+        )
+        .await
+        .expect("probe reply should succeed");
+        let turn1_body = probe.request_body_at(0);
         let turn1_reserved = reserved_cost(&turn1_body, rate);
 
         let assistant_content = serde_json::json!([{"type": "tool_use", "id": tool_use_id, "name": tool_name, "input": {}}]);
