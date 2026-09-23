@@ -607,6 +607,7 @@ mod tests {
         let token = "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6ImsxIn0.eyJzdWIiOiJ1c2VyXzEiLCJleHAiOjQxMDI0NDQ4MDB9.AAAA";
         let error = verify_token(token, &keys).expect_err("a forged signature must be rejected");
         assert!(error.contains("JWT verification failed"), "{error}");
+        assert!(error.contains("InvalidSignature"), "{error}");
     }
 
     #[test]
