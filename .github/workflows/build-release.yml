@@ -1,7 +1,8 @@
 name: Build release
 
-# Builds what a host needs to run Cortex, and nothing else: the server and
-# worker binaries plus the built web app, uploaded as one artifact.
+# Builds what a host needs to run Cortex, and nothing else: the server, worker
+# and worker-key binaries plus the built web app, uploaded as one artifact;
+# optionally (input `images`) the worker's container images as a second one.
 #
 # It does not deploy. The repository holds no host credentials, so copying the
 # artifact to a host is a separate, manual step (see docs/operations/).
@@ -12,6 +13,11 @@ name: Build release
 
 on:
   workflow_dispatch:
+    inputs:
+      images:
+        description: Also build the worker's container images (sandbox, egress, runner)
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -31,8 +37,10 @@ jobs:
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
-      - name: Build server and worker
-        run: cargo build --release --locked -p cortex-api --bin cortex-server -p cortex-worker --bin cortex-worker
+      # cortex-worker-key issues worker credentials on the host, next to the
+      # database; there is deliberately no HTTP route for it.
+      - name: Build server, worker and worker-key tool
+        run: cargo build --release --locked -p cortex-api --bin cortex-server --bin cortex-worker-key -p cortex-worker --bin cortex-worker
 
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6
         with:
@@ -54,7 +62,7 @@ jobs:
       - name: Assemble
         run: |
           mkdir -p out/bin
-          cp target/release/cortex-server target/release/cortex-worker out/bin/
+          cp target/release/cortex-server target/release/cortex-worker target/release/cortex-worker-key out/bin/
           cp -r cortex/dist out/www
           git rev-parse HEAD > out/COMMIT
           (cd out && sha256sum bin/* > SHA256SUMS)
@@ -64,3 +72,44 @@ jobs:
           name: cortex-release-${{ github.sha }}
           path: out/
           retention-days: 14
+
+  # The worker's containers, tagged with this commit and run, so a receipt
+  # naming an image names the commit it came from and no rebuild can reuse the
+  # tag; the image ID in IMAGES names the image itself. Built here because
+  # the host is too small to compile the egress mediator itself. Shipped as a
+  # `docker save` archive; the host loads it with `docker load`.
+  images:
+    if: inputs.images
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v5
+        with:
+          persist-credentials: false
+
+      - name: Build images
+        run: |
+          set -euo pipefail
+          tag="$(git rev-parse --short=12 HEAD)-${{ github.run_id }}"
+          docker build -f Dockerfile.sandbox -t "cortex/sandbox:base-$tag" .
+          docker build -f Dockerfile.sandbox-provider \
+            --build-arg BASE="cortex/sandbox:base-$tag" \
+            -t "cortex/sandbox:$tag" .
+          docker build -f Dockerfile.egress -t "cortex/egress:$tag" .
+          docker build -f Dockerfile.runner -t "cortex/runner:$tag" .
+          mkdir -p images
+          docker save "cortex/sandbox:$tag" "cortex/egress:$tag" "cortex/runner:$tag" \
+            | gzip -1 > images/cortex-images.tar.gz
+          for i in sandbox egress runner; do
+            id=$(docker image inspect --format '{{.Id}}' "cortex/$i:$tag")
+            echo "cortex/$i:$tag $id"
+          done > images/IMAGES
+          git rev-parse HEAD > images/COMMIT
+          (cd images && sha256sum cortex-images.tar.gz IMAGES COMMIT > SHA256SUMS)
+          cat images/IMAGES
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: cortex-images-${{ github.sha }}
+          path: images/
+          retention-days: 14
+          compression-level: 0
