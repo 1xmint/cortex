@@ -1,0 +1,61 @@
+name: Build release
+
+# Builds what a host needs to run Cortex, and nothing else: the server and
+# worker binaries plus the built web app, uploaded as one artifact.
+#
+# It does not deploy. The repository holds no host credentials, so copying the
+# artifact to a host is a separate, manual step (see docs/operations/).
+#
+# Built on ubuntu-24.04 because the production host runs Ubuntu 24.04: the
+# binaries link against the runner's glibc, and a newer runner could produce a
+# binary the host cannot load.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v5
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install 1.97.1 --profile minimal
+          rustup default 1.97.1
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      - name: Build server and worker
+        run: cargo build --release --locked -p cortex-api --bin cortex-server -p cortex-worker --bin cortex-worker
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: cortex/package-lock.json
+
+      - name: Build web app
+        working-directory: cortex
+        run: |
+          npm ci
+          npm run build
+
+      - name: Assemble
+        run: |
+          mkdir -p out/bin
+          cp target/release/cortex-server target/release/cortex-worker out/bin/
+          cp -r cortex/dist out/www
+          git rev-parse HEAD > out/COMMIT
+          (cd out && sha256sum bin/* > SHA256SUMS)
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: cortex-release-${{ github.sha }}
+          path: out/
+          retention-days: 14
