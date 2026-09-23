@@ -192,7 +192,7 @@ pub async fn chat(
         let unlock_header = headers
             .get(KEY_UNLOCK_HEADER)
             .and_then(|v| v.to_str().ok())
-            .map(str::to_string);
+            .map(|v| zeroize::Zeroizing::new(v.to_string()));
         return crate::chat_zen::chat(
             State(state),
             user,

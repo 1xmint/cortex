@@ -73,7 +73,7 @@ pub async fn save_key(
     State(state): State<Arc<AppState>>,
     user: ClerkUser,
     Path(provider): Path<String>,
-    body: axum::body::Bytes,
+    raw_body: axum::body::Bytes,
 ) -> ApiResult<StatusCode> {
     if !SUPPORTED_PROVIDERS.contains(&provider.as_str()) {
         return Err(bad_provider());
@@ -91,6 +91,14 @@ pub async fn save_key(
     // never risks axum's rejection message echoing the raw bytes back to the
     // caller or into a log: the fixed error text below is all that is ever
     // returned or recorded.
+    //
+    // `raw_body` holds the key and the unlock secret in a hyper-owned
+    // `Bytes`, which cannot be wiped in place (hyper's own buffers are
+    // outside our control regardless). Copy it into a `Zeroizing<Vec<u8>>`
+    // we do own, drop the original `Bytes` immediately, and parse from the
+    // copy so the one buffer we can wipe is wiped.
+    let body: zeroize::Zeroizing<Vec<u8>> = zeroize::Zeroizing::new(raw_body.to_vec());
+    drop(raw_body);
     let request: SaveKeyRequest = serde_json::from_slice(&body).map_err(|_| {
         (
             StatusCode::BAD_REQUEST,
@@ -99,6 +107,7 @@ pub async fn save_key(
             }),
         )
     })?;
+    drop(body);
 
     byok::validate_key_format(&request.api_key).map_err(|msg| {
         (

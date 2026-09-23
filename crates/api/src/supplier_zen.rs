@@ -105,7 +105,7 @@ impl ProviderTransport for ZenTransport {
     ) -> impl Future<Output = Result<TransportResponse, TransportFailure>> + Send {
         let client = self.client.clone();
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
-        let key = supplier_key.to_string();
+        let key = zeroize::Zeroizing::new(supplier_key.to_string());
         let allowed = ALLOWED_MODELS.contains(&request.model.as_str());
         let model = request.model.clone();
         let max_output_tokens = request.max_output_tokens;
@@ -166,9 +166,26 @@ impl ProviderTransport for ZenTransport {
                 });
             }
 
+            // Built from a `Zeroizing<String>` so the "Bearer <key>" copy is
+            // wiped as soon as it goes out of scope, and marked sensitive so
+            // reqwest/hyper never include it in a `Debug` print or trace log
+            // (the `HeaderValue` byte buffer itself is still reqwest's, and
+            // outside our control -- `set_sensitive` is the closest
+            // equivalent reqwest's builder API offers to zeroizing it).
+            let bearer_value = zeroize::Zeroizing::new(format!("Bearer {}", key.as_str()));
+            let mut auth_header =
+                reqwest::header::HeaderValue::from_str(&bearer_value).map_err(|_| {
+                    TransportFailure {
+                        kind: TransportFailureKind::NotSent,
+                        upstream_request_id: None,
+                        message: "zen key is not a valid header value".into(),
+                    }
+                })?;
+            auth_header.set_sensitive(true);
+
             let response = client
                 .post(&url)
-                .header("Authorization", format!("Bearer {key}"))
+                .header("Authorization", auth_header)
                 .json(&body)
                 .send()
                 .await
