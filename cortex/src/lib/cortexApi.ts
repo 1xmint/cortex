@@ -176,6 +176,10 @@ async function readErrorMessage(res: Response): Promise<string> {
 export const AUTH_CHANNEL_NAME = 'cortex-auth';
 
 function dispatchUnauthorized() {
+  // A 401 for a request that could not carry a credential (no token getter
+  // registered yet) says nothing about the session, so it must not raise the
+  // "session expired" banner. Once a getter exists, every 401 still counts.
+  if (!_tokenGetter && !_somaDelegation) return;
   try {
     window.dispatchEvent(new CustomEvent('cortex:unauthorized'));
   } catch {

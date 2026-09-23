@@ -44,7 +44,7 @@ import ProjectChat from './components/chat/ProjectChat';
 import PersonalTaskManager from './components/personal/PersonalTaskManager';
 import TaskManagerSwitcher from './components/shell/TaskManagerSwitcher';
 import { useChatSession } from './lib/useChatSession';
-import { useAuthGate } from './lib/useAuthGate';
+import { AuthTokenRegistrar, useAuthGate } from './lib/useAuthGate';
 import { useSomaSession } from './lib/useSomaSession';
 import { useBilling } from './lib/useBilling';
 import { isOnboardingComplete } from './lib/onboarding';
@@ -62,7 +62,6 @@ import {
   getDeploymentStatus,
   getUserRouting,
   listConversations,
-  setAuthTokenGetter,
   type BillingAccessState,
   type ConversationSummary,
   type DeploymentStatus,
@@ -264,7 +263,7 @@ function CortexShell() {
     [groupId, groups],
   );
   const activeGroupId = activeGroup.id;
-  const { isLoaded, isSignedIn, userId, getToken, clerkEnabled } = useAuthGate();
+  const { isLoaded, isSignedIn, userId, clerkEnabled } = useAuthGate();
   // Auto-creates user's Soma identity + session-scoped delegation on sign-in
   useSomaSession(userId ?? 'anonymous', isSignedIn);
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -296,10 +295,6 @@ function CortexShell() {
   const handleConversationsChanged = useCallback(() => {
     setConversationListVersion((version) => version + 1);
   }, []);
-
-  useEffect(() => {
-    if (getToken) setAuthTokenGetter(getToken);
-  }, [getToken]);
 
   useEffect(() => {
     let cancelled = false;
@@ -1097,6 +1092,7 @@ function CortexShell() {
 export default function App() {
   return (
     <BrowserRouter>
+      <AuthTokenRegistrar />
       <Routes>
         {/* Mission control — the six panes of cortex/plan/SURFACE.md.
             Chat is the sixth pane and a doorway; it keeps "/" until F2 moves
