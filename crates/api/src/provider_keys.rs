@@ -47,9 +47,13 @@ pub async fn list_keys(
     Ok(Json(db.list_provider_keys(&user.user_id)))
 }
 
-#[derive(Deserialize)]
+/// `api_key` and `unlock` are wiped from memory (`zeroize::ZeroizeOnDrop`)
+/// the moment this request goes out of scope -- covering every early-return
+/// path in `save_key`, not just its final line.
+#[derive(Deserialize, zeroize::ZeroizeOnDrop)]
 pub struct SaveKeyRequest {
     api_key: String,
+    #[zeroize(skip)]
     device_id: String,
     /// Base64url (no padding) of the 32-byte AES-256-GCM secret this browser
     /// generated for this device. Never logged, never stored -- used once to

@@ -71,6 +71,29 @@ describe('save / load / clear round trip', () => {
   });
 });
 
+describe('anonymous / empty user id', () => {
+  it('never saves, loads, or clears a device key for the "anonymous" placeholder', () => {
+    const key = generateZenDeviceKey();
+    saveZenDeviceKey('anonymous', key);
+    expect(loadZenDeviceKey('anonymous')).toBeNull();
+    expect(window.localStorage.getItem('cortex.zenDeviceKey.anonymous')).toBeNull();
+
+    // Seed as if a bug elsewhere wrote under the placeholder anyway --
+    // loading it back must still refuse.
+    window.localStorage.setItem('cortex.zenDeviceKey.anonymous', JSON.stringify(key));
+    expect(loadZenDeviceKey('anonymous')).toBeNull();
+
+    expect(() => clearZenDeviceKey('anonymous')).not.toThrow();
+  });
+
+  it('never saves, loads, or clears a device key for an empty user id', () => {
+    const key = generateZenDeviceKey();
+    saveZenDeviceKey('', key);
+    expect(loadZenDeviceKey('')).toBeNull();
+    expect(window.localStorage.getItem('cortex.zenDeviceKey.')).toBeNull();
+  });
+});
+
 describe('malformed / unavailable storage', () => {
   it('returns null for malformed JSON', () => {
     window.localStorage.setItem('cortex.zenDeviceKey.user-1', 'not-json{{{');

@@ -30,6 +30,18 @@ export interface ZenDeviceKey {
 
 const SECRET_LEN = 32;
 
+/**
+ * `useAuthGate` falls back to the literal string `'anonymous'` for `userId`
+ * while Clerk has not finished loading (or has no signed-in user). Saving or
+ * loading a device key under that placeholder would let an unauthenticated
+ * caller read -- or silently overwrite -- whatever device key later loads
+ * for the *real* signed-in user on this browser once auth resolves. Every
+ * entry point in this module refuses `''` and `'anonymous'` for that reason.
+ */
+function isUsableUserId(userId: string): boolean {
+  return userId !== '' && userId !== 'anonymous';
+}
+
 function storageKey(userId: string): string {
   return `cortex.zenDeviceKey.${userId}`;
 }
@@ -70,6 +82,7 @@ function isZenDeviceKey(value: unknown): value is ZenDeviceKey {
  * rather than a crash.
  */
 export function loadZenDeviceKey(userId: string): ZenDeviceKey | null {
+  if (!isUsableUserId(userId)) return null;
   try {
     const raw = window.localStorage.getItem(storageKey(userId));
     if (!raw) return null;
@@ -82,6 +95,7 @@ export function loadZenDeviceKey(userId: string): ZenDeviceKey | null {
 
 /** Saves `key` as this browser's device key for `userId`. Never throws. */
 export function saveZenDeviceKey(userId: string, key: ZenDeviceKey): void {
+  if (!isUsableUserId(userId)) return;
   try {
     window.localStorage.setItem(storageKey(userId), JSON.stringify(key));
   } catch {
@@ -95,6 +109,7 @@ export function saveZenDeviceKey(userId: string, key: ZenDeviceKey): void {
  * customer explicitly removes the key from this device -- not on sign-out.
  */
 export function clearZenDeviceKey(userId: string): void {
+  if (!isUsableUserId(userId)) return;
   try {
     window.localStorage.removeItem(storageKey(userId));
   } catch {

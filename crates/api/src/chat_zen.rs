@@ -97,7 +97,9 @@ const KEY_UNREADABLE_MESSAGE: &str = "Re-enter your Zen key on this device in Se
 /// value into its two parts. Returns `None` for anything malformed -- the
 /// caller turns that into the same fixed 409 message either way, never the
 /// parse failure detail.
-pub(crate) fn parse_unlock_header(value: &str) -> Option<(String, [u8; byok::UNLOCK_LEN])> {
+pub(crate) fn parse_unlock_header(
+    value: &str,
+) -> Option<(String, zeroize::Zeroizing<[u8; byok::UNLOCK_LEN]>)> {
     let (device_id, unlock_b64) = value.split_once('.')?;
     if !byok::valid_device_id(device_id) {
         return None;

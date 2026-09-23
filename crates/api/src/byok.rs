@@ -60,6 +60,7 @@ use base64::Engine;
 use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Key};
 use rand::Rng;
+use zeroize::Zeroizing;
 
 /// Nonce length for AES-256-GCM, in bytes.
 pub const NONCE_LEN: usize = 12;
@@ -76,11 +77,11 @@ pub const UNLOCK_LEN: usize = 32;
 /// up captured in more places than the one call site that needs it;
 /// construct a fresh one from the decrypted bytes if more than one copy is
 /// truly needed.
-pub struct ZenApiKey(String);
+pub struct ZenApiKey(Zeroizing<String>);
 
 impl ZenApiKey {
     pub fn new(secret: String) -> Self {
-        Self(secret)
+        Self(Zeroizing::new(secret))
     }
 
     /// The plaintext key. Named loudly so a caller cannot reach for it by
@@ -149,11 +150,12 @@ fn aad(user_id: &str, provider: &str, device_id: &str) -> Vec<u8> {
 /// or the `X-Cortex-Key-Unlock` header) into the 32-byte AES-256-GCM key.
 /// Fails unless the decoded length is exactly [`UNLOCK_LEN`] -- this is the
 /// entire validity check; the browser is trusted to generate it randomly.
-pub fn decode_unlock(unlock: &str) -> Result<[u8; UNLOCK_LEN], ByokError> {
+pub fn decode_unlock(unlock: &str) -> Result<Zeroizing<[u8; UNLOCK_LEN]>, ByokError> {
     let bytes = URL_SAFE_NO_PAD
         .decode(unlock)
         .map_err(|_| ByokError::MalformedUnlock)?;
-    bytes.try_into().map_err(|_| ByokError::MalformedUnlock)
+    let array: [u8; UNLOCK_LEN] = bytes.try_into().map_err(|_| ByokError::MalformedUnlock)?;
+    Ok(Zeroizing::new(array))
 }
 
 /// A shape check for a `device_id`: bounded length, and only characters a
