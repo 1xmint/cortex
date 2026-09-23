@@ -19,6 +19,7 @@ yanked = "deny"
 ignore = [
     # Add RustSec IDs here with a one-line reason and a date, e.g.
     # { id = "RUSTSEC-0000-0000", reason = "no upgrade path yet; revisit 2026-10" },
+    { id = "RUSTSEC-2023-0071", reason = "rsa is reached only via jsonwebtoken rust_crypto for RS256 public-key verification of Clerk JWTs; Marvin needs private-key ops; no fixed rsa release; revisit 2026-12" },
 ]
 
 [bans]

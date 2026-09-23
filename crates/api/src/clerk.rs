@@ -591,6 +591,25 @@ mod tests {
     const ISSUER: Option<&str> = Some("https://clerk.heyvera.org");
     const AUTHORIZED_PARTY: Option<&str> = Some("https://heyvera.org");
 
+    /// A well-formed RS256 token with a bad signature must be rejected with an
+    /// error. Without a jsonwebtoken crypto backend this panicked instead,
+    /// which dropped every signed-in request in production.
+    #[test]
+    fn verify_token_checks_signature_without_panicking() {
+        // RFC 7517 appendix A.1 example RSA public key.
+        let keys = vec![JwkKey {
+            kid: "k1".into(),
+            kty: "RSA".into(),
+            n: "0vx7agoebGcQSuuPiLJXZptN9nndrQmbXEps2aiAFbWhM78LhWx4cbbfAAtVT86zwu1RK7aPFFxuhDR1L6tSoc_BJECPebWKRXjBZCiFV4n3oknjhMstn64tZ_2W-5JsGY4Hc5n9yBXArwl93lqt7_RN5w6Cf0h4QyQ5v-65YGjQR0_FDW2QvzqY368QQMicAtaSqzs8KJZgnYb9c7d0zgdAZHzu6qMQvRL5hajrn1n91CbOpbISD08qNLyrdkt-bFTWhAI4vMQFh6WeZu0fM4lFd2NcRwr3XPksINHaQ-G_xBniIqbw0Ls1jF44-csFCur-kEgU8awapJzKnqDKgw".into(),
+            e: "AQAB".into(),
+        }];
+        // {"alg":"RS256","typ":"JWT","kid":"k1"} . {"sub":"user_1","exp":4102444800} . junk
+        let token = "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6ImsxIn0.eyJzdWIiOiJ1c2VyXzEiLCJleHAiOjQxMDI0NDQ4MDB9.AAAA";
+        let error = verify_token(token, &keys).expect_err("a forged signature must be rejected");
+        assert!(error.contains("JWT verification failed"), "{error}");
+        assert!(error.contains("InvalidSignature"), "{error}");
+    }
+
     #[test]
     fn production_auth_requires_every_trust_anchor() {
         assert_eq!(
