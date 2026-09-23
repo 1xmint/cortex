@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useState } from 'react';
 import { ChevronDown, Lock } from 'lucide-react';
 import { getChatModels, type ChatModelEntry } from '../../lib/cortexApi';
+import { useAuthGate } from '../../lib/useAuthGate';
+import { loadZenDeviceKey } from '../../lib/zenDeviceKey';
 
 /** `unavailable_reason` -> the short copy shown next to a disabled Zen entry. */
 function reasonLabel(reason: string | null): string {
@@ -9,8 +11,6 @@ function reasonLabel(reason: string | null): string {
       return 'add a key';
     case 'key_rejected':
       return 'key rejected';
-    case 'byok_disabled':
-      return 'unavailable';
     default:
       return 'unavailable';
   }
@@ -31,19 +31,24 @@ interface ModelPickerProps {
 }
 
 export default function ModelPicker({ selectedModel, onSelect, onOpenModelSettings, zenKeyError }: ModelPickerProps) {
+  const { userId } = useAuthGate();
   const [models, setModels] = useState<ChatModelEntry[]>([]);
   const [open, setOpen] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
 
   const load = useCallback(async () => {
     try {
-      const { models: next } = await getChatModels();
+      // Only send this device's id -- never its secret -- and only when a
+      // local device key exists, so the server can report whether *this*
+      // device's Zen key is usable.
+      const deviceId = loadZenDeviceKey(userId)?.deviceId;
+      const { models: next } = await getChatModels(deviceId);
       setModels(next);
       setLoadError(null);
     } catch (err) {
       setLoadError(err instanceof Error ? err.message : 'Could not load models');
     }
-  }, []);
+  }, [userId]);
 
   useEffect(() => {
     void load();

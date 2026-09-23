@@ -2,7 +2,7 @@
 //! Write-only: nothing here ever returns more than the last 4 characters of
 //! a saved key, and the request body is never logged or echoed back.
 //!
-//! See `crates/api/src/byok.rs` for the cipher and master-key scheme, and
+//! See `crates/api/src/byok.rs` for the split-key cipher scheme, and
 //! `crates/api/src/db/provider_keys.rs` for the row shape.
 
 use std::collections::{HashMap, VecDeque};
@@ -16,24 +16,17 @@ use serde::Deserialize;
 
 use crate::byok::{self, ByokError};
 use crate::clerk::ClerkUser;
+use crate::db::ProviderKeyCapError;
 use crate::db::ProviderKeySummary;
+use crate::db::MAX_DEVICES_PER_PROVIDER;
 use crate::routes::{db_ref, ApiResult, ErrorResponse};
 use crate::state::AppState;
 
-/// Providers this endpoint accepts. Only `zen` today — see plan D2/D5.
+/// Providers this endpoint accepts. Only `zen` today -- see plan D2/D5.
 const SUPPORTED_PROVIDERS: &[&str] = &["zen"];
 
 fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
-}
-
-fn feature_off() -> (StatusCode, Json<ErrorResponse>) {
-    (
-        StatusCode::SERVICE_UNAVAILABLE,
-        Json(ErrorResponse {
-            error: "provider keys are not enabled".into(),
-        }),
-    )
 }
 
 fn bad_provider() -> (StatusCode, Json<ErrorResponse>) {
@@ -54,9 +47,18 @@ pub async fn list_keys(
     Ok(Json(db.list_provider_keys(&user.user_id)))
 }
 
-#[derive(Deserialize)]
+/// `api_key` and `unlock` are wiped from memory (`zeroize::ZeroizeOnDrop`)
+/// the moment this request goes out of scope -- covering every early-return
+/// path in `save_key`, not just its final line.
+#[derive(Deserialize, zeroize::ZeroizeOnDrop)]
 pub struct SaveKeyRequest {
     api_key: String,
+    #[zeroize(skip)]
+    device_id: String,
+    /// Base64url (no padding) of the 32-byte AES-256-GCM secret this browser
+    /// generated for this device. Never logged, never stored -- used once to
+    /// encrypt `api_key`, then dropped.
+    unlock: String,
 }
 
 /// `PUT /api/provider-keys/{provider}`
@@ -64,17 +66,15 @@ pub struct SaveKeyRequest {
 /// The body is read into a typed struct up front (`SaveKeyRequest`) rather
 /// than logged or echoed anywhere: axum's default JSON rejection message can
 /// include the offending body, so a malformed request here still must not
-/// put the submitted key in a response or a log line. Nothing in this
-/// handler passes `body` or `request.api_key` to `tracing`.
+/// put the submitted key or unlock secret in a response or a log line.
+/// Nothing in this handler passes `body`, `request.api_key`, or
+/// `request.unlock` to `tracing`.
 pub async fn save_key(
     State(state): State<Arc<AppState>>,
     user: ClerkUser,
     Path(provider): Path<String>,
     body: axum::body::Bytes,
 ) -> ApiResult<StatusCode> {
-    if !byok::KekRing::enabled() {
-        return Err(feature_off());
-    }
     if !SUPPORTED_PROVIDERS.contains(&provider.as_str()) {
         return Err(bad_provider());
     }
@@ -107,18 +107,88 @@ pub async fn save_key(
         )
     })?;
 
-    let last4 = byok::last4_of(&request.api_key);
-    let encrypted =
-        byok::encrypt(&user.user_id, &provider, &request.api_key).map_err(map_byok_error)?;
+    if !byok::valid_device_id(&request.device_id) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "invalid device id".into(),
+            }),
+        ));
+    }
+
+    let unlock = byok::decode_unlock(&request.unlock).map_err(map_byok_error)?;
 
     let db = db_ref(&state)?;
-    db.upsert_provider_key(&user.user_id, &provider, &encrypted, &last4, now_ms());
 
-    Ok(StatusCode::NO_CONTENT)
+    let last4 = byok::last4_of(&request.api_key);
+    let encrypted = byok::encrypt(
+        &user.user_id,
+        &provider,
+        &request.device_id,
+        &unlock,
+        &request.api_key,
+    )
+    .map_err(map_byok_error)?;
+
+    // The existence check, device-cap count, and the write itself all
+    // happen inside one transaction (`upsert_provider_key_capped`) so two
+    // concurrent saves for new devices cannot both slip past the cap.
+    let result = db.upsert_provider_key_capped(
+        &user.user_id,
+        &provider,
+        &request.device_id,
+        &encrypted,
+        &last4,
+        now_ms(),
+    );
+
+    match result {
+        Ok(()) => Ok(StatusCode::NO_CONTENT),
+        Err(ProviderKeyCapError::CapReached) => Err((
+            StatusCode::CONFLICT,
+            Json(ErrorResponse {
+                error: format!(
+                    "you already have {MAX_DEVICES_PER_PROVIDER} devices saved for this provider; remove one before adding another"
+                ),
+            }),
+        )),
+        Err(ProviderKeyCapError::Db(msg)) => {
+            tracing::error!(error = %msg, "failed to save provider key");
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: "failed to store key".into(),
+                }),
+            ))
+        }
+    }
 }
 
-/// `DELETE /api/provider-keys/{provider}`
-pub async fn delete_key(
+/// `DELETE /api/provider-keys/{provider}/{device_id}` -- removes one device.
+pub async fn delete_key_device(
+    State(state): State<Arc<AppState>>,
+    user: ClerkUser,
+    Path((provider, device_id)): Path<(String, String)>,
+) -> ApiResult<StatusCode> {
+    if !SUPPORTED_PROVIDERS.contains(&provider.as_str()) {
+        return Err(bad_provider());
+    }
+    let db = db_ref(&state)?;
+    if db.delete_provider_key_device(&user.user_id, &provider, &device_id) {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err((
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: "no key saved for this provider on this device".into(),
+            }),
+        ))
+    }
+}
+
+/// `DELETE /api/provider-keys/{provider}` -- removes every device's key for
+/// this provider.
+pub async fn delete_key_all(
     State(state): State<Arc<AppState>>,
     user: ClerkUser,
     Path(provider): Path<String>,
@@ -127,7 +197,7 @@ pub async fn delete_key(
         return Err(bad_provider());
     }
     let db = db_ref(&state)?;
-    if db.delete_provider_key(&user.user_id, &provider) {
+    if db.delete_provider_keys_all_devices(&user.user_id, &provider) {
         Ok(StatusCode::NO_CONTENT)
     } else {
         Err((
@@ -141,9 +211,12 @@ pub async fn delete_key(
 
 fn map_byok_error(err: ByokError) -> (StatusCode, Json<ErrorResponse>) {
     match err {
-        ByokError::NotConfigured | ByokError::VersionUnavailable(_) | ByokError::MalformedKek => {
-            feature_off()
-        }
+        ByokError::MalformedUnlock => (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "invalid unlock secret".into(),
+            }),
+        ),
         ByokError::DecryptFailed => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ErrorResponse {
@@ -182,4 +255,11 @@ fn check_rate_limit(user_id: &str) -> bool {
         windows.insert(user_id.to_string(), window);
     }
     allowed
+}
+
+pub(crate) fn reset_save_limits() {
+    SAVE_WINDOWS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
 }

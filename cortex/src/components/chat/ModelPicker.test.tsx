@@ -12,11 +12,13 @@ vi.mock('../../lib/cortexApi', async () => {
 });
 
 import { getChatModels, type ChatModelEntry } from '../../lib/cortexApi';
+import { saveZenDeviceKey } from '../../lib/zenDeviceKey';
 import ModelPicker from './ModelPicker';
 
 afterEach(() => {
   vi.clearAllMocks();
   cleanup();
+  window.localStorage.clear();
 });
 
 const MODELS: ChatModelEntry[] = [
@@ -79,5 +81,24 @@ describe('ModelPicker', () => {
     // The picker itself never calls onSelect on its own in response to the error.
     expect(onSelect).not.toHaveBeenCalled();
     expect(getChatModels).toHaveBeenCalledTimes(1);
+  });
+
+  it('fetches models without a device header when this browser has no local Zen device key', async () => {
+    vi.mocked(getChatModels).mockResolvedValue({ models: MODELS });
+
+    render(<ModelPicker selectedModel={undefined} onSelect={vi.fn()} />);
+
+    await waitFor(() => expect(getChatModels).toHaveBeenCalledTimes(1));
+    expect(getChatModels).toHaveBeenCalledWith(undefined);
+  });
+
+  it('fetches models with this device\'s id (never a secret) when a local Zen device key exists', async () => {
+    vi.mocked(getChatModels).mockResolvedValue({ models: MODELS });
+    saveZenDeviceKey('local', { deviceId: 'device-abc', secret: 'super-secret-value' });
+
+    render(<ModelPicker selectedModel={undefined} onSelect={vi.fn()} />);
+
+    await waitFor(() => expect(getChatModels).toHaveBeenCalledTimes(1));
+    expect(getChatModels).toHaveBeenCalledWith('device-abc');
   });
 });

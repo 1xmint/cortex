@@ -3,7 +3,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use axum::extract::State;
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event, KeepAlive, KeepAliveStream, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
@@ -137,9 +137,17 @@ async fn resolve_provider(
     ProviderPath::None
 }
 
+/// The header carrying a BYOK unlock secret, `<device_id>.<base64url secret>`.
+/// Never logged: see `crate::lib`'s router construction comment.
+pub(crate) const KEY_UNLOCK_HEADER: &str = "x-cortex-key-unlock";
+/// The header carrying only a device id, for `GET /api/chat/models` to
+/// report that device's key status. Never carries a secret.
+pub(crate) const KEY_DEVICE_HEADER: &str = "x-cortex-key-device";
+
 pub async fn chat(
     State(state): State<Arc<AppState>>,
     user: ClerkUser,
+    headers: HeaderMap,
     Json(req): Json<ChatRequest>,
 ) -> Result<Sse<BoxedSseStream>, Response> {
     if req.message.len() > MAX_MESSAGE_LEN {
@@ -181,7 +189,19 @@ pub async fn chat(
         .map(str::to_string)
     {
         let system_prompt = system_prompt_for_intent(intent).to_string();
-        return crate::chat_zen::chat(State(state), user, req, zen_model, system_prompt).await;
+        let unlock_header = headers
+            .get(KEY_UNLOCK_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+        return crate::chat_zen::chat(
+            State(state),
+            user,
+            req,
+            zen_model,
+            system_prompt,
+            unlock_header,
+        )
+        .await;
     }
 
     // Billing hole guard: `/api/chat/models` is the only source of truth for
@@ -355,6 +375,7 @@ fn claude_tier_model_values() -> [&'static str; 3] {
 pub async fn chat_models(
     State(state): State<Arc<AppState>>,
     user: ClerkUser,
+    headers: HeaderMap,
 ) -> Json<ModelsResponse> {
     let mut models = Vec::new();
     for tier in ["fast", "balanced", "powerful"] {
@@ -368,26 +389,25 @@ pub async fn chat_models(
         });
     }
 
-    let byok_enabled = crate::byok::KekRing::enabled();
-    let key_status: Option<String> = if byok_enabled {
-        state
+    // BYOK is always available (no server-held master key to be missing);
+    // a device's key status is only known once that device names itself.
+    let device_id = headers
+        .get(KEY_DEVICE_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .filter(|id| crate::byok::valid_device_id(id));
+    let key_status: Option<String> = match device_id {
+        Some(device_id) => state
             .db
             .as_ref()
-            .and_then(|db| db.get_provider_key_row(&user.user_id, "zen"))
-            .map(|row| row.status)
-    } else {
-        None
+            .and_then(|db| db.get_provider_key_status(&user.user_id, "zen", device_id)),
+        None => None,
     };
 
     for model in crate::supplier_zen::allowed_models() {
-        let (available, reason) = if !byok_enabled {
-            (false, Some("byok_disabled"))
-        } else {
-            match key_status.as_deref() {
-                Some("active") => (true, None),
-                Some("rejected") => (false, Some("key_rejected")),
-                _ => (false, Some("needs_key")),
-            }
+        let (available, reason) = match key_status.as_deref() {
+            Some("active") => (true, None),
+            Some("rejected") => (false, Some("key_rejected")),
+            _ => (false, Some("needs_key")),
         };
         models.push(ModelEntry {
             provider: "zen".into(),

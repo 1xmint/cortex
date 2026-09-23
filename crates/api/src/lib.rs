@@ -68,6 +68,14 @@ pub fn build_gateway_cli_proof_router(
 ) -> Router {
     provider_gateway_http::proof_router(db, signing_key, authorization_id)
 }
+
+/// Clear the in-process "10 key saves per hour" counters. Route tests share
+/// one test user across a whole process, so they reset between cases; the
+/// limit itself is unchanged.
+#[doc(hidden)]
+pub fn reset_provider_key_save_limits() {
+    provider_keys::reset_save_limits();
+}
 pub mod stripe_client;
 mod usage_api;
 mod user;
@@ -552,9 +560,21 @@ pub fn build_cortex_router(state: Arc<AppState>) -> Router {
             "/api/provider-keys",
             get(provider_keys::list_keys),
         )
+        // `save_key`/`delete_key_all` bodies and headers must never reach a
+        // log line: the PUT body carries `unlock` (see `provider_keys::
+        // SaveKeyRequest`), and `chat`/`chat_models` below read
+        // `X-Cortex-Key-Unlock`/`X-Cortex-Key-Device` from request headers.
+        // `tower-http`'s `sensitive-headers` feature is not enabled in this
+        // workspace (see root `Cargo.toml`), so this is enforced by every
+        // handler simply never passing those values to `tracing`, rather
+        // than by a header-redaction layer.
         .route(
             "/api/provider-keys/{provider}",
-            put(provider_keys::save_key).delete(provider_keys::delete_key),
+            put(provider_keys::save_key).delete(provider_keys::delete_key_all),
+        )
+        .route(
+            "/api/provider-keys/{provider}/{device_id}",
+            delete(provider_keys::delete_key_device),
         )
         .route("/api/integrations/status", get(integrations::integration_status))
         .route("/api/integrations/slack/oauth/start", post(integrations::slack_oauth_start))
