@@ -74,11 +74,11 @@ describe('auth token getter registration order', () => {
     expect(new Headers(init?.headers).has('Authorization')).toBe(false);
   });
 
-  it('AuthTokenRegistrar registers during render, so first-mount fetches carry the bearer', async () => {
+  it('AuthTokenRegistrar registers during render, not in an effect, so a sibling mounted after it still gets the bearer on its first fetch', async () => {
     render(
       <>
-        <gate.AuthTokenRegistrar />
         <FetchOnMount />
+        <gate.AuthTokenRegistrar />
       </>,
     );
 
