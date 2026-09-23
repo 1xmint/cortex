@@ -101,6 +101,10 @@ export default function ModelKeysTab() {
   }
 
   async function handleDeleteOtherDevice(deviceId: string) {
+    // Requires confirmation first: this deletes another device's key without
+    // that device being present to notice, so it must not fire from a single
+    // click. Callers only reach this once `confirmingDeleteDevice` already
+    // matches `deviceId` (see the inline confirm/cancel row in the JSX below).
     setDeleting(true);
     setDeleteError(null);
     try {
@@ -243,22 +247,52 @@ export default function ModelKeysTab() {
                         Other devices
                       </p>
                       {otherDeviceEntries.map((entry) => (
-                        <div key={entry.device_id} className="flex items-center justify-between gap-2">
-                          <p className="text-xs text-[var(--muted)]">
-                            Zen key {maskedKey(entry.last4)}
-                            {entry.status === 'rejected' ? ' · rejected' : ''} · added{' '}
-                            {formatDate(entry.created_at)}
-                          </p>
-                          <button
-                            type="button"
-                            disabled={deleting}
-                            onClick={() => void handleDeleteOtherDevice(entry.device_id)}
-                            aria-label={`Remove device ${maskedKey(entry.last4)}`}
-                            className="inline-flex shrink-0 items-center gap-1 rounded-lg border border-red-500/40 bg-red-500/10 px-2 py-1 text-[10px] font-medium text-red-300 transition hover:bg-red-500/20 active:scale-95 disabled:opacity-30"
-                          >
-                            <Trash2 className="h-3 w-3" />
-                            Remove
-                          </button>
+                        <div key={entry.device_id} className="flex flex-col gap-2">
+                          <div className="flex items-center justify-between gap-2">
+                            <p className="text-xs text-[var(--muted)]">
+                              Zen key {maskedKey(entry.last4)}
+                              {entry.status === 'rejected' ? ' · rejected' : ''} · added{' '}
+                              {formatDate(entry.created_at)}
+                            </p>
+                            {confirmingDeleteDevice !== entry.device_id && (
+                              <button
+                                type="button"
+                                disabled={deleting}
+                                onClick={() => { setConfirmingDeleteDevice(entry.device_id); setDeleteError(null); }}
+                                aria-label={`Remove device ${maskedKey(entry.last4)}`}
+                                className="inline-flex shrink-0 items-center gap-1 rounded-lg border border-red-500/40 bg-red-500/10 px-2 py-1 text-[10px] font-medium text-red-300 transition hover:bg-red-500/20 active:scale-95 disabled:opacity-30"
+                              >
+                                <Trash2 className="h-3 w-3" />
+                                Remove
+                              </button>
+                            )}
+                          </div>
+                          {confirmingDeleteDevice === entry.device_id && (
+                            <div className="flex flex-col gap-2 rounded-lg border border-red-500/15 bg-red-500/5 p-3">
+                              <p className="text-xs text-red-200 flex items-center gap-1.5">
+                                <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
+                                Remove the Zen key {maskedKey(entry.last4)} from that device? Chats
+                                using Zen models will stop working there until a new key is added.
+                              </p>
+                              <div className="flex gap-2">
+                                <button
+                                  type="button"
+                                  onClick={() => setConfirmingDeleteDevice(null)}
+                                  className="rounded-lg border border-white/10 px-3 py-1.5 text-xs text-[var(--muted)] transition hover:text-white"
+                                >
+                                  Cancel
+                                </button>
+                                <button
+                                  type="button"
+                                  disabled={deleting}
+                                  onClick={() => void handleDeleteOtherDevice(entry.device_id)}
+                                  className="rounded-lg bg-red-500 px-3 py-1.5 text-xs font-medium text-white transition hover:bg-red-400 active:scale-95 disabled:opacity-30"
+                                >
+                                  {deleting ? 'Removing...' : 'Confirm remove'}
+                                </button>
+                              </div>
+                            </div>
+                          )}
                         </div>
                       ))}
                     </div>
