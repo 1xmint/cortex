@@ -26,7 +26,7 @@ pub use provider_gateway::{
     AdminHoldError, ProviderHoldRow, ProviderHoldsSummary, ProviderReservation, SpendAuthorization,
     HOLD_CAPACITY_WARN_SHARE, STALE_RESERVATION_AGE_MS,
 };
-pub use provider_keys::{ProviderKeyRow, ProviderKeySummary};
+pub use provider_keys::{ProviderKeyRow, ProviderKeySummary, MAX_DEVICES_PER_PROVIDER};
 
 pub struct Database {
     conn: Mutex<Connection>,
@@ -550,6 +550,9 @@ fn apply_migrations(conn: &Connection) {
     if current < 70 {
         migrate_v70(conn);
     }
+    if current < 71 {
+        migrate_v71(conn);
+    }
 }
 
 fn migrate_v68(conn: &Connection) {
@@ -732,6 +735,56 @@ fn migrate_v70(conn: &Connection) {
     .expect("migration v70 failed creating user_provider_keys");
 
     tracing::info!("applied migration v70: user_provider_keys (encrypted BYOK provider keys)");
+}
+
+fn migrate_v71(conn: &Connection) {
+    // Split-key BYOK: replaces `user_provider_keys` (v70) entirely. That
+    // table encrypted every row under a server-held master key
+    // (`CORTEX_BYOK_KEK_V<n>`); this one has no server-held key at all --
+    // the AES-256-GCM key is a 32-byte secret generated in the browser per
+    // device and sent with each save or chat request, never stored here.
+    // See `crates/api/src/byok.rs` for the cipher and threat model.
+    //
+    // `user_provider_keys` has zero real rows in production as of this
+    // migration (BYOK shipped behind the old scheme very recently and no
+    // customer has used it yet), so this drops it outright rather than
+    // attempting an in-place migration that would need a master key this
+    // server no longer has to even read the old rows.
+    //
+    // `PRIMARY KEY (user_id, provider, device_id)` makes "one key per
+    // provider per device per user" a schema fact: `upsert_provider_key`
+    // relies on this for its `ON CONFLICT` upsert, and a customer may now
+    // have several devices each holding their own copy of the same Zen key.
+    //
+    // Numbered v71: the maximum on main at rebase time was v70. `schema_version`
+    // is one counter shared with the HeyVera Socials product -- re-check the
+    // maximum before claiming a number, because whichever branch merges
+    // second has its migration silently skipped.
+    conn.execute_batch(
+        "DROP TABLE IF EXISTS user_provider_keys;
+
+        CREATE TABLE IF NOT EXISTS user_provider_device_keys (
+            user_id      TEXT NOT NULL,
+            provider     TEXT NOT NULL CHECK (provider IN ('zen')),
+            device_id    TEXT NOT NULL,
+            nonce        BLOB NOT NULL,
+            ciphertext   BLOB NOT NULL,
+            last4        TEXT NOT NULL,
+            status       TEXT NOT NULL DEFAULT 'active'
+                CHECK (status IN ('active', 'rejected')),
+            created_at   INTEGER NOT NULL,
+            updated_at   INTEGER NOT NULL,
+            last_used_at INTEGER,
+            PRIMARY KEY (user_id, provider, device_id)
+        );
+
+        UPDATE schema_version SET version = 71;",
+    )
+    .expect("migration v71 failed creating user_provider_device_keys");
+
+    tracing::info!(
+        "applied migration v71: user_provider_device_keys (split-key BYOK, no server master key)"
+    );
 }
 
 fn migrate_v67(conn: &Connection) {

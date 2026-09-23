@@ -2,23 +2,37 @@
 //! key"). Today this is OpenCode Zen only; see `provider_keys.rs` for the
 //! routes and `db/provider_keys.rs` for the row shape.
 //!
-//! # Master key (KEK)
+//! # Split-key scheme (no server master key)
 //!
-//! The key-encryption key comes from a versioned environment variable,
-//! `CORTEX_BYOK_KEK_V<n>`, 32 random bytes, base64-encoded (`openssl rand
-//! -base64 32`). `CORTEX_BYOK_KEK_CURRENT` names which version new writes
-//! use; reads use whichever version a row's `key_version` column says.
+//! There is **no server-held key-encryption key** (KEK) here. An earlier
+//! version of this module kept one in `CORTEX_BYOK_KEK_V<n>` env vars; that
+//! is gone. Instead, the 32-byte AES-256-GCM key for a given (user, device)
+//! is generated **in the browser** (`crypto.getRandomValues`, see
+//! `cortex/src/lib/zenDeviceKey.ts`) and sent to this server only inside the
+//! `unlock` field of a save request, or the `X-Cortex-Key-Unlock` header of a
+//! chat request. This server never persists that 32-byte secret anywhere: it
+//! is used in memory, once, to encrypt or decrypt, and then dropped.
+//!
+//! ## Threat model this buys
+//!
+//! - **Database or server-at-rest theft** (a stolen backup, a leaked SQLite
+//!   file): the attacker gets `nonce` and `ciphertext` columns only. Without
+//!   the browser-held secret, those decrypt to nothing.
+//! - **A page-script compromise (XSS) that can only read `localStorage`**:
+//!   the attacker gets the browser's half (`device_id` + secret) but not the
+//!   server's stored ciphertext, so they still cannot read a Zen key for a
+//!   *different* device that never had that secret, and stealing the local
+//!   value only exposes what that one device could already use for chat.
+//! - **What this does not buy**: a live compromise of this server process
+//!   while a chat request is in flight can still see the plaintext key for
+//!   that one request, in memory, for the duration of that request -- the
+//!   same as any server that ever calls out to a third-party API on a
+//!   customer's behalf. There is no way to avoid this and still let Cortex's
+//!   server make the outbound Zen call.
 //!
 //! This is a **dedicated** secret, not derived from `CLERK_SECRET_KEY` or any
-//! other auth secret. A deleted helper in this codebase once derived a
-//! storage key from the Clerk secret; rotating Clerk would have silently made
-//! every stored customer key unreadable, and it tied an auth secret to a
-//! storage secret for no reason. Do not bring that back —
+//! other auth secret, and it never touches this module either --
 //! `grep -rn "CLERK_SECRET_KEY" crates/api/src/byok.rs` must stay empty.
-//!
-//! **No KEK means the feature is off.** There is no dev fallback key in any
-//! build, test or otherwise — tests set `CORTEX_BYOK_KEK_V1` explicitly. The
-//! old helper's `"dev-only-insecure-key-replace-me!"` must not come back.
 //!
 //! # Cipher
 //!
@@ -27,37 +41,41 @@
 //! `soma` (ADR-0003) and BYOK must work with `soma` off, so it is not used
 //! here.
 //!
-//! The nonce is 12 random bytes, freshly generated on every write — reusing a
-//! nonce under the same key breaks AES-GCM's confidentiality and integrity
-//! guarantees, so each row's `nonce` column is independent even when a key is
-//! replaced.
+//! The nonce is 12 random bytes, freshly generated on every write -- reusing
+//! a nonce under the same key breaks AES-GCM's confidentiality and integrity
+//! guarantees, so each row's `nonce` column is independent even when the
+//! same device re-saves a key.
 //!
-//! The additional authenticated data (AAD) binds the ciphertext to the row it
-//! belongs to: `"cortex-byok:v1:" || user_id || ":" || provider`. A ciphertext
-//! moved to another user's row, or to another provider's column, fails to
-//! decrypt (`aes_gcm::Error`, which carries no detail) rather than silently
+//! The additional authenticated data (AAD) binds the ciphertext to the exact
+//! row it belongs to: `"cortex-byok:v2:" || user_id || ":" || provider ||
+//! ":" || device_id`. A ciphertext moved to another user's row, another
+//! provider's column, or another device's row fails to decrypt
+//! (`aes_gcm::Error`, which carries no detail) rather than silently
 //! decrypting into garbage that then gets sent to a provider on someone
 //! else's behalf.
 
-use std::collections::HashMap;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine;
 
 use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Key};
-use base64::{engine::general_purpose::STANDARD, Engine};
 use rand::Rng;
 
 /// Nonce length for AES-256-GCM, in bytes.
 pub const NONCE_LEN: usize = 12;
+
+/// Length of the browser-generated unlock secret, in bytes.
+pub const UNLOCK_LEN: usize = 32;
 
 /// A decrypted provider API key, held in memory only for the duration of one
 /// request.
 ///
 /// Deliberately opaque: no `Display`, no `Serialize`, and `Debug` is
 /// hand-written to redact the value so a stray `{:?}` in a log line or panic
-/// message cannot leak it. No `Clone` either — cloning is how a value ends up
-/// captured in more places than the one call site that needs it; construct
-/// a fresh one from the decrypted bytes if more than one copy is truly
-/// needed.
+/// message cannot leak it. No `Clone` either -- cloning is how a value ends
+/// up captured in more places than the one call site that needs it;
+/// construct a fresh one from the decrypted bytes if more than one copy is
+/// truly needed.
 pub struct ZenApiKey(String);
 
 impl ZenApiKey {
@@ -93,114 +111,72 @@ pub fn last4_of(secret: &str) -> String {
     }
 }
 
-/// One customer-provider key's on-disk representation.
+/// One customer-provider-device key's on-disk representation.
 #[derive(Debug)]
 pub struct EncryptedKey {
-    pub key_version: i64,
     pub nonce: Vec<u8>,
     pub ciphertext: Vec<u8>,
 }
 
-/// Why a KEK operation failed. Deliberately does not carry the underlying
-/// `aes_gcm::Error` (it has no useful detail) or any key material.
+/// Why a split-key operation failed. Deliberately does not carry the
+/// underlying `aes_gcm::Error` (it has no useful detail) or any key
+/// material.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ByokError {
-    /// No `CORTEX_BYOK_KEK_V<current>` is configured. The feature is off.
-    NotConfigured,
-    /// A specific `key_version` was requested but that KEK version's env var
-    /// is unset. This is the "operator retired a KEK a row still needs"
-    /// case — recoverable by the customer re-entering their key, not a bug.
-    VersionUnavailable(i64),
-    /// Decryption failed: wrong key, wrong AAD (wrong user/provider), or a
-    /// corrupted row.
+    /// Decryption failed: wrong unlock secret, wrong AAD (wrong
+    /// user/provider/device), or a corrupted row.
     DecryptFailed,
-    /// The configured KEK is not valid 32-byte base64.
-    MalformedKek,
+    /// The `unlock` value did not decode to exactly [`UNLOCK_LEN`] bytes.
+    MalformedUnlock,
 }
 
 impl std::fmt::Display for ByokError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ByokError::NotConfigured => write!(f, "provider keys are not enabled"),
-            ByokError::VersionUnavailable(v) => {
-                write!(f, "key encryption key version {v} is not available")
-            }
             ByokError::DecryptFailed => write!(f, "failed to decrypt stored key"),
-            ByokError::MalformedKek => write!(f, "master key is malformed"),
+            ByokError::MalformedUnlock => write!(f, "malformed unlock secret"),
         }
     }
 }
 
 impl std::error::Error for ByokError {}
 
-/// Reads `CORTEX_BYOK_KEK_V<n>` / `CORTEX_BYOK_KEK_CURRENT` from the process
-/// environment on every call. Env vars, not a cached snapshot, so an operator
-/// rotating in a fresh version via the deploy's secret store takes effect on
-/// the next request without a restart-timed race — the tradeoff is one env
-/// lookup per encrypt/decrypt, which is negligible next to the AES-GCM call
-/// itself.
-pub struct KekRing;
-
-impl KekRing {
-    /// The version new writes should use, or `None` if BYOK is off (no
-    /// `CORTEX_BYOK_KEK_CURRENT`, or that version's key is unset).
-    pub fn current_version() -> Option<i64> {
-        let current: i64 = std::env::var("CORTEX_BYOK_KEK_CURRENT")
-            .ok()?
-            .trim()
-            .parse()
-            .ok()?;
-        Self::load(current).ok()?;
-        Some(current)
-    }
-
-    /// Whether BYOK is configured at all. Routes use this to return 503
-    /// "provider keys are not enabled" instead of touching the database.
-    pub fn enabled() -> bool {
-        Self::current_version().is_some()
-    }
-
-    fn load(version: i64) -> Result<[u8; 32], ByokError> {
-        let var = format!("CORTEX_BYOK_KEK_V{version}");
-        let raw = std::env::var(&var).map_err(|_| ByokError::VersionUnavailable(version))?;
-        let bytes = STANDARD
-            .decode(raw.trim())
-            .map_err(|_| ByokError::MalformedKek)?;
-        let arr: [u8; 32] = bytes.try_into().map_err(|_| ByokError::MalformedKek)?;
-        Ok(arr)
-    }
-
-    /// Every KEK version currently configured, for `rewrap_provider_keys`
-    /// and admin/introspection. Scans `CORTEX_BYOK_KEK_V1` upward and stops
-    /// at the first gap, which matches how versions are meant to be assigned
-    /// (a contiguous, ever-increasing sequence; retiring one only removes
-    /// its own env var once nothing references it, per the module doc).
-    pub fn configured_versions() -> Vec<i64> {
-        let mut versions = Vec::new();
-        let mut v = 1i64;
-        loop {
-            if std::env::var(format!("CORTEX_BYOK_KEK_V{v}")).is_ok() {
-                versions.push(v);
-                v += 1;
-            } else {
-                break;
-            }
-        }
-        versions
-    }
+fn aad(user_id: &str, provider: &str, device_id: &str) -> Vec<u8> {
+    format!("cortex-byok:v2:{user_id}:{provider}:{device_id}").into_bytes()
 }
 
-fn aad(user_id: &str, provider: &str) -> Vec<u8> {
-    format!("cortex-byok:v1:{user_id}:{provider}").into_bytes()
+/// Decodes a base64url-no-padding `unlock` value (from a save request body
+/// or the `X-Cortex-Key-Unlock` header) into the 32-byte AES-256-GCM key.
+/// Fails unless the decoded length is exactly [`UNLOCK_LEN`] -- this is the
+/// entire validity check; the browser is trusted to generate it randomly.
+pub fn decode_unlock(unlock: &str) -> Result<[u8; UNLOCK_LEN], ByokError> {
+    let bytes = URL_SAFE_NO_PAD
+        .decode(unlock)
+        .map_err(|_| ByokError::MalformedUnlock)?;
+    bytes.try_into().map_err(|_| ByokError::MalformedUnlock)
 }
 
-/// Encrypt `plaintext` for `(user_id, provider)` under the current KEK
-/// version. Fails with [`ByokError::NotConfigured`] if no current KEK is set
-/// — callers must check this before ever prompting for or receiving a key.
-pub fn encrypt(user_id: &str, provider: &str, plaintext: &str) -> Result<EncryptedKey, ByokError> {
-    let version = KekRing::current_version().ok_or(ByokError::NotConfigured)?;
-    let key_bytes = KekRing::load(version)?;
-    let key: &Key<Aes256Gcm> = &key_bytes.into();
+/// A shape check for a `device_id`: bounded length, and only characters a
+/// UUID (or a similar client-generated id) would ever contain. This is not
+/// cryptographic -- it exists so a malformed or oversized value from a
+/// client is rejected with 400 before it reaches the database or the AAD,
+/// not to constrain what a legitimate browser-generated `crypto.randomUUID()`
+/// can produce.
+pub fn valid_device_id(id: &str) -> bool {
+    !id.is_empty() && id.len() <= 64 && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+}
+
+/// Encrypt `plaintext` for `(user_id, provider, device_id)` under the
+/// caller-supplied 32-byte unlock secret. The secret is never read from any
+/// server-side config -- it always comes from the request that called this.
+pub fn encrypt(
+    user_id: &str,
+    provider: &str,
+    device_id: &str,
+    unlock: &[u8; UNLOCK_LEN],
+    plaintext: &str,
+) -> Result<EncryptedKey, ByokError> {
+    let key: &Key<Aes256Gcm> = unlock.into();
     let cipher = Aes256Gcm::new(key);
 
     let mut nonce_bytes = [0u8; NONCE_LEN];
@@ -211,28 +187,29 @@ pub fn encrypt(user_id: &str, provider: &str, plaintext: &str) -> Result<Encrypt
             &nonce_bytes.into(),
             Payload {
                 msg: plaintext.as_bytes(),
-                aad: &aad(user_id, provider),
+                aad: &aad(user_id, provider, device_id),
             },
         )
         .map_err(|_| ByokError::DecryptFailed)?;
 
     Ok(EncryptedKey {
-        key_version: version,
         nonce: nonce_bytes.to_vec(),
         ciphertext,
     })
 }
 
-/// Decrypt a stored row for `(user_id, provider)`. Fails if the row's
-/// `key_version` KEK is unavailable, or if the ciphertext/AAD do not match —
-/// including a ciphertext that belongs to a different user or provider.
+/// Decrypt a stored row for `(user_id, provider, device_id)` using the
+/// caller-supplied unlock secret. Fails if the ciphertext/AAD/secret do not
+/// match -- including a ciphertext that belongs to a different user,
+/// provider, or device, or a secret that is simply wrong.
 pub fn decrypt(
     user_id: &str,
     provider: &str,
+    device_id: &str,
+    unlock: &[u8; UNLOCK_LEN],
     encrypted: &EncryptedKey,
 ) -> Result<ZenApiKey, ByokError> {
-    let key_bytes = KekRing::load(encrypted.key_version)?;
-    let key: &Key<Aes256Gcm> = &key_bytes.into();
+    let key: &Key<Aes256Gcm> = unlock.into();
     let cipher = Aes256Gcm::new(key);
 
     if encrypted.nonce.len() != NONCE_LEN {
@@ -249,7 +226,7 @@ pub fn decrypt(
             &nonce_bytes.into(),
             Payload {
                 msg: &encrypted.ciphertext,
-                aad: &aad(user_id, provider),
+                aad: &aad(user_id, provider, device_id),
             },
         )
         .map_err(|_| ByokError::DecryptFailed)?;
@@ -257,13 +234,6 @@ pub fn decrypt(
     String::from_utf8(plaintext)
         .map(ZenApiKey::new)
         .map_err(|_| ByokError::DecryptFailed)
-}
-
-/// Re-encrypt a row under the current KEK version if it is not already
-/// there. Idempotent: called again on an already-current row, `should_rewrap`
-/// is false and nothing happens.
-pub fn should_rewrap(row_version: i64, current_version: i64) -> bool {
-    row_version != current_version
 }
 
 /// Format validation for a submitted key, independent of any live check
@@ -281,163 +251,121 @@ pub fn validate_key_format(candidate: &str) -> Result<(), &'static str> {
     Ok(())
 }
 
-/// Rewraps every stored row whose `key_version` is not the current one,
-/// re-encrypting it under the current KEK and leaving everything else about
-/// the row unchanged. Returns how many rows were rewrapped, keyed by
-/// provider, for a startup log line.
-///
-/// Bounded and idempotent: a row already at the current version is skipped,
-/// so running this at every startup costs nothing once a fleet has finished
-/// rotating. It does nothing (`current_version` is `None`) when BYOK is off.
-///
-/// A row that fails to decrypt or re-encrypt is left as-is (for the customer
-/// to re-enter their key) rather than failing the whole batch; the number of
-/// such rows is logged here — never the row's user, provider, or key
-/// material — so a stuck rotation is visible instead of silently skipped.
-pub fn rewrap_provider_keys(db: &crate::db::Database) -> Result<HashMap<String, usize>, ByokError> {
-    let Some(current) = KekRing::current_version() else {
-        return Ok(HashMap::new());
-    };
-    let rows = db.list_provider_key_rows_needing_rewrap(current);
-    let mut rewrapped: HashMap<String, usize> = HashMap::new();
-    let mut skipped: usize = 0;
-    for row in rows {
-        let old_version = row.key_version;
-        let old_nonce = row.nonce.clone();
-        let encrypted = EncryptedKey {
-            key_version: row.key_version,
-            nonce: row.nonce.clone(),
-            ciphertext: row.ciphertext.clone(),
-        };
-        let plaintext = match decrypt(&row.user_id, &row.provider, &encrypted) {
-            Ok(p) => p,
-            Err(_) => {
-                // Unreadable under any KEK we have; leave it for the
-                // customer to re-enter.
-                skipped += 1;
-                continue;
-            }
-        };
-        match encrypt(&row.user_id, &row.provider, plaintext.expose_secret()) {
-            Ok(fresh) => {
-                db.rewrap_provider_key_row(
-                    &row.user_id,
-                    &row.provider,
-                    old_version,
-                    &old_nonce,
-                    &fresh,
-                );
-                *rewrapped.entry(row.provider.clone()).or_insert(0) += 1;
-            }
-            Err(_) => skipped += 1,
+/// Logs one warning naming any legacy `CORTEX_BYOK_KEK_*` env var that is
+/// still set at startup -- names only, never values, since these were base64
+/// key material under the old scheme. Purely informational: this server no
+/// longer reads them for anything.
+pub fn warn_if_legacy_kek_env_present() {
+    let mut found: Vec<String> = Vec::new();
+    if std::env::var("CORTEX_BYOK_KEK_CURRENT").is_ok() {
+        found.push("CORTEX_BYOK_KEK_CURRENT".to_string());
+    }
+    let mut v = 1i64;
+    loop {
+        let name = format!("CORTEX_BYOK_KEK_V{v}");
+        if std::env::var(&name).is_ok() {
+            found.push(name);
+            v += 1;
+        } else {
+            break;
         }
     }
-    if skipped > 0 {
+    if !found.is_empty() {
         tracing::warn!(
-            skipped,
-            "BYOK rewrap: rows skipped (decrypt/encrypt failed)"
+            vars = ?found,
+            "legacy CORTEX_BYOK_KEK_* env vars are set but no longer used (split-key BYOK has no server master key)"
         );
     }
-    Ok(rewrapped)
 }
 
-// Environment variables are process-global, and cargo runs unit tests across
-// this crate's whole test binary (including `db::provider_keys::tests`) on
-// multiple threads by default — two tests racing to set different
-// `CORTEX_BYOK_KEK_*` vars would be flaky. One lock, shared by every test
-// module that touches these vars, so two locks in the same binary can't fail
-// to exclude each other.
+/// Re-exported for callers/tests that still want to base64-encode arbitrary
+/// bytes for fixtures (e.g. a fake 32-byte unlock secret) without pulling in
+/// `base64` directly.
 #[cfg(test)]
-pub(crate) static BYOK_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+pub(crate) fn test_unlock_b64(bytes: [u8; UNLOCK_LEN]) -> String {
+    URL_SAFE_NO_PAD.encode(bytes)
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn with_test_kek<T>(f: impl FnOnce() -> T) -> T {
-        let _guard = BYOK_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::set_var("CORTEX_BYOK_KEK_V1", STANDARD.encode([7u8; 32]));
-        std::env::set_var("CORTEX_BYOK_KEK_CURRENT", "1");
-        let result = f();
-        std::env::remove_var("CORTEX_BYOK_KEK_V1");
-        std::env::remove_var("CORTEX_BYOK_KEK_CURRENT");
-        std::env::remove_var("CORTEX_BYOK_KEK_V2");
-        result
+    fn unlock(byte: u8) -> [u8; UNLOCK_LEN] {
+        [byte; UNLOCK_LEN]
     }
 
     #[test]
     fn round_trips() {
-        with_test_kek(|| {
-            let plaintext = "zen-test-SECRETSECRET1234";
-            let enc = encrypt("user-a", "zen", plaintext).expect("encrypt");
-            assert!(!enc
-                .ciphertext
-                .windows(plaintext.len())
-                .any(|w| w == plaintext.as_bytes()));
-            let dec = decrypt("user-a", "zen", &enc).expect("decrypt");
-            assert_eq!(dec.expose_secret(), plaintext);
-        });
+        let plaintext = "zen-test-SECRETSECRET1234";
+        let key = unlock(7);
+        let enc = encrypt("user-a", "zen", "device-1", &key, plaintext).expect("encrypt");
+        assert!(!enc
+            .ciphertext
+            .windows(plaintext.len())
+            .any(|w| w == plaintext.as_bytes()));
+        let dec = decrypt("user-a", "zen", "device-1", &key, &enc).expect("decrypt");
+        assert_eq!(dec.expose_secret(), plaintext);
     }
 
     #[test]
     fn encrypting_twice_uses_a_fresh_nonce_and_ciphertext() {
-        with_test_kek(|| {
-            let plaintext = "zen-test-SECRETSECRET1234";
-            let first = encrypt("user-a", "zen", plaintext).expect("encrypt 1");
-            let second = encrypt("user-a", "zen", plaintext).expect("encrypt 2");
-            assert_ne!(first.nonce, second.nonce, "nonces must not repeat");
-            assert_ne!(
-                first.ciphertext, second.ciphertext,
-                "ciphertexts must differ across independent encryptions"
-            );
-        });
+        let plaintext = "zen-test-SECRETSECRET1234";
+        let key = unlock(7);
+        let first = encrypt("user-a", "zen", "device-1", &key, plaintext).expect("encrypt 1");
+        let second = encrypt("user-a", "zen", "device-1", &key, plaintext).expect("encrypt 2");
+        assert_ne!(first.nonce, second.nonce, "nonces must not repeat");
+        assert_ne!(
+            first.ciphertext, second.ciphertext,
+            "ciphertexts must differ across independent encryptions"
+        );
     }
 
     #[test]
     fn wrong_user_cannot_decrypt() {
-        with_test_kek(|| {
-            let enc = encrypt("user-a", "zen", "secret-key-value").expect("encrypt");
-            let err = decrypt("user-b", "zen", &enc).unwrap_err();
-            assert_eq!(err, ByokError::DecryptFailed);
-        });
+        let key = unlock(7);
+        let enc = encrypt("user-a", "zen", "device-1", &key, "secret-key-value").expect("encrypt");
+        let err = decrypt("user-b", "zen", "device-1", &key, &enc).unwrap_err();
+        assert_eq!(err, ByokError::DecryptFailed);
     }
 
     #[test]
     fn wrong_provider_cannot_decrypt() {
-        with_test_kek(|| {
-            let enc = encrypt("user-a", "zen", "secret-key-value").expect("encrypt");
-            let err = decrypt("user-a", "other", &enc).unwrap_err();
-            assert_eq!(err, ByokError::DecryptFailed);
-        });
+        let key = unlock(7);
+        let enc = encrypt("user-a", "zen", "device-1", &key, "secret-key-value").expect("encrypt");
+        let err = decrypt("user-a", "other", "device-1", &key, &enc).unwrap_err();
+        assert_eq!(err, ByokError::DecryptFailed);
     }
 
     #[test]
-    fn no_kek_means_not_configured() {
-        let _guard = BYOK_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::remove_var("CORTEX_BYOK_KEK_V1");
-        std::env::remove_var("CORTEX_BYOK_KEK_CURRENT");
-        assert!(!KekRing::enabled());
-        let err = encrypt("user-a", "zen", "secret-key-value").unwrap_err();
-        assert_eq!(err, ByokError::NotConfigured);
+    fn wrong_device_cannot_decrypt() {
+        let key = unlock(7);
+        let enc = encrypt("user-a", "zen", "device-1", &key, "secret-key-value").expect("encrypt");
+        let err = decrypt("user-a", "zen", "device-2", &key, &enc).unwrap_err();
+        assert_eq!(err, ByokError::DecryptFailed);
     }
 
     #[test]
-    fn rotation_rewraps_under_new_version() {
-        with_test_kek(|| {
-            let old = encrypt("user-a", "zen", "secret-key-value").expect("encrypt v1");
-            assert_eq!(old.key_version, 1);
+    fn wrong_secret_cannot_decrypt() {
+        let key = unlock(7);
+        let other = unlock(9);
+        let enc = encrypt("user-a", "zen", "device-1", &key, "secret-key-value").expect("encrypt");
+        let err = decrypt("user-a", "zen", "device-1", &other, &enc).unwrap_err();
+        assert_eq!(err, ByokError::DecryptFailed);
+    }
 
-            std::env::set_var("CORTEX_BYOK_KEK_V2", STANDARD.encode([9u8; 32]));
-            std::env::set_var("CORTEX_BYOK_KEK_CURRENT", "2");
-
-            assert!(should_rewrap(old.key_version, 2));
-            let plaintext = decrypt("user-a", "zen", &old).expect("v1 key still readable");
-            let fresh = encrypt("user-a", "zen", plaintext.expose_secret()).expect("encrypt v2");
-            assert_eq!(fresh.key_version, 2);
-            assert!(!should_rewrap(fresh.key_version, 2));
-            let dec = decrypt("user-a", "zen", &fresh).expect("decrypt v2");
-            assert_eq!(dec.expose_secret(), plaintext.expose_secret());
-        });
+    #[test]
+    fn unlock_must_decode_to_32_bytes() {
+        assert!(decode_unlock(&test_unlock_b64(unlock(1))).is_ok());
+        assert_eq!(
+            decode_unlock("not-base64!!!").unwrap_err(),
+            ByokError::MalformedUnlock
+        );
+        // 16 bytes, valid base64url, wrong length.
+        let short = URL_SAFE_NO_PAD.encode([1u8; 16]);
+        assert_eq!(
+            decode_unlock(&short).unwrap_err(),
+            ByokError::MalformedUnlock
+        );
     }
 
     #[test]
@@ -459,5 +387,14 @@ mod tests {
         let key = ZenApiKey::new("zen-test-SECRETSECRET1234".to_string());
         let shown = format!("{key:?}");
         assert!(!shown.contains("SECRETSECRET"));
+    }
+
+    #[test]
+    fn device_id_shape_check() {
+        assert!(valid_device_id("3fa85f64-5717-4562-b3fc-2c963f66afa6"));
+        assert!(!valid_device_id(""));
+        assert!(!valid_device_id(&"a".repeat(65)));
+        assert!(!valid_device_id("has a space"));
+        assert!(!valid_device_id("has/slash"));
     }
 }
