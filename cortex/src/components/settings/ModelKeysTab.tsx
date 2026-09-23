@@ -73,12 +73,20 @@ export default function ModelKeysTab() {
     setSaving(true);
     setSaveError(null);
     try {
+      // Reuse this device's existing deviceId when there is one -- only the
+      // secret is fresh per save. Reusing the id makes "Replace" overwrite
+      // this device's row on the server instead of creating a new one,
+      // which would otherwise pile up rows toward the 10-device cap. A new
+      // deviceId is only generated the first time this browser saves a key.
+      const existing = loadZenDeviceKey(userId);
       const fresh = generateZenDeviceKey();
-      await saveProviderKey('zen', value, fresh.deviceId, fresh.secret);
+      const toSave = existing ? { deviceId: existing.deviceId, secret: fresh.secret } : fresh;
+      await saveProviderKey('zen', value, toSave.deviceId, toSave.secret);
       // Only persist the device key locally once the server has accepted
       // it -- a failed save must not leave this browser believing it has a
-      // working key the server never stored.
-      saveZenDeviceKey(userId, fresh);
+      // working key the server never stored, and must not strand the old
+      // key if this was a replace.
+      saveZenDeviceKey(userId, toSave);
       setKeyInput('');
       setEditing(false);
       await refresh();
@@ -89,6 +97,20 @@ export default function ModelKeysTab() {
       );
     } finally {
       setSaving(false);
+    }
+  }
+
+  async function handleDeleteOtherDevice(deviceId: string) {
+    setDeleting(true);
+    setDeleteError(null);
+    try {
+      await deleteProviderKeyDevice('zen', deviceId);
+      setConfirmingDeleteDevice(null);
+      await refresh();
+    } catch (err) {
+      setDeleteError(err instanceof Error ? err.message : 'Could not delete key');
+    } finally {
+      setDeleting(false);
     }
   }
 
@@ -221,11 +243,23 @@ export default function ModelKeysTab() {
                         Other devices
                       </p>
                       {otherDeviceEntries.map((entry) => (
-                        <p key={entry.device_id} className="text-xs text-[var(--muted)]">
-                          Zen key {maskedKey(entry.last4)}
-                          {entry.status === 'rejected' ? ' · rejected' : ''} · added{' '}
-                          {formatDate(entry.created_at)}
-                        </p>
+                        <div key={entry.device_id} className="flex items-center justify-between gap-2">
+                          <p className="text-xs text-[var(--muted)]">
+                            Zen key {maskedKey(entry.last4)}
+                            {entry.status === 'rejected' ? ' · rejected' : ''} · added{' '}
+                            {formatDate(entry.created_at)}
+                          </p>
+                          <button
+                            type="button"
+                            disabled={deleting}
+                            onClick={() => void handleDeleteOtherDevice(entry.device_id)}
+                            aria-label={`Remove device ${maskedKey(entry.last4)}`}
+                            className="inline-flex shrink-0 items-center gap-1 rounded-lg border border-red-500/40 bg-red-500/10 px-2 py-1 text-[10px] font-medium text-red-300 transition hover:bg-red-500/20 active:scale-95 disabled:opacity-30"
+                          >
+                            <Trash2 className="h-3 w-3" />
+                            Remove
+                          </button>
+                        </div>
                       ))}
                     </div>
                   )}

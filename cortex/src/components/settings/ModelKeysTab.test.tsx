@@ -201,6 +201,83 @@ describe('ModelKeysTab', () => {
     expect(loadZenDeviceKey('local')).toBeNull();
   });
 
+  it('reuses this device\'s deviceId on replace, changing only the secret', async () => {
+    vi.mocked(getProviderKeys)
+      .mockResolvedValueOnce([{ ...SUMMARY, status: 'rejected' }])
+      .mockResolvedValueOnce([SUMMARY]);
+    vi.mocked(saveProviderKey).mockResolvedValue(undefined);
+    seedLocalDeviceKey(THIS_DEVICE_ID);
+    const before = loadZenDeviceKey('local');
+
+    render(<ModelKeysTab />);
+
+    await waitFor(() => expect(screen.getByRole('button', { name: /replace/i })).toBeInTheDocument());
+    fireEvent.click(screen.getByRole('button', { name: /replace/i }));
+
+    const input = await screen.findByLabelText(/OpenCode Zen API key/i) as HTMLInputElement;
+    fireEvent.change(input, { target: { value: 'sk-new-secret-value' } });
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: /save key/i }));
+      await Promise.resolve();
+    });
+
+    await waitFor(() => expect(saveProviderKey).toHaveBeenCalledTimes(1));
+    const [, , deviceId, unlock] = vi.mocked(saveProviderKey).mock.calls[0];
+    expect(deviceId).toBe(THIS_DEVICE_ID);
+    expect(unlock).not.toBe(before?.secret);
+
+    const after = loadZenDeviceKey('local');
+    expect(after?.deviceId).toBe(THIS_DEVICE_ID);
+    expect(after?.secret).not.toBe(before?.secret);
+  });
+
+  it('keeps the old stored key when a replace save fails', async () => {
+    vi.mocked(getProviderKeys).mockResolvedValue([{ ...SUMMARY, status: 'rejected' }]);
+    vi.mocked(saveProviderKey).mockRejectedValue(new CortexApiError(400, 'zen rejected that key'));
+    seedLocalDeviceKey(THIS_DEVICE_ID);
+    const before = loadZenDeviceKey('local');
+
+    render(<ModelKeysTab />);
+
+    await waitFor(() => expect(screen.getByRole('button', { name: /replace/i })).toBeInTheDocument());
+    fireEvent.click(screen.getByRole('button', { name: /replace/i }));
+
+    const input = await screen.findByLabelText(/OpenCode Zen API key/i) as HTMLInputElement;
+    fireEvent.change(input, { target: { value: 'sk-new-secret-value' } });
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: /save key/i }));
+      await Promise.resolve();
+    });
+
+    await waitFor(() => expect(screen.getByText('zen rejected that key')).toBeInTheDocument());
+    expect(loadZenDeviceKey('local')).toEqual(before);
+  });
+
+  it('removes another device via its row button and refreshes the list', async () => {
+    const otherDeviceEntry = {
+      ...SUMMARY,
+      device_id: 'device-other-33333333-3333-3333-3333-333333333333',
+      last4: '4242',
+    };
+    vi.mocked(getProviderKeys)
+      .mockResolvedValueOnce([SUMMARY, otherDeviceEntry])
+      .mockResolvedValueOnce([SUMMARY]);
+    vi.mocked(deleteProviderKeyDevice).mockResolvedValue(undefined);
+    seedLocalDeviceKey(THIS_DEVICE_ID);
+
+    render(<ModelKeysTab />);
+
+    await waitFor(() => expect(screen.getByText(/••••4242/)).toBeInTheDocument());
+    fireEvent.click(screen.getByRole('button', { name: /remove device ••••4242/i }));
+
+    await waitFor(() => expect(deleteProviderKeyDevice).toHaveBeenCalledWith('zen', otherDeviceEntry.device_id));
+    await waitFor(() => expect(screen.queryByText(/••••4242/)).not.toBeInTheDocument());
+    // Removing another device must not touch this device's stored key.
+    expect(loadZenDeviceKey('local')?.deviceId).toBe(THIS_DEVICE_ID);
+  });
+
   it('shows a rejected key for this device with Replace available', async () => {
     vi.mocked(getProviderKeys).mockResolvedValue([{ ...SUMMARY, status: 'rejected' }]);
     seedLocalDeviceKey(THIS_DEVICE_ID);
