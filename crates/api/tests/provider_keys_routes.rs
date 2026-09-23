@@ -342,9 +342,11 @@ async fn logs_never_contain_a_submitted_key_or_unlock() {
         .with_writer(move || BufWriter(writer_buf.clone()))
         .finish();
 
-    let _dispatch_guard = tracing::subscriber::set_default(subscriber);
-
+    // Take the test lock before installing the capture, so no other case is
+    // running while this one listens and the capture holds only these
+    // requests.
     let (_serial, app) = router().await;
+    let _dispatch_guard = tracing::subscriber::set_default(subscriber);
     let unlock = test_unlock();
 
     // A valid key.
@@ -399,7 +401,8 @@ async fn logs_never_contain_a_submitted_key_or_unlock() {
     // means the subscriber saw nothing and the check below would prove nothing.
     assert!(
         captured.contains("request completed"),
-        "log capture saw nothing"
+        "log capture saw no request log ({} bytes captured)",
+        captured.len()
     );
     assert!(
         !captured.contains("SECRETSECRET"),
