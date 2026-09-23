@@ -245,3 +245,10 @@ fn check_rate_limit(user_id: &str) -> bool {
     }
     allowed
 }
+
+pub(crate) fn reset_save_limits() {
+    SAVE_WINDOWS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
+}

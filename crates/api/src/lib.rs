@@ -68,6 +68,14 @@ pub fn build_gateway_cli_proof_router(
 ) -> Router {
     provider_gateway_http::proof_router(db, signing_key, authorization_id)
 }
+
+/// Clear the in-process "10 key saves per hour" counters. Route tests share
+/// one test user across a whole process, so they reset between cases; the
+/// limit itself is unchanged.
+#[doc(hidden)]
+pub fn reset_provider_key_save_limits() {
+    provider_keys::reset_save_limits();
+}
 pub mod stripe_client;
 mod usage_api;
 mod user;

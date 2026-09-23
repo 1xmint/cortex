@@ -20,7 +20,15 @@ fn test_unlock() -> String {
     URL_SAFE_NO_PAD.encode([7u8; 32])
 }
 
-async fn router() -> axum::Router {
+/// Every case runs as the same test user, and the "10 key saves per hour"
+/// limit is process-wide, so cases take this lock and start from a clean
+/// counter instead of spending each other's saves.
+static SERIAL: once_cell::sync::Lazy<tokio::sync::Mutex<()>> =
+    once_cell::sync::Lazy::new(|| tokio::sync::Mutex::new(()));
+
+async fn router() -> (tokio::sync::MutexGuard<'static, ()>, axum::Router) {
+    let serial = SERIAL.lock().await;
+    cortex_api::reset_provider_key_save_limits();
     std::env::set_var("CORTEX_AUTH_DISABLED", "1");
     let dir = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(dir.path().join(".cortex")).unwrap();
@@ -30,7 +38,7 @@ async fn router() -> axum::Router {
         None,
     )
     .await;
-    cortex_api::build_cortex_router(state)
+    (serial, cortex_api::build_cortex_router(state))
 }
 
 async fn send(
@@ -69,7 +77,7 @@ async fn json_body(response: axum::response::Response) -> serde_json::Value {
 /// never the submitted key or the unlock secret.
 #[tokio::test]
 async fn put_then_get_returns_only_last4() {
-    let app = router().await;
+    let (_serial, app) = router().await;
 
     let put = send(
         &app,
@@ -107,7 +115,7 @@ async fn put_then_get_returns_only_last4() {
 /// device id is 400. An unlock that isn't 32 bytes is 400.
 #[tokio::test]
 async fn put_rejects_bad_provider_and_bad_key_and_bad_device_and_bad_unlock() {
-    let app = router().await;
+    let (_serial, app) = router().await;
 
     let bad_provider = send(
         &app,
@@ -173,7 +181,7 @@ async fn put_rejects_bad_provider_and_bad_key_and_bad_device_and_bad_unlock() {
 /// DELETE one device then GET is empty; DELETE again is 404.
 #[tokio::test]
 async fn delete_one_device_then_get_is_empty_and_repeat_delete_is_404() {
-    let app = router().await;
+    let (_serial, app) = router().await;
 
     let put = send(
         &app,
@@ -214,7 +222,7 @@ async fn delete_one_device_then_get_is_empty_and_repeat_delete_is_404() {
 /// DELETE without a device id removes every device's row for the provider.
 #[tokio::test]
 async fn delete_all_devices_removes_every_row() {
-    let app = router().await;
+    let (_serial, app) = router().await;
 
     for device in ["device-1", "device-2"] {
         let put = send(
@@ -250,7 +258,7 @@ async fn delete_all_devices_removes_every_row() {
 /// writes no row; the 10 existing rows are untouched.
 #[tokio::test]
 async fn an_eleventh_device_is_refused_with_409() {
-    let app = router().await;
+    let (_serial, app) = router().await;
 
     for i in 0..10 {
         let put = send(
@@ -267,6 +275,9 @@ async fn an_eleventh_device_is_refused_with_409() {
         assert_eq!(put.status(), StatusCode::NO_CONTENT);
     }
 
+    // Ten saves used the hourly allowance; clear it so the 11th save is
+    // judged by the device cap alone.
+    cortex_api::reset_provider_key_save_limits();
     let eleventh = send(
         &app,
         Method::PUT,
@@ -285,6 +296,7 @@ async fn an_eleventh_device_is_refused_with_409() {
     assert_eq!(value.as_array().unwrap().len(), 10);
 
     // Replacing an existing device's key never counts against the cap.
+    cortex_api::reset_provider_key_save_limits();
     let replace = send(
         &app,
         Method::PUT,
@@ -332,7 +344,7 @@ async fn logs_never_contain_a_submitted_key_or_unlock() {
 
     let _dispatch_guard = tracing::subscriber::set_default(subscriber);
 
-    let app = router().await;
+    let (_serial, app) = router().await;
     let unlock = test_unlock();
 
     // A valid key.
@@ -407,7 +419,7 @@ async fn logs_never_contain_a_submitted_key_or_unlock() {
 /// unit tests (`db/provider_keys.rs`) instead of here.
 #[tokio::test]
 async fn a_saved_key_is_scoped_to_this_process_test_user_only() {
-    let app = router().await;
+    let (_serial, app) = router().await;
     let put = send(
         &app,
         Method::PUT,
