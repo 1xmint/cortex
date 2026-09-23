@@ -119,13 +119,17 @@ pub(crate) async fn chat(
     req: ChatRequest,
     zen_model: String,
     system_prompt: String,
-    unlock_header: Option<String>,
+    unlock_header: Option<zeroize::Zeroizing<String>>,
 ) -> Result<Sse<BoxedSseStream>, Response> {
     if !supplier_zen::allowed_models().contains(&zen_model.as_str()) {
         return Err(bad_model(&zen_model));
     }
 
-    let Some((device_id, unlock)) = unlock_header.as_deref().and_then(parse_unlock_header) else {
+    let Some((device_id, unlock)) = unlock_header
+        .as_deref()
+        .map(String::as_str)
+        .and_then(parse_unlock_header)
+    else {
         return Err(zen_key_required(MISSING_UNLOCK_HEADER_MESSAGE.into()));
     };
 
@@ -776,7 +780,7 @@ mod tests {
             req,
             MODEL.into(),
             "system".into(),
-            Some(unlock_header),
+            Some(zeroize::Zeroizing::new(unlock_header)),
         )
         .await;
 
@@ -813,7 +817,7 @@ mod tests {
             req,
             MODEL.into(),
             "system".into(),
-            Some("not-a-valid-header".into()),
+            Some(zeroize::Zeroizing::new("not-a-valid-header".to_string())),
         )
         .await;
 
@@ -860,7 +864,7 @@ mod tests {
             req,
             MODEL.into(),
             "system".into(),
-            Some(format!("device-4c.{wrong_unlock}")),
+            Some(zeroize::Zeroizing::new(format!("device-4c.{wrong_unlock}"))),
         )
         .await;
 

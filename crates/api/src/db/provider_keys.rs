@@ -182,8 +182,12 @@ impl Database {
             )));
         }
 
-        conn.execute("COMMIT", [])
-            .map_err(|e| ProviderKeyCapError::Db(format!("failed to commit transaction: {e}")))?;
+        if let Err(e) = conn.execute("COMMIT", []) {
+            let _ = conn.execute("ROLLBACK", []);
+            return Err(ProviderKeyCapError::Db(format!(
+                "failed to commit transaction: {e}"
+            )));
+        }
         Ok(())
     }
 

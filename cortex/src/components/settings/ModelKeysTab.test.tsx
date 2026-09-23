@@ -271,11 +271,33 @@ describe('ModelKeysTab', () => {
 
     await waitFor(() => expect(screen.getByText(/••••4242/)).toBeInTheDocument());
     fireEvent.click(screen.getByRole('button', { name: /remove device ••••4242/i }));
+    fireEvent.click(await screen.findByRole('button', { name: /confirm remove/i }));
 
     await waitFor(() => expect(deleteProviderKeyDevice).toHaveBeenCalledWith('zen', otherDeviceEntry.device_id));
     await waitFor(() => expect(screen.queryByText(/••••4242/)).not.toBeInTheDocument());
     // Removing another device must not touch this device's stored key.
     expect(loadZenDeviceKey('local')?.deviceId).toBe(THIS_DEVICE_ID);
+  });
+
+  it('asks for confirmation before removing another device, and sends no DELETE on cancel', async () => {
+    const otherDeviceEntry = {
+      ...SUMMARY,
+      device_id: 'device-other-33333333-3333-3333-3333-333333333333',
+      last4: '4242',
+    };
+    vi.mocked(getProviderKeys).mockResolvedValue([SUMMARY, otherDeviceEntry]);
+    seedLocalDeviceKey(THIS_DEVICE_ID);
+
+    render(<ModelKeysTab />);
+
+    await waitFor(() => expect(screen.getByText(/••••4242/)).toBeInTheDocument());
+    fireEvent.click(screen.getByRole('button', { name: /remove device ••••4242/i }));
+
+    // The confirm row appears, and cancelling it must send no DELETE at all.
+    fireEvent.click(await screen.findByRole('button', { name: /cancel/i }));
+
+    expect(deleteProviderKeyDevice).not.toHaveBeenCalled();
+    expect(screen.getByText(/••••4242/)).toBeInTheDocument();
   });
 
   it('shows a rejected key for this device with Replace available', async () => {

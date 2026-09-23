@@ -60,7 +60,7 @@ use base64::Engine;
 use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Key};
 use rand::Rng;
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 /// Nonce length for AES-256-GCM, in bytes.
 pub const NONCE_LEN: usize = 12;
@@ -151,10 +151,19 @@ fn aad(user_id: &str, provider: &str, device_id: &str) -> Vec<u8> {
 /// Fails unless the decoded length is exactly [`UNLOCK_LEN`] -- this is the
 /// entire validity check; the browser is trusted to generate it randomly.
 pub fn decode_unlock(unlock: &str) -> Result<Zeroizing<[u8; UNLOCK_LEN]>, ByokError> {
-    let bytes = URL_SAFE_NO_PAD
-        .decode(unlock)
-        .map_err(|_| ByokError::MalformedUnlock)?;
-    let array: [u8; UNLOCK_LEN] = bytes.try_into().map_err(|_| ByokError::MalformedUnlock)?;
+    // `Zeroizing` wraps the decoded `Vec` immediately so every exit path
+    // (wrong length included) wipes it on drop instead of leaving the
+    // secret sitting in a freed heap allocation.
+    let bytes: Zeroizing<Vec<u8>> = Zeroizing::new(
+        URL_SAFE_NO_PAD
+            .decode(unlock)
+            .map_err(|_| ByokError::MalformedUnlock)?,
+    );
+    if bytes.len() != UNLOCK_LEN {
+        return Err(ByokError::MalformedUnlock);
+    }
+    let mut array = [0u8; UNLOCK_LEN];
+    array.copy_from_slice(&bytes);
     Ok(Zeroizing::new(array))
 }
 
@@ -235,7 +244,14 @@ pub fn decrypt(
 
     String::from_utf8(plaintext)
         .map(ZenApiKey::new)
-        .map_err(|_| ByokError::DecryptFailed)
+        .map_err(|e| {
+            // `FromUtf8Error` still owns the decrypted bytes on failure -- wipe
+            // them before dropping instead of leaving the key sitting in freed
+            // memory.
+            let mut bytes = e.into_bytes();
+            bytes.zeroize();
+            ByokError::DecryptFailed
+        })
 }
 
 /// Format validation for a submitted key, independent of any live check
