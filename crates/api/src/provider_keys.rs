@@ -16,6 +16,7 @@ use serde::Deserialize;
 
 use crate::byok::{self, ByokError};
 use crate::clerk::ClerkUser;
+use crate::db::ProviderKeyCapError;
 use crate::db::ProviderKeySummary;
 use crate::db::MAX_DEVICES_PER_PROVIDER;
 use crate::routes::{db_ref, ApiResult, ErrorResponse};
@@ -115,22 +116,6 @@ pub async fn save_key(
 
     let db = db_ref(&state)?;
 
-    // Device cap: an existing row for this exact device is a replace, not a
-    // new device, so it never counts against the cap.
-    let existing = db.get_provider_key_row(&user.user_id, &provider, &request.device_id);
-    if existing.is_none()
-        && db.count_provider_key_devices(&user.user_id, &provider) >= MAX_DEVICES_PER_PROVIDER
-    {
-        return Err((
-            StatusCode::CONFLICT,
-            Json(ErrorResponse {
-                error: format!(
-                    "you already have {MAX_DEVICES_PER_PROVIDER} devices saved for this provider; remove one before adding another"
-                ),
-            }),
-        ));
-    }
-
     let last4 = byok::last4_of(&request.api_key);
     let encrypted = byok::encrypt(
         &user.user_id,
@@ -141,7 +126,10 @@ pub async fn save_key(
     )
     .map_err(map_byok_error)?;
 
-    db.upsert_provider_key(
+    // The existence check, device-cap count, and the write itself all
+    // happen inside one transaction (`upsert_provider_key_capped`) so two
+    // concurrent saves for new devices cannot both slip past the cap.
+    let result = db.upsert_provider_key_capped(
         &user.user_id,
         &provider,
         &request.device_id,
@@ -150,7 +138,26 @@ pub async fn save_key(
         now_ms(),
     );
 
-    Ok(StatusCode::NO_CONTENT)
+    match result {
+        Ok(()) => Ok(StatusCode::NO_CONTENT),
+        Err(ProviderKeyCapError::CapReached) => Err((
+            StatusCode::CONFLICT,
+            Json(ErrorResponse {
+                error: format!(
+                    "you already have {MAX_DEVICES_PER_PROVIDER} devices saved for this provider; remove one before adding another"
+                ),
+            }),
+        )),
+        Err(ProviderKeyCapError::Db(msg)) => {
+            tracing::error!(error = %msg, "failed to save provider key");
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: "failed to store key".into(),
+                }),
+            ))
+        }
+    }
 }
 
 /// `DELETE /api/provider-keys/{provider}/{device_id}` -- removes one device.

@@ -26,7 +26,9 @@ pub use provider_gateway::{
     AdminHoldError, ProviderHoldRow, ProviderHoldsSummary, ProviderReservation, SpendAuthorization,
     HOLD_CAPACITY_WARN_SHARE, STALE_RESERVATION_AGE_MS,
 };
-pub use provider_keys::{ProviderKeyRow, ProviderKeySummary, MAX_DEVICES_PER_PROVIDER};
+pub use provider_keys::{
+    ProviderKeyCapError, ProviderKeyRow, ProviderKeySummary, MAX_DEVICES_PER_PROVIDER,
+};
 
 pub struct Database {
     conn: Mutex<Connection>,

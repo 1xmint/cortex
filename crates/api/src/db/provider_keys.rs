@@ -9,10 +9,21 @@
 
 use super::*;
 use crate::byok::EncryptedKey;
+use rusqlite::OptionalExtension;
 
-/// Maximum device rows per (user, provider). Enforced by the route, not
-/// here -- this module only counts.
+/// Maximum device rows per (user, provider), enforced atomically inside
+/// `upsert_provider_key_capped`'s transaction.
 pub const MAX_DEVICES_PER_PROVIDER: i64 = 10;
+
+/// Why `upsert_provider_key_capped` refused to write.
+#[derive(Debug)]
+pub enum ProviderKeyCapError {
+    /// This is a genuinely new device and `(user_id, provider)` already has
+    /// `MAX_DEVICES_PER_PROVIDER` rows.
+    CapReached,
+    /// A `rusqlite` failure unrelated to the cap (begin/read/write/commit).
+    Db(String),
+}
 
 /// What `GET /api/provider-keys` returns. Never carries `nonce` or
 /// `ciphertext` -- those fields do not exist on this type at all, so a future
@@ -74,6 +85,7 @@ impl Database {
 
     /// How many device rows already exist for `(user_id, provider)`, for the
     /// route's device-cap check (`byok::MAX_DEVICES_PER_PROVIDER`).
+    #[cfg(test)]
     pub fn count_provider_key_devices(&self, user_id: &str, provider: &str) -> i64 {
         let conn = self.conn();
         conn.query_row(
@@ -84,10 +96,19 @@ impl Database {
         .expect("count_provider_key_devices")
     }
 
-    /// Insert or replace the key for `(user_id, provider, device_id)`. Always
-    /// resets `status` to `'active'`: replacing a rejected key on the same
-    /// device should make it selectable again on the next chat request.
-    pub fn upsert_provider_key(
+    /// Insert or replace the key for `(user_id, provider, device_id)`,
+    /// enforcing `MAX_DEVICES_PER_PROVIDER` for genuinely new devices.
+    ///
+    /// The existence check, the device count, and the write all happen
+    /// inside one `BEGIN IMMEDIATE` transaction on this connection's single
+    /// lock, so two concurrent saves for new devices on the same
+    /// `(user_id, provider)` cannot both read "9 devices, room for one
+    /// more" and both insert -- `BEGIN IMMEDIATE` takes the writer lock up
+    /// front, so the second save blocks until the first commits and then
+    /// sees the up-to-date count. Always resets `status` to `'active'`:
+    /// replacing a rejected key on the same device should make it
+    /// selectable again on the next chat request.
+    pub fn upsert_provider_key_capped(
         &self,
         user_id: &str,
         provider: &str,
@@ -95,9 +116,45 @@ impl Database {
         encrypted: &EncryptedKey,
         last4: &str,
         now_ms: i64,
-    ) {
+    ) -> Result<(), ProviderKeyCapError> {
         let conn = self.conn();
-        conn.execute(
+
+        conn.execute("BEGIN IMMEDIATE", [])
+            .map_err(|e| ProviderKeyCapError::Db(format!("failed to begin transaction: {e}")))?;
+
+        let existing: bool = conn
+            .query_row(
+                "SELECT 1 FROM user_provider_device_keys
+                 WHERE user_id = ?1 AND provider = ?2 AND device_id = ?3",
+                params![user_id, provider, device_id],
+                |_| Ok(()),
+            )
+            .optional()
+            .map_err(|e| {
+                conn.execute("ROLLBACK", []).ok();
+                ProviderKeyCapError::Db(format!("failed to check existing device row: {e}"))
+            })?
+            .is_some();
+
+        if !existing {
+            let count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM user_provider_device_keys
+                     WHERE user_id = ?1 AND provider = ?2",
+                    params![user_id, provider],
+                    |row| row.get(0),
+                )
+                .map_err(|e| {
+                    conn.execute("ROLLBACK", []).ok();
+                    ProviderKeyCapError::Db(format!("failed to count device rows: {e}"))
+                })?;
+            if count >= MAX_DEVICES_PER_PROVIDER {
+                conn.execute("ROLLBACK", []).ok();
+                return Err(ProviderKeyCapError::CapReached);
+            }
+        }
+
+        let write = conn.execute(
             "INSERT INTO user_provider_device_keys
                 (user_id, provider, device_id, nonce, ciphertext, last4, status,
                  created_at, updated_at, last_used_at)
@@ -117,8 +174,35 @@ impl Database {
                 last4,
                 now_ms,
             ],
-        )
-        .expect("upsert user_provider_device_keys");
+        );
+        if let Err(e) = write {
+            conn.execute("ROLLBACK", []).ok();
+            return Err(ProviderKeyCapError::Db(format!(
+                "failed to upsert user_provider_device_keys: {e}"
+            )));
+        }
+
+        conn.execute("COMMIT", [])
+            .map_err(|e| ProviderKeyCapError::Db(format!("failed to commit transaction: {e}")))?;
+        Ok(())
+    }
+
+    /// Test/fixture convenience over `upsert_provider_key_capped` that
+    /// panics on any error, including the cap -- production code always
+    /// goes through `upsert_provider_key_capped` so the route can map a
+    /// reached cap to its 409 response.
+    #[cfg(test)]
+    pub fn upsert_provider_key(
+        &self,
+        user_id: &str,
+        provider: &str,
+        device_id: &str,
+        encrypted: &EncryptedKey,
+        last4: &str,
+        now_ms: i64,
+    ) {
+        self.upsert_provider_key_capped(user_id, provider, device_id, encrypted, last4, now_ms)
+            .expect("upsert_provider_key_capped");
     }
 
     /// Hard delete one device's row. Returns whether a row existed.
@@ -315,6 +399,62 @@ mod tests {
         assert!(!db.delete_provider_key_device("user-b", "zen", "device-1"));
         // user-a's row is untouched by user-b's attempts.
         assert_eq!(db.list_provider_keys("user-a").len(), 1);
+    }
+
+    #[test]
+    fn capped_upsert_refuses_an_11th_new_device_but_allows_replacing_an_existing_one() {
+        let db = test_db();
+        let key = unlock(3);
+
+        for i in 0..MAX_DEVICES_PER_PROVIDER {
+            let device = format!("device-{i}");
+            let enc =
+                byok::encrypt("user-a", "zen", &device, &key, "zen-test-SECRETSECRET1234").unwrap();
+            db.upsert_provider_key_capped("user-a", "zen", &device, &enc, "1234", 1000)
+                .expect("first 10 devices should be allowed");
+        }
+        assert_eq!(
+            db.list_provider_keys("user-a").len(),
+            MAX_DEVICES_PER_PROVIDER as usize
+        );
+
+        // An 11th, genuinely new device is refused.
+        let enc = byok::encrypt(
+            "user-a",
+            "zen",
+            "device-11th",
+            &key,
+            "zen-test-SECRETSECRET1234",
+        )
+        .unwrap();
+        let err = db
+            .upsert_provider_key_capped("user-a", "zen", "device-11th", &enc, "1234", 2000)
+            .expect_err("11th new device should be refused");
+        assert!(matches!(err, ProviderKeyCapError::CapReached));
+        assert_eq!(
+            db.list_provider_keys("user-a").len(),
+            MAX_DEVICES_PER_PROVIDER as usize
+        );
+
+        // Replacing an existing device's row is still allowed at the cap.
+        let replacement = byok::encrypt(
+            "user-a",
+            "zen",
+            "device-0",
+            &key,
+            "zen-test-SECRETSECRET5678",
+        )
+        .unwrap();
+        db.upsert_provider_key_capped("user-a", "zen", "device-0", &replacement, "5678", 3000)
+            .expect("replacing an existing device should be allowed at the cap");
+        assert_eq!(
+            db.list_provider_keys("user-a").len(),
+            MAX_DEVICES_PER_PROVIDER as usize
+        );
+        let row = db
+            .get_provider_key_row("user-a", "zen", "device-0")
+            .unwrap();
+        assert_eq!(row.updated_at, 3000);
     }
 
     #[test]
