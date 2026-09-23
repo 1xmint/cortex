@@ -40,6 +40,15 @@ const STREAM_RECONNECT_DELAYS_MS = [1000, 2000, 4000];
 const RETRYABLE_STATUSES = new Set([503]);
 
 /**
+ * Split-key BYOK headers -- see `crates/api/src/chat.rs`. `KEY_UNLOCK_HEADER`
+ * carries `<device_id>.<base64url secret>` and must only ever go on a Zen
+ * chat request (`streamChat` below enforces this); `KEY_DEVICE_HEADER`
+ * carries only the device id, for `getChatModels`, and never the secret.
+ */
+const KEY_UNLOCK_HEADER = 'X-Cortex-Key-Unlock';
+const KEY_DEVICE_HEADER = 'X-Cortex-Key-Device';
+
+/**
  * Wraps a fetch call with exponential-backoff retry logic.
  * Retries on 503 responses, network errors, and AbortError-free timeouts.
  * Attempts: up to 3 total (initial + 2 retries), delays: 1s / 2s / 4s.
@@ -283,15 +292,28 @@ export function streamChat(
    * must never be sent as `model`. See crates/api/src/chat.rs.
    */
   model?: string,
+  /**
+   * This browser's split-key BYOK device key (see `../lib/zenDeviceKey`).
+   * Attached as `X-Cortex-Key-Unlock` only when `model` is a `"zen:*"`
+   * selection -- never on any other request, including a Claude-tier chat
+   * call made with a device key present.
+   */
+  zenDeviceKey?: { deviceId: string; secret: string } | null,
 ): AbortController {
   const controller = new AbortController();
+  const isZenModel = model?.startsWith('zen:') ?? false;
 
   (async () => {
     for (let attempt = 0; attempt <= STREAM_RECONNECT_DELAYS_MS.length; attempt++) {
       try {
         const res = await authedFetch(apiUrl('/api/chat'), {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: {
+            'Content-Type': 'application/json',
+            ...(isZenModel && zenDeviceKey
+              ? { [KEY_UNLOCK_HEADER]: `${zenDeviceKey.deviceId}.${zenDeviceKey.secret}` }
+              : {}),
+          },
           body: JSON.stringify({
             message,
             file_paths: filePaths,
@@ -405,6 +427,7 @@ export function streamChat(
 
 export interface ProviderKeySummary {
   provider: string;
+  device_id: string;
   last4: string;
   status: 'active' | 'rejected' | string;
   created_at: number;
@@ -417,17 +440,29 @@ export async function getProviderKeys(): Promise<ProviderKeySummary[]> {
 }
 
 /**
- * `PUT /api/provider-keys/{provider}`. Resolves on 204; throws
- * `CortexApiError` with the server's message on 400 (bad key), 429 (rate
- * limit) or 503 (feature off). Callers must clear the key input after this
- * settles either way -- success or failure -- never on a timer, and never
- * hold the value anywhere else in state.
+ * `PUT /api/provider-keys/{provider}`. `deviceId`/`unlock` are this
+ * browser's split-key BYOK device id and base64url secret (see
+ * `../lib/zenDeviceKey`) -- the server encrypts `apiKey` with `unlock` and
+ * never stores it. Resolves on 204; throws `CortexApiError` with the
+ * server's message on 400 (bad key, bad device id, or malformed unlock) or
+ * 409 (10-device cap reached for this provider). Callers must clear the key
+ * input after this settles either way -- success or failure -- never on a
+ * timer, and never hold the value anywhere else in state. Callers must also
+ * only persist `deviceId`/`unlock` locally (via `saveZenDeviceKey`) after
+ * this resolves -- saving it before a successful response would leave the
+ * browser believing it has a working device key that the server never
+ * accepted.
  */
-export async function saveProviderKey(provider: string, apiKey: string): Promise<void> {
+export async function saveProviderKey(
+  provider: string,
+  apiKey: string,
+  deviceId: string,
+  unlock: string,
+): Promise<void> {
   const res = await authedFetch(apiUrl(`/api/provider-keys/${encodeURIComponent(provider)}`), {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ api_key: apiKey }),
+    body: JSON.stringify({ api_key: apiKey, device_id: deviceId, unlock }),
   });
   if (!res.ok) {
     if (res.status === 401) dispatchUnauthorized();
@@ -435,8 +470,28 @@ export async function saveProviderKey(provider: string, apiKey: string): Promise
   }
 }
 
-/** `DELETE /api/provider-keys/{provider}`. Resolves on 204, throws on 404. */
-export async function deleteProviderKey(provider: string): Promise<void> {
+/**
+ * `DELETE /api/provider-keys/{provider}/{device_id}`. Removes only that one
+ * device's row. Resolves on 204, throws on 404 (nothing saved for that
+ * device).
+ */
+export async function deleteProviderKeyDevice(provider: string, deviceId: string): Promise<void> {
+  const res = await authedFetch(
+    apiUrl(`/api/provider-keys/${encodeURIComponent(provider)}/${encodeURIComponent(deviceId)}`),
+    { method: 'DELETE' },
+  );
+  if (!res.ok) {
+    if (res.status === 401) dispatchUnauthorized();
+    throw new CortexApiError(res.status, await readErrorMessage(res), res.headers.get('Retry-After'));
+  }
+}
+
+/**
+ * `DELETE /api/provider-keys/{provider}`. Removes every device's saved key
+ * for this provider, not just this browser's. Resolves on 204, throws on
+ * 404 (nothing saved for any device).
+ */
+export async function deleteProviderKeyAllDevices(provider: string): Promise<void> {
   const res = await authedFetch(apiUrl(`/api/provider-keys/${encodeURIComponent(provider)}`), {
     method: 'DELETE',
   });
@@ -455,15 +510,22 @@ export interface ChatModelEntry {
   label: string;
   billing: 'credits' | 'your_zen_key' | string;
   available: boolean;
-  unavailable_reason: 'byok_disabled' | 'key_rejected' | 'needs_key' | string | null;
+  unavailable_reason: 'key_rejected' | 'needs_key' | string | null;
 }
 
 export interface ChatModelsResponse {
   models: ChatModelEntry[];
 }
 
-export async function getChatModels(): Promise<ChatModelsResponse> {
-  return requestJson<ChatModelsResponse>('/api/chat/models');
+/**
+ * `GET /api/chat/models`. `deviceId` is sent as `X-Cortex-Key-Device` only
+ * when this browser has a local Zen device key -- callers pass `undefined`
+ * otherwise. Only the id crosses the wire here, never the unlock secret.
+ */
+export async function getChatModels(deviceId?: string): Promise<ChatModelsResponse> {
+  return requestJson<ChatModelsResponse>('/api/chat/models', {
+    headers: deviceId ? { [KEY_DEVICE_HEADER]: deviceId } : undefined,
+  });
 }
 
 /**

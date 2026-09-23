@@ -2,11 +2,19 @@ import { useCallback, useEffect, useState } from 'react';
 import { AlertTriangle, KeyRound, Loader2, Trash2 } from 'lucide-react';
 import {
   CortexApiError,
-  deleteProviderKey,
+  deleteProviderKeyAllDevices,
+  deleteProviderKeyDevice,
   getProviderKeys,
   saveProviderKey,
   type ProviderKeySummary,
 } from '../../lib/cortexApi';
+import { useAuthGate } from '../../lib/useAuthGate';
+import {
+  clearZenDeviceKey,
+  generateZenDeviceKey,
+  loadZenDeviceKey,
+  saveZenDeviceKey,
+} from '../../lib/zenDeviceKey';
 
 function formatDate(ms: number | null | undefined): string {
   if (!ms) return 'never';
@@ -19,6 +27,7 @@ function maskedKey(last4: string): string {
 }
 
 export default function ModelKeysTab() {
+  const { userId } = useAuthGate();
   const [keys, setKeys] = useState<ProviderKeySummary[]>([]);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -30,9 +39,10 @@ export default function ModelKeysTab() {
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
 
-  const [confirmingDelete, setConfirmingDelete] = useState(false);
+  const [confirmingDeleteDevice, setConfirmingDeleteDevice] = useState<string | null>(null);
   const [deleting, setDeleting] = useState(false);
   const [deleteError, setDeleteError] = useState<string | null>(null);
+  const [confirmingDeleteAll, setConfirmingDeleteAll] = useState(false);
 
   const refresh = useCallback(async () => {
     setLoading(true);
@@ -51,14 +61,24 @@ export default function ModelKeysTab() {
     void refresh();
   }, [refresh]);
 
-  const zenKey = keys.find((k) => k.provider === 'zen') ?? null;
+  const zenKeys = keys.filter((k) => k.provider === 'zen');
+  const localDeviceKey = loadZenDeviceKey(userId);
+  const thisDeviceEntry = localDeviceKey
+    ? zenKeys.find((k) => k.device_id === localDeviceKey.deviceId) ?? null
+    : null;
+  const otherDeviceEntries = zenKeys.filter((k) => k.device_id !== localDeviceKey?.deviceId);
 
   async function handleSave() {
     const value = keyInput;
     setSaving(true);
     setSaveError(null);
     try {
-      await saveProviderKey('zen', value);
+      const fresh = generateZenDeviceKey();
+      await saveProviderKey('zen', value, fresh.deviceId, fresh.secret);
+      // Only persist the device key locally once the server has accepted
+      // it -- a failed save must not leave this browser believing it has a
+      // working key the server never stored.
+      saveZenDeviceKey(userId, fresh);
       setKeyInput('');
       setEditing(false);
       await refresh();
@@ -72,12 +92,28 @@ export default function ModelKeysTab() {
     }
   }
 
-  async function handleDelete() {
+  async function handleDeleteThisDevice(deviceId: string) {
     setDeleting(true);
     setDeleteError(null);
     try {
-      await deleteProviderKey('zen');
-      setConfirmingDelete(false);
+      await deleteProviderKeyDevice('zen', deviceId);
+      if (localDeviceKey?.deviceId === deviceId) clearZenDeviceKey(userId);
+      setConfirmingDeleteDevice(null);
+      await refresh();
+    } catch (err) {
+      setDeleteError(err instanceof Error ? err.message : 'Could not delete key');
+    } finally {
+      setDeleting(false);
+    }
+  }
+
+  async function handleDeleteAll() {
+    setDeleting(true);
+    setDeleteError(null);
+    try {
+      await deleteProviderKeyAllDevices('zen');
+      clearZenDeviceKey(userId);
+      setConfirmingDeleteAll(false);
       await refresh();
     } catch (err) {
       setDeleteError(err instanceof Error ? err.message : 'Could not delete key');
@@ -99,6 +135,10 @@ export default function ModelKeysTab() {
             OpenCode Zen: runs GLM, Kimi, DeepSeek and MiniMax on your own Zen account. Cortex
             does not charge credits for these; Zen bills you directly.
           </p>
+          <p className="mt-2 text-xs text-[var(--muted)]">
+            Your key is locked with a code kept only in this browser. It works only on devices
+            where you entered it.
+          </p>
 
           {loading ? (
             <div className="mt-3 flex items-center gap-2 text-xs text-[var(--muted)]">
@@ -108,48 +148,117 @@ export default function ModelKeysTab() {
           ) : loadError ? (
             <p className="mt-3 text-xs text-red-400" role="alert">{loadError}</p>
           ) : (
-            <div className="mt-3">
-              {zenKey && !editing ? (
+            <div className="mt-3 flex flex-col gap-3">
+              {zenKeys.length > 0 && !editing ? (
                 <div className="flex flex-col gap-2">
-                  {zenKey.status === 'rejected' ? (
-                    <p className="text-xs font-medium text-red-400" role="alert">
-                      Zen rejected this key
-                    </p>
-                  ) : (
-                    <p className="text-sm text-white">
-                      Zen key {maskedKey(zenKey.last4)} · added {formatDate(zenKey.created_at)} · last used{' '}
-                      {formatDate(zenKey.last_used_at)}
-                    </p>
+                  {thisDeviceEntry && (
+                    <div className="flex flex-col gap-1 rounded-lg border border-white/8 bg-white/[0.03] px-3 py-2">
+                      <p className="text-[10px] font-semibold uppercase tracking-wider text-[var(--muted)]">
+                        This device
+                      </p>
+                      {thisDeviceEntry.status === 'rejected' ? (
+                        <p className="text-xs font-medium text-red-400" role="alert">
+                          Zen rejected this key
+                        </p>
+                      ) : (
+                        <p className="text-sm text-white">
+                          Zen key {maskedKey(thisDeviceEntry.last4)} · added{' '}
+                          {formatDate(thisDeviceEntry.created_at)} · last used{' '}
+                          {formatDate(thisDeviceEntry.last_used_at)}
+                        </p>
+                      )}
+                      <div className="flex items-center gap-2">
+                        <button
+                          type="button"
+                          onClick={() => { setEditing(true); setSaveError(null); }}
+                          className="rounded-lg border border-white/10 bg-white/8 px-3 py-1.5 text-xs font-medium text-white transition hover:bg-white/12 active:scale-95"
+                        >
+                          Replace
+                        </button>
+                        {confirmingDeleteDevice !== thisDeviceEntry.device_id ? (
+                          <button
+                            type="button"
+                            onClick={() => { setConfirmingDeleteDevice(thisDeviceEntry.device_id); setDeleteError(null); }}
+                            className="inline-flex items-center gap-1.5 rounded-lg border border-red-500/40 bg-red-500/10 px-3 py-1.5 text-xs font-medium text-red-300 transition hover:bg-red-500/20 active:scale-95"
+                          >
+                            <Trash2 className="h-3.5 w-3.5" />
+                            Remove from this device
+                          </button>
+                        ) : null}
+                      </div>
+                      {confirmingDeleteDevice === thisDeviceEntry.device_id && (
+                        <div className="flex flex-col gap-2 rounded-lg border border-red-500/15 bg-red-500/5 p-3">
+                          <p className="text-xs text-red-200 flex items-center gap-1.5">
+                            <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
+                            Remove the Zen key from this device? Chats using Zen models will stop
+                            working on this device until you add a new one.
+                          </p>
+                          <div className="flex gap-2">
+                            <button
+                              type="button"
+                              onClick={() => setConfirmingDeleteDevice(null)}
+                              className="rounded-lg border border-white/10 px-3 py-1.5 text-xs text-[var(--muted)] transition hover:text-white"
+                            >
+                              Cancel
+                            </button>
+                            <button
+                              type="button"
+                              disabled={deleting}
+                              onClick={() => void handleDeleteThisDevice(thisDeviceEntry.device_id)}
+                              className="rounded-lg bg-red-500 px-3 py-1.5 text-xs font-medium text-white transition hover:bg-red-400 active:scale-95 disabled:opacity-30"
+                            >
+                              {deleting ? 'Removing...' : 'Confirm remove'}
+                            </button>
+                          </div>
+                        </div>
+                      )}
+                    </div>
                   )}
-                  <div className="flex items-center gap-2">
+
+                  {otherDeviceEntries.length > 0 && (
+                    <div className="flex flex-col gap-1 rounded-lg border border-white/8 bg-white/[0.03] px-3 py-2">
+                      <p className="text-[10px] font-semibold uppercase tracking-wider text-[var(--muted)]">
+                        Other devices
+                      </p>
+                      {otherDeviceEntries.map((entry) => (
+                        <p key={entry.device_id} className="text-xs text-[var(--muted)]">
+                          Zen key {maskedKey(entry.last4)}
+                          {entry.status === 'rejected' ? ' · rejected' : ''} · added{' '}
+                          {formatDate(entry.created_at)}
+                        </p>
+                      ))}
+                    </div>
+                  )}
+
+                  {!thisDeviceEntry && (
                     <button
                       type="button"
                       onClick={() => { setEditing(true); setSaveError(null); }}
-                      className="rounded-lg border border-white/10 bg-white/8 px-3 py-1.5 text-xs font-medium text-white transition hover:bg-white/12 active:scale-95"
+                      className="self-start rounded-lg bg-[var(--accent)] px-3 py-1.5 text-xs font-medium text-black transition hover:brightness-110 active:scale-95"
                     >
-                      Replace
+                      Add a key on this device
                     </button>
-                    {!confirmingDelete ? (
-                      <button
-                        type="button"
-                        onClick={() => { setConfirmingDelete(true); setDeleteError(null); }}
-                        className="inline-flex items-center gap-1.5 rounded-lg border border-red-500/40 bg-red-500/10 px-3 py-1.5 text-xs font-medium text-red-300 transition hover:bg-red-500/20 active:scale-95"
-                      >
-                        <Trash2 className="h-3.5 w-3.5" />
-                        Delete
-                      </button>
-                    ) : null}
-                  </div>
-                  {confirmingDelete && (
+                  )}
+
+                  {!confirmingDeleteAll ? (
+                    <button
+                      type="button"
+                      onClick={() => { setConfirmingDeleteAll(true); setDeleteError(null); }}
+                      className="self-start text-xs text-red-300 underline underline-offset-2 hover:text-red-200"
+                    >
+                      Remove from all devices
+                    </button>
+                  ) : (
                     <div className="flex flex-col gap-2 rounded-lg border border-red-500/15 bg-red-500/5 p-3">
                       <p className="text-xs text-red-200 flex items-center gap-1.5">
                         <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
-                        Delete your saved Zen key? Chats using Zen models will stop working until you add a new one.
+                        Remove the Zen key from every device? Chats using Zen models will stop
+                        working everywhere until keys are added again.
                       </p>
                       <div className="flex gap-2">
                         <button
                           type="button"
-                          onClick={() => setConfirmingDelete(false)}
+                          onClick={() => setConfirmingDeleteAll(false)}
                           className="rounded-lg border border-white/10 px-3 py-1.5 text-xs text-[var(--muted)] transition hover:text-white"
                         >
                           Cancel
@@ -157,15 +266,15 @@ export default function ModelKeysTab() {
                         <button
                           type="button"
                           disabled={deleting}
-                          onClick={() => void handleDelete()}
+                          onClick={() => void handleDeleteAll()}
                           className="rounded-lg bg-red-500 px-3 py-1.5 text-xs font-medium text-white transition hover:bg-red-400 active:scale-95 disabled:opacity-30"
                         >
-                          {deleting ? 'Deleting...' : 'Confirm delete'}
+                          {deleting ? 'Removing...' : 'Confirm remove from all devices'}
                         </button>
                       </div>
-                      {deleteError && <p className="text-xs text-red-400" role="alert">{deleteError}</p>}
                     </div>
                   )}
+                  {deleteError && <p className="text-xs text-red-400" role="alert">{deleteError}</p>}
                 </div>
               ) : (
                 <div className="flex flex-col gap-2">
@@ -191,7 +300,7 @@ export default function ModelKeysTab() {
                     >
                       {saving ? 'Saving...' : 'Save key'}
                     </button>
-                    {zenKey && (
+                    {zenKeys.length > 0 && (
                       <button
                         type="button"
                         disabled={saving}

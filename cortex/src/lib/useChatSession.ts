@@ -22,6 +22,7 @@ import {
   type ConversationMessage,
 } from './cortexApi';
 import { createImplementationMessage } from './projectImplementation';
+import { loadZenDeviceKey } from './zenDeviceKey';
 // TODO: Implement workspace routing integration
 // import {
 //   getWorkspaceContext,
@@ -1014,6 +1015,7 @@ export function useChatSession({
             }, errorContent);
           },
           modelForRequest,
+          modelForRequest ? loadZenDeviceKey(userId) : null,
         );
 
         abortRef.current = controller;
