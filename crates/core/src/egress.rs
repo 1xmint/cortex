@@ -70,6 +70,15 @@ pub fn expand_registry(name: &str) -> Option<Vec<String>> {
     None
 }
 
+/// The one host the provider gateway lives at.
+///
+/// Hardcoded, not read from configuration: the gateway bearer is the token
+/// that lets a sandbox spend Cortex's own supplier keys, and a compromised or
+/// misconfigured brain must not be able to redirect it to another host by
+/// setting an env var. Changing where the gateway lives is a code change and
+/// a deploy, on purpose.
+pub const PROVIDER_GATEWAY_HOST: &str = "api.heyvera.org";
+
 /// The single API host each provider's CLI must reach to do any work at all.
 ///
 /// One host per provider, and the entry is the whole grant. This is the same
@@ -86,7 +95,7 @@ pub fn expand_registry(name: &str) -> Option<Vec<String>> {
 pub const PROVIDER_ENDPOINTS: &[(ProviderId, &str)] = &[
     // Claude Code talks to the request-forwarding gateway. The supplier host
     // is deliberately absent from the sandbox allowlist.
-    (ProviderId::Claude, "cortex.heyvera.org"),
+    (ProviderId::Claude, PROVIDER_GATEWAY_HOST),
     (ProviderId::Openai, "api.openai.com"),
     (ProviderId::Gemini, "generativelanguage.googleapis.com"),
     // Zen is API-only and has no CLI, so no sandboxed step is ever routed to
@@ -537,7 +546,7 @@ mod tests {
         assert_eq!(merged.granted_registries().len(), 4);
 
         let hosts = merged.network_policy.allowed_hosts();
-        assert!(hosts.contains(&"cortex.heyvera.org".to_string()));
+        assert!(hosts.contains(&PROVIDER_GATEWAY_HOST.to_string()));
         assert!(hosts.contains(&"registry.npmjs.org".to_string()));
 
         // Every host still traces to a grant, which is what the worker
@@ -569,7 +578,7 @@ mod tests {
         let merged = EgressPlan::union(&read_only, &claude);
         assert_eq!(
             merged.network_policy.allowed_hosts(),
-            &["cortex.heyvera.org".to_string()]
+            &[PROVIDER_GATEWAY_HOST.to_string()]
         );
         assert_eq!(merged.granted_provider(), Some("claude"));
         assert!(merged.granted_registries().is_empty());
@@ -593,7 +602,7 @@ mod tests {
         let two = EgressPlan {
             network_policy: NetworkPolicy::Allowlist {
                 hosts: vec![
-                    "cortex.heyvera.org".to_string(),
+                    PROVIDER_GATEWAY_HOST.to_string(),
                     "api.openai.com".to_string(),
                 ],
             },

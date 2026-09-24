@@ -9,6 +9,11 @@
 # repository and were removed when Cortex became its own repository. If a
 # request for one of those arrives here it should 404, not be quietly proxied
 # somewhere; that is the point of not having a broad fallback.
+#
+# cortex.heyvera.org is now a Cloudflare Pages static site and no longer
+# reaches this host at all; the block below is what still needs a real
+# backend behind it. The provider gateway moved to api.heyvera.org, below,
+# because a Pages site cannot proxy anything.
 
 cortex.heyvera.org {
 	# API routes - MUST be first for priority.
@@ -21,8 +26,9 @@ cortex.heyvera.org {
 	#
 	# /metrics and /internal/provider/v1/messages are real routes and are
 	# deliberately NOT here. Prometheus scrapes over the private network and
-	# the provider endpoint is for the worker; neither belongs on the public
-	# hostname. Adding them would be a change in exposure, not a fix.
+	# the provider endpoint is on api.heyvera.org (see below); neither
+	# belongs on this public hostname. Adding them would be a change in
+	# exposure, not a fix.
 	@api path /api/* /v1/health /v1/ready
 	handle @api {
 		reverse_proxy localhost:3001 {
@@ -54,5 +60,26 @@ cortex.heyvera.org {
 		X-Content-Type-Options nosniff
 		X-Frame-Options DENY
 		Referrer-Policy strict-origin-when-cross-origin
+	}
+}
+
+# The provider gateway, and nothing else. A sandbox is handed a bearer that is
+# only valid against this host (see cortex_core::egress::PROVIDER_GATEWAY_HOST
+# and the worker's sandbox policy check), so this site must not grow a second
+# route: anything this proxies is somewhere that bearer can reach.
+api.heyvera.org {
+	@gateway path /internal/provider/*
+	handle @gateway {
+		reverse_proxy localhost:3001 {
+			header_up Host {upstream_hostport}
+			header_up X-Real-IP {remote}
+			header_up X-Forwarded-For {remote}
+			header_up X-Forwarded-Proto {scheme}
+		}
+	}
+
+	# No fallback: there is no other service on this hostname.
+	handle {
+		respond 404
 	}
 }

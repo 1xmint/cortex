@@ -2127,7 +2127,7 @@ mod tests {
         for (provider, host, other) in [
             (
                 ProviderId::Claude,
-                "cortex.heyvera.org",
+                cortex_core::egress::PROVIDER_GATEWAY_HOST,
                 "api.anthropic.com",
             ),
             (ProviderId::Openai, "api.openai.com", "api.anthropic.com"),
@@ -2194,7 +2194,9 @@ mod tests {
         );
         let effective = job.effective_egress.expect("recorded");
 
-        assert!(effective.iter().any(|e| e == "cortex.heyvera.org:443"));
+        let expected_gateway_endpoint =
+            format!("{}:443", cortex_core::egress::PROVIDER_GATEWAY_HOST);
+        assert!(effective.iter().any(|e| *e == expected_gateway_endpoint));
         assert!(effective.iter().any(|e| e == "index.crates.io:443"));
 
         let registries: Vec<_> = job

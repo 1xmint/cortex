@@ -219,7 +219,6 @@ fn literal_manifest_exactly_matches_cortex_router() {
 fn caddy_forwards_only_paths_the_cortex_backend_serves() {
     for host in [
         "\nheyvera.org, www.heyvera.org {",
-        "\napi.heyvera.org {",
         "\npulse.heyvera.org {",
     ] {
         assert!(
@@ -229,8 +228,8 @@ fn caddy_forwards_only_paths_the_cortex_backend_serves() {
     }
     assert_eq!(
         CADDYFILE.matches(".heyvera.org {").count(),
-        1,
-        "the Caddyfile serves the Cortex host and nothing else"
+        2,
+        "the Caddyfile serves the Cortex host and the provider gateway host, nothing else"
     );
     assert!(!CADDYFILE.contains("localhost:3402"), "legacy ClawNet port");
 
@@ -255,8 +254,9 @@ fn caddy_forwards_only_paths_the_cortex_backend_serves() {
     }
 
     // Real routes that are deliberately off the public hostname: Prometheus
-    // scrapes over the private network, and the provider endpoint is the
-    // worker's. Publishing either is a change in exposure, not a fix.
+    // scrapes over the private network, and the provider endpoint is on the
+    // gateway host below. Publishing either here would be a change in
+    // exposure, not a fix.
     for private in ["/metrics", "/internal/"] {
         assert!(
             !directives.contains(private),
@@ -273,6 +273,34 @@ fn caddy_forwards_only_paths_the_cortex_backend_serves() {
         upstreams,
         vec!["localhost:3001"],
         "cortex-api is the only backend this file knows"
+    );
+
+    // The provider gateway host: this is the only place `/internal/provider`
+    // may be reverse-proxied, and it must go to the same backend.
+    let gateway_host = format!("\n{} {{", cortex_core::egress::PROVIDER_GATEWAY_HOST);
+    assert!(
+        CADDYFILE.contains(&gateway_host),
+        "the provider gateway host constant and the Caddyfile must agree on where the gateway lives"
+    );
+    let gateway_site = caddy_site(&gateway_host).replace("\r\n", "\n");
+    let gateway_directives = gateway_site
+        .lines()
+        .filter(|line| !line.trim_start().starts_with('#'))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        gateway_directives.contains("@gateway path /internal/provider/*"),
+        "the gateway host forwards only the provider route"
+    );
+    let gateway_upstreams = gateway_directives
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("reverse_proxy "))
+        .map(|rest| rest.trim_end_matches('{').trim())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        gateway_upstreams,
+        vec!["localhost:3001"],
+        "the gateway forwards to the same cortex-api backend"
     );
 }
 

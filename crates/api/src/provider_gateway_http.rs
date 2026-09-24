@@ -31,7 +31,15 @@ use crate::provider_gateway::{
 use crate::state::AppState;
 
 const STUB_SUPPLIER_KEY: &str = "STUB-PROVIDER-NOT-A-REAL-KEY";
-const GATEWAY_BASE_URL: &str = "https://cortex.heyvera.org/internal/provider";
+
+/// Where the gateway itself is reachable, derived from the one host constant
+/// so this and the sandbox's allowlist/policy checks can never drift apart.
+static GATEWAY_BASE_URL: once_cell::sync::Lazy<String> = once_cell::sync::Lazy::new(|| {
+    format!(
+        "https://{}/internal/provider",
+        cortex_core::egress::PROVIDER_GATEWAY_HOST
+    )
+});
 
 /// Anthropic keys are far longer than this; anything shorter is a typo or a
 /// placeholder, and a placeholder must not switch real spending on.
@@ -125,7 +133,7 @@ pub(crate) fn issue_access(
         attempt_id: attempt_id.to_string(),
         provider: provider_label.into(),
         model: model.to_string(),
-        base_url: GATEWAY_BASE_URL.into(),
+        base_url: GATEWAY_BASE_URL.clone(),
         expires_at_ms,
         bearer: cortex_core::protocol::GatewayBearer::new(signed.expose()),
     })
