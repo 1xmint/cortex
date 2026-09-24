@@ -192,7 +192,14 @@ export function markSessionExpired(): void {
  * Auth is checked per handler on the server (a `ClerkUser` argument), not by
  * a router layer, so this list mirrors the handlers that take none.
  */
-const PUBLIC_PATH_PREFIXES = ['/api/health', '/api/deployment/', '/api/deploy-'];
+const PUBLIC_PATHS = new Set([
+  '/api/health',
+  '/api/deploy-info',
+  '/api/deploy-metadata',
+  '/api/deploy-status',
+  '/api/deployment/status',
+  '/api/deployment/events',
+]);
 
 function isPublicPath(url: string): boolean {
   let path: string;
@@ -201,7 +208,7 @@ function isPublicPath(url: string): boolean {
   } catch {
     return false;
   }
-  return PUBLIC_PATH_PREFIXES.some((prefix) => path.startsWith(prefix));
+  return PUBLIC_PATHS.has(path);
 }
 
 /**
