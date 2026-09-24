@@ -1564,6 +1564,16 @@ async fn try_heal(state: &AppState, _sched: &mut SchedulerState, run_id: &str, s
 
     let kind = parse_step_kind(&kind_str);
     if !kind.is_healable() {
+        // Nothing will repair this step, so whatever needed it to succeed
+        // can never start. Skip it now, or the run waits forever on steps
+        // that stay pending.
+        let skipped = db.cascade_failure(step_id);
+        if !skipped.is_empty() {
+            tracing::info!(
+                "step {step_id} ({kind_str}) cannot be healed: skipped {} downstream steps",
+                skipped.len()
+            );
+        }
         return;
     }
 
@@ -2634,5 +2644,25 @@ mod tests {
                 .iter()
                 .all(|route| route.provider == ProviderId::Claude));
         }
+    }
+
+    #[tokio::test]
+    async fn a_failed_heal_step_skips_the_retry_waiting_on_it() {
+        // Seen live: a heal step failed, heal steps are not healed again,
+        // and the retry that needed it sat pending with the run stuck.
+        let temporary = tempfile::tempdir().expect("temporary workspace");
+        let workspace = temporary.path().to_path_buf();
+        std::fs::create_dir_all(workspace.join(".cortex")).expect("workspace metadata");
+        let state = AppState::new(workspace.join(".cortex/ledger.jsonl"), workspace, None).await;
+        let db = state.db.as_ref().expect("database");
+        let run_id = db.create_run("user-1", "Heal fails", "auto", &[]);
+        let heal = db.create_step(&run_id, "heal", "standard", "medium", "Repair");
+        let retry = db.create_step(&run_id, "execute", "standard", "medium", "Retry");
+        db.add_step_dependency(&retry, &heal, "success_required");
+
+        let mut sched = SchedulerState::new();
+        try_heal(&state, &mut sched, &run_id, &heal).await;
+
+        assert_eq!(db.get_step_status(&retry).as_deref(), Some("skipped"));
     }
 }

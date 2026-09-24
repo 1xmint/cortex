@@ -10052,6 +10052,14 @@ impl Database {
             params![error, now, step_id, lease_gen],
         ).unwrap_or(0);
         if rows > 0 {
+            // A failed step is finished with its paths. Keeping the lease
+            // blocks whatever runs next on them until the TTL runs out.
+            let _ = conn.execute(
+                "UPDATE resource_leases
+                 SET status = 'released', released_at = ?1
+                 WHERE step_id = ?2 AND holder_type = 'step' AND status = 'active'",
+                params![now, step_id],
+            );
             let context = step_event_context(&conn, step_id);
             insert_operations_event(
                 &conn,
@@ -10093,6 +10101,12 @@ impl Database {
             params![error, now, step_id],
         ).unwrap_or(0);
         if rows > 0 {
+            let _ = conn.execute(
+                "UPDATE resource_leases
+                 SET status = 'released', released_at = ?1
+                 WHERE step_id = ?2 AND holder_type = 'step' AND status = 'active'",
+                params![now, step_id],
+            );
             let context = step_event_context(&conn, step_id);
             insert_operations_event(
                 &conn,
@@ -16697,6 +16711,22 @@ mod truth {
 
         db.acquire_step_path_leases("user-1", &run_id, "heal-1", "repo-1", &keys)
             .expect("a terminal step must not keep holding its paths");
+    }
+
+    #[test]
+    fn a_failed_step_frees_the_paths_it_held() {
+        // Seen live: a heal step failed, its lease stayed active, and the
+        // run could not finish until the TTL ran out.
+        let db = test_db();
+        let (run_id, gen) = leased_step(&db, "step-1");
+        let keys = vec![".".to_string()];
+        db.acquire_step_path_leases("user-1", &run_id, "step-1", "repo-1", &keys)
+            .expect("first holder");
+
+        assert!(db.fail_step("step-1", gen, "delivered nothing", None));
+
+        db.acquire_step_path_leases("user-1", &run_id, "next-1", "repo-1", &keys)
+            .expect("a failed step must not keep holding its paths");
     }
 
     #[test]
