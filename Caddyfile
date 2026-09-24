@@ -1,5 +1,7 @@
 # Cortex — Caddy reverse proxy config
-# Deploy to /etc/caddy/Caddyfile on the Cortex host.
+# Cortex's part of the shared /etc/caddy/Caddyfile on the Cortex host.
+# Merge it into that file by hand; copying it over the live file would drop
+# HeyVera's routes and sites.
 #
 # API:  localhost:3001         (cortex-api, the only backend this file knows)
 #
@@ -27,6 +29,11 @@
 # other routes on it: the worker's strict `https://{host}/` prefix check
 # (crates/worker/src/sandbox/policy.rs), the sandbox egress allowlist, and
 # /api/* requiring a Clerk JWT that the bearer does not carry.
+#
+# Because the host is shared, sandbox code can also reach HeyVera's public
+# /v1/* routes here, with no credentials. Before real customer code runs, the
+# gateway should get a hostname of its own that forwards only
+# /internal/provider/*, so the sandbox reaches nothing else.
 api.heyvera.org {
 	# The provider gateway. Bare reverse_proxy: this is a machine-to-machine
 	# route, not a browser request, so it carries none of the header_up

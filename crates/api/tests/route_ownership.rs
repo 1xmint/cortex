@@ -237,8 +237,15 @@ fn caddy_forwards_only_paths_the_cortex_backend_serves() {
         1,
         "the Caddyfile serves exactly the one shared api.heyvera.org host"
     );
+    // Judge directives, not comments: the header comment names HeyVera's
+    // ports to explain what lives on the shared host.
+    let file_directives = CADDYFILE
+        .lines()
+        .filter(|line| !line.trim_start().starts_with('#'))
+        .collect::<Vec<_>>()
+        .join("\n");
     assert!(
-        !CADDYFILE.contains("localhost:3402"),
+        !file_directives.contains("localhost:3402"),
         "legacy ClawNet port; this repo does not own HeyVera's routes on the shared host"
     );
 

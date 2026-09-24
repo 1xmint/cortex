@@ -157,9 +157,9 @@ fi
 
 # ── caddy ────────────────────────────────────
 if [ -f "$REPO_DIR/Caddyfile" ]; then
-  sudo cp "$REPO_DIR/Caddyfile" /etc/caddy/Caddyfile
-  sudo systemctl reload caddy 2>/dev/null || true
-  echo "[caddy] Reloaded"
+  # The live Caddyfile is shared with HeyVera; copying this one over it would
+  # drop HeyVera's routes. Merge changes by hand.
+  echo "[caddy] Not copied: merge $REPO_DIR/Caddyfile into /etc/caddy/Caddyfile by hand"
 fi
 
 # ── start + health ───────────────────────────
@@ -195,7 +195,7 @@ sleep 2
 PROXY_HEALTHY=false
 for i in $(seq 1 15); do
   echo -n "."
-  if curl -sf https://cortex.heyvera.org/api/health >/dev/null 2>&1; then
+  if curl -sf https://api.heyvera.org/api/health >/dev/null 2>&1; then
     PROXY_HEALTHY=true
     break
   fi
@@ -212,7 +212,7 @@ if ! $PROXY_HEALTHY; then
   sudo systemctl restart caddy
   sleep 5
 
-  if curl -sf https://cortex.heyvera.org/api/health >/dev/null 2>&1; then
+  if curl -sf https://api.heyvera.org/api/health >/dev/null 2>&1; then
     echo "[auto] ✓ Proxy fixed by Caddy restart"
   else
     echo "[fail] Automatic fix failed — manual intervention needed"
@@ -223,7 +223,7 @@ fi
 
 echo ""
 echo "  ✓ Cortex deployed and verified — $BRANCH @ $COMMIT"
-echo "    Backend: https://cortex.heyvera.org/api/health"
+echo "    Backend: https://api.heyvera.org/api/health"
 echo "    Frontend: https://cortex.heyvera.org"
 echo "    Logs: sudo journalctl -u $SVC_NAME -f"
 echo ""
