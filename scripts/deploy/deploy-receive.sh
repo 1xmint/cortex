@@ -78,11 +78,14 @@ cleanup() {
   local status="$1"
   if [ "$status" -ne 0 ] && [ "$RESTORE_NEEDED" -eq 1 ]; then
     log "deploy failed after swap; restoring previous release from $BACKUP_DIR"
+    local restore_failed=0
     for item in bin COMMIT SHA256SUMS www; do
       [ -e "$BACKUP_DIR/$item" ] || continue
-      rm -rf -- "${INSTALL_ROOT:?}/$item.restore"
-      cp -a -- "$BACKUP_DIR/$item" "$INSTALL_ROOT/$item.restore"
-      mv -T -- "$INSTALL_ROOT/$item.restore" "$INSTALL_ROOT/$item"
+      rm -rf -- "$INSTALL_ROOT/$item.restore" "$INSTALL_ROOT/$item.failed"
+      cp -a -- "$BACKUP_DIR/$item" "$INSTALL_ROOT/$item.restore" || { log "ERROR: cannot copy $item from backup"; restore_failed=1; continue; }
+      [ -e "$INSTALL_ROOT/$item" ] && mv -T -- "$INSTALL_ROOT/$item" "$INSTALL_ROOT/$item.failed"
+      mv -T -- "$INSTALL_ROOT/$item.restore" "$INSTALL_ROOT/$item" || { log "ERROR: restore of $item failed"; restore_failed=1; }
+      rm -rf -- "$INSTALL_ROOT/$item.failed"
     done
     if [ -d "$INSTALL_ROOT/bin" ]; then
       chmod +x "$INSTALL_ROOT"/bin/* 2>/dev/null || true
@@ -91,7 +94,11 @@ cleanup() {
     systemctl --user restart cortex-next || true
     wait_for_health || log "WARNING: restored release did not become healthy either"
     systemctl --user restart cortex-next-worker || true
-    log "restore complete; exiting non-zero"
+    if [ "$restore_failed" -eq 0 ]; then
+      log "restore complete; exiting non-zero"
+    else
+      log "restore was PARTIAL (one or more items failed to restore); exiting non-zero"
+    fi
   fi
   rm -rf -- "$INCOMING_DIR" 2>/dev/null || true
   exit "$status"
@@ -183,20 +190,31 @@ done
 # --- 5. restart, health-check, restart worker -------------------------------
 log "restarting cortex-next"
 systemctl --user restart cortex-next
+CORTEX_NEXT_N0="$(systemctl --user show -p NRestarts --value cortex-next)"
 log "waiting up to ${HEALTH_TIMEOUT_SECS}s for $HEALTH_URL"
 if ! wait_for_health; then
   fail "cortex-next did not become healthy within ${HEALTH_TIMEOUT_SECS}s"
 fi
-log "cortex-next is healthy"
+CORTEX_NEXT_N1="$(systemctl --user show -p NRestarts --value cortex-next)"
+CORTEX_NEXT_ACTIVE="$(systemctl --user show -p ActiveState --value cortex-next)"
+if [ "$CORTEX_NEXT_ACTIVE" != "active" ] || [ "$CORTEX_NEXT_N1" != "$CORTEX_NEXT_N0" ]; then
+  fail "cortex-next is not stable after restart (ActiveState=$CORTEX_NEXT_ACTIVE, NRestarts $CORTEX_NEXT_N0 -> $CORTEX_NEXT_N1)"
+fi
+log "cortex-next is healthy and stable"
 
 log "restarting cortex-next-worker"
 systemctl --user restart cortex-next-worker
-sleep 5
-systemctl --user is-active --quiet cortex-next-worker \
-  || fail "cortex-next-worker did not become active within 5s of restart"
+n0="$(systemctl --user show -p NRestarts --value cortex-next-worker)"
+sleep 12
+n1="$(systemctl --user show -p NRestarts --value cortex-next-worker)"
+worker_active="$(systemctl --user show -p ActiveState --value cortex-next-worker)"
+if [ "$worker_active" != "active" ] || [ "$n1" != "$n0" ]; then
+  fail "cortex-next-worker is not stable after restart (ActiveState=$worker_active, NRestarts $n0 -> $n1)"
+fi
+log "cortex-next-worker is stable"
 
 # --- 6. confirm the deployed commit -----------------------------------------
-DEPLOY_INFO="$(curl -fsS "$DEPLOY_INFO_URL")" || fail "could not reach $DEPLOY_INFO_URL after restart"
+DEPLOY_INFO="$(curl -fsS --max-time 10 "$DEPLOY_INFO_URL")" || fail "could not reach $DEPLOY_INFO_URL after restart"
 LIVE_COMMIT="$(printf '%s' "$DEPLOY_INFO" | grep -o '"commit"[[:space:]]*:[[:space:]]*"[0-9a-f]\{40\}"' | grep -o '[0-9a-f]\{40\}' || true)"
 if [ "$LIVE_COMMIT" != "$NEW_COMMIT" ]; then
   fail "deploy-info commit '$LIVE_COMMIT' does not match deployed commit '$NEW_COMMIT'"

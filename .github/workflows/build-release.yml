@@ -38,9 +38,12 @@ permissions:
 # by deploy.yml's workflow_run trigger after the newer one already deployed.
 # Cancel the older push build; leave workflow_dispatch runs alone since those
 # are usually a deliberate one-off (e.g. building images) and canceling one
-# because another started could surprise whoever kicked it off.
+# because another started could surprise whoever kicked it off. The group
+# includes github.event_name, not just github.ref, so a push to main can't
+# land in the same group as (and cancel) an in-progress workflow_dispatch run
+# on that same ref.
 concurrency:
-  group: build-release-${{ github.ref }}
+  group: build-release-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'push' }}
 
 jobs:

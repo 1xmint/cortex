@@ -52,12 +52,19 @@ Add `tag:ci` to `tagOwners` (owned by whoever administers the tailnet):
 }
 ```
 
+If `tag:ci` already exists in `tagOwners` — `.github/workflows/host-db-migration.yml`
+joins the tailnet as `tag:ci` too, using the same `TS_OAUTH_CLIENT_ID` /
+`TS_OAUTH_SECRET` pair — merge into that existing entry instead of adding a
+second `"tag:ci"` key (JSON object keys aren't unique across a hand-edited
+policy file the way they'd be enforced in a schema, so a duplicate key
+silently shadows the first and is easy to miss in review).
+
 Grant `tag:ci` reach to the deploy host on port 22 — with `grants`:
 
 ```json
 {
   "grants": [
-    { "src": ["tag:ci"], "dst": ["tag:deploy"], "ip": ["22"] }
+    { "src": ["tag:ci"], "dst": ["tag:deploy"], "ip": ["tcp:22"] }
   ]
 }
 ```
@@ -99,6 +106,11 @@ If this tailnet has a catch-all rule such as
 default-allow grant), remove it — otherwise `tag:ci` already has access to
 everything and the rules above restrict nothing.
 
+Confirm only the deploy host carries `tag:deploy` (Settings -> Machines,
+filter by tag). `tag:ci`'s `ssh`/grant reach is scoped to `dst: ["tag:deploy"]`,
+not to a specific device, so if a second machine ever picked up that tag,
+`tag:ci` would gain SSH into it too without anyone touching the ACL.
+
 ### 2. Create a Tailscale OAuth client scoped to `tag:ci`
 
 In the admin console under Settings -> OAuth clients, create a client with:
@@ -111,19 +123,60 @@ In the admin console under Settings -> OAuth clients, create a client with:
 Save the client ID and secret; they become `TS_OAUTH_CLIENT_ID` and
 `TS_OAUTH_SECRET` below.
 
+#### If this OAuth client ID/secret ever leaks
+
+1. In the admin console under Settings -> OAuth clients, revoke the client
+   immediately.
+2. Under Settings -> Machines, filter by tag `tag:ci` and delete every device
+   in that list — a leaked secret can mint new ephemeral `tag:ci` nodes for as
+   long as any of them still exist, and revoking the client alone doesn't
+   remove nodes it already created.
+3. Re-check the ACL policy for any *other* `ssh` or grant rule whose `src`
+   includes `tag:ci`, `autogroup:tagged`, or `*` — the rules in step 1 above
+   are meant to be the only path in, but a leak is exactly the moment to
+   confirm nothing broader was added later that would let a re-minted
+   `tag:ci` node (or any tagged node) reach further than `guardian` on the
+   deploy host.
+4. Confirm only the deploy host carries `tag:deploy` (see above) — a
+   `tag:ci` node's reach is bounded by that tag, so a stray device holding it
+   would matter here too.
+5. Create a new OAuth client (step 2 above) and update the
+   `TS_OAUTH_CLIENT_ID` / `TS_OAUTH_SECRET` environment secrets (step 4
+   below) with the new values.
+
 ### 3. Install `deploy-receive.sh` on the deploy host
 
 On the deploy host, as `guardian`:
 
 ```bash
 mkdir -p /home/guardian/cortex-next
-# Copy scripts/deploy/deploy-receive.sh from this repo to that path, then:
-chmod 755 /home/guardian/cortex-next/deploy-receive.sh
 ```
 
-scp from a Windows machine drops the executable bit — always `chmod +x` (or
-`755` as above) after copying the script over, before the first deploy tries
-to run it.
+From Git Bash in this repo, copy the script to the host:
+
+```bash
+scp scripts/deploy/deploy-receive.sh guardian@clawguard.tail618cfc.ts.net:cortex-next/
+```
+
+Then, on the host:
+
+```bash
+sed -i 's/\r$//' ~/cortex-next/deploy-receive.sh && chmod 755 ~/cortex-next/deploy-receive.sh
+```
+
+scp from a Windows machine drops the executable bit and (depending on Git's
+`core.autocrlf` setting) can leave CRLF line endings, which make the script
+fail to run on the host — `chmod +x` (or `755` as above) alone isn't enough;
+always run both the `sed` and the `chmod` after copying the script over,
+before the first deploy tries to run it. (`.gitattributes` forces
+`scripts/deploy/*.sh` to LF in the repo itself, but that only controls what
+`git checkout` writes — it doesn't touch a file `scp` already copied out.)
+
+CI does not ship this script to the host — `deploy.yml` only invokes
+`~/cortex-next/deploy-receive.sh` by its fixed path, it never uploads it.
+Whenever `scripts/deploy/deploy-receive.sh` changes in the repo, repeat the
+`scp` + `sed` + `chmod` steps above to reinstall it, or the host keeps running
+the old version.
 
 `deploy-receive.sh` restarts `cortex-next` and `cortex-next-worker` with
 `systemctl --user`, which needs `guardian`'s user manager to be running even
@@ -141,12 +194,17 @@ key could always have piped anything into `deploy-receive.sh` anyway. The
 `production` environment's branch rule (step 4) is the actual access control:
 it limits who can even get a workflow run in a position to reach the host.
 
-### 4. Create the `production` environment and set secrets
+### 4. Create or edit the `production` environment and set secrets
 
-In the repo's Settings -> Environments, create an environment named
-`production` with a deployment branch rule restricting it to `main`. The
-`deploy` job in `deploy.yml` declares `environment: production`, so a run can
-only reach the deploy steps if its ref is `main`.
+In the repo's Settings -> Environments, create or edit an environment named
+`production` with a deployment branch rule restricting it to `main`. Create it
+explicitly rather than letting the first workflow run do it implicitly: a
+job's first reference to an environment that doesn't exist yet auto-creates it
+with no deployment branch rules at all, which would let `deploy.yml`'s
+`environment: production` gate run for any branch until someone notices and
+adds the rule by hand. The `deploy` job in `deploy.yml` declares
+`environment: production`, so a run can only reach the deploy steps if its ref
+is `main`.
 
 Store the two secrets as environment secrets (not repository secrets), so
 they're only available to jobs running under `production`. Run each of these

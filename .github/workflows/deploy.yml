@@ -55,8 +55,13 @@ jobs:
           fi
 
       # A workflow_run event is a snapshot of the build that triggered it. If
-      # another push to main built and deployed while this run was queued, its
-      # build is stale — deploying it now would overwrite the newer release.
+      # another push to main built (build-release.yml ran again) while this
+      # run was queued, this build is stale — deploying it now would overwrite
+      # the newer release. Comparing against main's HEAD commit is the wrong
+      # check: main can advance for reasons that don't produce a new build
+      # (docs, workflow files outside build-release.yml's paths filter, etc.),
+      # which would make this guard skip every real deploy. Compare instead
+      # against the most recent push-triggered build-release.yml run on main.
       - name: Guard against a superseded workflow_run
         id: guard
         if: steps.secrets.outputs.ok == 'true'
@@ -69,10 +74,10 @@ jobs:
             echo "proceed=true" >>"$GITHUB_OUTPUT"
             exit 0
           fi
-          latest_sha="$(gh api "repos/$REPO/commits/main" --jq .sha)"
+          latest="$(gh api "repos/$REPO/actions/workflows/build-release.yml/runs?branch=main&event=push&per_page=1" --jq '.workflow_runs[0].head_sha')"
           head_sha="${{ github.event.workflow_run.head_sha }}"
-          if [ "$head_sha" != "$latest_sha" ]; then
-            echo "::notice::build $head_sha is no longer main's HEAD ($latest_sha); a newer push superseded it. Skipping deploy."
+          if [ "$head_sha" != "$latest" ]; then
+            echo "::notice::build $head_sha is not the newest push build of build-release.yml on main ($latest); a newer push superseded it. Skipping deploy."
             echo "proceed=false" >>"$GITHUB_OUTPUT"
           else
             echo "proceed=true" >>"$GITHUB_OUTPUT"
@@ -94,8 +99,8 @@ jobs:
           fi
 
           run_info="$(gh api "repos/$REPO/actions/runs/$RUN_ID" \
-            --jq '[.path,.event,.head_branch,.head_repository.full_name,.conclusion]|@tsv')"
-          IFS=$'\t' read -r run_path run_event run_branch run_repo run_conclusion <<<"$run_info"
+            --jq '[.path,.event,.head_branch,.head_repository.full_name,.conclusion,.head_sha]|@tsv')"
+          IFS=$'\t' read -r run_path run_event run_branch run_repo run_conclusion head_sha <<<"$run_info"
 
           if [ "$run_path" != ".github/workflows/build-release.yml" ] || \
              { [ "$run_event" != "push" ] && [ "$run_event" != "workflow_dispatch" ]; } || \
@@ -103,6 +108,17 @@ jobs:
              [ "$run_repo" != "$REPO" ] || \
              [ "$run_conclusion" != "success" ]; then
             echo "::error::run $RUN_ID is not a successful build-release.yml run on main in $REPO (path=$run_path event=$run_event branch=$run_branch repo=$run_repo conclusion=$run_conclusion)"
+            exit 1
+          fi
+
+          # $run_branch reporting "main" only reflects the ref the run was
+          # triggered on; it says nothing about whether that commit is still
+          # reachable from main today (a manual build_run_id could point at a
+          # run from a since-force-pushed or deleted branch). Confirm the
+          # build commit is actually on main's history.
+          compare_status="$(gh api "repos/$REPO/compare/$head_sha...main" --jq .status)"
+          if [ "$compare_status" != "identical" ] && [ "$compare_status" != "ahead" ]; then
+            echo "::error::run $RUN_ID's commit $head_sha is not on main (compare status: $compare_status)"
             exit 1
           fi
 
