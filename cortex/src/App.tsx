@@ -62,6 +62,7 @@ import {
   getDeploymentStatus,
   getUserRouting,
   listConversations,
+  markSessionExpired,
   type BillingAccessState,
   type ConversationSummary,
   type DeploymentStatus,
@@ -358,6 +359,7 @@ function CortexShell() {
     // Listen for 401 events dispatched by the API layer or other parts of the app
     function handle401(event: CustomEvent<unknown>) {
       void event;
+      markSessionExpired();
       setSessionExpired(true);
     }
     window.addEventListener('cortex:unauthorized', handle401 as EventListener);
@@ -373,6 +375,7 @@ function CortexShell() {
       : null;
     const onAuthMessage = (event: MessageEvent<{ type?: string }>) => {
       if (event.data?.type === 'logout') {
+        markSessionExpired();
         setSessionExpired(true);
       } else if (event.data?.type === 'authorized') {
         setSessionExpired(false);

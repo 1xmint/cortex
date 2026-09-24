@@ -133,7 +133,7 @@ async function authedFetch(url: string, init?: RequestInit): Promise<Response> {
   if (!headers.has('Content-Type') && init?.method && init.method !== 'GET') {
     headers.set('Content-Type', 'application/json');
   }
-  return noteAuthorized(await fetchWithRetry(url, { ...init, headers }), headers);
+  return noteAuthorized(url, await fetchWithRetry(url, { ...init, headers }), headers);
 }
 
 async function bearerFetch(url: string, init?: RequestInit): Promise<Response> {
@@ -143,7 +143,7 @@ async function bearerFetch(url: string, init?: RequestInit): Promise<Response> {
   if (!headers.has('Content-Type') && init?.method && init.method !== 'GET') {
     headers.set('Content-Type', 'application/json');
   }
-  return noteAuthorized(await fetchWithRetry(url, { ...init, headers }), headers);
+  return noteAuthorized(url, await fetchWithRetry(url, { ...init, headers }), headers);
 }
 
 export class CortexApiError extends Error {
@@ -179,13 +179,41 @@ export const AUTH_CHANNEL_NAME = 'cortex-auth';
  * credentialed request succeeds and clears it. */
 let _unauthorizedRaised = false;
 
+/** Record that the "session expired" banner is up, however it was raised
+ * (this module, projectApi, or another tab's logout broadcast), so the next
+ * real success can lower it. */
+export function markSessionExpired(): void {
+  _unauthorizedRaised = true;
+}
+
 /**
- * A credentialed request that succeeds proves the session works again (Clerk
- * refreshed the token, or the user signed back in), so lower the banner a
- * 401 raised. Only fires once per 401, not on every successful request.
+ * Routes the server answers without checking the credential. Every request
+ * carries the bearer, so a success here says nothing about the session.
+ * Auth is checked per handler on the server (a `ClerkUser` argument), not by
+ * a router layer, so this list mirrors the handlers that take none.
  */
-function noteAuthorized(res: Response, headers: Headers): Response {
-  if (!_unauthorizedRaised || !res.ok || !headers.has('Authorization')) return res;
+const PUBLIC_PATH_PREFIXES = ['/api/health', '/api/deployment/', '/api/deploy-'];
+
+function isPublicPath(url: string): boolean {
+  let path: string;
+  try {
+    path = new URL(url, 'http://localhost').pathname;
+  } catch {
+    return false;
+  }
+  return PUBLIC_PATH_PREFIXES.some((prefix) => path.startsWith(prefix));
+}
+
+/**
+ * A credentialed request that succeeds on a route that checks the credential
+ * proves the session works again (Clerk refreshed the token, or the user
+ * signed back in), so lower the banner a 401 raised. Fires once per raise,
+ * not on every successful request.
+ */
+function noteAuthorized(url: string, res: Response, headers: Headers): Response {
+  if (!_unauthorizedRaised || !res.ok || !headers.has('Authorization') || isPublicPath(url)) {
+    return res;
+  }
   _unauthorizedRaised = false;
   try {
     window.dispatchEvent(new CustomEvent('cortex:authorized'));
