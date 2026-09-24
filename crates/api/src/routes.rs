@@ -1238,6 +1238,7 @@ pub async fn cancel_run(
     {
         let workers = state.workers.read().await;
         for (step_id, assigned_worker, lease_gen) in &outcome.in_flight {
+            let mut signalled = false;
             if let Some(worker) = assigned_worker.as_deref().and_then(|w| workers.get(w)) {
                 if worker
                     .tx
@@ -1249,12 +1250,28 @@ pub async fn cancel_run(
                     .is_ok()
                 {
                     signalled_steps += 1;
+                    signalled = true;
                 }
             }
-            // The step will never report its own completion now, so its
-            // partial usage (provider, model, duration) is recorded here
-            // rather than lost.
-            crate::ws::record_step_usage(db, step_id, *lease_gen, Some(&user.user_id), None, None);
+            // A signalled worker is still assigned to this step (cancel_run
+            // leaves `assigned_worker` in place for exactly this reason), so
+            // its late StepCompleted/StepFailed report is accepted by the ws
+            // quiet path and carries the real token counts — recording usage
+            // here too would double it. Only record here when the worker
+            // could not be signalled (not connected, or the send failed): it
+            // will never report back, so this is the only place its partial
+            // usage (provider, model, duration; no token counts available
+            // from the route) is ever captured.
+            if !signalled {
+                crate::ws::record_step_usage(
+                    db,
+                    step_id,
+                    *lease_gen,
+                    Some(&user.user_id),
+                    None,
+                    None,
+                );
+            }
         }
     }
     for step_id in &in_flight_ids {

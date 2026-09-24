@@ -323,6 +323,11 @@ pub struct SchedulerState {
     pub user_queues: HashMap<String, UserQueue>,
     pub schedulable_users: VecDeque<String>,
     enqueued_step_ids: HashSet<String>,
+    // Steps currently occupying a concurrency slot. A slot is only freed when
+    // its step_id is actually removed from this set, so a step can never be
+    // double-freed by two independent completion paths (e.g. a cancellation
+    // racing a retry) racing on the same step.
+    running_step_ids: HashSet<String>,
 }
 
 impl Default for SchedulerState {
@@ -337,6 +342,7 @@ impl SchedulerState {
             user_queues: HashMap::new(),
             schedulable_users: VecDeque::new(),
             enqueued_step_ids: HashSet::new(),
+            running_step_ids: HashSet::new(),
         }
     }
 
@@ -365,6 +371,7 @@ impl SchedulerState {
                         if let Some(step) = q.ready_steps.pop_front() {
                             self.enqueued_step_ids.remove(&step.step_id);
                             q.running_count += 1;
+                            self.running_step_ids.insert(step.step_id.clone());
                             if !q.ready_steps.is_empty() {
                                 self.schedulable_users.push_back(user_id);
                             }
@@ -380,7 +387,14 @@ impl SchedulerState {
         None
     }
 
-    pub fn mark_step_done(&mut self, user_id: &str) {
+    /// Frees the concurrency slot held by `step_id`, if any. Safe to call
+    /// more than once for the same step (e.g. a cancellation racing a retry
+    /// or a delivery): only the call that actually removes the step_id from
+    /// `running_step_ids` frees a slot, so the second caller is a no-op.
+    pub fn mark_step_done(&mut self, user_id: &str, step_id: &str) {
+        if !self.running_step_ids.remove(step_id) {
+            return;
+        }
         if let Some(q) = self.user_queues.get_mut(user_id) {
             q.running_count = q.running_count.saturating_sub(1);
 
@@ -905,9 +919,49 @@ mod tests {
         assert!(state.next_assignable().is_none());
 
         // Mark done, should be able to get next
-        state.mark_step_done("user-a");
+        state.mark_step_done("user-a", "a-0");
         let next = state.next_assignable().unwrap();
         assert_eq!(next.step_id, "a-1");
+    }
+
+    #[test]
+    fn scheduler_mark_step_done_does_not_double_free_slot() {
+        let mut state = SchedulerState::new();
+
+        state
+            .user_queues
+            .entry("user-a".into())
+            .or_default()
+            .max_concurrent = 1;
+
+        for i in 0..2 {
+            state.enqueue_ready_step(StepRef {
+                step_id: format!("a-{i}"),
+                run_id: "r1".into(),
+                user_id: "user-a".into(),
+                kind: StepKind::Execute,
+                work_kind: Some(WorkKind::Modify),
+                tier: "execute".into(),
+                risk: "low".into(),
+                objective: format!("task {i}"),
+            });
+        }
+
+        let first = state.next_assignable().unwrap();
+        assert_eq!(first.step_id, "a-0");
+        assert_eq!(state.user_queues["user-a"].running_count, 1);
+
+        // Two independent completion paths (e.g. a cancel racing a retry)
+        // both try to free the same step's slot. Only the first should count.
+        state.mark_step_done("user-a", "a-0");
+        state.mark_step_done("user-a", "a-0");
+        assert_eq!(state.user_queues["user-a"].running_count, 0);
+
+        // Only one more step should be assignable, not two, even though
+        // mark_step_done was called twice.
+        let second = state.next_assignable().unwrap();
+        assert_eq!(second.step_id, "a-1");
+        assert_eq!(state.user_queues["user-a"].running_count, 1);
     }
 
     #[test]

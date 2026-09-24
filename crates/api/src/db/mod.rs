@@ -5454,9 +5454,12 @@ fn update_run_status_tx(
     } else {
         None
     };
+    // Never resurrect a run that already reached a terminal status: a slow
+    // caller (e.g. RunCreated) racing a fast cancel must not overwrite the
+    // cancellation.
     let rows = tx.execute(
         "UPDATE runs SET status = ?1, failure_reason = ?2, finished_at = ?3, updated_at = ?4, version = version + 1
-         WHERE id = ?5",
+         WHERE id = ?5 AND status NOT IN ('succeeded', 'failed', 'cancelled')",
         params![status, failure_reason, finished, now, run_id],
     )?;
     if rows == 0 {
@@ -9383,8 +9386,15 @@ impl Database {
             .map_err(|err| CancelError::Internal(err.to_string()))?;
 
         for step_id in &cancellable_ids {
+            // `assigned_worker` is deliberately left in place (only
+            // `lease_deadline` is cleared): a worker already mid-flight when
+            // the run was cancelled still needs to be identifiable as the
+            // step's rightful worker when its report lands late, so ws.rs can
+            // tell that worker's report apart from an impostor's. Clearing
+            // `lease_deadline` is enough on its own to make `verify_step_worker`
+            // (which requires a live deadline) reject the step outright.
             tx.execute(
-                "UPDATE steps SET status = 'cancelled', last_error = ?1, assigned_worker = NULL,
+                "UPDATE steps SET status = 'cancelled', last_error = ?1,
                  lease_deadline = NULL, updated_at = ?2, version = version + 1
                  WHERE id = ?3",
                 params![reason, now, step_id],
@@ -9665,6 +9675,23 @@ impl Database {
             );
         }
         lease_gen
+    }
+
+    /// True iff `step_id` is still leased at exactly `lease_gen`.
+    ///
+    /// Dispatch calls this immediately before sending `ExecuteStep`, after
+    /// issuing the step's provider spend authorization: a cancel (or any
+    /// other re-lease) that lands in that window changes the step's status
+    /// away from `leased` or bumps its `lease_gen`, and the caller must not
+    /// hand the worker a step whose lease it can no longer prove it holds.
+    pub fn step_still_leased(&self, step_id: &str, lease_gen: i64) -> bool {
+        let conn = self.conn();
+        conn.query_row(
+            "SELECT 1 FROM steps WHERE id = ?1 AND status = 'leased' AND lease_gen = ?2",
+            params![step_id, lease_gen],
+            |_| Ok(()),
+        )
+        .is_ok()
     }
 
     /// Record what actually ran, at dispatch.
@@ -11350,6 +11377,33 @@ impl Database {
             |row| row.get::<_, String>(0),
         )
         .ok()
+    }
+
+    /// True iff `step_id` is still recorded as assigned to `worker_id`
+    /// (and, when given, at exactly `lease_gen`). Used on the cancelled-step
+    /// quiet path in ws.rs: `cancel_run` deliberately leaves `assigned_worker`
+    /// in place for an in-flight step, so a late report can be told apart
+    /// from an impostor claiming a step it never held, without relying on
+    /// `verify_step_worker`'s `status IN ('leased', 'running')` check, which a
+    /// cancelled step always fails.
+    pub fn step_assigned_to(&self, step_id: &str, worker_id: &str, lease_gen: Option<i64>) -> bool {
+        let conn = self.conn();
+        match lease_gen {
+            Some(gen) => conn
+                .query_row(
+                    "SELECT 1 FROM steps WHERE id = ?1 AND assigned_worker = ?2 AND lease_gen = ?3",
+                    params![step_id, worker_id, gen],
+                    |_| Ok(()),
+                )
+                .is_ok(),
+            None => conn
+                .query_row(
+                    "SELECT 1 FROM steps WHERE id = ?1 AND assigned_worker = ?2",
+                    params![step_id, worker_id],
+                    |_| Ok(()),
+                )
+                .is_ok(),
+        }
     }
 
     pub fn get_all_step_statuses(&self, run_id: &str) -> Vec<(String, String)> {

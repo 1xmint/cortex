@@ -321,6 +321,26 @@ impl Database {
         Ok(())
     }
 
+    /// Revokes a single spend authorization by id. Used when a step's lease
+    /// is lost (or its gen advances) between issuing the authorization and
+    /// sending `ExecuteStep`: the worker was never told to run, so the
+    /// authorization must not be left `active` for `reserve_provider_request`
+    /// to honor.
+    pub fn revoke_spend_authorization(&self, authorization_id: &str) {
+        let conn = self.conn();
+        if let Err(e) = conn.execute(
+            "UPDATE provider_spend_authorizations SET status = 'revoked'
+             WHERE id = ?1 AND status = 'active'",
+            params![authorization_id],
+        ) {
+            tracing::error!(
+                authorization_id,
+                error = %e,
+                "failed to revoke spend authorization for an undispatched step"
+            );
+        }
+    }
+
     pub fn gateway_model_rate(
         &self,
         authorization_id: &str,
@@ -389,7 +409,12 @@ impl Database {
                 "SELECT id, user_id, run_id, attempt_id, provider, model,
                         price_list_id, max_micro_usd, expires_at
                  FROM provider_spend_authorizations
-                 WHERE id = ?1 AND status = 'active' AND expires_at > ?2",
+                 WHERE id = ?1 AND status = 'active' AND expires_at > ?2
+                   AND NOT EXISTS (
+                       SELECT 1 FROM runs r
+                       WHERE r.id = provider_spend_authorizations.run_id
+                         AND r.status = 'cancelled'
+                   )",
                 params![claims.authorization_id, now_ms],
                 |row| {
                     Ok(SpendAuthorization {
@@ -1022,6 +1047,31 @@ mod tests {
         let summary = db.provider_holds_summary(NOW, 10);
         assert_eq!(summary.reserved_total_micro_usd, 1_500);
         assert!(summary.over_threshold);
+    }
+
+    // --- reserve_provider_request refuses a cancelled run's authorization ---
+
+    #[test]
+    fn reserve_provider_request_refuses_authorization_for_a_cancelled_run() {
+        let db = test_db();
+        let claims = fixture(&db, 1_000_000, 1_000_000);
+
+        db.conn()
+            .execute(
+                "INSERT INTO runs (id, user_id, goal, status, created_at, updated_at)
+                 VALUES ('run-1', 'tenant-1', 'goal', 'cancelled', ?1, ?1)",
+                params![NOW],
+            )
+            .unwrap();
+
+        let err = db
+            .reserve_provider_request(&claims, "chat:cancelled-run", "digest", 1_000, NOW)
+            .unwrap_err();
+        assert_eq!(
+            err, "spend authorization is missing, revoked, or expired",
+            "an authorization whose run was cancelled must not be reservable, \
+             even though the row itself is still `status = 'active'`"
+        );
     }
 
     // --- settle / release happy paths ---

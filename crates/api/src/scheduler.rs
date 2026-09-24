@@ -117,7 +117,7 @@ async fn apply_event(state: &AppState, sched: &mut SchedulerState, event: &Sched
                 let user_id = get_run_user(db, run_id);
                 // The worker is free again regardless of what the verdict turns
                 // out to be, so the concurrency slot is released here.
-                sched.mark_step_done(&user_id);
+                sched.mark_step_done(&user_id, step_id);
 
                 // Invariant 6: a worker's report can never emit a positive
                 // routing reward. At delivery the step is `verifying` and no
@@ -174,7 +174,7 @@ async fn apply_event(state: &AppState, sched: &mut SchedulerState, event: &Sched
             }
             if let Some(db) = &state.db {
                 let user_id = get_run_user(db, run_id);
-                sched.mark_step_done(&user_id);
+                sched.mark_step_done(&user_id, step_id);
                 update_bandit_from_outcome(state, db, step_id, false, None).await;
 
                 // Check for auth-related failures — these are not healable
@@ -246,8 +246,8 @@ async fn apply_event(state: &AppState, sched: &mut SchedulerState, event: &Sched
                 // One `mark_step_done` per in-flight step: each occupied its
                 // own concurrency slot, and cancellation is not a failure, so
                 // there is no bandit update, no heal, and no cascade here.
-                for _ in in_flight {
-                    sched.mark_step_done(&user_id);
+                for step_id in in_flight {
+                    sched.mark_step_done(&user_id, step_id);
                 }
             }
             load_ready_steps_for_run(state, sched, run_id).await;
@@ -265,12 +265,12 @@ async fn schedule_until_blocked(state: &AppState, sched: &mut SchedulerState) {
         match dispatch_step(state, &step).await {
             DispatchOutcome::Dispatched => {}
             DispatchOutcome::RetryLater => {
-                sched.mark_step_done(&step.user_id);
+                sched.mark_step_done(&step.user_id, &step.step_id);
                 sched.enqueue_ready_step(step);
                 break;
             }
             DispatchOutcome::WaitingForApproval => {
-                sched.mark_step_done(&step.user_id);
+                sched.mark_step_done(&step.user_id, &step.step_id);
                 break;
             }
         }
@@ -751,6 +751,25 @@ async fn dispatch_step(state: &AppState, step: &StepRef) -> DispatchOutcome {
             hosts = ?provider_egress.network_policy.allowed_hosts(),
             "granting provider egress for this step"
         );
+    }
+
+    // Re-check the lease immediately before handing the step to a worker.
+    // `issue_access` just created a live provider spend authorization; if a
+    // cancel (or any other re-lease) landed while that call was in flight,
+    // the step is no longer `leased` at this `lease_gen` and the worker must
+    // never be told to run it. Revoke the authorization we just issued so it
+    // cannot be exercised by anyone, and give up the lease.
+    if !db.step_still_leased(&step.step_id, lease_gen) {
+        tracing::warn!(
+            step_id = %step.step_id,
+            lease_gen,
+            "step lease no longer held at dispatch time — dropping the step \
+             instead of sending ExecuteStep"
+        );
+        if let Some(access) = &provider_gateway {
+            db.revoke_spend_authorization(&access.authorization_id);
+        }
+        return DispatchOutcome::RetryLater;
     }
 
     let msg = BrainMessage::ExecuteStep {
