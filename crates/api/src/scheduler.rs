@@ -2889,4 +2889,76 @@ mod tests {
             "a cancelled step must never acquire a fresh path lease"
         );
     }
+
+    // NOTE on the two other PR #60 `dispatch_step` Drop branches (the
+    // "step stopped while its paths were being leased" release-and-drop at
+    // the resource-lease re-check, and the `step_still_leased` re-check just
+    // before `ExecuteStep`): both guard against a cancel/re-lease landing in
+    // the narrow window between an initial state read and a re-read a few
+    // lines later. In the real system that window is crossed by a
+    // *transaction commit on another connection*, not by anything this
+    // process awaits on. Within `dispatch_step` there is no `.await` between
+    // `acquire_step_path_leases` and its immediate status re-check, nor
+    // between `lease_step` and `step_still_leased`, so nothing a unit test
+    // does between those two lines can be observed by the code under test —
+    // the two reads always see the same database state. Reaching either
+    // branch from a black-box test would need either a real second thread
+    // racing actual SQLite writes against those exact lines (flaky and not
+    // representative of the bug) or a seam injected into `dispatch_step` to
+    // run test code between the two reads (a refactor of non-test code,
+    // outside this task's scope). Skipped for that reason; the "step is no
+    // longer pending/ready/orphaned at dispatch time" guard that runs before
+    // any lease is acquired is already covered above.
+
+    #[tokio::test]
+    async fn check_run_done_does_not_resurrect_an_already_cancelled_run() {
+        // A completion check can race a cancel: the last step finishes
+        // (terminal, non-cancelled) after `cancel_run` already committed
+        // 'cancelled' on the run row. `check_run_done`'s terminal guard must
+        // see the row is already terminal and return without flipping the
+        // run to 'succeeded'/'failed' or emitting `RunCompleted` — mirrors
+        // `update_run_status_reports_no_change_for_an_already_terminal_run`
+        // in db/mod.rs, one layer up.
+        let temporary = tempfile::tempdir().expect("temporary workspace");
+        let workspace = temporary.path().to_path_buf();
+        std::fs::create_dir_all(workspace.join(".cortex")).expect("workspace metadata");
+        let state = AppState::new(workspace.join(".cortex/ledger.jsonl"), workspace, None).await;
+        let db = state.db.as_ref().expect("database");
+
+        let run_id = db.create_run("user-1", "finish then cancel", "auto", &[]);
+        let step_id = db.create_step(&run_id, "execute", "balanced", "medium", "do it");
+
+        db.cancel_run(&run_id, "user-1", "stop it")
+            .expect("cancel_run");
+        assert_eq!(
+            db.list_user_runs_by_id(&run_id).unwrap()["status"],
+            "cancelled"
+        );
+
+        // The step reports done (e.g. a verdict that arrived after the
+        // cancel already landed) — every step is terminal and none are
+        // failed/cancelled, so `check_run_completion` would call this a
+        // success if the run's own status were not already terminal.
+        db.conn()
+            .execute(
+                "UPDATE steps SET status = 'succeeded' WHERE id = ?1",
+                rusqlite::params![step_id],
+            )
+            .unwrap();
+
+        let events_before = db.list_run_operations_events(&run_id, 25).len();
+
+        check_run_done(&state, &run_id).await;
+
+        assert_eq!(
+            db.list_user_runs_by_id(&run_id).unwrap()["status"],
+            "cancelled",
+            "a run already terminal as cancelled must never be resurrected as succeeded"
+        );
+        assert_eq!(
+            db.list_run_operations_events(&run_id, 25).len(),
+            events_before,
+            "no completion write means no new run-status event"
+        );
+    }
 }

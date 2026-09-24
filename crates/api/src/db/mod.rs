@@ -17326,6 +17326,42 @@ mod truth {
             assert_eq!(found, 1, "{table} must exist after migration");
         }
     }
+
+    /// `ws.rs`'s quiet path for a StepFailed/StepCompleted report gates on
+    /// `step_assigned_to(step, worker, lease_gen)` before touching the step's
+    /// status: a report from a worker that does not hold the step, or that
+    /// holds it at a stale `lease_gen`, must be told apart from the worker
+    /// that actually does, so a late message from a worker a cancel already
+    /// re-leased away from cannot be mistaken for the current holder's
+    /// report.
+    #[test]
+    fn step_assigned_to_tells_the_current_holder_from_an_impostor_or_a_stale_lease() {
+        let db = test_db();
+        let (_run, lease_gen) = leased_step(&db, "step-1");
+
+        assert!(
+            db.step_assigned_to("step-1", "worker-1", Some(lease_gen)),
+            "the worker holding the step at its current lease_gen must match"
+        );
+        assert!(
+            db.step_assigned_to("step-1", "worker-1", None),
+            "matching worker with no lease_gen given must still match"
+        );
+
+        assert!(
+            !db.step_assigned_to("step-1", "worker-2", Some(lease_gen)),
+            "a different worker must never be told it holds this step"
+        );
+        assert!(
+            !db.step_assigned_to("step-1", "worker-2", None),
+            "a different worker must never match even without a lease_gen"
+        );
+
+        assert!(
+            !db.step_assigned_to("step-1", "worker-1", Some(lease_gen + 1)),
+            "a stale lease_gen must not match, even for the right worker"
+        );
+    }
 }
 
 // --- Durable verification jobs (PR B) ------------------------------------
