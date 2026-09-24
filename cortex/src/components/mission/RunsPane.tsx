@@ -8,8 +8,10 @@ import {
   ExternalLink,
   GitPullRequest,
   RefreshCw,
+  XCircle,
 } from 'lucide-react';
 import {
+  cancelRun,
   createRunPullRequest,
   getRun,
   listRuns,
@@ -64,6 +66,11 @@ const TERMINAL = new Set([
 // branch" when the run changed nothing -- but there is no reason to show a
 // button for a run that was cancelled or that crashed.
 const SHIPPABLE = new Set(['verified', 'manual_override', 'completed']);
+
+// A run is only worth offering a Cancel button while it can still spend
+// money or do work: once it is planning, running, or merely queued, there is
+// something to stop. A terminal run has nothing left to cancel.
+const CANCELLABLE = new Set(['pending', 'planning', 'running']);
 
 function StepRow({ step, runId }: { step: RunStep; runId: string }) {
   const [expanded, setExpanded] = useState(false);
@@ -170,6 +177,32 @@ export default function RunsPane() {
   const [prPending, setPrPending] = useState<string | null>(null);
   const [prError, setPrError] = useState<{ runId: string; message: string } | null>(null);
 
+  // Two-step confirm: the first click just arms the button, so a stray click
+  // never stops a run. `cancelConfirm` holds the run id awaiting a second
+  // click; it is cleared on any run switch so an armed button never survives
+  // into a different run's row.
+  const [cancelConfirm, setCancelConfirm] = useState<string | null>(null);
+  const [cancelPending, setCancelPending] = useState<string | null>(null);
+  const [cancelError, setCancelError] = useState<{ runId: string; message: string } | null>(null);
+
+  const cancelSelectedRun = useCallback(async (runId: string) => {
+    setCancelPending(runId);
+    setCancelError(null);
+    try {
+      await cancelRun(runId);
+      const refreshed = await getRun(runId);
+      setDetail((current) => (current?.id === runId ? refreshed : current));
+    } catch (err) {
+      setCancelError({
+        runId,
+        message: err instanceof Error ? err.message : 'could not cancel run',
+      });
+    } finally {
+      setCancelConfirm(null);
+      setCancelPending((current) => (current === runId ? null : current));
+    }
+  }, []);
+
   const openPullRequest = useCallback(async (runId: string) => {
     setPrPending(runId);
     setPrError(null);
@@ -214,6 +247,7 @@ export default function RunsPane() {
     streamRef.current = null;
     setDetail(null);
     setLive(false);
+    setCancelConfirm(null);
     if (!selected) return;
 
     let cancelled = false;
@@ -348,7 +382,33 @@ export default function RunsPane() {
                     <p className="t-micro mt-1 flex items-center gap-2 text-[var(--muted)]">
                       <StatusChip status={detail.status} label={detail.status ?? 'unknown'} />
                       {detail.profile && <span>{detail.profile}</span>}
+                      {detail.status && CANCELLABLE.has(detail.status) && (
+                        <button
+                          type="button"
+                          disabled={cancelPending === detail.id}
+                          onClick={() => {
+                            if (cancelConfirm === detail.id) {
+                              void cancelSelectedRun(detail.id);
+                            } else {
+                              setCancelConfirm(detail.id);
+                            }
+                          }}
+                          className="t-micro ml-auto inline-flex items-center gap-1 rounded-md border border-[var(--err-line)] px-2 py-0.5 text-[var(--err-strong)] transition-colors hover:bg-[var(--err-soft)] disabled:cursor-not-allowed disabled:opacity-50"
+                        >
+                          <XCircle className={`h-3 w-3 ${cancelPending === detail.id ? 'animate-pulse' : ''}`} aria-hidden />
+                          {cancelPending === detail.id
+                            ? 'Cancelling…'
+                            : cancelConfirm === detail.id
+                              ? 'Click again to cancel'
+                              : 'Cancel run'}
+                        </button>
+                      )}
                     </p>
+                    {cancelError?.runId === detail.id && (
+                      <p className="t-micro mt-1.5 rounded border border-[var(--err-line)] bg-[var(--err-soft)] px-2.5 py-1.5 text-[var(--err-strong)]">
+                        {cancelError.message}
+                      </p>
+                    )}
                   </header>
 
                   <ul className="rounded-lg border border-[var(--line)] bg-[var(--surface)]">

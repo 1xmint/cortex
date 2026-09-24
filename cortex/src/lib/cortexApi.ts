@@ -2127,6 +2127,21 @@ export async function createRunPullRequest(
   });
 }
 
+export interface CancelRunResponse {
+  run_id: string;
+  status: string;
+  already_terminal: boolean;
+  cancelled_steps: number;
+  signalled_steps: number;
+}
+
+export async function cancelRun(runId: string, reason?: string): Promise<CancelRunResponse> {
+  return requestJson<CancelRunResponse>(`/api/runs/${runId}/cancel`, {
+    method: 'POST',
+    body: JSON.stringify(reason ? { reason } : {}),
+  });
+}
+
 export function streamRun(
   runId: string,
   onEvent: (event: RunStreamEvent) => void,
