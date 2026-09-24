@@ -9907,7 +9907,16 @@ impl Database {
         // the transition: a release that committed separately could leave a
         // path held by a finished step if the process died between the two,
         // and nothing would ever free it except the TTL.
-        if rows > 0 && matches!(to_state, "verified" | "failed" | "inconclusive") {
+        //
+        // `execution_failed` belongs here too: the worker refused to start,
+        // and the heal chain that follows writes the same paths, so a lease
+        // kept past it blocks the step's own repair until the TTL runs out.
+        if rows > 0
+            && matches!(
+                to_state,
+                "verified" | "failed" | "inconclusive" | "execution_failed" | "manual_override"
+            )
+        {
             let _ = tx.execute(
                 "UPDATE resource_leases
                  SET status = 'released', released_at = ?1
@@ -16671,6 +16680,23 @@ mod truth {
 
         let (state, _) = db.get_verification_state("step-1", "a1", gen).unwrap();
         assert_eq!(state, "execution_failed");
+    }
+
+    #[test]
+    fn an_execution_failure_frees_the_paths_the_step_held() {
+        // Seen live: the worker refused a step (no git repository), the heal
+        // chain it triggered wanted the same path, and it waited on the
+        // refused step's lease every tick for the full TTL.
+        let db = test_db();
+        let (run_id, gen) = leased_step(&db, "step-1");
+        let keys = vec![".".to_string()];
+        db.acquire_step_path_leases("user-1", &run_id, "step-1", "repo-1", &keys)
+            .expect("first holder");
+
+        assert!(db.record_execution_failure("step-1", "a1", gen, "worktree_unavailable"));
+
+        db.acquire_step_path_leases("user-1", &run_id, "heal-1", "repo-1", &keys)
+            .expect("a terminal step must not keep holding its paths");
     }
 
     #[test]
