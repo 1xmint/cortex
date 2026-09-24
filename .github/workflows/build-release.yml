@@ -4,14 +4,24 @@ name: Build release
 # and worker-key binaries plus the built web app, uploaded as one artifact;
 # optionally (input `images`) the worker's container images as a second one.
 #
-# It does not deploy. The repository holds no host credentials, so copying the
-# artifact to a host is a separate, manual step (see docs/operations/).
+# It does not deploy. deploy.yml watches for a successful run of this workflow
+# on main and ships the resulting artifact to the production host over
+# Tailscale, but only once the owner has configured its secrets (see
+# docs/DEPLOY.md) — until then, copying the artifact to a host stays a manual
+# step (see docs/operations/).
 #
 # Built on ubuntu-24.04 because the production host runs Ubuntu 24.04: the
 # binaries link against the runner's glibc, and a newer runner could produce a
 # binary the host cannot load.
 
 on:
+  push:
+    branches: [main]
+    paths:
+      - 'crates/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/build-release.yml'
   workflow_dispatch:
     inputs:
       images:
