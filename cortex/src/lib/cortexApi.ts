@@ -133,7 +133,7 @@ async function authedFetch(url: string, init?: RequestInit): Promise<Response> {
   if (!headers.has('Content-Type') && init?.method && init.method !== 'GET') {
     headers.set('Content-Type', 'application/json');
   }
-  return fetchWithRetry(url, { ...init, headers });
+  return noteAuthorized(url, await fetchWithRetry(url, { ...init, headers }), headers);
 }
 
 async function bearerFetch(url: string, init?: RequestInit): Promise<Response> {
@@ -143,7 +143,7 @@ async function bearerFetch(url: string, init?: RequestInit): Promise<Response> {
   if (!headers.has('Content-Type') && init?.method && init.method !== 'GET') {
     headers.set('Content-Type', 'application/json');
   }
-  return fetchWithRetry(url, { ...init, headers });
+  return noteAuthorized(url, await fetchWithRetry(url, { ...init, headers }), headers);
 }
 
 export class CortexApiError extends Error {
@@ -175,11 +175,76 @@ async function readErrorMessage(res: Response): Promise<string> {
 /** BroadcastChannel name used for cross-tab auth sync. */
 export const AUTH_CHANNEL_NAME = 'cortex-auth';
 
+/** True once a 401 has raised the "session expired" banner, until a later
+ * credentialed request succeeds and clears it. */
+let _unauthorizedRaised = false;
+
+/** Record that the "session expired" banner is up, however it was raised
+ * (this module, projectApi, or another tab's logout broadcast), so the next
+ * real success can lower it. */
+export function markSessionExpired(): void {
+  _unauthorizedRaised = true;
+}
+
+/**
+ * Routes the server answers without checking the credential. Every request
+ * carries the bearer, so a success here says nothing about the session.
+ * Auth is checked per handler on the server (a `ClerkUser` argument), not by
+ * a router layer, so this list mirrors the handlers that take none.
+ */
+const PUBLIC_PATHS = new Set([
+  '/api/health',
+  '/api/deploy-info',
+  '/api/deploy-metadata',
+  '/api/deploy-status',
+  '/api/deployment/status',
+  '/api/deployment/events',
+]);
+
+function isPublicPath(url: string): boolean {
+  let path: string;
+  try {
+    path = new URL(url, 'http://localhost').pathname;
+  } catch {
+    return false;
+  }
+  return PUBLIC_PATHS.has(path);
+}
+
+/**
+ * A credentialed request that succeeds on a route that checks the credential
+ * proves the session works again (Clerk refreshed the token, or the user
+ * signed back in), so lower the banner a 401 raised. Fires once per raise,
+ * not on every successful request.
+ */
+function noteAuthorized(url: string, res: Response, headers: Headers): Response {
+  if (!_unauthorizedRaised || !res.ok || !headers.has('Authorization') || isPublicPath(url)) {
+    return res;
+  }
+  _unauthorizedRaised = false;
+  try {
+    window.dispatchEvent(new CustomEvent('cortex:authorized'));
+  } catch {
+    // ignore in non-browser environments
+  }
+  try {
+    if (typeof BroadcastChannel !== 'undefined') {
+      const ch = new BroadcastChannel(AUTH_CHANNEL_NAME);
+      ch.postMessage({ type: 'authorized' });
+      ch.close();
+    }
+  } catch {
+    // ignore in non-browser environments
+  }
+  return res;
+}
+
 function dispatchUnauthorized() {
   // A 401 for a request that could not carry a credential (no token getter
   // registered yet) says nothing about the session, so it must not raise the
   // "session expired" banner. Once a getter exists, every 401 still counts.
   if (!_tokenGetter && !_somaDelegation) return;
+  _unauthorizedRaised = true;
   try {
     window.dispatchEvent(new CustomEvent('cortex:unauthorized'));
   } catch {

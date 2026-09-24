@@ -62,6 +62,7 @@ import {
   getDeploymentStatus,
   getUserRouting,
   listConversations,
+  markSessionExpired,
   type BillingAccessState,
   type ConversationSummary,
   type DeploymentStatus,
@@ -358,9 +359,15 @@ function CortexShell() {
     // Listen for 401 events dispatched by the API layer or other parts of the app
     function handle401(event: CustomEvent<unknown>) {
       void event;
+      markSessionExpired();
       setSessionExpired(true);
     }
     window.addEventListener('cortex:unauthorized', handle401 as EventListener);
+    // A later credentialed request succeeded, so the session works again.
+    function handleAuthorized() {
+      setSessionExpired(false);
+    }
+    window.addEventListener('cortex:authorized', handleAuthorized);
 
     // Multi-tab session sync: listen for logout broadcast from other tabs
     const authChannel = typeof BroadcastChannel !== 'undefined'
@@ -368,13 +375,17 @@ function CortexShell() {
       : null;
     const onAuthMessage = (event: MessageEvent<{ type?: string }>) => {
       if (event.data?.type === 'logout') {
+        markSessionExpired();
         setSessionExpired(true);
+      } else if (event.data?.type === 'authorized') {
+        setSessionExpired(false);
       }
     };
     authChannel?.addEventListener('message', onAuthMessage);
 
     return () => {
       window.removeEventListener('cortex:unauthorized', handle401 as EventListener);
+      window.removeEventListener('cortex:authorized', handleAuthorized);
       authChannel?.removeEventListener('message', onAuthMessage);
       authChannel?.close();
     };

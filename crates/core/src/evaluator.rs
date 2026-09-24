@@ -342,15 +342,6 @@ fn reliability_bonus(success_rate: Option<f64>, sample_count: u64) -> f64 {
     ((rate - 0.80) / 0.20 * 12.0).clamp(-15.0, 12.0)
 }
 
-fn latency_penalty(provider: ProviderId, estimated_duration_ms: u64) -> f64 {
-    match provider {
-        ProviderId::Openai if estimated_duration_ms < 90_000 => 18.0,
-        ProviderId::Openai if estimated_duration_ms < 180_000 => 10.0,
-        ProviderId::Gemini if estimated_duration_ms < 90_000 => 8.0,
-        _ => 0.0,
-    }
-}
-
 fn risk_alignment_bonus(risk: RiskLevel, tier: Tier) -> f64 {
     match (risk, tier) {
         (RiskLevel::Critical, Tier::Think) => 20.0,
@@ -389,9 +380,13 @@ fn provider_fit_score(
     evidence: &DecisionEvidence,
     profile: Profile,
 ) -> f64 {
+    // No latency term: supplier speed is not measured yet, and
+    // `estimated_duration_ms` is one constant per step kind shared by every
+    // candidate, so a "latency" bonus keyed on it was a fixed per-supplier
+    // preference (OpenAI up to +18, Gemini +8, Claude and Zen 0). Add one back
+    // only from measured per-supplier latency.
     let cap = capability_bonus(candidate.tier, evidence.intent.default_tier);
     let rel = reliability_bonus(candidate.success_rate, candidate.sample_count);
-    let lat = latency_penalty(candidate.provider, candidate.estimated_duration_ms);
     let risk_align = risk_alignment_bonus(evidence.risk.level, candidate.tier);
     let bias = profile_bias(
         profile,
@@ -400,7 +395,7 @@ fn provider_fit_score(
         evidence.risk.level,
     );
 
-    cap + rel + lat + risk_align + bias
+    cap + rel + risk_align + bias
 }
 
 // --- Policy function ---
@@ -972,6 +967,71 @@ mod tests {
 
         // With cost-saver weights (budget=0.45), OpenAI's lower pressure should win
         assert_eq!(decision.provider, ProviderId::Openai);
+    }
+
+    #[test]
+    fn provider_fit_does_not_favour_a_supplier_by_step_duration() {
+        let evidence = DecisionEvidence {
+            intent: IntentEvidence {
+                intent: Intent::Fix,
+                confidence: 0.9,
+                default_tier: Tier::Execute,
+            },
+            risk: RiskEvidence {
+                level: RiskLevel::Low,
+                basis: RiskBasis::Static,
+                static_level: RiskLevel::Low,
+                file_risk: None,
+                history_success_rate: None,
+            },
+            budget: BudgetEvidence {
+                pressures: HashMap::new(),
+            },
+            provider_fit: ProviderFitEvidence { candidates: vec![] },
+        };
+        let candidate = |provider, estimated_duration_ms| CandidateScore {
+            provider,
+            tier: Tier::Execute,
+            worker_id: Some("w1".into()),
+            authenticated: true,
+            pressure: 0.2,
+            success_rate: Some(0.9),
+            sample_count: 50,
+            estimated_duration_ms,
+        };
+
+        // Every step-kind duration the scheduler hands out, shared by all
+        // candidates in a step (scheduler.rs estimated_duration_ms).
+        for duration in [30_000, 90_000, 120_000, 180_000] {
+            for profile in [Profile::Auto, Profile::Balanced] {
+                let claude = provider_fit_score(
+                    &candidate(ProviderId::Claude, duration),
+                    &evidence,
+                    profile,
+                );
+                let openai = provider_fit_score(
+                    &candidate(ProviderId::Openai, duration),
+                    &evidence,
+                    profile,
+                );
+                assert_eq!(claude, openai, "{profile:?} at {duration}ms");
+            }
+            for profile in [Profile::CostSaver, Profile::QualityFirst] {
+                let scores: Vec<f64> = [
+                    ProviderId::Claude,
+                    ProviderId::Openai,
+                    ProviderId::Gemini,
+                    ProviderId::Zen,
+                ]
+                .into_iter()
+                .map(|p| provider_fit_score(&candidate(p, duration), &evidence, profile))
+                .collect();
+                assert!(
+                    scores.windows(2).all(|w| w[0] == w[1]),
+                    "{profile:?} at {duration}ms: {scores:?}"
+                );
+            }
+        }
     }
 
     #[test]

@@ -456,7 +456,6 @@ pub struct CandidateScore {
     pub capability_status: ProviderStatus,
     pub pressure_penalty: f64,
     pub fit_bonus: f64,         // coupling/isolation match
-    pub latency_penalty: f64,   // startup overhead for short tasks
     pub reliability: f64,       // from outcome history
     pub total: f64,
 }
@@ -1056,7 +1055,7 @@ score = 50
 **Provider fit score:**
 - Capability bonus: +22 exact tier, +10 higher tier, -35 lower tier
 - Reliability bonus: (success_rate - 0.80) × 60, clamped [-15, +12], requires 20+ samples
-- Latency penalty: -18 if OpenAI + task < 90s, -10 if < 180s
+- Latency: no term. Supplier latency is not measured, and the step's estimated duration is the same for every candidate, so an earlier OpenAI/Gemini "latency" bonus was removed as a hidden supplier preference.
 - Underused bonus: +12 if provider < 30% pressure and peers > 55%
 - Risk alignment: +20 critical/think, +12 high/think, +8 high/execute
 - Profile bias: cost-saver favors search (+8), quality-first favors think (+12)
