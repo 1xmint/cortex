@@ -2,12 +2,14 @@
 # ---------------------------------------------------------------------------
 # deploy-receive.sh — receives a release artifact and swaps it into place.
 #
-# Runs on the deploy host as an SSH forced command:
-#   command="/home/guardian/cortex-next/deploy-receive.sh",restrict
-# in guardian's authorized_keys, so it is the only thing the deploy key can
-# ever run. SSH_ORIGINAL_COMMAND is ignored except that "deploy" (the value
-# the deploy.yml workflow sends) is accepted as a no-op label — anything else
-# arriving on stdin is still just a tar.gz.
+# Runs on the deploy host over Tailscale SSH. deploy.yml connects as guardian
+# and invokes this script by its fixed path directly:
+#   ssh ... guardian@clawguard.tail618cfc.ts.net '~/cortex-next/deploy-receive.sh' < release.tar.gz
+# Tailscale SSH (RunSSH) authenticates the connection via the tailnet ACL —
+# see docs/DEPLOY.md — so there is no authorized_keys forced command and no
+# deploy private key to leak; anyone who can reach this script can already
+# run arbitrary code as guardian over the same SSH session, so this script's
+# job is safety (verify, back up, roll back), not access control.
 #
 # Input: a gzip'd tar of a build-release.yml artifact, on stdin. Contains:
 #   COMMIT, SHA256SUMS, bin/{cortex-server,cortex-worker,cortex-worker-key}, www/
@@ -24,7 +26,8 @@
 #   3. verify SHA256SUMS and that COMMIT is a 40-hex-char sha
 #   4. back up the DB and the current bin/, COMMIT, SHA256SUMS, www/
 #   5. swap the new bin/, COMMIT, SHA256SUMS, www/ into place
-#   6. restart cortex-next, poll /api/health, then restart cortex-next-worker
+#   6. restart cortex-next, poll /api/health, then restart cortex-next-worker and
+#      confirm it is active
 #   7. confirm /api/deploy-info reports the new commit
 #
 # On any failure at or after step 5, the previous bin/, COMMIT, SHA256SUMS and
@@ -36,18 +39,21 @@
 # backups/<ts>/cortex.db in hand.
 # ---------------------------------------------------------------------------
 set -euo pipefail
+trap '' PIPE HUP
+
+INSTALL_ROOT="$(cd -- "$(dirname -- "$(readlink -f -- "$0")")" && pwd)"
+cd "$INSTALL_ROOT"
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
 
 log() {
-  printf '[deploy-receive] %s\n' "$1"
+  printf '[deploy-receive] %s\n' "$1" >>"$INSTALL_ROOT/deploy.log" 2>/dev/null || true
+  printf '[deploy-receive] %s\n' "$1" >&2 || true
 }
 
 fail() {
   log "ERROR: $1"
   exit 1
 }
-
-INSTALL_ROOT="$(cd -- "$(dirname -- "$(readlink -f -- "$0")")" && pwd)"
-cd "$INSTALL_ROOT"
 
 TS="$(date -u +%Y%m%dT%H%M%SZ)"
 LOCK_FILE="$INSTALL_ROOT/.deploy.lock"
@@ -58,10 +64,7 @@ HEALTH_URL="http://localhost:3001/api/health"
 DEPLOY_INFO_URL="http://localhost:3001/api/deploy-info"
 HEALTH_TIMEOUT_SECS=60
 
-# SSH_ORIGINAL_COMMAND is informational only. deploy.yml sends "deploy"; any
-# other value is logged and otherwise ignored — the artifact on stdin is the
-# only thing that drives behavior.
-log "invoked (SSH_ORIGINAL_COMMAND=${SSH_ORIGINAL_COMMAND:-<none>})"
+log "invoked"
 
 exec 9>"$LOCK_FILE"
 if ! flock -n 9; then
@@ -71,13 +74,15 @@ log "acquired lock on $LOCK_FILE"
 
 RESTORE_NEEDED=0
 cleanup() {
-  local status=$?
+  set +e
+  local status="$1"
   if [ "$status" -ne 0 ] && [ "$RESTORE_NEEDED" -eq 1 ]; then
     log "deploy failed after swap; restoring previous release from $BACKUP_DIR"
     for item in bin COMMIT SHA256SUMS www; do
       [ -e "$BACKUP_DIR/$item" ] || continue
-      rm -rf -- "${INSTALL_ROOT:?}/$item"
-      cp -a -- "$BACKUP_DIR/$item" "$INSTALL_ROOT/$item"
+      rm -rf -- "${INSTALL_ROOT:?}/$item.restore"
+      cp -a -- "$BACKUP_DIR/$item" "$INSTALL_ROOT/$item.restore"
+      mv -T -- "$INSTALL_ROOT/$item.restore" "$INSTALL_ROOT/$item"
     done
     if [ -d "$INSTALL_ROOT/bin" ]; then
       chmod +x "$INSTALL_ROOT"/bin/* 2>/dev/null || true
@@ -88,14 +93,15 @@ cleanup() {
     systemctl --user restart cortex-next-worker || true
     log "restore complete; exiting non-zero"
   fi
+  rm -rf -- "$INCOMING_DIR" 2>/dev/null || true
   exit "$status"
 }
-trap cleanup EXIT
+trap 'cleanup $?' EXIT
 
 wait_for_health() {
   local waited=0
   while [ "$waited" -lt "$HEALTH_TIMEOUT_SECS" ]; do
-    if curl -fsS -o /dev/null -w '%{http_code}' "$HEALTH_URL" 2>/dev/null | grep -q '^200$'; then
+    if curl -fsS --max-time 10 -o /dev/null -w '%{http_code}' "$HEALTH_URL" 2>/dev/null | grep -q '^200$'; then
       return 0
     fi
     sleep 2
@@ -173,7 +179,6 @@ for item in bin COMMIT SHA256SUMS www; do
   rm -rf -- "${INSTALL_ROOT:?}/$item"
   mv -- "$INCOMING_DIR/$item" "$INSTALL_ROOT/$item"
 done
-rmdir "$INCOMING_DIR" 2>/dev/null || true
 
 # --- 5. restart, health-check, restart worker -------------------------------
 log "restarting cortex-next"
@@ -186,6 +191,9 @@ log "cortex-next is healthy"
 
 log "restarting cortex-next-worker"
 systemctl --user restart cortex-next-worker
+sleep 5
+systemctl --user is-active --quiet cortex-next-worker \
+  || fail "cortex-next-worker did not become active within 5s of restart"
 
 # --- 6. confirm the deployed commit -----------------------------------------
 DEPLOY_INFO="$(curl -fsS "$DEPLOY_INFO_URL")" || fail "could not reach $DEPLOY_INFO_URL after restart"

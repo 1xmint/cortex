@@ -19,6 +19,7 @@ on:
     branches: [main]
     paths:
       - 'crates/**'
+      - 'cortex/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - '.github/workflows/build-release.yml'
@@ -31,6 +32,16 @@ on:
 
 permissions:
   contents: read
+
+# A push that lands while an earlier build for the same ref is still running
+# would otherwise let the slower (older) build finish last and get picked up
+# by deploy.yml's workflow_run trigger after the newer one already deployed.
+# Cancel the older push build; leave workflow_dispatch runs alone since those
+# are usually a deliberate one-off (e.g. building images) and canceling one
+# because another started could surprise whoever kicked it off.
+concurrency:
+  group: build-release-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'push' }}
 
 jobs:
   build:
