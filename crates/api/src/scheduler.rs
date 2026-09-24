@@ -117,7 +117,7 @@ async fn apply_event(state: &AppState, sched: &mut SchedulerState, event: &Sched
                 let user_id = get_run_user(db, run_id);
                 // The worker is free again regardless of what the verdict turns
                 // out to be, so the concurrency slot is released here.
-                sched.mark_step_done(&user_id);
+                sched.mark_step_done(&user_id, step_id);
 
                 // Invariant 6: a worker's report can never emit a positive
                 // routing reward. At delivery the step is `verifying` and no
@@ -174,7 +174,7 @@ async fn apply_event(state: &AppState, sched: &mut SchedulerState, event: &Sched
             }
             if let Some(db) = &state.db {
                 let user_id = get_run_user(db, run_id);
-                sched.mark_step_done(&user_id);
+                sched.mark_step_done(&user_id, step_id);
                 update_bandit_from_outcome(state, db, step_id, false, None).await;
 
                 // Check for auth-related failures — these are not healable
@@ -236,6 +236,24 @@ async fn apply_event(state: &AppState, sched: &mut SchedulerState, event: &Sched
             }
         }
 
+        SchedulerEvent::RunCancelled { run_id, in_flight } => {
+            tracing::info!(
+                "scheduler: run {run_id} cancelled, freeing {} in-flight slot(s)",
+                in_flight.len()
+            );
+            if let Some(db) = &state.db {
+                let user_id = get_run_user(db, run_id);
+                // One `mark_step_done` per in-flight step: each occupied its
+                // own concurrency slot, and cancellation is not a failure, so
+                // there is no bandit update, no heal, and no cascade here.
+                for step_id in in_flight {
+                    sched.mark_step_done(&user_id, step_id);
+                }
+            }
+            load_ready_steps_for_run(state, sched, run_id).await;
+            check_run_done(state, run_id).await;
+        }
+
         SchedulerEvent::Reconcile => {
             tracing::debug!("scheduler: reconcile tick");
         }
@@ -247,13 +265,23 @@ async fn schedule_until_blocked(state: &AppState, sched: &mut SchedulerState) {
         match dispatch_step(state, &step).await {
             DispatchOutcome::Dispatched => {}
             DispatchOutcome::RetryLater => {
-                sched.mark_step_done(&step.user_id);
+                sched.mark_step_done(&step.user_id, &step.step_id);
                 sched.enqueue_ready_step(step);
                 break;
             }
             DispatchOutcome::WaitingForApproval => {
-                sched.mark_step_done(&step.user_id);
+                sched.mark_step_done(&step.user_id, &step.step_id);
                 break;
+            }
+            DispatchOutcome::Drop => {
+                // The step is gone for good (cancelled, or its run is
+                // terminal) — free its concurrency slot like any other
+                // terminal outcome, but deliberately do not
+                // `enqueue_ready_step` it. Re-queuing a dead step is exactly
+                // the bug this outcome exists to stop: it would keep taking
+                // a scheduling turn and, worse, keep re-acquiring path
+                // leases on every tick forever.
+                sched.mark_step_done(&step.user_id, &step.step_id);
             }
         }
     }
@@ -263,6 +291,12 @@ enum DispatchOutcome {
     Dispatched,
     RetryLater,
     WaitingForApproval,
+    /// Terminal for this dispatch attempt: the step must not be re-queued.
+    /// Distinct from `RetryLater`, which means "queue it again, this was
+    /// ordinary contention" — `Drop` means the step (or its run) is no
+    /// longer in a dispatchable state at all, so re-queuing would only spin
+    /// forever re-acquiring resources for work that will never run.
+    Drop,
 }
 
 async fn dispatch_step(state: &AppState, step: &StepRef) -> DispatchOutcome {
@@ -282,6 +316,38 @@ async fn dispatch_step(state: &AppState, step: &StepRef) -> DispatchOutcome {
         Some(db) => db,
         None => return DispatchOutcome::RetryLater,
     };
+
+    // --- Cancellation guard ---
+    //
+    // A step queued behind the per-user concurrency cap can sit in the ready
+    // queue for a while. If it (or its run) left the dispatchable state
+    // while it waited — most commonly `cancel_run` — dispatching it further
+    // would acquire fresh path leases for work that must never run and then
+    // fail downstream (e.g. `lease_step` refusing a non-pending step),
+    // bouncing back to the queue forever and starving every other step that
+    // needs the same paths. Check this before acquiring anything.
+    match db.get_step_status(&step.step_id).as_deref() {
+        Some("pending") | Some("ready") | Some("orphaned") => {}
+        other => {
+            tracing::info!(
+                step_id = %step.step_id,
+                status = ?other,
+                "step is no longer pending/ready/orphaned at dispatch time — dropping"
+            );
+            return DispatchOutcome::Drop;
+        }
+    }
+    if matches!(
+        db.get_run_status(&step.run_id).as_deref(),
+        Some("cancelled") | Some("succeeded") | Some("failed")
+    ) {
+        tracing::info!(
+            step_id = %step.step_id,
+            run_id = %step.run_id,
+            "run is terminal — dropping step instead of dispatching"
+        );
+        return DispatchOutcome::Drop;
+    }
 
     // --- Billing gate check ---
     let gate = crate::billing::check_usage_gate(
@@ -335,6 +401,28 @@ async fn dispatch_step(state: &AppState, step: &StepRef) -> DispatchOutcome {
                 "path is leased by another step — waiting, will retry next tick"
             );
             return DispatchOutcome::RetryLater;
+        }
+
+        // A cancel that commits between the check above and the acquire
+        // releases nothing, because the rows did not exist yet. The two writes
+        // are serialised, so reading again here either sees the cancel or runs
+        // before it and is released by it. Without this, the rows outlive the
+        // run until the lease TTL, blocking the same paths for other steps.
+        let step_dispatchable = matches!(
+            db.get_step_status(&step.step_id).as_deref(),
+            Some("pending") | Some("ready") | Some("orphaned")
+        );
+        let run_terminal = matches!(
+            db.get_run_status(&step.run_id).as_deref(),
+            Some("cancelled") | Some("succeeded") | Some("failed")
+        );
+        if !step_dispatchable || run_terminal {
+            db.release_step_resource_leases(&step.step_id);
+            tracing::info!(
+                step_id = %step.step_id,
+                "step stopped while its paths were being leased — released and dropping"
+            );
+            return DispatchOutcome::Drop;
         }
     }
 
@@ -535,13 +623,33 @@ async fn dispatch_step(state: &AppState, step: &StepRef) -> DispatchOutcome {
     let lease_gen = match db.lease_step(&step.step_id, &worker_id, deadline) {
         Some(g) => g,
         None => {
+            // `lease_step`'s CAS only succeeds from 'pending' | 'ready' |
+            // 'orphaned'. If the step has since moved out of those (a cancel
+            // landed while we were routing/gating above) it will never
+            // succeed no matter how many times we retry — drop it and give
+            // back the path leases this dispatch just acquired, rather than
+            // holding them across a `RetryLater` that requeues forever.
+            let status = db.get_step_status(&step.step_id);
+            let droppable = !matches!(
+                status.as_deref(),
+                Some("pending") | Some("ready") | Some("orphaned")
+            );
             tracing::warn!(
                 step_id = %step.step_id,
                 worker_id = %worker_id,
-                "CAS lease failed for step — skipping. If this repeats every tick \
-                 for the same step, check the error log: `lease_step` reports a \
-                 database failure separately, because it is not the same thing."
+                status = ?status,
+                droppable,
+                "CAS lease failed for step. If this repeats every tick for a step \
+                 that is still pending/ready/orphaned, check the error log: \
+                 `lease_step` reports a database failure separately, because it \
+                 is not the same thing."
             );
+            if droppable {
+                if !lease_keys.is_empty() {
+                    db.release_step_resource_leases(&step.step_id);
+                }
+                return DispatchOutcome::Drop;
+            }
             return DispatchOutcome::RetryLater;
         }
     };
@@ -733,6 +841,35 @@ async fn dispatch_step(state: &AppState, step: &StepRef) -> DispatchOutcome {
             hosts = ?provider_egress.network_policy.allowed_hosts(),
             "granting provider egress for this step"
         );
+    }
+
+    // Re-check the lease immediately before handing the step to a worker.
+    // `issue_access` just created a live provider spend authorization; if a
+    // cancel (or any other re-lease) landed while that call was in flight,
+    // the step is no longer `leased` at this `lease_gen` and the worker must
+    // never be told to run it. Revoke the authorization we just issued so it
+    // cannot be exercised by anyone, and give up the lease.
+    if !db.step_still_leased(&step.step_id, lease_gen) {
+        tracing::warn!(
+            step_id = %step.step_id,
+            lease_gen,
+            "step lease no longer held at dispatch time — dropping the step \
+             instead of sending ExecuteStep"
+        );
+        if let Some(access) = &provider_gateway {
+            db.revoke_spend_authorization(&access.authorization_id);
+        }
+        // The step was re-leased or cancelled out from under us (the comment
+        // above already said "dropping" — `RetryLater` here was the bug:
+        // it re-queued a step that will never again pass this check, and
+        // every later tick re-acquired fresh path leases for it before
+        // failing here again, permanently blocking every other step on the
+        // same paths. Release what this dispatch just acquired and drop it
+        // for good instead.
+        if !lease_keys.is_empty() {
+            db.release_step_resource_leases(&step.step_id);
+        }
+        return DispatchOutcome::Drop;
     }
 
     let msg = BrainMessage::ExecuteStep {
@@ -1715,7 +1852,19 @@ async fn check_run_done(state: &AppState, run_id: &str) {
             }
         }
 
-        db.update_run_status(run_id, status_str, None);
+        // `update_run_status` reports whether it actually changed a row. A
+        // cancel can land between the terminal check above and this write, in
+        // which case the guarded UPDATE (status not already terminal) matches
+        // nothing here — the run is already 'cancelled' — and emitting
+        // `RunCompleted{succeeded|failed}` (or broadcasting the status) over
+        // that would be a stale, contradictory event for a run that already
+        // finished as cancelled.
+        if !db.update_run_status(run_id, status_str, None) {
+            tracing::debug!(
+                "run {run_id} status update to '{status_str}' changed no row, skipping completion event"
+            );
+            return;
+        }
 
         // Log branch info for PR creation if the run succeeded with changes
         if final_status == RunStatus::Succeeded {
@@ -2664,5 +2813,80 @@ mod tests {
         try_heal(&state, &mut sched, &run_id, &heal).await;
 
         assert_eq!(db.get_step_status(&retry).as_deref(), Some("skipped"));
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_ready_step_queued_behind_the_cap_is_dropped_not_requeued() {
+        // Regression for the bounce found in PR #60 review: `dispatch_step`
+        // used to return `RetryLater` for a step that turned out to be
+        // cancelled (or whose run had gone terminal) while it sat behind
+        // another user's concurrency cap in the ready queue. `RetryLater`
+        // means "queue it again" — so it came right back next tick, and
+        // because the cancellation check ran *after* path leases are
+        // acquired, every one of those ticks minted a fresh `.`-scoped
+        // resource lease for the step before failing downstream, forever
+        // blocking every other tree-changing step in that repo.
+        let temporary = tempfile::tempdir().expect("temporary workspace");
+        let workspace = temporary.path().to_path_buf();
+        std::fs::create_dir_all(workspace.join(".cortex")).expect("workspace metadata");
+        let state = AppState::new(workspace.join(".cortex/ledger.jsonl"), workspace, None).await;
+        let db = state.db.as_ref().expect("database");
+
+        let user_id = "user-cancel";
+        let run_id = db.create_run(user_id, "Cancel me", "auto", &[]);
+        // `Execute` with no declared target paths derives the repo-wide "."
+        // write lease described in the review finding.
+        let step_id = db.create_step(&run_id, "execute", "balanced", "medium", "touch file");
+
+        // `dispatch_step` bails out on "no worker" before it ever reaches the
+        // cancellation guard, so a worker has to be registered for this test
+        // to exercise the code path under test.
+        let (tx, _rx) = mpsc::channel(8);
+        state.workers.write().await.insert(
+            "worker-1".to_string(),
+            crate::state::ConnectedWorker {
+                worker_id: "worker-1".to_string(),
+                user_id: user_id.to_string(),
+                available_providers: Vec::new(),
+                disabled_providers: HashSet::new(),
+                tx,
+            },
+        );
+
+        // Cancel before the step is ever dispatched — exactly the race this
+        // covers: the step was already sitting in the ready queue when the
+        // cancel landed.
+        db.cancel_run(run_id.as_str(), user_id, "test cancel")
+            .expect("cancel_run");
+        assert_eq!(db.get_step_status(&step_id).as_deref(), Some("cancelled"));
+
+        let step = StepRef {
+            step_id: step_id.clone(),
+            run_id: run_id.clone(),
+            user_id: user_id.to_string(),
+            kind: StepKind::Execute,
+            work_kind: None,
+            tier: "balanced".into(),
+            risk: "medium".into(),
+            objective: "touch file".into(),
+        };
+
+        let mut sched = SchedulerState::new();
+        sched.enqueue_ready_step(step);
+
+        schedule_until_blocked(&state, &mut sched).await;
+
+        // Dropped, not re-queued: nothing left to assign on the next tick.
+        assert!(
+            sched.next_assignable().is_none(),
+            "a dropped step must not come back out of the ready queue"
+        );
+
+        // And critically, nothing was leased on its behalf: the guard fired
+        // before `acquire_step_path_leases` ever ran.
+        assert!(
+            db.list_active_resource_leases_for_run(&run_id).is_empty(),
+            "a cancelled step must never acquire a fresh path lease"
+        );
     }
 }

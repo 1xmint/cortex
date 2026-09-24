@@ -414,6 +414,31 @@ async fn handle_worker_msg(
             // Verify this worker owns the step
             if let Some(db) = &state.db {
                 if !db.verify_step_worker(&step_id, worker_id) {
+                    // A cancelled step keeps its `assigned_worker` on purpose
+                    // (cancel_run only clears `lease_deadline`), so a worker
+                    // that was already mid-flight when the user cancelled
+                    // will still land here. That is expected, not an
+                    // intrusion attempt — but only for the worker the step
+                    // was actually leased to at that lease_gen; anyone else
+                    // reporting on a cancelled step is exactly the impostor
+                    // case the SECURITY path below exists for.
+                    if db.get_step_status(&step_id).as_deref() == Some("cancelled")
+                        && db.step_assigned_to(&step_id, worker_id, Some(lease_gen))
+                    {
+                        tracing::info!(
+                            "worker {worker_id} reported StepCompleted for step {step_id} \
+                             after it was cancelled — dropping message (msg={message_id})"
+                        );
+                        record_step_usage(
+                            db,
+                            &step_id,
+                            lease_gen,
+                            authed_user_id.as_deref(),
+                            output.tokens_in,
+                            output.tokens_out,
+                        );
+                        return;
+                    }
                     tracing::warn!(
                         "SECURITY: worker {worker_id} attempted StepCompleted for step {step_id} \
                          which is not assigned to it — dropping message (msg={message_id})"
@@ -797,6 +822,27 @@ async fn handle_worker_msg(
             // Verify this worker owns the step
             if let Some(db) = &state.db {
                 if !db.verify_step_worker(&step_id, worker_id) {
+                    // Same reasoning as the StepCompleted case above: a
+                    // cancelled step keeps its `assigned_worker`, so a worker
+                    // reporting failure for it after the fact is expected —
+                    // but only from the worker it was actually leased to.
+                    if db.get_step_status(&step_id).as_deref() == Some("cancelled")
+                        && db.step_assigned_to(&step_id, worker_id, Some(lease_gen))
+                    {
+                        tracing::info!(
+                            "worker {worker_id} reported StepFailed for step {step_id} \
+                             after it was cancelled — dropping message (msg={message_id})"
+                        );
+                        record_step_usage(
+                            db,
+                            &step_id,
+                            lease_gen,
+                            authed_user_id.as_deref(),
+                            None,
+                            None,
+                        );
+                        return;
+                    }
                     tracing::warn!(
                         "SECURITY: worker {worker_id} attempted StepFailed for step {step_id} \
                          which is not assigned to it — dropping message (msg={message_id})"
@@ -1378,7 +1424,7 @@ fn resolve_run_id(
     None
 }
 
-fn record_step_usage(
+pub(crate) fn record_step_usage(
     db: &crate::db::Database,
     step_id: &str,
     lease_gen: i64,
