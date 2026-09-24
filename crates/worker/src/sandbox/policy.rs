@@ -565,7 +565,7 @@ mod tests {
             "ANTHROPIC_BASE_URL=https://{}/internal/provider",
             cortex_core::egress::PROVIDER_GATEWAY_HOST
         );
-        assert!(env.iter().any(|entry| *entry == expected_base_url));
+        assert!(env.contains(&expected_base_url));
         assert!(env
             .iter()
             .any(|entry| entry == "ANTHROPIC_AUTH_TOKEN=signed-capability"));
@@ -599,6 +599,33 @@ mod tests {
                 // compares the leading characters.
                 base_url: format!(
                     "https://{}.evil.com/internal/provider",
+                    cortex_core::egress::PROVIDER_GATEWAY_HOST
+                ),
+                ..gateway_access()
+            },
+            ProviderGatewayAccess {
+                // Userinfo before an `@` is not part of the host: the real
+                // host here is `evil.com`.
+                base_url: format!(
+                    "https://{}@evil.com/internal/provider",
+                    cortex_core::egress::PROVIDER_GATEWAY_HOST
+                ),
+                ..gateway_access()
+            },
+            ProviderGatewayAccess {
+                // A non-default port is not the gateway; the strict prefix
+                // must not treat it as one.
+                base_url: format!(
+                    "https://{}:8443/internal/provider",
+                    cortex_core::egress::PROVIDER_GATEWAY_HOST
+                ),
+                ..gateway_access()
+            },
+            ProviderGatewayAccess {
+                // Plain HTTP is not the gateway, even to the right host: the
+                // scheme is part of the required prefix.
+                base_url: format!(
+                    "http://{}/internal/provider",
                     cortex_core::egress::PROVIDER_GATEWAY_HOST
                 ),
                 ..gateway_access()
