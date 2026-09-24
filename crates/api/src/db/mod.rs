@@ -11233,6 +11233,20 @@ impl Database {
         .ok()
     }
 
+    /// Cheap standalone status lookup for a run — no join to `steps`, so it's
+    /// safe to call on every dispatch tick. Used at the top of `dispatch_step`
+    /// to drop a step whose run was cancelled out from under it instead of
+    /// leasing paths for work that will never run.
+    pub fn get_run_status(&self, run_id: &str) -> Option<String> {
+        let conn = self.conn();
+        conn.query_row(
+            "SELECT status FROM runs WHERE id = ?1",
+            params![run_id],
+            |row| row.get::<_, String>(0),
+        )
+        .ok()
+    }
+
     /// Check if a run belongs to the given user. Returns true if the run exists and is owned by user_id.
     pub fn verify_run_owner(&self, run_id: &str, user_id: &str) -> bool {
         let conn = self.conn();
@@ -14132,6 +14146,40 @@ mod tests {
             &[],
         );
         assert!(second.is_ok());
+    }
+
+    /// Callers rely on `update_run_status`'s return value to tell a real
+    /// completion apart from a write that landed too late: the scheduler's
+    /// `check_run_done` uses it to skip emitting `RunCompleted` (and a
+    /// status-changed broadcast) when a cancel already made the run terminal
+    /// before the guarded update ran. If this ever silently returned `true`
+    /// for a no-op write, that guard would stop working and a cancelled run
+    /// could still get a stale `succeeded`/`failed` completion event.
+    #[test]
+    fn update_run_status_reports_no_change_for_an_already_terminal_run() {
+        let db = test_db();
+        let run_id = db.create_run("user-1", "Cancel me", "auto", &[]);
+
+        let cancel_outcome = db
+            .cancel_run(&run_id, "user-1", "test cancel")
+            .expect("cancel_run");
+        assert!(!cancel_outcome.already_terminal);
+
+        // A completion check racing the cancel lands here: the row is
+        // already 'cancelled', so this guarded UPDATE must match nothing.
+        let changed = db.update_run_status(&run_id, "succeeded", None);
+        assert!(
+            !changed,
+            "update_run_status must report no change when the run is already terminal"
+        );
+
+        // And the row itself must be untouched: still 'cancelled', not
+        // clobbered to 'succeeded'.
+        let run = db.list_user_runs_by_id(&run_id).expect("run exists");
+        assert_eq!(
+            run.get("status").and_then(|s| s.as_str()),
+            Some("cancelled")
+        );
     }
 
     #[test]
