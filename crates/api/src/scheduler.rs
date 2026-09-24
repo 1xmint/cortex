@@ -402,6 +402,28 @@ async fn dispatch_step(state: &AppState, step: &StepRef) -> DispatchOutcome {
             );
             return DispatchOutcome::RetryLater;
         }
+
+        // A cancel that commits between the check above and the acquire
+        // releases nothing, because the rows did not exist yet. The two writes
+        // are serialised, so reading again here either sees the cancel or runs
+        // before it and is released by it. Without this, the rows outlive the
+        // run until the lease TTL, blocking the same paths for other steps.
+        let step_dispatchable = matches!(
+            db.get_step_status(&step.step_id).as_deref(),
+            Some("pending") | Some("ready") | Some("orphaned")
+        );
+        let run_terminal = matches!(
+            db.get_run_status(&step.run_id).as_deref(),
+            Some("cancelled") | Some("succeeded") | Some("failed")
+        );
+        if !step_dispatchable || run_terminal {
+            db.release_step_resource_leases(&step.step_id);
+            tracing::info!(
+                step_id = %step.step_id,
+                "step stopped while its paths were being leased — released and dropping"
+            );
+            return DispatchOutcome::Drop;
+        }
     }
 
     // --- Build evidence and route through evaluator ---
