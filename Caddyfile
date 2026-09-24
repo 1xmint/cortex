@@ -14,34 +14,28 @@
 #
 # cortex.heyvera.org is now a Cloudflare Pages static site and no longer
 # reaches this host at all, so its Caddy block was deleted rather than kept
-# around unserved. The provider gateway lives on api.heyvera.org, below,
-# because a Pages site cannot proxy anything.
+# around unserved.
+#
+# The provider gateway has a hostname of its own, gateway.heyvera.org, that
+# forwards only /internal/provider/*. A sandbox is handed a provider-gateway
+# bearer that is only valid against that host (see
+# cortex_core::egress::PROVIDER_GATEWAY_HOST), and the sandbox egress
+# allowlist names that host alone, so sandbox code can reach the gateway and
+# nothing else: not /api/*, and not HeyVera's routes on api.heyvera.org. The
+# worker's strict `https://{host}/` prefix check
+# (crates/worker/src/sandbox/policy.rs) keeps the bearer off lookalike hosts.
+#
+# In production the edge in front of this host is a Cloudflare tunnel, not
+# this file. Its rule for gateway.heyvera.org must carry the same limit
+# (`path: ^/internal/provider/`, then a 404 for the rest of that hostname);
+# forwarding the whole hostname would let sandbox code reach every Cortex
+# route through the gateway host.
 #
 # api.heyvera.org is shared with the HeyVera repository. The live host also
 # carries HeyVera's /v1/social/*, /v1/pulse/*, /v1/health, /v1/ready and
 # /v1/* routes (to localhost:3002 and localhost:3402); those belong to the
-# heyvera repo and are not listed here. Only Cortex's own two routes are
-# below.
-#
-# A sandbox is handed a provider-gateway bearer that is only valid against
-# this host (see cortex_core::egress::PROVIDER_GATEWAY_HOST). That bearer's
-# reach past this hostname is bounded elsewhere, not by this file having no
-# other routes on it: the worker's strict `https://{host}/` prefix check
-# (crates/worker/src/sandbox/policy.rs), the sandbox egress allowlist, and
-# /api/* requiring a Clerk JWT that the bearer does not carry.
-#
-# Because the host is shared, sandbox code can also reach HeyVera's public
-# /v1/* routes here, with no credentials. Before real customer code runs, the
-# gateway should get a hostname of its own that forwards only
-# /internal/provider/*, so the sandbox reaches nothing else.
+# heyvera repo and are not listed here. Only Cortex's own route is below.
 api.heyvera.org {
-	# The provider gateway. Bare reverse_proxy: this is a machine-to-machine
-	# route, not a browser request, so it carries none of the header_up
-	# rewriting below.
-	handle /internal/provider/* {
-		reverse_proxy localhost:3001
-	}
-
 	# Cortex product API
 	handle /api/* {
 		reverse_proxy localhost:3001 {
@@ -58,6 +52,28 @@ api.heyvera.org {
 
 	# No match above: not a Cortex route. (The live host also has HeyVera's
 	# routes here; this repo does not own or list them.)
+	handle {
+		respond "Not found" 404
+	}
+
+	# Security headers
+	header {
+		X-Content-Type-Options nosniff
+		X-Frame-Options DENY
+		Referrer-Policy strict-origin-when-cross-origin
+	}
+}
+
+gateway.heyvera.org {
+	# The provider gateway, and nothing else. Bare reverse_proxy: this is a
+	# machine-to-machine route, not a browser request, so it carries none of
+	# the header_up rewriting the product API uses.
+	handle /internal/provider/* {
+		reverse_proxy localhost:3001
+	}
+
+	# Everything else on this host 404s: sandbox code can reach this
+	# hostname, so it must lead nowhere but the gateway.
 	handle {
 		respond "Not found" 404
 	}
