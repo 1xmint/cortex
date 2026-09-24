@@ -1142,10 +1142,17 @@ fn route_step(
         // Check capability status from DB
         // No capability record = not available (unknown providers default to unauthenticated)
         let cap_status = db.get_provider_status(user_id, &provider_str);
-        let authenticated = cap_status
-            .as_deref()
-            .map(|s| s != "unavailable")
-            .unwrap_or(false);
+        // A worker's claim only says the CLI is installed. The sandbox admits
+        // a credential for Claude alone: supplier keys never enter it, and
+        // the gateway bearer is refused for any other provider at the
+        // sandbox boundary (`sanctioned_env_for_request` in the worker's
+        // sandbox/policy.rs). Routing elsewhere hands the step a model it
+        // can never sign in to.
+        let authenticated = provider == ProviderId::Claude
+            && cap_status
+                .as_deref()
+                .map(|s| s != "unavailable")
+                .unwrap_or(false);
 
         let estimated_duration = match step.kind {
             StepKind::Search => 30_000,
@@ -2585,5 +2592,47 @@ mod tests {
             .alternatives_considered
             .iter()
             .all(|route| route.provider != ProviderId::Zen));
+    }
+
+    #[test]
+    fn a_worker_with_codex_installed_still_routes_runs_to_claude() {
+        // The deployed worker has both the `claude` and `codex` CLIs, so it
+        // claims both providers. On the old code the latency bonus routed a
+        // short test step to OpenAI, whose sandbox never gets a credential,
+        // so the step could not reach a model at all.
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(&dir.path().join("scheduler-claims.sqlite"));
+        db.register_worker("worker-both", "user-both");
+        for provider in ["claude", "openai", "gemini"] {
+            db.upsert_provider_capability("worker-both", "user-both", provider, None);
+        }
+
+        for kind in [StepKind::Test, StepKind::Search, StepKind::Execute] {
+            let step = StepRef {
+                step_id: "step-both".into(),
+                run_id: "run-both".into(),
+                user_id: "user-both".into(),
+                kind,
+                work_kind: None,
+                tier: "balanced".into(),
+                risk: "medium".into(),
+                objective: "create hello.txt".into(),
+            };
+
+            let (decision, _evidence) = route_step(
+                &db,
+                "user-both",
+                &step,
+                Tier::Execute,
+                RiskLevel::Medium,
+                None,
+            );
+
+            assert_eq!(decision.provider, ProviderId::Claude, "{kind:?}");
+            assert!(decision
+                .alternatives_considered
+                .iter()
+                .all(|route| route.provider == ProviderId::Claude));
+        }
     }
 }
