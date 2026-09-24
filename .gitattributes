@@ -1,2 +1,7 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+
+# Deploy scripts are copied by hand (scp) onto a Linux host and run there;
+# force LF endings regardless of the checkout platform so a Windows checkout
+# doesn't hand the host a CRLF script.
+scripts/deploy/*.sh text eol=lf
