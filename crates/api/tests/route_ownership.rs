@@ -244,10 +244,7 @@ fn caddy_forwards_only_paths_the_cortex_backend_serves() {
         .lines()
         .filter(|line| !line.trim_start().starts_with('#'))
         .collect::<Vec<_>>()
-        .join(
-            "
-",
-        );
+        .join("\n");
     assert!(
         !file_directives.contains("localhost:3402"),
         "legacy ClawNet port; this repo does not own HeyVera's routes on the shared host"
@@ -261,11 +258,7 @@ fn caddy_forwards_only_paths_the_cortex_backend_serves() {
         "api.heyvera.org",
         "the gateway must not share a host with the product API"
     );
-    let gateway_host = format!(
-        "
-{} {{",
-        cortex_core::egress::PROVIDER_GATEWAY_HOST
-    );
+    let gateway_host = format!("\n{} {{", cortex_core::egress::PROVIDER_GATEWAY_HOST);
     assert!(
         CADDYFILE.contains(&gateway_host),
         "the provider gateway host constant and the Caddyfile must agree on where the gateway lives"
@@ -274,11 +267,7 @@ fn caddy_forwards_only_paths_the_cortex_backend_serves() {
 
     // HeyVera's routes live on the shared host in production but are not in
     // this file, so this is the complete list this repo may claim there.
-    assert_cortex_site(
-        "
-api.heyvera.org {",
-        &["/api/*"],
-    );
+    assert_cortex_site("\napi.heyvera.org {", &["/api/*"]);
 }
 
 /// One Caddy site's `handle` paths are exactly `paths`, all to the one
@@ -286,19 +275,12 @@ api.heyvera.org {",
 /// security headers. Comments describe removed sites and HeyVera's routes,
 /// so only directives are judged.
 fn assert_cortex_site(label: &str, paths: &[&str]) {
-    let site = caddy_site(label).replace(
-        "
-", "
-",
-    );
+    let site = caddy_site(label).replace("\r\n", "\n");
     let directives = site
         .lines()
         .filter(|line| !line.trim_start().starts_with('#'))
         .collect::<Vec<_>>()
-        .join(
-            "
-",
-        );
+        .join("\n");
 
     let handle_paths: Vec<&str> = directives
         .lines()

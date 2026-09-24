@@ -25,6 +25,12 @@
 # worker's strict `https://{host}/` prefix check
 # (crates/worker/src/sandbox/policy.rs) keeps the bearer off lookalike hosts.
 #
+# In production the edge in front of this host is a Cloudflare tunnel, not
+# this file. Its rule for gateway.heyvera.org must carry the same limit
+# (`path: ^/internal/provider/`, then a 404 for the rest of that hostname);
+# forwarding the whole hostname would let sandbox code reach every Cortex
+# route through the gateway host.
+#
 # api.heyvera.org is shared with the HeyVera repository. The live host also
 # carries HeyVera's /v1/social/*, /v1/pulse/*, /v1/health, /v1/ready and
 # /v1/* routes (to localhost:3002 and localhost:3402); those belong to the
