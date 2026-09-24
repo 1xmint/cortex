@@ -13598,6 +13598,7 @@ impl Database {
 
 #[cfg(test)]
 mod tests {
+    use super::truth::{leased_step, status_of};
     use super::*;
 
     pub(super) fn test_db() -> Database {
@@ -16739,7 +16740,7 @@ mod truth {
     }
 
     /// A run with one leased, running step, ready to receive a delivery.
-    fn leased_step(db: &Database, step_id: &str) -> (String, i64) {
+    pub(super) fn leased_step(db: &Database, step_id: &str) -> (String, i64) {
         let now = Utc::now().timestamp_millis();
         let run_id = db.create_run_with_steps(
             "user-1",
@@ -16770,7 +16771,7 @@ mod truth {
         (run_id, lease_gen)
     }
 
-    fn status_of(db: &Database, step_id: &str) -> String {
+    pub(super) fn status_of(db: &Database, step_id: &str) -> String {
         db.get_step_status(step_id).expect("step exists")
     }
 
