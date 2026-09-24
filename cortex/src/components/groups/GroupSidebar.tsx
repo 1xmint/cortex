@@ -6,6 +6,9 @@ import Sidebar from '../Sidebar';
 
 type SettingsTab = 'integrations' | 'spend' | 'billing';
 
+// The Projects page has no working backend yet; flip this back on once it does.
+const SHOW_PROJECTS_LINK: boolean = false;
+
 interface GroupSidebarProps {
   groups: CortexGroup[];
   activeGroupId: string;
@@ -103,35 +106,37 @@ export default function GroupSidebar({
         </nav>
       </div>
 
-      {/* Projects Section */}
-      <div className="border-b border-white/6 p-3">
-        <div className="mb-2">
-          <div className="text-xs font-medium uppercase tracking-[0.08em] text-[var(--muted)]">
-            Development
-          </div>
-        </div>
-
-        <nav aria-label="Development tools">
-          <NavLink
-            to="/projects"
-            className={`group flex min-w-0 items-center gap-2 rounded-xl px-2.5 py-2 text-left transition ${
-              isProjectsActive
-                ? 'bg-white/8 text-white shadow-[inset_0_0_0_1px_rgba(255,255,255,0.04)]'
-                : 'text-[var(--muted-strong)] hover:bg-white/5 hover:text-white'
-            }`}
-          >
-            <div className="h-8 w-8 shrink-0 rounded-lg border border-white/10 bg-blue-500/10 flex items-center justify-center">
-              <FolderOpen className="h-4 w-4 text-blue-400" />
+      {/* Projects Section: hidden until Projects has a working backend. */}
+      {SHOW_PROJECTS_LINK && (
+        <div className="border-b border-white/6 p-3">
+          <div className="mb-2">
+            <div className="text-xs font-medium uppercase tracking-[0.08em] text-[var(--muted)]">
+              Development
             </div>
-            <span className="min-w-0 flex-1">
-              <span className="block truncate text-sm font-medium">Projects</span>
-              <span className="mt-0.5 block truncate text-[11px] text-[var(--muted)]">
-                Code repositories and workspaces
+          </div>
+
+          <nav aria-label="Development tools">
+            <NavLink
+              to="/projects"
+              className={`group flex min-w-0 items-center gap-2 rounded-xl px-2.5 py-2 text-left transition ${
+                isProjectsActive
+                  ? 'bg-white/8 text-white shadow-[inset_0_0_0_1px_rgba(255,255,255,0.04)]'
+                  : 'text-[var(--muted-strong)] hover:bg-white/5 hover:text-white'
+              }`}
+            >
+              <div className="h-8 w-8 shrink-0 rounded-lg border border-white/10 bg-blue-500/10 flex items-center justify-center">
+                <FolderOpen className="h-4 w-4 text-blue-400" />
+              </div>
+              <span className="min-w-0 flex-1">
+                <span className="block truncate text-sm font-medium">Projects</span>
+                <span className="mt-0.5 block truncate text-[11px] text-[var(--muted)]">
+                  Code repositories and workspaces
+                </span>
               </span>
-            </span>
-          </NavLink>
-        </nav>
-      </div>
+            </NavLink>
+          </nav>
+        </div>
+      )}
 
       <div className="min-h-0 flex-1">
         <Sidebar
