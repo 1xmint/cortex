@@ -372,7 +372,7 @@ fn api_not_found_router() -> Router<Arc<AppState>> {
         .route("/internal/{*rest}", any(api_not_found))
 }
 
-/// Build router with only Cortex routes (cortex.heyvera.org).
+/// Build router with only Cortex routes (served on api.heyvera.org).
 pub fn build_cortex_router(state: Arc<AppState>) -> Router {
     let cortex_static_dir =
         std::env::var("CORTEX_STATIC_DIR").unwrap_or_else(|_| "cortex/dist".to_string());

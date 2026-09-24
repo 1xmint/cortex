@@ -886,7 +886,10 @@ async fn egress_records_the_provider_grant_separately_from_the_registry_grant() 
         .map(|e| e.to_string())
         .collect();
 
-    assert!(endpoints.contains(&"cortex.heyvera.org:443".to_string()));
+    assert!(endpoints.contains(&format!(
+        "{}:443",
+        cortex_core::egress::PROVIDER_GATEWAY_HOST
+    )));
     assert!(endpoints.contains(&"index.crates.io:443".to_string()));
 
     // And the grants are still two things, not one merged host list.

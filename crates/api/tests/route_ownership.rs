@@ -206,11 +206,16 @@ fn literal_manifest_exactly_matches_cortex_router() {
     );
 }
 
-/// The Caddyfile is the edge, and since the split it carries one site. The
-/// guarantee it has to keep is that every path it forwards is a path the
-/// backend still serves. `/v1` is therefore named route by route: a broad
-/// `/v1/*` proxy would forward the deleted `/v1/social/*` and `/v1/pulse/*`
-/// surface to a backend that no longer answers it.
+/// The Caddyfile is the edge, and it carries one site: `api.heyvera.org`,
+/// shared with the HeyVera repository. This repo does not own or list
+/// HeyVera's routes on that host, but it does have to prove its own claim on
+/// it is exactly `/internal/provider/*` and `/api/*`, both to the same
+/// backend, and that nothing it lists (in particular `/metrics`) is exposed
+/// that shouldn't be.
+///
+/// `cortex.heyvera.org` used to be a second site here; it is a Cloudflare
+/// Pages static site now and no longer reaches this host, so its block was
+/// deleted rather than kept unserved.
 ///
 /// This replaced a test that asserted the HeyVera sites explicitly 404'd the
 /// Cortex paths and vice versa. Those sites live in the HeyVera repository
@@ -219,50 +224,72 @@ fn literal_manifest_exactly_matches_cortex_router() {
 fn caddy_forwards_only_paths_the_cortex_backend_serves() {
     for host in [
         "\nheyvera.org, www.heyvera.org {",
-        "\napi.heyvera.org {",
         "\npulse.heyvera.org {",
+        "\ncortex.heyvera.org {",
     ] {
         assert!(
             !CADDYFILE.contains(host),
-            "{host:?} belongs to the HeyVera repository and must not come back"
+            "{host:?} belongs to the HeyVera repository, or moved to Cloudflare Pages, and must not come back"
         );
     }
     assert_eq!(
         CADDYFILE.matches(".heyvera.org {").count(),
         1,
-        "the Caddyfile serves the Cortex host and nothing else"
+        "the Caddyfile serves exactly the one shared api.heyvera.org host"
     );
-    assert!(!CADDYFILE.contains("localhost:3402"), "legacy ClawNet port");
+    // Judge directives, not comments: the header comment names HeyVera's
+    // ports to explain what lives on the shared host.
+    let file_directives = CADDYFILE
+        .lines()
+        .filter(|line| !line.trim_start().starts_with('#'))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        !file_directives.contains("localhost:3402"),
+        "legacy ClawNet port; this repo does not own HeyVera's routes on the shared host"
+    );
 
-    // Comments here describe the sites that were removed, so judge the
-    // directives alone.
-    let site = caddy_site("\ncortex.heyvera.org {").replace("\r\n", "\n");
+    // The provider gateway host: the constant and the Caddyfile must agree
+    // on where the gateway lives.
+    let gateway_host = format!("\n{} {{", cortex_core::egress::PROVIDER_GATEWAY_HOST);
+    assert!(
+        CADDYFILE.contains(&gateway_host),
+        "the provider gateway host constant and the Caddyfile must agree on where the gateway lives"
+    );
+
+    // Comments here describe removed sites and HeyVera's routes on the
+    // shared host, so judge the directives alone.
+    let site = caddy_site(&gateway_host).replace("\r\n", "\n");
     let directives = site
         .lines()
         .filter(|line| !line.trim_start().starts_with('#'))
         .collect::<Vec<_>>()
         .join("\n");
 
-    assert!(
-        directives.contains("@api path /api/* /v1/health /v1/ready"),
-        "the two Cortex /v1 routes are named one by one"
+    // The exact set of Cortex `handle` paths on this site. HeyVera's routes
+    // live on the same host in production but are not in this file, so this
+    // is the complete list this repo may claim here.
+    let handle_paths: Vec<&str> = directives
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("handle "))
+        .map(|rest| rest.trim_end_matches('{').trim())
+        .filter(|path| !path.is_empty())
+        .collect();
+    assert_eq!(
+        handle_paths,
+        vec!["/internal/provider/*", "/api/*"],
+        "these are the only two paths this repo may claim on api.heyvera.org"
     );
-    for absent in ["/v1/*", "/v1/social", "/v1/pulse"] {
-        assert!(
-            !directives.contains(absent),
-            "{absent} would reach a backend that no longer serves it"
-        );
-    }
 
-    // Real routes that are deliberately off the public hostname: Prometheus
-    // scrapes over the private network, and the provider endpoint is the
-    // worker's. Publishing either is a change in exposure, not a fix.
-    for private in ["/metrics", "/internal/"] {
-        assert!(
-            !directives.contains(private),
-            "{private} must not be exposed on the public hostname"
-        );
-    }
+    assert!(
+        !directives.contains("/metrics"),
+        "/metrics must not be exposed on the public hostname; Prometheus scrapes over the private network"
+    );
+
+    assert!(
+        directives.contains("respond \"Not found\" 404"),
+        "an unmatched path (including HeyVera's, which this repo does not list) must not silently fall through to Cortex"
+    );
 
     let upstreams = directives
         .lines()
@@ -271,8 +298,15 @@ fn caddy_forwards_only_paths_the_cortex_backend_serves() {
         .collect::<Vec<_>>();
     assert_eq!(
         upstreams,
-        vec!["localhost:3001"],
-        "cortex-api is the only backend this file knows"
+        vec!["localhost:3001", "localhost:3001"],
+        "both Cortex routes go to the same backend, and no other backend is named"
+    );
+
+    assert!(
+        directives.contains("X-Content-Type-Options nosniff")
+            && directives.contains("X-Frame-Options DENY")
+            && directives.contains("Referrer-Policy strict-origin-when-cross-origin"),
+        "the shared host must keep its security headers"
     );
 }
 

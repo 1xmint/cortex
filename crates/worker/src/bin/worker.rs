@@ -33,7 +33,7 @@ async fn main() {
         .init();
 
     let brain_url =
-        env::var("CORTEX_BRAIN_URL").unwrap_or_else(|_| "wss://cortex.heyvera.org/api/ws".into());
+        env::var("CORTEX_BRAIN_URL").unwrap_or_else(|_| "wss://api.heyvera.org/api/ws".into());
 
     let token = env::var("CORTEX_TOKEN").unwrap_or_default();
 

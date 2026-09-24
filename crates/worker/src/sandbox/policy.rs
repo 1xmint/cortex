@@ -93,6 +93,11 @@ pub fn sanctioned_env_for_request(
     let Some(access) = request.provider_gateway.as_ref() else {
         return env;
     };
+    // The gateway bearer may only be sent to Cortex's own gateway. This has
+    // to stay a strict `https://{host}/` prefix match: a looser check (no
+    // trailing slash, or a suffix match) would also admit a lookalike host
+    // like `https://api.heyvera.org.evil.com/`.
+    let gateway_prefix = format!("https://{}/", cortex_core::egress::PROVIDER_GATEWAY_HOST);
     if access.provider != "claude"
         || access.authorization_id.trim().is_empty()
         || access.run_id != job.run_id
@@ -100,7 +105,7 @@ pub fn sanctioned_env_for_request(
         || access.model != job.model_ref.catalog_id
         || access.expires_at_ms <= now_ms
         || access.bearer.expose().trim().is_empty()
-        || !access.base_url.starts_with("https://cortex.heyvera.org/")
+        || !access.base_url.starts_with(&gateway_prefix)
         || !job
             .capability_grants
             .iter()
@@ -538,7 +543,10 @@ mod tests {
             attempt_id: "attempt-1".into(),
             provider: "claude".into(),
             model: "claude-opus-5".into(),
-            base_url: "https://cortex.heyvera.org/internal/provider".into(),
+            base_url: format!(
+                "https://{}/internal/provider",
+                cortex_core::egress::PROVIDER_GATEWAY_HOST
+            ),
             expires_at_ms: 2_000,
             bearer: cortex_core::protocol::GatewayBearer::new("signed-capability"),
         }
@@ -553,9 +561,11 @@ mod tests {
         let request = SandboxRequest::new("/tmp/wt", "claude", Vec::new())
             .with_provider_gateway(Some(gateway_access()));
         let env = sanctioned_env_for_request(&job, &request, 1_000);
-        assert!(env.iter().any(|entry| {
-            entry == "ANTHROPIC_BASE_URL=https://cortex.heyvera.org/internal/provider"
-        }));
+        let expected_base_url = format!(
+            "ANTHROPIC_BASE_URL=https://{}/internal/provider",
+            cortex_core::egress::PROVIDER_GATEWAY_HOST
+        );
+        assert!(env.contains(&expected_base_url));
         assert!(env
             .iter()
             .any(|entry| entry == "ANTHROPIC_AUTH_TOKEN=signed-capability"));
@@ -582,6 +592,42 @@ mod tests {
             },
             ProviderGatewayAccess {
                 base_url: "https://api.anthropic.com".into(),
+                ..gateway_access()
+            },
+            ProviderGatewayAccess {
+                // A lookalike host must not pass a prefix check that only
+                // compares the leading characters.
+                base_url: format!(
+                    "https://{}.evil.com/internal/provider",
+                    cortex_core::egress::PROVIDER_GATEWAY_HOST
+                ),
+                ..gateway_access()
+            },
+            ProviderGatewayAccess {
+                // Userinfo before an `@` is not part of the host: the real
+                // host here is `evil.com`.
+                base_url: format!(
+                    "https://{}@evil.com/internal/provider",
+                    cortex_core::egress::PROVIDER_GATEWAY_HOST
+                ),
+                ..gateway_access()
+            },
+            ProviderGatewayAccess {
+                // A non-default port is not the gateway; the strict prefix
+                // must not treat it as one.
+                base_url: format!(
+                    "https://{}:8443/internal/provider",
+                    cortex_core::egress::PROVIDER_GATEWAY_HOST
+                ),
+                ..gateway_access()
+            },
+            ProviderGatewayAccess {
+                // Plain HTTP is not the gateway, even to the right host: the
+                // scheme is part of the required prefix.
+                base_url: format!(
+                    "http://{}/internal/provider",
+                    cortex_core::egress::PROVIDER_GATEWAY_HOST
+                ),
                 ..gateway_access()
             },
             ProviderGatewayAccess {
@@ -633,7 +679,7 @@ mod tests {
         let mut job = job();
         job.network_policy = NetworkPolicy::Allowlist {
             hosts: vec![
-                "cortex.heyvera.org".to_string(),
+                cortex_core::egress::PROVIDER_GATEWAY_HOST.to_string(),
                 // Present in the allowlist but justified by no grant: the
                 // shape a widened plan would have.
                 "api.openai.com".to_string(),
@@ -643,7 +689,10 @@ mod tests {
             provider: "claude".to_string(),
         }];
 
-        assert_eq!(effective_hosts(&job), ["cortex.heyvera.org"]);
+        assert_eq!(
+            effective_hosts(&job),
+            [cortex_core::egress::PROVIDER_GATEWAY_HOST]
+        );
         assert!(needs_network(&job));
         assert_eq!(ungranted_hosts(&job), ["api.openai.com"]);
     }
