@@ -271,6 +271,14 @@ pub enum SchedulerEvent {
         provider: String,
         user_id: String,
     },
+    /// A user cancelled a run. `in_flight` is the steps that were
+    /// leased/running at the moment of cancellation — each one occupied a
+    /// concurrency slot that now needs freeing. No bandit update, no heal,
+    /// no cascade: cancellation is not a failure to learn from.
+    RunCancelled {
+        run_id: String,
+        in_flight: Vec<String>,
+    },
     Reconcile,
 }
 

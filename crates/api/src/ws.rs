@@ -414,6 +414,26 @@ async fn handle_worker_msg(
             // Verify this worker owns the step
             if let Some(db) = &state.db {
                 if !db.verify_step_worker(&step_id, worker_id) {
+                    // A cancelled step is unassigned on purpose (cancel_run
+                    // clears assigned_worker), so a worker that was already
+                    // mid-flight when the user cancelled will still land
+                    // here. That is expected, not an intrusion attempt — keep
+                    // its usage, log it quietly, and move on.
+                    if db.get_step_status(&step_id).as_deref() == Some("cancelled") {
+                        tracing::info!(
+                            "worker {worker_id} reported StepCompleted for step {step_id} \
+                             after it was cancelled — dropping message (msg={message_id})"
+                        );
+                        record_step_usage(
+                            db,
+                            &step_id,
+                            lease_gen,
+                            authed_user_id.as_deref(),
+                            output.tokens_in,
+                            output.tokens_out,
+                        );
+                        return;
+                    }
                     tracing::warn!(
                         "SECURITY: worker {worker_id} attempted StepCompleted for step {step_id} \
                          which is not assigned to it — dropping message (msg={message_id})"
@@ -797,6 +817,24 @@ async fn handle_worker_msg(
             // Verify this worker owns the step
             if let Some(db) = &state.db {
                 if !db.verify_step_worker(&step_id, worker_id) {
+                    // Same reasoning as the StepCompleted case above: a
+                    // cancelled step is unassigned on purpose, so a worker
+                    // reporting failure for it after the fact is expected.
+                    if db.get_step_status(&step_id).as_deref() == Some("cancelled") {
+                        tracing::info!(
+                            "worker {worker_id} reported StepFailed for step {step_id} \
+                             after it was cancelled — dropping message (msg={message_id})"
+                        );
+                        record_step_usage(
+                            db,
+                            &step_id,
+                            lease_gen,
+                            authed_user_id.as_deref(),
+                            None,
+                            None,
+                        );
+                        return;
+                    }
                     tracing::warn!(
                         "SECURITY: worker {worker_id} attempted StepFailed for step {step_id} \
                          which is not assigned to it — dropping message (msg={message_id})"
@@ -1378,7 +1416,7 @@ fn resolve_run_id(
     None
 }
 
-fn record_step_usage(
+pub(crate) fn record_step_usage(
     db: &crate::db::Database,
     step_id: &str,
     lease_gen: i64,

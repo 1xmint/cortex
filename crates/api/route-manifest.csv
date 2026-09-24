@@ -75,6 +75,7 @@ cortex,GET,/api/providers
 cortex,GET|POST,/api/runs
 cortex,GET,/api/runs/{id}
 cortex,GET,/api/runs/{id}/events
+cortex,POST,/api/runs/{id}/cancel
 cortex,POST,/api/runs/{id}/pr
 cortex,GET,/api/runs/{id}/stream
 cortex,GET,/api/runs/{run_id}/steps/{step_id}/receipt

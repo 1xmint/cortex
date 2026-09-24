@@ -1153,6 +1153,140 @@ pub async fn create_pr(
     Ok(Json(result))
 }
 
+// --- Cancel run ---
+
+#[derive(Deserialize, Default)]
+pub struct CancelRunRequest {
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct CancelRunResponse {
+    pub run_id: String,
+    pub status: String,
+    pub already_terminal: bool,
+    pub cancelled_steps: usize,
+    pub signalled_steps: usize,
+}
+
+/// Stop a run the caller owns. Uses the plain signed-in user extractor
+/// (`ClerkUser`), not `PremiumUser` — a lapsed subscriber still needs to be
+/// able to stop their own spend, cancel button or not.
+pub async fn cancel_run(
+    State(state): State<Arc<AppState>>,
+    user: ClerkUser,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    body: Option<Json<CancelRunRequest>>,
+) -> Result<Json<CancelRunResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let db = state.db.as_ref().ok_or_else(|| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: "database not available".into(),
+            }),
+        )
+    })?;
+
+    let reason = body
+        .and_then(|Json(req)| req.reason)
+        .filter(|r| !r.trim().is_empty())
+        .unwrap_or_else(|| "cancelled by user".to_string());
+
+    let outcome = db
+        .cancel_run(&id, &user.user_id, &reason)
+        .map_err(|err| match err {
+            crate::db::CancelError::NotFound => (
+                StatusCode::NOT_FOUND,
+                Json(ErrorResponse {
+                    error: "run not found".into(),
+                }),
+            ),
+            crate::db::CancelError::Internal(err) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse { error: err }),
+            ),
+        })?;
+
+    if outcome.already_terminal {
+        let status = db
+            .list_user_runs_by_id(&id)
+            .and_then(|run| {
+                run.get("status")
+                    .and_then(|s| s.as_str())
+                    .map(str::to_string)
+            })
+            .unwrap_or_else(|| "unknown".to_string());
+        return Ok(Json(CancelRunResponse {
+            run_id: id,
+            status,
+            already_terminal: true,
+            cancelled_steps: 0,
+            signalled_steps: 0,
+        }));
+    }
+
+    // Signal every worker that was mid-flight on this run, record what it had
+    // already spent, and drop its SSE sender so nothing keeps writing to a
+    // step that no longer exists as far as the caller is concerned.
+    let in_flight_ids: Vec<String> = outcome
+        .in_flight
+        .iter()
+        .map(|(step_id, _, _)| step_id.clone())
+        .collect();
+    let mut signalled_steps = 0usize;
+    {
+        let workers = state.workers.read().await;
+        for (step_id, assigned_worker, lease_gen) in &outcome.in_flight {
+            if let Some(worker) = assigned_worker.as_deref().and_then(|w| workers.get(w)) {
+                if worker
+                    .tx
+                    .send(cortex_core::protocol::BrainMessage::CancelStep {
+                        step_id: step_id.clone(),
+                        reason: reason.clone(),
+                    })
+                    .await
+                    .is_ok()
+                {
+                    signalled_steps += 1;
+                }
+            }
+            // The step will never report its own completion now, so its
+            // partial usage (provider, model, duration) is recorded here
+            // rather than lost.
+            crate::ws::record_step_usage(db, step_id, *lease_gen, Some(&user.user_id), None, None);
+        }
+    }
+    for step_id in &in_flight_ids {
+        state.remove_step_sender(step_id).await;
+    }
+
+    state
+        .emit_scheduler_event(cortex_engine::captain::SchedulerEvent::RunCancelled {
+            run_id: id.clone(),
+            in_flight: in_flight_ids,
+        })
+        .await;
+    state
+        .emit_mc_event(
+            &user.user_id,
+            crate::mission_control::MissionControlEvent::RunCompleted {
+                run_id: id.clone(),
+                status: "cancelled".to_string(),
+                total_cost: None,
+            },
+        )
+        .await;
+
+    Ok(Json(CancelRunResponse {
+        run_id: id,
+        status: "cancelled".to_string(),
+        already_terminal: false,
+        cancelled_steps: outcome.cancelled_steps.len(),
+        signalled_steps,
+    }))
+}
+
 // --- Cost Projection ---
 
 /// Map a step kind string to the default provider to use for estimation.

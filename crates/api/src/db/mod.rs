@@ -5408,6 +5408,92 @@ fn upsert_verification_state(
     Ok(())
 }
 
+/// Outcome of `Database::cancel_run`. `in_flight` carries the
+/// (step_id, assigned_worker, lease_gen) of every step that was leased or
+/// running at the moment of cancellation, so the caller can signal those
+/// workers and free the scheduler's concurrency slots for them.
+#[derive(Debug, Clone)]
+pub struct CancelOutcome {
+    pub already_terminal: bool,
+    pub cancelled_steps: Vec<String>,
+    pub in_flight: Vec<(String, Option<String>, i64)>,
+}
+
+#[derive(Debug, Clone)]
+pub enum CancelError {
+    /// The run does not exist, or exists but belongs to another user. Both
+    /// cases return this so a cancel request can't be used to learn which
+    /// run ids belong to someone else.
+    NotFound,
+    Internal(String),
+}
+
+impl std::fmt::Display for CancelError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CancelError::NotFound => write!(f, "run not found"),
+            CancelError::Internal(err) => write!(f, "internal error: {err}"),
+        }
+    }
+}
+
+/// Shared body of `update_run_status`: flips the run's status, records
+/// `run.status_changed`, and — for a terminal status — releases the run's
+/// resource leases (including step-held ones, since `resource_leases.run_id`
+/// is never null). Factored out so `cancel_run` can do the same status flip
+/// inside its own transaction instead of reimplementing it.
+fn update_run_status_tx(
+    tx: &Connection,
+    run_id: &str,
+    status: &str,
+    failure_reason: Option<&str>,
+    now: i64,
+) -> rusqlite::Result<bool> {
+    let finished = if matches!(status, "succeeded" | "failed" | "cancelled") {
+        Some(now)
+    } else {
+        None
+    };
+    let rows = tx.execute(
+        "UPDATE runs SET status = ?1, failure_reason = ?2, finished_at = ?3, updated_at = ?4, version = version + 1
+         WHERE id = ?5",
+        params![status, failure_reason, finished, now, run_id],
+    )?;
+    if rows == 0 {
+        return Ok(false);
+    }
+
+    let context = run_event_context(tx, run_id);
+    try_insert_operations_event(
+        tx,
+        context.as_ref().map(|context| context.user_id.as_str()),
+        context
+            .as_ref()
+            .and_then(|context| context.group_id.as_deref()),
+        None,
+        context
+            .as_ref()
+            .and_then(|context| context.task_id.as_deref()),
+        Some(run_id),
+        None,
+        None,
+        "run.status_changed",
+        "run",
+        run_id,
+        &serde_json::json!({
+            "status": status,
+            "failure_reason": failure_reason,
+            "finished_at": finished,
+        }),
+    )?;
+
+    if finished.is_some() {
+        release_resource_leases_for_run_tx_checked(tx, run_id, now)?;
+    }
+
+    Ok(true)
+}
+
 fn insert_run_operations_event(
     conn: &Connection,
     run_id: &str,
@@ -9190,11 +9276,6 @@ impl Database {
     ) -> bool {
         let mut conn = self.conn();
         let now = Utc::now().timestamp_millis();
-        let finished = if matches!(status, "succeeded" | "failed" | "cancelled") {
-            Some(now)
-        } else {
-            None
-        };
         let tx = match conn.transaction() {
             Ok(tx) => tx,
             Err(err) => {
@@ -9207,12 +9288,12 @@ impl Database {
                 return false;
             }
         };
-        let rows = match tx.execute(
-            "UPDATE runs SET status = ?1, failure_reason = ?2, finished_at = ?3, updated_at = ?4, version = version + 1
-             WHERE id = ?5",
-            params![status, failure_reason, finished, now, run_id],
-        ) {
-            Ok(rows) => rows,
+
+        let result = update_run_status_tx(&tx, run_id, status, failure_reason, now)
+            .and_then(|changed| tx.commit().map(|_| changed));
+
+        match result {
+            Ok(changed) => changed,
             Err(err) => {
                 tracing::warn!(
                     run_id = run_id,
@@ -9220,56 +9301,145 @@ impl Database {
                     error = %err,
                     "failed to update run status"
                 );
-                return false;
+                false
             }
-        };
-        if rows == 0 {
-            return false;
+        }
+    }
+
+    /// Cancel a run the user owns: stop dispatching new work, cancel every
+    /// step that has not yet produced a result, revoke the run's provider
+    /// spend authorizations so no new model call can charge it, and release
+    /// its resource leases. Delivered/verifying steps are left alone — a
+    /// verdict already in flight still charges or refunds exactly as it does
+    /// today, so cancelling never doubles up with that path.
+    ///
+    /// Missing and not-owned runs return the same `NotFound` error so a
+    /// cancel request can't be used to probe whether a run id belongs to
+    /// someone else. Cancelling an already-terminal run is a no-op: no writes,
+    /// no events, `already_terminal: true`.
+    pub fn cancel_run(
+        &self,
+        run_id: &str,
+        user_id: &str,
+        reason: &str,
+    ) -> Result<CancelOutcome, CancelError> {
+        let mut conn = self.conn();
+        let now = Utc::now().timestamp_millis();
+        let tx = conn
+            .transaction()
+            .map_err(|err| CancelError::Internal(err.to_string()))?;
+
+        let status: String = tx
+            .query_row(
+                "SELECT status FROM runs WHERE id = ?1 AND user_id = ?2",
+                params![run_id, user_id],
+                |row| row.get(0),
+            )
+            .map_err(|_| CancelError::NotFound)?;
+
+        if matches!(status.as_str(), "succeeded" | "failed" | "cancelled") {
+            // Idempotent: a second cancel of a run that already finished
+            // touches nothing and emits nothing.
+            return Ok(CancelOutcome {
+                already_terminal: true,
+                cancelled_steps: Vec::new(),
+                in_flight: Vec::new(),
+            });
         }
 
-        let context = run_event_context(&tx, run_id);
-        let result = try_insert_operations_event(
-            &tx,
-            context.as_ref().map(|context| context.user_id.as_str()),
-            context
-                .as_ref()
-                .and_then(|context| context.group_id.as_deref()),
-            None,
-            context
-                .as_ref()
-                .and_then(|context| context.task_id.as_deref()),
-            Some(run_id),
-            None,
-            None,
-            "run.status_changed",
-            "run",
-            run_id,
-            &serde_json::json!({
-                "status": status,
-                "failure_reason": failure_reason,
-                "finished_at": finished,
-            }),
+        // Steps already leased/running are the ones a worker may be spending
+        // money on right now; the caller needs their worker + lease_gen to
+        // signal the worker and to record their partial usage.
+        let in_flight: Vec<(String, Option<String>, i64)> = tx
+            .prepare(
+                "SELECT id, assigned_worker, lease_gen FROM steps
+                 WHERE run_id = ?1 AND status IN ('leased', 'running')",
+            )
+            .and_then(|mut stmt| {
+                stmt.query_map(params![run_id], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()
+            })
+            .map_err(|err| CancelError::Internal(err.to_string()))?;
+
+        // Everything still queued or in flight gets cancelled. Delivered and
+        // verifying steps are deliberately excluded: their verdict is already
+        // on its way and still needs to charge or refund as today.
+        let cancellable_ids: Vec<String> = tx
+            .prepare(
+                "SELECT id FROM steps
+                 WHERE run_id = ?1
+                 AND status IN ('pending', 'ready', 'orphaned', 'leased', 'running')",
+            )
+            .and_then(|mut stmt| {
+                stmt.query_map(params![run_id], |row| row.get::<_, String>(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()
+            })
+            .map_err(|err| CancelError::Internal(err.to_string()))?;
+
+        for step_id in &cancellable_ids {
+            tx.execute(
+                "UPDATE steps SET status = 'cancelled', last_error = ?1, assigned_worker = NULL,
+                 lease_deadline = NULL, updated_at = ?2, version = version + 1
+                 WHERE id = ?3",
+                params![reason, now, step_id],
+            )
+            .map_err(|err| CancelError::Internal(err.to_string()))?;
+            release_step_leases(&tx, step_id, now);
+
+            let context = step_event_context(&tx, step_id);
+            try_insert_operations_event(
+                &tx,
+                context.as_ref().map(|context| context.user_id.as_str()),
+                context
+                    .as_ref()
+                    .and_then(|context| context.group_id.as_deref()),
+                None,
+                context
+                    .as_ref()
+                    .and_then(|context| context.task_id.as_deref()),
+                Some(run_id),
+                Some(step_id),
+                None,
+                "step.cancelled",
+                "step",
+                step_id,
+                &serde_json::json!({
+                    "status": "cancelled",
+                    "reason": reason,
+                    "source": "run_cancelled",
+                }),
+            )
+            .map_err(|err| CancelError::Internal(err.to_string()))?;
+        }
+
+        // Revoke the run's spend authorizations so `reserve_provider_request`
+        // refuses any new model call for it. In-flight
+        // `provider_request_reservations` are left untouched — those requests
+        // already left the building and still settle or time out normally.
+        tx.execute(
+            "UPDATE provider_spend_authorizations SET status = 'revoked'
+             WHERE run_id = ?1 AND status = 'active'",
+            params![run_id],
         )
-        .and_then(|_| {
-            if finished.is_some() {
-                release_resource_leases_for_run_tx_checked(&tx, run_id, now).map(|_| ())
-            } else {
-                Ok(())
-            }
+        .map_err(|err| CancelError::Internal(err.to_string()))?;
+
+        update_run_status_tx(&tx, run_id, "cancelled", Some(reason), now)
+            .map_err(|err| CancelError::Internal(err.to_string()))?;
+
+        tx.commit()
+            .map_err(|err| CancelError::Internal(err.to_string()))?;
+
+        Ok(CancelOutcome {
+            already_terminal: false,
+            cancelled_steps: cancellable_ids,
+            in_flight,
         })
-        .and_then(|_| tx.commit());
-
-        if let Err(err) = result {
-            tracing::warn!(
-                run_id = run_id,
-                status = status,
-                error = %err,
-                "failed to commit run status transaction"
-            );
-            return false;
-        }
-
-        true
     }
 
     // --- Steps ---
@@ -13907,6 +14077,186 @@ mod tests {
             &[],
         );
         assert!(second.is_ok());
+    }
+
+    #[test]
+    fn cancel_run_cancels_unfinished_steps_and_releases_leases() {
+        let db = test_db();
+        let run_id = db
+            .create_run_with_steps_and_resource_leases(
+                "user-1",
+                "Ship path change",
+                "auto",
+                &["src/main.rs".to_string()],
+                None,
+                None,
+                None,
+                &[path_lease("src/main.rs")],
+                &[test_step("step-a")],
+                &[],
+            )
+            .expect("first run");
+        db.update_run_status(&run_id, "running", None);
+        assert_eq!(db.list_active_resource_leases_for_run(&run_id).len(), 1);
+
+        let outcome = db
+            .cancel_run(&run_id, "user-1", "user requested cancel")
+            .expect("owner can cancel their own run");
+        assert!(!outcome.already_terminal);
+        assert_eq!(outcome.cancelled_steps, vec!["step-a".to_string()]);
+        assert!(
+            outcome.in_flight.is_empty(),
+            "step-a was only pending, not in flight"
+        );
+
+        assert_eq!(status_of(&db, "step-a"), "cancelled");
+        assert_eq!(
+            db.list_user_runs_by_id(&run_id).unwrap()["status"],
+            "cancelled"
+        );
+        assert!(db.list_active_resource_leases_for_run(&run_id).is_empty());
+
+        let events = db.list_run_operations_events(&run_id, 25);
+        assert!(events
+            .iter()
+            .any(|event| event.event_type == "step.cancelled" && event.entity_id == "step-a"));
+        assert!(events.iter().any(|event| {
+            event.event_type == "run.status_changed" && event.payload["status"] == "cancelled"
+        }));
+    }
+
+    #[test]
+    fn cancel_run_frees_in_flight_leased_steps() {
+        let db = test_db();
+        let (run_id, lease_gen) = leased_step(&db, "step-running");
+
+        let outcome = db
+            .cancel_run(&run_id, "user-1", "stop spending")
+            .expect("owner can cancel");
+        assert_eq!(
+            outcome.in_flight,
+            vec![(
+                "step-running".to_string(),
+                Some("worker-1".to_string()),
+                lease_gen
+            )]
+        );
+        assert_eq!(status_of(&db, "step-running"), "cancelled");
+        assert!(db.get_worker_active_steps("worker-1").is_empty());
+
+        // A cancelled step is no longer assigned to anyone, and lease_step
+        // must refuse to hand it back out.
+        assert!(db
+            .lease_step(
+                "step-running",
+                "worker-2",
+                Utc::now().timestamp_millis() + 60_000
+            )
+            .is_none());
+    }
+
+    #[test]
+    fn cancel_run_revokes_active_spend_authorizations() {
+        let db = test_db();
+        let run_id = db.create_run("user-1", "spend some money", "auto", &[]);
+        let now = Utc::now().timestamp_millis();
+        db.create_spend_authorization(
+            &crate::db::provider_gateway::SpendAuthorization {
+                id: "auth-1".to_string(),
+                user_id: "user-1".to_string(),
+                run_id: run_id.clone(),
+                attempt_id: "attempt-1".to_string(),
+                provider: "anthropic".to_string(),
+                model: "claude".to_string(),
+                price_list_id: "default".to_string(),
+                max_micro_usd: 1_000_000,
+                expires_at_ms: now + 600_000,
+            },
+            now,
+        )
+        .expect("create authorization");
+
+        db.cancel_run(&run_id, "user-1", "stop spending")
+            .expect("owner can cancel");
+
+        let status: String = db
+            .conn()
+            .query_row(
+                "SELECT status FROM provider_spend_authorizations WHERE id = 'auth-1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "revoked");
+    }
+
+    #[test]
+    fn cancel_run_by_a_different_user_is_not_found_and_changes_nothing() {
+        let db = test_db();
+        let run_id = db.create_run("owner", "do the thing", "auto", &[]);
+        db.create_step(&run_id, "execute", "medium", "medium", "step");
+
+        let result = db.cancel_run(&run_id, "someone-else", "nope");
+        assert!(matches!(result, Err(CancelError::NotFound)));
+        assert_eq!(
+            db.list_user_runs_by_id(&run_id).unwrap()["status"],
+            "pending"
+        );
+    }
+
+    #[test]
+    fn cancel_run_on_a_terminal_run_is_a_no_op() {
+        let db = test_db();
+        let run_id = db.create_run("user-1", "already done", "auto", &[]);
+        assert!(db.update_run_status(&run_id, "succeeded", None));
+        let events_before = db.list_run_operations_events(&run_id, 25).len();
+
+        let outcome = db
+            .cancel_run(&run_id, "user-1", "too late")
+            .expect("cancelling a terminal run is not an error");
+        assert!(outcome.already_terminal);
+        assert!(outcome.cancelled_steps.is_empty());
+
+        assert_eq!(
+            db.list_run_operations_events(&run_id, 25).len(),
+            events_before,
+            "an idempotent cancel writes no new events"
+        );
+        assert_eq!(
+            db.list_user_runs_by_id(&run_id).unwrap()["status"],
+            "succeeded"
+        );
+    }
+
+    #[test]
+    fn cancel_run_leaves_a_delivered_step_untouched() {
+        let db = test_db();
+        let (run_id, lease_gen) = leased_step(&db, "step-delivered");
+        assert!(db.deliver_step(
+            "step-delivered",
+            "attempt-1",
+            lease_gen,
+            Some("done"),
+            None,
+            None,
+            None,
+        ));
+        assert_eq!(status_of(&db, "step-delivered"), "delivered");
+
+        let outcome = db
+            .cancel_run(&run_id, "user-1", "stop the rest")
+            .expect("owner can cancel");
+        assert!(outcome.cancelled_steps.is_empty());
+        assert!(outcome.in_flight.is_empty());
+        assert_eq!(
+            status_of(&db, "step-delivered"),
+            "delivered",
+            "a delivered step's verdict still charges or refunds as today"
+        );
+        assert_eq!(
+            db.list_user_runs_by_id(&run_id).unwrap()["status"],
+            "cancelled"
+        );
     }
 
     #[test]

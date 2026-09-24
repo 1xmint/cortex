@@ -236,6 +236,24 @@ async fn apply_event(state: &AppState, sched: &mut SchedulerState, event: &Sched
             }
         }
 
+        SchedulerEvent::RunCancelled { run_id, in_flight } => {
+            tracing::info!(
+                "scheduler: run {run_id} cancelled, freeing {} in-flight slot(s)",
+                in_flight.len()
+            );
+            if let Some(db) = &state.db {
+                let user_id = get_run_user(db, run_id);
+                // One `mark_step_done` per in-flight step: each occupied its
+                // own concurrency slot, and cancellation is not a failure, so
+                // there is no bandit update, no heal, and no cascade here.
+                for _ in in_flight {
+                    sched.mark_step_done(&user_id);
+                }
+            }
+            load_ready_steps_for_run(state, sched, run_id).await;
+            check_run_done(state, run_id).await;
+        }
+
         SchedulerEvent::Reconcile => {
             tracing::debug!("scheduler: reconcile tick");
         }
