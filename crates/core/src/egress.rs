@@ -77,7 +77,11 @@ pub fn expand_registry(name: &str) -> Option<Vec<String>> {
 /// misconfigured brain must not be able to redirect it to another host by
 /// setting an env var. Changing where the gateway lives is a code change and
 /// a deploy, on purpose.
-pub const PROVIDER_GATEWAY_HOST: &str = "api.heyvera.org";
+///
+/// It is a hostname of its own, not the shared `api.heyvera.org`: the edge
+/// forwards only `/internal/provider/*` here, so a sandbox allowed to reach
+/// this host reaches the gateway and nothing else.
+pub const PROVIDER_GATEWAY_HOST: &str = "gateway.heyvera.org";
 
 /// The single API host each provider's CLI must reach to do any work at all.
 ///

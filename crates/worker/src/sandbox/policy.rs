@@ -96,7 +96,7 @@ pub fn sanctioned_env_for_request(
     // The gateway bearer may only be sent to Cortex's own gateway. This has
     // to stay a strict `https://{host}/` prefix match: a looser check (no
     // trailing slash, or a suffix match) would also admit a lookalike host
-    // like `https://api.heyvera.org.evil.com/`.
+    // like `https://gateway.heyvera.org.evil.com/`.
     let gateway_prefix = format!("https://{}/", cortex_core::egress::PROVIDER_GATEWAY_HOST);
     if access.provider != "claude"
         || access.authorization_id.trim().is_empty()
