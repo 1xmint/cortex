@@ -55,9 +55,7 @@ Add `tag:ci` to `tagOwners` (owned by whoever administers the tailnet):
 If `tag:ci` already exists in `tagOwners` — `.github/workflows/host-db-migration.yml`
 joins the tailnet as `tag:ci` too, using the same `TS_OAUTH_CLIENT_ID` /
 `TS_OAUTH_SECRET` pair — merge into that existing entry instead of adding a
-second `"tag:ci"` key (JSON object keys aren't unique across a hand-edited
-policy file the way they'd be enforced in a schema, so a duplicate key
-silently shadows the first and is easy to miss in review).
+second `"tag:ci"` key.
 
 Grant `tag:ci` reach to the deploy host on port 22 — with `grants`:
 
@@ -101,10 +99,21 @@ browser re-auth that a CI runner can't perform. Use the `tag:deploy` tag in
 `dst`, not the host's MagicDNS name: a name resolves to whichever device
 holds it today, while the tag follows the device even if that changes.
 
-If this tailnet has a catch-all rule such as
-`{"action":"accept","src":["*"],"dst":["*:*"]}` (or an equivalent
-default-allow grant), remove it — otherwise `tag:ci` already has access to
-everything and the rules above restrict nothing.
+If the policy has a catch-all such as
+`{"action":"accept","src":["*"],"dst":["*:*"]}` (grants form:
+`{"src":["*"],"dst":["*"],"ip":["*"]}`), do **not** just delete it: it is
+usually the only rule that lets your own devices reach the server, and
+Tailscale SSH still needs network access to port 22. Replace it with a rule
+that covers people but not tagged machines:
+`{"action":"accept","src":["autogroup:member"],"dst":["*:*"]}` (grants form:
+`{"src":["autogroup:member"],"dst":["*"],"ip":["*"]}`). Add explicit rules for
+any other tagged device that needs to reach something. Then confirm
+`ssh guardian@clawguard.tail618cfc.ts.net` still works from your own machine
+before going on to the next step.
+
+`host-db-migration.yml` uses the same `tag:ci` credentials but connects as
+`vars.DEPLOY_USER || 'deploy'`. The `ssh` rule above only allows `guardian`,
+so if that workflow is still used it needs its own `ssh` rule for its user.
 
 Confirm only the deploy host carries `tag:deploy` (Settings -> Machines,
 filter by tag). `tag:ci`'s `ssh`/grant reach is scoped to `dst: ["tag:deploy"]`,

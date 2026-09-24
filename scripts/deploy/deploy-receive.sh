@@ -84,8 +84,12 @@ cleanup() {
       rm -rf -- "$INSTALL_ROOT/$item.restore" "$INSTALL_ROOT/$item.failed"
       cp -a -- "$BACKUP_DIR/$item" "$INSTALL_ROOT/$item.restore" || { log "ERROR: cannot copy $item from backup"; restore_failed=1; continue; }
       [ -e "$INSTALL_ROOT/$item" ] && mv -T -- "$INSTALL_ROOT/$item" "$INSTALL_ROOT/$item.failed"
-      mv -T -- "$INSTALL_ROOT/$item.restore" "$INSTALL_ROOT/$item" || { log "ERROR: restore of $item failed"; restore_failed=1; }
-      rm -rf -- "$INSTALL_ROOT/$item.failed"
+      if mv -T -- "$INSTALL_ROOT/$item.restore" "$INSTALL_ROOT/$item"; then
+        rm -rf -- "$INSTALL_ROOT/$item.failed"
+      else
+        [ -e "$INSTALL_ROOT/$item.failed" ] && mv -T -- "$INSTALL_ROOT/$item.failed" "$INSTALL_ROOT/$item" 2>/dev/null
+        log "ERROR: restore of $item failed"; restore_failed=1
+      fi
     done
     if [ -d "$INSTALL_ROOT/bin" ]; then
       chmod +x "$INSTALL_ROOT"/bin/* 2>/dev/null || true
@@ -195,6 +199,9 @@ log "waiting up to ${HEALTH_TIMEOUT_SECS}s for $HEALTH_URL"
 if ! wait_for_health; then
   fail "cortex-next did not become healthy within ${HEALTH_TIMEOUT_SECS}s"
 fi
+# Health answered once; wait past the unit's restart delay so a crash right
+# after the first 200 shows up as a restart or a non-active state.
+sleep 12
 CORTEX_NEXT_N1="$(systemctl --user show -p NRestarts --value cortex-next)"
 CORTEX_NEXT_ACTIVE="$(systemctl --user show -p ActiveState --value cortex-next)"
 if [ "$CORTEX_NEXT_ACTIVE" != "active" ] || [ "$CORTEX_NEXT_N1" != "$CORTEX_NEXT_N0" ]; then
