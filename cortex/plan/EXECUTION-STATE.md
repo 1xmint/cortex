@@ -3138,7 +3138,10 @@ party holding keys on a customer's behalf, and this repository's own
 `VISION.md` already says "Not BYOK" / "Not a model gateway" — Zen BYOK chat
 should never have shipped against that vision without a written exception
 from OpenCode, which was never obtained. The revert lands as draft PR(s)
-under independent review before merging. Revert PR: pending.
+under independent review before merging. Revert PR:
+[#72](https://github.com/1xmint/cortex/pull/72), draft until its independent
+review passes. It deletes every BYOK key file, so the open "zeroize the
+remaining key file" item closes with it rather than as separate work.
 
 ## 2026-09-25 M-D-0017 — cancel-run: users can stop an in-progress run
 
@@ -3168,3 +3171,36 @@ server automatically" (merged 2026-09-24) added `build-release.yml` →
 the deploy step, because `TS_OAUTH_CLIENT_ID`/`TS_OAUTH_SECRET` are not set in
 the GitHub `production` environment. Production has not moved by auto-deploy
 yet. See STATE.md.
+
+## 2026-09-26 M-D-0020 — "done" includes Phases 27–30; grading, price and consent decisions
+
+Decided by Josh, 2026-09-26, unless marked otherwise.
+
+- **Scope.** "Done" (frontend and backend polished) includes Phases 27–30 of
+  `HARNESS-EXCELLENCE-PLAN-2026-08.md`. Every mechanism is built and tested
+  against the stub provider; no paid model run happens before Josh's final
+  real run. The phase exit gates (`p_fa`, Cortex-at-`ultra` against the best
+  single model, the maintainer-acceptance arm) are measurements that need many
+  paid runs, so they are a separate, budgeted decision after that run.
+- **Who sets the grade.** Cortex's planner declares `verdict_class` (`strong`
+  or `authored`) at plan time and shows it on the plan receipt before any
+  spend. The customer cannot upgrade it.
+- **Price of an `authored` verdict.** Half the task class's credits, rounded
+  up; the receipt says the work was checked by tests the agent wrote and was
+  not independently verified. A failed `authored` task is still refunded in
+  full. `strong` is full price. This is a ratio, not a price: CREDITS.md
+  still has no measured cost curve. (Josh delegated this one: "place yourself
+  as the customer and decide".)
+- **Racing.** The customer pays for every attempt, only at the top effort
+  level, with the maximum spend shown and approved before it starts. Racing
+  runs only on `strong` contracts (plan, Phase 27.4).
+- **PR harvest for the Phase 30 suites is opt-in only.** This overrides the
+  opt-out outcome corpus in decision #4 for harvested pull requests.
+- **Refunds stay.** Cortex is not BYOK (VISION.md:43): a refund returns
+  credits and Cortex absorbs the model cost. Whether a failed task's branch
+  still reaches the customer is to be checked; if it does, refunds can be
+  farmed, and the recommendation is to return the failure report, not the
+  branch.
+- **The final run tests charging and refunds** and is the very last step. The
+  first price list is proposed then, for Josh's approval; without one,
+  `freeze_step_quote` dispatches unquoted and uncharged.
