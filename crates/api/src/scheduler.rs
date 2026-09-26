@@ -713,6 +713,17 @@ async fn dispatch_step(state: &AppState, step: &StepRef) -> DispatchOutcome {
     let check_specs =
         derive_step_check_specs(step.kind, risk, &allowed_paths, &state.workspace_dir);
 
+    let effective_work_kind = step
+        .work_kind
+        .unwrap_or_else(|| work_kind_for_step(step.kind, &step.objective));
+
+    // Declare the verdict class here, at plan time, before the worker ever
+    // sees the task -- so delivery cannot choose the stronger claim after the
+    // fact. See `diff_surface::declare_verdict_class` for the rule (Phase 27,
+    // step 1: conservative, and stated as such).
+    task.verdict_class =
+        cortex_core::diff_surface::declare_verdict_class(&check_specs, effective_work_kind);
+
     // Freeze the exam here, at dispatch, before the worker sees the task.
     // Verification happens after delivery, and the `CheckSpec` argv needed to
     // run it does not survive the downgrade to `RequiredCheck` below — so if
@@ -745,16 +756,15 @@ async fn dispatch_step(state: &AppState, step: &StepRef) -> DispatchOutcome {
         db,
         &step.run_id,
         &step.step_id,
-        step.work_kind
-            .unwrap_or_else(|| work_kind_for_step(step.kind, &step.objective)),
+        effective_work_kind,
         risk,
         !cortex_core::check_derivation::is_unverified_by_construction(&check_specs),
+        task.verdict_class,
     );
 
     task.required_checks = check_specs.iter().map(as_required_check).collect();
     let recipe = build_work_recipe(
-        step.work_kind
-            .unwrap_or_else(|| work_kind_for_step(step.kind, &step.objective)),
+        effective_work_kind,
         &step.objective,
         risk,
         tier,
@@ -1017,6 +1027,7 @@ fn freeze_step_quote(
     work_kind: WorkKind,
     risk: RiskLevel,
     verifiable: bool,
+    verdict_class: cortex_core::diff_surface::VerdictClass,
 ) {
     let Some(list) = db.active_price_list() else {
         tracing::warn!(
@@ -1029,7 +1040,10 @@ fn freeze_step_quote(
     };
 
     let class = cortex_core::task_class::TaskClass::new(work_kind, risk, verifiable);
-    let Some((credits, billable)) = crate::pricing::quote(&list, &class) else {
+    // `verdict_class` is applied here, once, so the plan-receipt quote, the
+    // charge, and the refund all read the same already-priced number rather
+    // than each recomputing "half of what" from a raw class price.
+    let Some((credits, billable)) = crate::pricing::quote(&list, &class, verdict_class) else {
         tracing::warn!(
             run_id, step_id, class = %class.key(), price_list_version = list.version,
             "the published price list does not price this class; dispatched without a quote"
