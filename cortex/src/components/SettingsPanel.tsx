@@ -8,10 +8,9 @@ import {
 import BillingPage from './billing/BillingPage';
 import SpendDashboard from './spend/SpendDashboard';
 import IntegrationSetup from './integrations/IntegrationSetup';
-import ModelKeysTab from './settings/ModelKeysTab';
 import type { RunProfile } from '../types';
 
-type SettingsTab = 'integrations' | 'modelKeys' | 'spend' | 'billing' | 'notifications' | 'account';
+type SettingsTab = 'integrations' | 'spend' | 'billing' | 'notifications' | 'account';
 
 const RUN_PROFILE_LABELS: Record<RunProfile, string> = {
   auto: 'Auto (adaptive)',
@@ -327,14 +326,6 @@ export default function SettingsPanel({
           >
             Integrations
           </button>
-          <button
-            onClick={() => setTab('modelKeys')}
-            className={`border-b-2 px-1 py-2.5 text-sm font-medium transition ${
-              tab === 'modelKeys' ? 'border-[var(--accent)] text-white' : 'border-transparent text-[var(--muted)] hover:text-white'
-            }`}
-          >
-            Model keys
-          </button>
           {/* Soma is fenced off by default; the tab is hidden rather than
               removed, because the feature returns. See SOMA_API_ENABLED. */}
           {SOMA_API_ENABLED && (
@@ -379,8 +370,6 @@ export default function SettingsPanel({
             <BillingPage billing={billing} />
           ) : tab === 'integrations' ? (
             <IntegrationSetup />
-          ) : tab === 'modelKeys' ? (
-            <ModelKeysTab />
           ) : tab === 'spend' ? (
             SOMA_API_ENABLED ? <SpendDashboard /> : null
           ) : tab === 'notifications' ? (

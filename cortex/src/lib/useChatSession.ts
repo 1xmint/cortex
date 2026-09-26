@@ -18,11 +18,9 @@ import {
   getConversation,
   streamChat,
   updateConversationTitle,
-  ZenKeyRequiredError,
   type ConversationMessage,
 } from './cortexApi';
 import { createImplementationMessage } from './projectImplementation';
-import { loadZenDeviceKey } from './zenDeviceKey';
 // TODO: Implement workspace routing integration
 // import {
 //   getWorkspaceContext,
@@ -284,15 +282,6 @@ export function useChatSession({
   const [messages, setMessages] = useState<ChatMessage[]>(getEmptyMessages);
   const [draft, setDraft] = useState('');
   const [isStreaming, setIsStreaming] = useState(false);
-  /**
-   * The chat model picker's selection, held in memory only (never
-   * localStorage/sessionStorage) -- `undefined` is the default Claude tier
-   * (no `model` sent to `/api/chat`); a `"zen:<id>"` value routes the next
-   * turn to that OpenCode Zen model on the customer's own key.
-   */
-  const [selectedModel, setSelectedModel] = useState<string | undefined>(undefined);
-  /** The server's message from a 409 `zen_key_required` on the last turn, if any. */
-  const [zenKeyError, setZenKeyError] = useState<string | null>(null);
   const [isLoadingConversation, setIsLoadingConversation] = useState(false);
   const [conversationNotFound, setConversationNotFound] = useState(false);
   const [activeConversationTitle, setActiveConversationTitle] = useState<string | null>(null);
@@ -391,11 +380,6 @@ export function useChatSession({
     );
   }, [userId]);
 
-  /** Picking a model clears any stale zen-key error from a previous turn. */
-  const onModelChange = useCallback((model: string | undefined) => {
-    setSelectedModel(model);
-    setZenKeyError(null);
-  }, []);
 
   const updateConfirmActionStatus = useCallback((messageId: string, status: ConfirmActionStatus) => {
     setMessages((cur) =>
@@ -712,10 +696,6 @@ export function useChatSession({
           routing_preferences: workspacePreferences,
         };
 
-        // Only a Zen selection is ever sent as `model` -- a Claude choice
-        // (or no selection) keeps today's behaviour of sending nothing.
-        const modelForRequest = selectedModel?.startsWith('zen:') ? selectedModel : undefined;
-
         const controller = streamChat(
           text,
           [],
@@ -855,7 +835,6 @@ export function useChatSession({
 
                 const flowResponse = parseFlowResponse(assistantContent);
 
-                setZenKeyError(null);
                 finalizeAssistant({
                   provider: assistantProvider,
                   model: assistantModel,
@@ -955,7 +934,6 @@ export function useChatSession({
                   : workEvent,
               ),
             ].slice(0, 24));
-            setZenKeyError(null);
             finalizeAssistant({
               provider: assistantProvider,
               model: assistantModel,
@@ -966,24 +944,6 @@ export function useChatSession({
           },
           (err) => {
             if (requestVersionRef.current !== streamVersion || finalized) return;
-
-            // 409 zen_key_required: show the server's message inline on the
-            // composer, never in the transcript, and never retry or switch
-            // model -- streamChat already made exactly one request for this
-            // turn. Drop the empty streaming placeholder rather than leaving
-            // a blank assistant bubble.
-            if (err instanceof ZenKeyRequiredError) {
-              finalized = true;
-              setZenKeyError(err.message);
-              setMessages((cur) => cur.filter((message) => message.id !== assistantId));
-              setIsStreaming(false);
-              setWorkEvents((currentEvents) =>
-                currentEvents.map((workEvent) =>
-                  workEvent.state === 'active' ? { ...workEvent, state: 'failed' as const } : workEvent,
-                ),
-              );
-              return;
-            }
 
             const errorContent = assistantContent
               ? `${assistantContent}\n\nError: Could not reach Cortex backend: ${err.message}`
@@ -1014,8 +974,6 @@ export function useChatSession({
               isStreaming: false,
             }, errorContent);
           },
-          modelForRequest,
-          modelForRequest ? loadZenDeviceKey(userId) : null,
         );
 
         abortRef.current = controller;
@@ -1062,7 +1020,6 @@ export function useChatSession({
     onConversationCreated,
     onConversationsChanged,
     runProfile,
-    selectedModel,
     sessionControls,
     userId,
   ]);
@@ -1076,9 +1033,6 @@ export function useChatSession({
     conversationNotFound,
     activeConversationTitle,
     workEvents,
-    selectedModel,
-    onModelChange,
-    zenKeyError,
     setDraft,
     sendMessage,
     stopStreaming,
