@@ -17,6 +17,18 @@ pub struct CortexStore {
     conn: Connection,
 }
 
+/// A hash of the whole schema `init()` produces (every table, index, trigger
+/// and view in `sqlite_master`), pinned in `store::tests::schema_fingerprint_matches_pinned_value`.
+///
+/// `routing.db` (opened here, at `crates/api/src/state.rs`'s `cortex_store_path`)
+/// has no version counter like `crates/api/src/db.rs`'s `SCHEMA_VERSION`, and
+/// it is not covered by `deploy-receive.sh`'s schema guard or its backup —
+/// see `docs/DEPLOY.md`. A change to this schema needs a manual deploy
+/// (`workflow_dispatch` with `allow_migration=true`), not an automatic one.
+/// This constant exists only so a schema edit here fails a test instead of
+/// shipping unnoticed.
+pub const ROUTING_SCHEMA_FINGERPRINT: u64 = 0x6b406d1582bf4bca;
+
 impl CortexStore {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         if let Some(parent) = path.as_ref().parent() {
@@ -325,6 +337,72 @@ mod tests {
     fn test_open_memory() {
         let store = CortexStore::open_memory().unwrap();
         assert_eq!(store.event_count().unwrap(), 0);
+    }
+
+    /// Normalises whitespace (including CRLF vs LF) in a `sqlite_master` dump
+    /// so the fingerprint below does not depend on incidental formatting of
+    /// the SQL text SQLite echoes back, only on the schema it describes.
+    fn normalize_schema_sql(sql: &str) -> String {
+        sql.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
+    /// FNV-1a: dependency-free, deterministic across processes and platforms,
+    /// which is all this needs — it is a change-detector, not a security hash.
+    fn fnv1a_64(bytes: &[u8]) -> u64 {
+        const OFFSET_BASIS: u64 = 0xcbf29ce484222325;
+        const PRIME: u64 = 0x100000001b3;
+        bytes.iter().fold(OFFSET_BASIS, |hash, &b| {
+            (hash ^ u64::from(b)).wrapping_mul(PRIME)
+        })
+    }
+
+    /// The full schema a fresh `CortexStore::init` produces, hashed.
+    fn schema_fingerprint(store: &CortexStore) -> u64 {
+        let mut stmt = store
+            .conn
+            .prepare(
+                "SELECT type, name, tbl_name, sql FROM sqlite_master \
+                 ORDER BY type, name",
+            )
+            .expect("failed to query sqlite_master");
+        let rows: Vec<String> = stmt
+            .query_map([], |r| {
+                let kind: String = r.get(0)?;
+                let name: String = r.get(1)?;
+                let tbl_name: String = r.get(2)?;
+                let sql: Option<String> = r.get(3)?;
+                Ok(format!(
+                    "{}|{}|{}|{}",
+                    kind,
+                    name,
+                    tbl_name,
+                    normalize_schema_sql(sql.as_deref().unwrap_or(""))
+                ))
+            })
+            .expect("failed to map sqlite_master rows")
+            .collect::<Result<_, _>>()
+            .expect("failed to read sqlite_master row");
+        fnv1a_64(rows.join("\n").as_bytes())
+    }
+
+    /// `routing.db` has no `SCHEMA_VERSION` counter and is outside
+    /// `deploy-receive.sh`'s automatic-deploy schema guard (see
+    /// `docs/DEPLOY.md`). This test hashes the schema a fresh `init()`
+    /// actually produces and pins it, so a schema change here fails a build
+    /// instead of shipping into production unannounced — routing.db changes
+    /// need a manual deploy (`workflow_dispatch` with `allow_migration=true`).
+    #[test]
+    fn schema_fingerprint_matches_pinned_value() {
+        let store = CortexStore::open_memory().unwrap();
+        let actual = schema_fingerprint(&store);
+        assert_eq!(
+            actual, ROUTING_SCHEMA_FINGERPRINT,
+            "routing.db schema changed — update ROUTING_SCHEMA_FINGERPRINT in \
+             crates/engine/src/store.rs, and note in your PR that routing.db \
+             changes need a manual deploy (workflow_dispatch, allow_migration=true) \
+             per docs/DEPLOY.md (computed fingerprint: {:#x})",
+            actual
+        );
     }
 
     #[test]
