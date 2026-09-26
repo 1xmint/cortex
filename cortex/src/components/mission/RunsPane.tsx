@@ -67,6 +67,22 @@ const TERMINAL = new Set([
 // button for a run that was cancelled or that crashed.
 const SHIPPABLE = new Set(['verified', 'manual_override', 'completed']);
 
+// A run's own status can read "completed" while a step underneath it was
+// independently verified as failed and refunded -- verification finishes
+// after execution does. The backend is the real gate (POST .../pr answers
+// 409 for exactly this), but showing an "Open pull request" button that is
+// certain to be refused, for work the customer was already refunded for, is
+// its own kind of lie. Same rule the backend applies: any step's terminal
+// verdict reading `failed` withholds the whole run's PR.
+export function hasFailedRefundedStep(steps: RunStep[]): boolean {
+  return steps.some(
+    (step) =>
+      step.status === 'failed' ||
+      step.verification_status === 'failed' ||
+      step.verifier_verdict === 'failed',
+  );
+}
+
 // A run is only worth offering a Cancel button while it can still spend
 // money or do work: once it is planning, running, or merely queued, there is
 // something to stop. A terminal run has nothing left to cancel.
@@ -432,7 +448,13 @@ export default function RunsPane() {
                       request is the moment this run's work leaves the machine
                       and asks a person to look at it, so what was and was not
                       checked belongs above the button, not after it. */}
-                  {detail.status && SHIPPABLE.has(detail.status) && (
+                  {detail.status && SHIPPABLE.has(detail.status) && hasFailedRefundedStep(detail.steps) && (
+                    <p className="t-micro mt-3 rounded-lg border border-[var(--err-line)] bg-[var(--err-soft)] px-3 py-2.5 text-[var(--err-strong)]">
+                      This task failed verification and was refunded; its changes are not
+                      delivered. See the failure report.
+                    </p>
+                  )}
+                  {detail.status && SHIPPABLE.has(detail.status) && !hasFailedRefundedStep(detail.steps) && (
                     <div className="mt-3 rounded-lg border border-[var(--line)] bg-[var(--surface)] px-3 py-2.5">
                       {pr?.runId === detail.id ? (
                         <a

@@ -104,6 +104,13 @@ jobs:
       # browser's real chat-stream and live-voice ingest code, so the two
       # sides of the wire can't drift the way `expires_at` did (server Unix
       # seconds, browser expecting ms/ISO) without a test failing here.
+      #
+      # 26 -> 31 with the five in
+      # `src/components/mission/RunsPane.hasFailedRefundedStep.test.ts`, which
+      # cover the guard that hides "Open pull request" for a run with a
+      # failed-and-refunded step -- the frontend half of withholding a
+      # refunded task's deliverable (POST /api/runs/{id}/pr enforces the same
+      # rule server-side and answers 409).
       - name: Test Cortex
         run: |
           set -euo pipefail
@@ -113,8 +120,8 @@ jobs:
           echo "$output"
           passed=$(echo "$output" | grep -oE "Tests +[0-9]+ passed" | grep -oE "[0-9]+" | tail -1)
           echo "cortex tests passed: ${passed:-0}"
-          if [ "${passed:-0}" -lt 26 ]; then
-            echo "::error::expected at least 26 Cortex tests to run, saw ${passed:-0}"
+          if [ "${passed:-0}" -lt 31 ]; then
+            echo "::error::expected at least 31 Cortex tests to run, saw ${passed:-0}"
             exit 1
           fi
 

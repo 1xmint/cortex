@@ -1097,6 +1097,40 @@ impl Database {
         })
     }
 
+    /// Whether any step of this run was refunded because its independent
+    /// verdict was `Failed`.
+    ///
+    /// A refunded task's work must not still reach the customer through a
+    /// pull request — that would let them collect both the refund and the
+    /// deliverable. This walks every step the run ever had, recomputes each
+    /// one's verdict the same way `get_receipt` does (from the frozen specs
+    /// and recorded executions, never from a status column that could drift),
+    /// and asks the ledger — not a status flag — whether a refund actually
+    /// landed for it. Both facts have to agree: a `Failed` verdict that for
+    /// some reason was never refunded (a ledger write failure, say) does not
+    /// trip this, because the owner's rule is specifically about failed *and*
+    /// refunded work, and a false block would need its own report.
+    ///
+    /// One step failing and refunding blocks the whole run's PR — a run is a
+    /// single deliverable, so partial delivery is not offered as a fallback.
+    pub fn run_has_failed_refunded_step(&self, run_id: &str) -> bool {
+        use cortex_core::billing_binding::RefundKey;
+
+        for (step_id, _status) in self.get_all_step_statuses(run_id) {
+            let Some(receipt) = self.get_receipt(run_id, &step_id) else {
+                continue;
+            };
+            if receipt.gate.verdict != Verdict::Failed {
+                continue;
+            }
+            let refund_key = RefundKey::for_verification(&receipt.verification_id);
+            if self.ledger_has_key(refund_key.as_str()) {
+                return true;
+            }
+        }
+        false
+    }
+
     /// Returns `Result` rather than panicking: these run in request paths, and
     /// `.expect()` on a database error took the handler down with it.
     pub fn reset_subscription_credits(

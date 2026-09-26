@@ -1017,6 +1017,20 @@ pub(crate) fn validate_run_for_pr(
 
     validate_pr_authority(db, user_id, run_id)?;
 
+    // A refunded task's changes are not delivered. If any step of this run
+    // failed verification and was refunded, the whole PR is refused — a run
+    // is one deliverable, and a partially-verified run does not get shipped
+    // piecemeal. The failure report (verdict, failed checks, their output) is
+    // still reachable through GET /api/runs/{run_id}/steps/{step_id}/receipt.
+    if db.run_has_failed_refunded_step(run_id) {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(ErrorResponse {
+                error: "This task failed verification and was refunded; its changes are not delivered. See the failure report.".into(),
+            }),
+        ));
+    }
+
     // Get the branch
     let branch = db.get_run_branch(run_id).ok_or_else(|| {
         (
