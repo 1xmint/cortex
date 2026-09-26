@@ -48,6 +48,7 @@ import { AuthTokenRegistrar, useAuthGate } from './lib/useAuthGate';
 import { useSomaSession } from './lib/useSomaSession';
 import { useBilling } from './lib/useBilling';
 import { isOnboardingComplete } from './lib/onboarding';
+import { SHOW_PROJECTS_LINK } from './lib/featureFlags';
 import SignInScreen from './components/auth/SignInScreen';
 import OperationsRoom from './components/operations/OperationsRoom';
 import OnboardingFlow from './components/onboarding/OnboardingFlow';
@@ -1119,8 +1120,18 @@ export default function App() {
         <Route path="/app" element={<Navigate to="/" replace />} />
         <Route path="/app/groups/:groupId/tasks" element={<CortexShell />} />
         <Route path="/app/groups/:groupId/operations" element={<OperationsRoom />} />
-        <Route path="/projects" element={<ProjectsView />} />
-        <Route path="/projects/:projectId" element={<ProjectsView />} />
+        {/* Projects: hidden until Projects has a working backend (see SHOW_PROJECTS_LINK). */}
+        {SHOW_PROJECTS_LINK ? (
+          <>
+            <Route path="/projects" element={<ProjectsView />} />
+            <Route path="/projects/:projectId" element={<ProjectsView />} />
+          </>
+        ) : (
+          <>
+            <Route path="/projects" element={<NotFoundPage />} />
+            <Route path="/projects/:projectId" element={<NotFoundPage />} />
+          </>
+        )}
         {/* Legacy redirects */}
         <Route path="/groups/:groupId/tasks" element={<LegacyGroupRedirect />} />
         <Route path="*" element={<NotFoundPage />} />

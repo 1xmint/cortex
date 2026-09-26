@@ -1526,10 +1526,20 @@ dev snapshot over production and never restores the live one. The safe path is
 `git fetch` (refs only, never touches the working tree), a separate
 `git worktree` at `origin/main`, build there, `sudo cp` the binary.
 
-### F11. There is no worker credential a service can hold
+That script has since been deleted. Deploys now run through
+`.github/workflows/deploy.yml`; see `docs/DEPLOY.md`.
 
-**The finding that explains why production has never had a worker**, and it is
-not a configuration mistake.
+### F11. There is no worker credential a service can hold *(closed 2026-09-25, see PR #54)*
+
+**Closed.** [PR #54](https://github.com/1xmint/cortex/pull/54), "ci(release):
+ship cortex-worker-key and optional worker images" (merged 2026-09-23), adds
+`cortex-worker-key` to mint the long-lived worker credential this finding says
+did not exist, plus optional worker images to run it. The worker key still
+has to be installed on the host — see STATE.md — but the design gap this
+finding describes is closed.
+
+**The finding that explained why production had never had a worker**, and it
+was not a configuration mistake.
 
 `cortex-worker.service` is installed and running. It connects, registers, and is
 disconnected within a millisecond, every five seconds, minting a new worker id
@@ -2066,6 +2076,20 @@ onboarding's `ProviderStep.tsx`.
 It was **split out of the docs PR** onto `fix/auth-remove-subscription-flow` and
 pushed. Its PR was **not** opened, because opening a PR arms auto-merge and this
 is a customer-facing onboarding change. Awaiting Josh.
+
+**Update, 2026-09-25.** The `fix/auth-remove-subscription-flow` branch no
+longer exists, locally or on the `cortex` remote — checked 2026-09-25 with
+`git branch -a | grep -i subscription` and `gh api
+repos/1xmint/cortex/branches -q '.[].name' | grep -i subscription`, both
+empty. The branch is lost.
+
+But `grep -rn "startAuth" crates/ cortex/src` on `main` as of 2026-09-25 finds
+**no matches** — the backend `startAuth` subscription flow that
+`FRONTEND-AUDIT.md` item 3 describes as "not closed" is not present in the
+code on `main` today. This finding is **closed**: the flow this commit
+removed is already gone from `main`, so the lost branch does not need to be
+redone. (`FRONTEND-AUDIT.md` and `HARNESS-EXCELLENCE-PLAN-2026-08.md` still
+describe it as open; those references are now stale.)
 
 ### F2. `CONCURRENCY-ASSESSMENT.md` was already on main
 
@@ -3075,3 +3099,108 @@ speaks.
 
 Unconfirmed: the text field name inside `session.input_transcript.delta`
 (the parser accepts `delta` or `text`).
+
+## 2026-09-25 note — the 2026-09-12 boundary was not the last word
+
+The 2026-09-12 entry above says "there is no further code-only task queued by
+this plan." That stopped being true: PRs #27–#67 landed after it, outside this
+plan. The M-D entries below record the ones that need a decision or are worth
+flagging here.
+
+## 2026-09-25 M-D-0016 — Zen BYOK: reverted, OpenCode ToS conflict
+
+[PRs #44](https://github.com/1xmint/cortex/pull/44),
+[#45](https://github.com/1xmint/cortex/pull/45),
+[#46](https://github.com/1xmint/cortex/pull/46),
+[#47](https://github.com/1xmint/cortex/pull/47),
+[#49](https://github.com/1xmint/cortex/pull/49) and
+[#50](https://github.com/1xmint/cortex/pull/50) (merged 2026-09-22 to
+2026-09-23) made OpenCode Zen chat BYOK-only: the customer supplies their own
+Zen key, at 0 Cortex credits, reachable only behind a paid Cortex
+subscription. (#48, merged in the same window, is the unrelated "add a manual
+Build release workflow" PR and is not part of this group.) See
+`cortex/plan/CREDITS.md` lines ~233–254.
+
+That conflicted with this repository's own docs on two counts: `VISION.md:43`
+says "Not BYOK" and `VISION.md:28-30` says "Not a model gateway"; and
+`CREDITS.md` cites a decision "`plan-zen-byok.md`, decision D1" that does not
+exist anywhere in this repository's git history — checked 2026-09-25 with
+`find . -iname '*zen-byok*'` (no match). It also conflicted with OpenCode's
+own terms of service (opencode.ai/legal/terms-of-service, read 2026-09-25):
+"You will only use the Services for your own internal use, and not on behalf
+of or for the benefit of any third party," with no BYOK/proxy carve-out for a
+hosted service holding a customer's key on their behalf.
+
+**Decided by Josh, 2026-09-25: revert.** PRs #44, #45, #46, #47, #49 and #50
+are reverted; #48 is unrelated and stays. Reason: OpenCode's terms restrict
+use to the customer's own internal use with no carve-out for a hosted third
+party holding keys on a customer's behalf, and this repository's own
+`VISION.md` already says "Not BYOK" / "Not a model gateway" — Zen BYOK chat
+should never have shipped against that vision without a written exception
+from OpenCode, which was never obtained. The revert lands as draft PR(s)
+under independent review before merging. Revert PR:
+[#72](https://github.com/1xmint/cortex/pull/72), draft until its independent
+review passes. It deletes every BYOK key file, so the open "zeroize the
+remaining key file" item closes with it rather than as separate work.
+
+## 2026-09-25 M-D-0017 — cancel-run: users can stop an in-progress run
+
+[PR #58](https://github.com/1xmint/cortex/pull/58) "Finish runs whose last
+step failed", [#59](https://github.com/1xmint/cortex/pull/59) "Free a
+cancelled step's paths", [#60](https://github.com/1xmint/cortex/pull/60) "Add
+cancel-run: let users stop an in-progress run", and
+[#64](https://github.com/1xmint/cortex/pull/64) "test(api): cover the cancel
+drop branches and the ws worker check" (merged 2026-09-24) add
+`Database::cancel_run`, a `POST /api/runs/{id}/cancel` route, and frontend
+cancel UI. #60's PR body notes `cargo test`/`cargo build` could not run
+locally on that box (linking fails locally per repo constraints) and was
+verified on GitHub Actions instead.
+
+## 2026-09-25 M-D-0018 — gateway host split
+
+[PR #66](https://github.com/1xmint/cortex/pull/66) "Give the provider gateway
+its own host, gateway.heyvera.org" (merged 2026-09-24).
+
+## 2026-09-25 M-D-0019 — auto-deploy shipped, has not yet moved production
+
+[PR #67](https://github.com/1xmint/cortex/pull/67) "Deploy releases to the
+server automatically" (merged 2026-09-24) added `build-release.yml` →
+`deploy.yml`. The first Deploy run,
+[36072223296](https://github.com/1xmint/cortex/actions/runs/36072223296)
+(2026-09-24), completed "success" but only printed a `::notice::` and skipped
+the deploy step, because `TS_OAUTH_CLIENT_ID`/`TS_OAUTH_SECRET` are not set in
+the GitHub `production` environment. Production has not moved by auto-deploy
+yet. See STATE.md.
+
+## 2026-09-26 M-D-0020 — "done" includes Phases 27–30; grading, price and consent decisions
+
+Decided by Josh, 2026-09-26, unless marked otherwise.
+
+- **Scope.** "Done" (frontend and backend polished) includes Phases 27–30 of
+  `HARNESS-EXCELLENCE-PLAN-2026-08.md`. Every mechanism is built and tested
+  against the stub provider; no paid model run happens before Josh's final
+  real run. The phase exit gates (`p_fa`, Cortex-at-`ultra` against the best
+  single model, the maintainer-acceptance arm) are measurements that need many
+  paid runs, so they are a separate, budgeted decision after that run.
+- **Who sets the grade.** Cortex's planner declares `verdict_class` (`strong`
+  or `authored`) at plan time and shows it on the plan receipt before any
+  spend. The customer cannot upgrade it.
+- **Price of an `authored` verdict.** Half the task class's credits, rounded
+  up; the receipt says the work was checked by tests the agent wrote and was
+  not independently verified. A failed `authored` task is still refunded in
+  full. `strong` is full price. This is a ratio, not a price: CREDITS.md
+  still has no measured cost curve. (Josh delegated this one: "place yourself
+  as the customer and decide".)
+- **Racing.** The customer pays for every attempt, only at the top effort
+  level, with the maximum spend shown and approved before it starts. Racing
+  runs only on `strong` contracts (plan, Phase 27.4).
+- **PR harvest for the Phase 30 suites is opt-in only.** This overrides the
+  opt-out outcome corpus in decision #4 for harvested pull requests.
+- **Refunds stay.** Cortex is not BYOK (VISION.md:43): a refund returns
+  credits and Cortex absorbs the model cost. Whether a failed task's branch
+  still reaches the customer is to be checked; if it does, refunds can be
+  farmed, and the recommendation is to return the failure report, not the
+  branch.
+- **The final run tests charging and refunds** and is the very last step. The
+  first price list is proposed then, for Josh's approval; without one,
+  `freeze_step_quote` dispatches unquoted and uncharged.

@@ -99,6 +99,8 @@ Branch: `extract/cortex-standalone` in `C:\Users\Josh\Desktop\GitHub\cortex-extr
    Caddy block had just been deleted, and `scripts/deploy-cortex.sh` fell back
    to stopping a systemd service called `heyvera`. The `Caddyfile` now names
    `/v1/health` and `/v1/ready` instead of proxying all of `/v1/*`.
+   `scripts/deploy-cortex.sh` has since been deleted; see `docs/DEPLOY.md` for
+   the current deploy path.
 3. ~~**Rename what is left.**~~ **Done** — commit `1f293dcb`. `crates/shared`
    turned out to be unused by Cortex and was dropped with the other Socials
    crates rather than renamed. `README.md`, `AGENTS.md`, `CONTRIBUTING.md`,
