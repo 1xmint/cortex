@@ -6,9 +6,11 @@ This document provides step-by-step instructions for setting up Claude and Codex
 
 ## Overview
 
-Cortex supports two authentication modes:
+Cortex supports one authentication mode:
 1. **BYOS (Bring Your Own Subscription)** - Users use their own Claude/OpenAI subscriptions
-2. **BYOK (Bring Your Own Keys)** - Users provide API keys directly in the UI
+
+(A BYOK "provide API keys directly in the UI" mode existed for OpenCode Zen
+chat only and was removed 2026-09-25 — see `cortex/plan/CREDITS.md`.)
 
 This guide covers BYOS mode, which provides the best user experience and cost efficiency.
 

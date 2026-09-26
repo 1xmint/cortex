@@ -3,10 +3,8 @@ mod agent_confirm;
 mod agent_tools;
 pub mod api_error;
 pub mod billing;
-pub mod byok;
 mod chat;
 mod chat_paid;
-mod chat_zen;
 pub mod clerk;
 mod context_api;
 // Public because tests/context_flow_integration_test.rs exercises it as a
@@ -30,10 +28,8 @@ pub mod mission_control;
 pub mod pricing;
 pub mod provider_gateway;
 mod provider_gateway_http;
-mod provider_keys;
 mod supplier_anthropic;
 mod supplier_openai;
-mod supplier_zen;
 pub mod verification_dispatcher;
 pub mod verification_driver;
 mod voice;
@@ -69,13 +65,6 @@ pub fn build_gateway_cli_proof_router(
     provider_gateway_http::proof_router(db, signing_key, authorization_id)
 }
 
-/// Clear the in-process "10 key saves per hour" counters. Route tests share
-/// one test user across a whole process, so they reset between cases; the
-/// limit itself is unchanged.
-#[doc(hidden)]
-pub fn reset_provider_key_save_limits() {
-    provider_keys::reset_save_limits();
-}
 pub mod stripe_client;
 mod usage_api;
 mod user;
@@ -557,26 +546,6 @@ pub fn build_cortex_router(state: Arc<AppState>) -> Router {
         .route("/api/user/routing", post(user::update_profile))
         .route("/api/user/github/status", get(user::github_status))
         .route("/api/user/repos/select", post(user::select_repos))
-        .route(
-            "/api/provider-keys",
-            get(provider_keys::list_keys),
-        )
-        // `save_key`/`delete_key_all` bodies and headers must never reach a
-        // log line: the PUT body carries `unlock` (see `provider_keys::
-        // SaveKeyRequest`), and `chat`/`chat_models` below read
-        // `X-Cortex-Key-Unlock`/`X-Cortex-Key-Device` from request headers.
-        // `tower-http`'s `sensitive-headers` feature is not enabled in this
-        // workspace (see root `Cargo.toml`), so this is enforced by every
-        // handler simply never passing those values to `tracing`, rather
-        // than by a header-redaction layer.
-        .route(
-            "/api/provider-keys/{provider}",
-            put(provider_keys::save_key).delete(provider_keys::delete_key_all),
-        )
-        .route(
-            "/api/provider-keys/{provider}/{device_id}",
-            delete(provider_keys::delete_key_device),
-        )
         .route("/api/integrations/status", get(integrations::integration_status))
         .route("/api/integrations/slack/oauth/start", post(integrations::slack_oauth_start))
         .route("/api/integrations/slack/oauth/callback", get(integrations::slack_oauth_callback))

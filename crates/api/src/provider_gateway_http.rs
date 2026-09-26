@@ -298,7 +298,8 @@ fn live_transport_for(provider: &str) -> Option<GatewayTransport> {
         "openai" => Some(GatewayTransport::LiveOpenAi(
             crate::supplier_openai::OpenAiTransport::new(),
         )),
-        // Zen is BYOK-only and never reaches the gateway; see supplier_zen.rs.
+        // Zen was BYOK-only and never reached the gateway; its chat path was
+        // removed 2026-09-25 (see cortex/plan/CREDITS.md).
         _ => None,
     }
 }

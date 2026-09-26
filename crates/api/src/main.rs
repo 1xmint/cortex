@@ -195,12 +195,6 @@ async fn main() {
 
     let state = AppState::new(ledger_path, workspace_dir, clerk_secret_key).await;
 
-    // BYOK is split-key now (see `cortex_api::byok`): there is no
-    // server-held master key to rewrap under. Warn once, by name only, if
-    // an old `CORTEX_BYOK_KEK_*` env var is still set somewhere in the
-    // deploy config, so it's obvious that it no longer does anything.
-    cortex_api::byok::warn_if_legacy_kek_env_present();
-
     // Start the scheduler loop
     let scheduler_tx = scheduler::spawn_scheduler(state.clone());
     state.set_scheduler_tx(scheduler_tx).await;
