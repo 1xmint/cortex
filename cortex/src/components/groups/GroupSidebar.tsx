@@ -1,13 +1,11 @@
 import { Plus, UsersRound, FolderOpen } from 'lucide-react';
 import { NavLink, useLocation } from 'react-router';
 import type { BillingStatus } from '../../lib/cortexApi';
+import { SHOW_PROJECTS_LINK } from '../../lib/featureFlags';
 import type { CortexGroup } from '../../lib/groups';
 import Sidebar from '../Sidebar';
 
 type SettingsTab = 'integrations' | 'spend' | 'billing';
-
-// The Projects page has no working backend yet; flip this back on once it does.
-const SHOW_PROJECTS_LINK: boolean = false;
 
 interface GroupSidebarProps {
   groups: CortexGroup[];
