@@ -346,7 +346,10 @@ fn claude_tier_model_values() -> [&'static str; 3] {
     ["fast", "balanced", "powerful"].map(|tier| crate::chat_paid::model_for_tier(Some(tier)))
 }
 
-pub async fn chat_models(State(_state): State<Arc<AppState>>, _user: ClerkUser) -> Json<ModelsResponse> {
+pub async fn chat_models(
+    State(_state): State<Arc<AppState>>,
+    _user: ClerkUser,
+) -> Json<ModelsResponse> {
     let mut models = Vec::new();
     for tier in ["fast", "balanced", "powerful"] {
         models.push(ModelEntry {
