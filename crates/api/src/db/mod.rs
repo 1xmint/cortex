@@ -4224,6 +4224,17 @@ pub struct Receipt {
     /// different fact and the one a reader should be able to rely on.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub egress: Option<EgressReceipt>,
+    /// What kind of claim this verdict is, declared at plan time before this
+    /// step ran -- so the customer sees the grade before they spend, not
+    /// after. `None` only for a receipt whose work contract could not be
+    /// read; it is not a third class.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verdict_class: Option<cortex_core::diff_surface::VerdictClass>,
+    /// What was actually charged for this step, and whether that charge was
+    /// discounted for an `authored` verdict. Both are the frozen quote's own
+    /// numbers, never recomputed here -- see `pricing::credits_for_verdict_class`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub charged_credits: Option<i64>,
 }
 
 /// The egress half of a receipt: what was asked for, and what was opened.

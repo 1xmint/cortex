@@ -123,6 +123,52 @@ pub fn resolve_class(declared: VerdictClass, partition: &SurfacePartition) -> Cl
     }
 }
 
+/// Decide the class a planner may declare for a task, before dispatch.
+///
+/// Phase 27, step 1. Conservative by design and stated as such: later steps
+/// refine this rule. `Strong` is reachable only when both hold:
+///
+/// - every *required* check already runs a command that existed in the base
+///   commit -- sourced from the ecosystem floor or a risk overlay, never from
+///   the contract's own acceptance criteria, because a check invented for this
+///   task is not evidence the customer already had.
+/// - the work itself does not need new tests to be meaningful. `Add` and
+///   `Test` are exactly the two kinds of work whose entire value is the exam
+///   they write; grading them against yesterday's battery would not test the
+///   thing being delivered.
+///
+/// An empty check set cannot be `Strong` either: there is no battery to have
+/// stayed byte-identical, so the claim would be vacuous. [`crate::battery_power`]
+/// enforces the equivalent rule (`Strong` claim, `None` battery power) further
+/// down the pipeline; this function refuses to manufacture the situation in
+/// the first place.
+///
+/// The customer cannot upgrade this after the fact -- the planner declares it
+/// once, before approval, and delivery is graded against what was declared.
+pub fn declare_verdict_class(
+    checks: &[crate::verification::CheckSpec],
+    work_kind: crate::task::WorkKind,
+) -> VerdictClass {
+    use crate::task::WorkKind;
+    use crate::verification::CheckSource;
+
+    if checks.is_empty() {
+        return VerdictClass::Authored;
+    }
+
+    let needs_new_tests = matches!(work_kind, WorkKind::Add | WorkKind::Test);
+    let all_checks_preexisting = checks
+        .iter()
+        .filter(|c| c.required)
+        .all(|c| c.source != CheckSource::Contract);
+
+    if !needs_new_tests && all_checks_preexisting {
+        VerdictClass::Strong
+    } else {
+        VerdictClass::Authored
+    }
+}
+
 /// Split a set of changed paths by surface.
 pub fn partition(paths: &[String], facts: &EcosystemFacts) -> SurfacePartition {
     let mut out = SurfacePartition::default();
@@ -406,5 +452,83 @@ mod tests {
         // When that lands, this assertion should flip, and its failure is the
         // signal that it did.
         assert_eq!(classify("src/thing.rs", &rust()), DiffSurface::Subject);
+    }
+
+    fn ecosystem_check(id: &str) -> crate::verification::CheckSpec {
+        crate::verification::CheckSpec {
+            id: id.to_string(),
+            source: crate::verification::CheckSource::Ecosystem,
+            command: vec!["cargo".into(), "test".into()],
+            timeout_secs: 60,
+            required: true,
+        }
+    }
+
+    fn contract_check(id: &str) -> crate::verification::CheckSpec {
+        let mut c = ecosystem_check(id);
+        c.source = crate::verification::CheckSource::Contract;
+        c
+    }
+
+    #[test]
+    fn preexisting_checks_on_work_that_needs_no_new_tests_declares_strong() {
+        let checks = vec![ecosystem_check("cargo:test")];
+        assert_eq!(
+            declare_verdict_class(&checks, crate::task::WorkKind::Refactor),
+            VerdictClass::Strong
+        );
+    }
+
+    #[test]
+    fn a_contract_authored_check_declares_authored_even_for_a_refactor() {
+        // A check minted from this task's own acceptance criteria is not
+        // evidence the customer already had; `strong` over it would be exactly
+        // the vacuous claim the module exists to prevent.
+        let checks = vec![ecosystem_check("cargo:test"), contract_check("acceptance-1")];
+        assert_eq!(
+            declare_verdict_class(&checks, crate::task::WorkKind::Refactor),
+            VerdictClass::Authored
+        );
+    }
+
+    #[test]
+    fn work_that_writes_new_tests_declares_authored_even_over_old_checks() {
+        // `Add` and `Test` are exactly the work whose value is the exam it
+        // writes. Grading either against yesterday's battery alone would not
+        // test what was actually delivered.
+        let checks = vec![ecosystem_check("cargo:test")];
+        assert_eq!(
+            declare_verdict_class(&checks, crate::task::WorkKind::Add),
+            VerdictClass::Authored
+        );
+        assert_eq!(
+            declare_verdict_class(&checks, crate::task::WorkKind::Test),
+            VerdictClass::Authored
+        );
+    }
+
+    #[test]
+    fn an_empty_battery_cannot_be_declared_strong() {
+        // There is no battery to have stayed byte-identical, so the claim
+        // would be vacuous -- and pairing `Strong` with no battery power is
+        // exactly what `battery_power::permitted_pairing` refuses downstream.
+        assert_eq!(
+            declare_verdict_class(&[], crate::task::WorkKind::Refactor),
+            VerdictClass::Authored
+        );
+    }
+
+    #[test]
+    fn an_advisory_contract_check_does_not_block_strong() {
+        // Only *required* checks are the exam that decides the verdict. An
+        // advisory contract check is recorded but cannot change the outcome,
+        // so it does not disqualify the class either.
+        let mut advisory = contract_check("advisory-note");
+        advisory.required = false;
+        let checks = vec![ecosystem_check("cargo:test"), advisory];
+        assert_eq!(
+            declare_verdict_class(&checks, crate::task::WorkKind::Modify),
+            VerdictClass::Strong
+        );
     }
 }

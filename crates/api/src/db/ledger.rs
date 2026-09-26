@@ -1085,6 +1085,17 @@ impl Database {
                 })
             });
 
+        // Declared at plan time, before this step ran -- read back from the
+        // frozen work contract rather than re-derived, for the same reason
+        // the gate is recomputed from frozen specs: a receipt shows what was
+        // decided before delivery, not a guess made after it.
+        let verdict_class = self
+            .read_step_work_contract(step_id, attempt)
+            .ok()
+            .flatten()
+            .map(|contract| contract.verdict_class);
+        let charged_credits = self.get_step_quote(run_id, step_id).map(|q| q.quoted_credits);
+
         Some(Receipt {
             verification_id,
             run_id: run_id.to_string(),
@@ -1094,6 +1105,8 @@ impl Database {
             gate: compute_verdict(&specs, &executions),
             executions,
             egress,
+            verdict_class,
+            charged_credits,
         })
     }
 

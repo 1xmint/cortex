@@ -41,7 +41,7 @@ fn a_fresh_database_publishes_a_provisional_list_that_prices_every_class() {
 
     for class in TaskClass::all() {
         let (credits, billable) =
-            pricing::quote(&list, &class).unwrap_or_else(|| panic!("no price for {}", class.key()));
+            pricing::quote(&list, &class, cortex_core::diff_surface::VerdictClass::Strong).unwrap_or_else(|| panic!("no price for {}", class.key()));
         assert!(credits > 0, "{} quoted zero", class.key());
         assert!(
             !billable,
@@ -193,7 +193,7 @@ fn a_provisional_quote_offers_nothing_to_the_ledger() {
     let (_dir, db) = db();
     let list = db.active_price_list().expect("published");
     let class = TaskClass::new(WorkKind::Modify, RiskLevel::High, true);
-    let (credits, billable) = pricing::quote(&list, &class).expect("priced");
+    let (credits, billable) = pricing::quote(&list, &class, cortex_core::diff_surface::VerdictClass::Strong).expect("priced");
 
     db.freeze_step_quote(&pricing::StepQuote {
         quote_id: "q".into(),

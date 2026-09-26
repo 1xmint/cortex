@@ -50,6 +50,7 @@
 
 use std::collections::BTreeMap;
 
+use cortex_core::diff_surface::VerdictClass;
 use cortex_core::routing::RiskLevel;
 use cortex_core::task::WorkKind;
 use cortex_core::task_class::TaskClass;
@@ -234,19 +235,45 @@ impl StepQuote {
     }
 }
 
-/// Quote a class against a list.
+/// Apply the owner's pricing decision for the declared verdict class:
+/// `strong` is charged in full, `authored` is charged half, rounded up.
+///
+/// Rounding up rather than down is deliberate and it is the conservative
+/// direction for the customer under the "loose grading costs half" rule --
+/// half of an odd number of credits rounds to a whole credit rather than
+/// silently discounting further than the policy states. Owner decision:
+/// Cortex decides the grade and the customer sees it before spending; loose
+/// grading costs half; failed tasks are refunded in full. This is the single
+/// place that arithmetic happens — the plan-receipt quote, the charge, and
+/// the refund all read the number this function produced, never recompute it.
+pub fn credits_for_verdict_class(full_credits: i64, verdict_class: VerdictClass) -> i64 {
+    match verdict_class {
+        VerdictClass::Strong => full_credits,
+        // `i64::div_ceil` is unstable on this toolchain; `full_credits` is
+        // always a non-negative credit count, so plain ceiling division by 2
+        // is equivalent and needs no nightly feature.
+        VerdictClass::Authored => (full_credits + 1) / 2,
+    }
+}
+
+/// Quote a class against a list, priced for the declared verdict class.
 ///
 /// Returns `None` when the class is not in the list. That is deliberate and it
 /// is the honest failure: a missing class means nobody decided what this work
 /// costs, and the correct behaviour is the one already in the driver — record
 /// the verdict, leave the ledger alone, say so.
-pub fn quote(list: &PriceList, class: &TaskClass) -> Option<(i64, bool)> {
+pub fn quote(
+    list: &PriceList,
+    class: &TaskClass,
+    verdict_class: VerdictClass,
+) -> Option<(i64, bool)> {
     let priced = list.class(class)?;
     // Both statuses must permit billing. A committed class inside a
     // provisional list is still provisional: the list is the published
     // artifact, and its status is a statement about the whole of it.
     let billable = priced.status.may_bill() && list.status.may_bill();
-    Some((priced.quoted_credits, billable))
+    let credits = credits_for_verdict_class(priced.quoted_credits, verdict_class);
+    Some((credits, billable))
 }
 
 /// Build the first price list: measured provider spend, plus a margin, marked
@@ -635,7 +662,7 @@ mod tests {
         // number so the number can be argued with; it must not move money.
         let list = seeded();
         for class in TaskClass::all() {
-            let (credits, billable) = quote(&list, &class).expect("priced");
+            let (credits, billable) = quote(&list, &class, VerdictClass::Strong).expect("priced");
             assert!(credits > 0, "{} quoted zero credits", class.key());
             assert!(
                 !billable,
@@ -653,7 +680,7 @@ mod tests {
         let mut list = seeded();
         list.classes[0].status = PriceStatus::Committed;
         let class = TaskClass::all()[0];
-        let (_, billable) = quote(&list, &class).expect("priced");
+        let (_, billable) = quote(&list, &class, VerdictClass::Strong).expect("priced");
         assert!(!billable);
     }
 
@@ -666,7 +693,7 @@ mod tests {
         list.status = PriceStatus::Committed;
         list.classes[0].status = PriceStatus::Committed;
         let class = TaskClass::all()[0];
-        let (credits, billable) = quote(&list, &class).expect("priced");
+        let (credits, billable) = quote(&list, &class, VerdictClass::Strong).expect("priced");
         assert!(billable);
         assert!(credits > 0);
     }
@@ -680,9 +707,38 @@ mod tests {
             .find(|c| c.key() == dropped.task_class)
             .unwrap();
         assert!(
-            quote(&list, &class).is_none(),
+            quote(&list, &class, VerdictClass::Strong).is_none(),
             "an unpriced class produced a price"
         );
+    }
+
+    #[test]
+    fn authored_costs_half_of_strong_rounded_up_even_credits() {
+        assert_eq!(credits_for_verdict_class(10, VerdictClass::Strong), 10);
+        assert_eq!(credits_for_verdict_class(10, VerdictClass::Authored), 5);
+    }
+
+    #[test]
+    fn authored_rounds_an_odd_credit_count_up_not_down() {
+        // Owner decision: loose grading costs half. Half of 9 is not a whole
+        // number of credits, and rounding down would understate what "half"
+        // means -- the customer sees an integer credit count either way, and
+        // rounding up is the direction that does not sell the claim short.
+        assert_eq!(credits_for_verdict_class(9, VerdictClass::Authored), 5);
+        assert_eq!(credits_for_verdict_class(1, VerdictClass::Authored), 1);
+        assert_eq!(credits_for_verdict_class(0, VerdictClass::Authored), 0);
+    }
+
+    #[test]
+    fn declared_class_changes_the_quoted_credits_and_nothing_else() {
+        let list = seeded();
+        let class = TaskClass::all()[0];
+        let (strong_credits, strong_billable) =
+            quote(&list, &class, VerdictClass::Strong).expect("priced");
+        let (authored_credits, authored_billable) =
+            quote(&list, &class, VerdictClass::Authored).expect("priced");
+        assert_eq!(authored_credits, credits_for_verdict_class(strong_credits, VerdictClass::Authored));
+        assert_eq!(strong_billable, authored_billable);
     }
 
     #[test]
