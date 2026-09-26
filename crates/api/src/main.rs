@@ -181,19 +181,36 @@ async fn main() {
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|_| std::env::current_dir().unwrap_or_else(|_| ".".into()));
 
-    let clerk_secret_key = std::env::var("CLERK_SECRET_KEY")
-        .ok()
-        .filter(|s| !s.is_empty());
+    let auth_config = match cortex_api::clerk::load_heyvera_auth_config() {
+        Ok(config) => config,
+        Err(msg) => {
+            tracing::error!("auth: {msg}");
+            eprintln!("auth: {msg}");
+            std::process::exit(1);
+        }
+    };
 
-    if clerk_secret_key.is_some() {
-        tracing::info!("auth: Clerk JWT verification enabled");
-    } else {
-        tracing::info!(
-            "auth: disabled (no CLERK_SECRET_KEY) — all requests treated as user \"local\""
-        );
+    match auth_config.mode {
+        cortex_api::clerk::HeyVeraAuthMode::Clerk => {
+            tracing::info!("auth: Clerk JWT verification enabled");
+        }
+        cortex_api::clerk::HeyVeraAuthMode::LocalDevelopment => {
+            let cause = if std::env::var("CLERK_SECRET_KEY")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .is_none()
+            {
+                "no CLERK_SECRET_KEY set"
+            } else {
+                "CORTEX_AUTH_DISABLED"
+            };
+            tracing::info!(
+                "auth: local development mode ({cause}) — all requests treated as user \"local\""
+            );
+        }
     }
 
-    let state = AppState::new(ledger_path, workspace_dir, clerk_secret_key).await;
+    let state = AppState::new(ledger_path, workspace_dir, auth_config.clerk_secret_key).await;
 
     // BYOK is split-key now (see `cortex_api::byok`): there is no
     // server-held master key to rewrap under. Warn once, by name only, if
