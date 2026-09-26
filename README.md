@@ -57,12 +57,10 @@ cd cortex && npm install && npm run dev
 
 ## Deploy
 
-```bash
-# VPS backend
-scripts/deploy-cortex.sh
+See [docs/DEPLOY.md](docs/DEPLOY.md) for the VPS backend deploy.
 
-# The frontend auto-deploys via Cloudflare Pages on push
-```
+Cloudflare Pages deploys `cortex/` from `main` on its own, independently of
+the backend release process, so the web app can run ahead of the backend.
 
 ## Key Docs
 

@@ -51,9 +51,9 @@ Read the live list rather than trusting this paragraph:
 gh api repos/:owner/:repo/branches/main/protection -q '.required_status_checks.contexts'
 ```
 
-`clippy` is deliberately **advisory** (`continue-on-error: true`) inside the
-`rust` job and must not be made required until someone reads its first full
-run — see the comment in `.github/workflows/ci.yml`.
+`clippy` runs with `-D warnings` as a step inside the required `rust` job —
+see `.github/workflows/ci.yml`. It is **not advisory**: a clippy warning fails
+the `rust` check and blocks the merge like any other failure in that job.
 
 ### Branch protection is strict, and auto-merge will not rescue you
 
@@ -125,8 +125,8 @@ the gate that does.
 
 ## The migration counter must be re-checked at rebase
 
-`schema_version` in `crates/api/src/db.rs` is a single counter, and every branch
-that adds a migration competes for the next number on it.
+`schema_version` in `crates/api/src/db/mod.rs` is a single counter, and every
+branch that adds a migration competes for the next number on it.
 
 **Read the current maximum at rebase time, not at design time.** If two branches
 both pick the next number and one merges first, the second branch's migration is
@@ -136,7 +136,7 @@ a single wave.
 
 ```bash
 git fetch origin
-git show origin/main:crates/api/src/db.rs | grep -oE 'fn migrate_v[0-9]+' | sort -V | tail -1
+git show origin/main:crates/api/src/db/mod.rs | grep -oE 'fn migrate_v[0-9]+' | sort -V | tail -1
 ```
 
 If your number is taken, renumber before merging. Say in the PR body which
@@ -162,7 +162,7 @@ says what changed; the body says why, and what it does not do.
 If the work was done with an AI assistant, keep the trailer:
 
 ```
-Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
 ```
 
 ## Security
