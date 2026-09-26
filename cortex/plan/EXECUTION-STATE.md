@@ -3139,9 +3139,9 @@ party holding keys on a customer's behalf, and this repository's own
 should never have shipped against that vision without a written exception
 from OpenCode, which was never obtained. The revert lands as draft PR(s)
 under independent review before merging. Revert PR:
-[#72](https://github.com/1xmint/cortex/pull/72), draft until its independent
-review passes. It deletes every BYOK key file, so the open "zeroize the
-remaining key file" item closes with it rather than as separate work.
+[#72](https://github.com/1xmint/cortex/pull/72). It deletes every BYOK key file, so the
+open "zeroize the remaining key file" item closes with it rather than as
+separate work.
 
 ## 2026-09-25 M-D-0017 — cancel-run: users can stop an in-progress run
 
