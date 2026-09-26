@@ -53,7 +53,7 @@ mkdir -p "$CORTEX_HOME" "$WORKSPACE_DIR" "$DATA_DIR" "$BIN_DIR" "$FRONTEND_DIR"
 # Build Rust backend
 log_info "Building Rust backend..."
 cd "$(dirname "$0")/.."
-cargo build --release --bin cortex-server
+cargo build --release -p cortex-api --bin cortex-server
 
 # Copy binary
 log_info "Installing backend binary..."

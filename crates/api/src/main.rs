@@ -195,8 +195,17 @@ async fn main() {
             tracing::info!("auth: Clerk JWT verification enabled");
         }
         cortex_api::clerk::HeyVeraAuthMode::LocalDevelopment => {
+            let cause = if std::env::var("CLERK_SECRET_KEY")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .is_none()
+            {
+                "no CLERK_SECRET_KEY set"
+            } else {
+                "CORTEX_AUTH_DISABLED"
+            };
             tracing::info!(
-                "auth: local development mode (CORTEX_AUTH_DISABLED) — all requests treated as user \"local\""
+                "auth: local development mode ({cause}) — all requests treated as user \"local\""
             );
         }
     }
