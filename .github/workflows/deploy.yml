@@ -25,6 +25,13 @@ on:
         description: Run ID of a build-release.yml run to deploy
         type: string
         required: true
+      allow_migration:
+        description: >-
+          Allow this deploy to migrate the production schema. Automatic
+          deploys (workflow_run) never set this; deploy-receive.sh refuses a
+          migrating deploy without it. See docs/DEPLOY.md.
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -160,7 +167,7 @@ jobs:
 
       - name: Package artifact for transport
         if: steps.secrets.outputs.ok == 'true' && steps.guard.outputs.proceed == 'true'
-        run: tar czf artifact.tgz -C release COMMIT SHA256SUMS bin www
+        run: tar czf artifact.tgz -C release COMMIT SCHEMA SHA256SUMS bin www
 
       # Tailscale SSH (not a deploy private key) authenticates the connection
       # below: the tailnet ACL grants tag:ci an "ssh" rule to reach guardian on
@@ -175,11 +182,20 @@ jobs:
 
       - name: Send artifact to the host
         if: steps.secrets.outputs.ok == 'true' && steps.guard.outputs.proceed == 'true'
+        env:
+          # The automatic workflow_run path never sets this; only a manual
+          # workflow_dispatch run with allow_migration=true does. See
+          # docs/DEPLOY.md and scripts/deploy/deploy-receive.sh.
+          ALLOW_MIGRATION: ${{ github.event_name == 'workflow_dispatch' && inputs.allow_migration && 'true' || '' }}
         run: |
           set -euo pipefail
+          receive_cmd='~/cortex-next/deploy-receive.sh'
+          if [ -n "$ALLOW_MIGRATION" ]; then
+            receive_cmd="$receive_cmd --allow-migration"
+          fi
           ssh -o BatchMode=yes -o ConnectTimeout=20 -o StrictHostKeyChecking=accept-new \
             guardian@clawguard.tail618cfc.ts.net \
-            '~/cortex-next/deploy-receive.sh' <artifact.tgz
+            "$receive_cmd" <artifact.tgz
 
       - name: Wait for the deployed commit to go live
         if: steps.secrets.outputs.ok == 'true' && steps.guard.outputs.proceed == 'true'

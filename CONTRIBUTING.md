@@ -142,6 +142,12 @@ git show origin/main:crates/api/src/db.rs | grep -oE 'fn migrate_v[0-9]+' | sort
 If your number is taken, renumber before merging. Say in the PR body which
 maximum you checked against and when.
 
+When you add a migration, also bump `SCHEMA_VERSION` in
+`crates/api/src/db/mod.rs` to match — deploy tooling reads that const (via
+`out/SCHEMA` in the release artifact) to refuse an automatic deploy that would
+migrate the production schema, and a unit test in that file fails the build if
+it drifts from what the migration chain actually produces.
+
 ## Deployment notes a contributor will trip over
 
 - **`CORTEX_SINGLE_NODE=1` is required.** The server exits without it. The

@@ -89,7 +89,21 @@ jobs:
           cp target/release/cortex-server target/release/cortex-worker target/release/cortex-worker-key out/bin/
           cp -r cortex/dist out/www
           git rev-parse HEAD > out/COMMIT
-          (cd out && sha256sum bin/* > SHA256SUMS)
+
+          # The schema the migration chain on this commit ends at. deploy.yml
+          # and deploy-receive.sh compare this against the live database's
+          # schema_version to refuse an automatic deploy that would migrate
+          # production (see docs/DEPLOY.md). Fail loudly if it can't be found
+          # rather than silently shipping an artifact deploy tooling can't
+          # reason about.
+          schema_version="$(grep -oE 'pub const SCHEMA_VERSION: u32 = [0-9]+' crates/api/src/db/mod.rs | grep -oE '[0-9]+$')"
+          if [ -z "$schema_version" ]; then
+            echo "::error::could not extract SCHEMA_VERSION from crates/api/src/db/mod.rs"
+            exit 1
+          fi
+          echo "$schema_version" > out/SCHEMA
+
+          (cd out && sha256sum bin/* COMMIT SCHEMA > SHA256SUMS)
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:

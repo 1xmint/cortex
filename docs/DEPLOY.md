@@ -242,6 +242,41 @@ gh workflow run deploy.yml -R 1xmint/cortex -f build_run_id=<run-id-of-a-build-r
 
 Find the run ID with `gh run list -R 1xmint/cortex --workflow=build-release.yml`.
 
+## A migrating deploy must be a human's choice
+
+Migrations run in-process at server boot (`crates/api/src/db/mod.rs`), and
+`deploy-receive.sh` can roll back the binaries and web app on a failed health
+check but cannot roll back the schema. If an automatic deploy migrated the
+database and then failed its health check, the database would be left ahead
+of the rolled-back binary — a state nothing here can safely repair on its
+own.
+
+So the build carries the schema version its migration chain ends at
+(`SCHEMA_VERSION` in `crates/api/src/db/mod.rs`, written to `out/SCHEMA` by
+`build-release.yml`), and `deploy-receive.sh` compares it against the live
+database's `schema_version` before swapping anything in:
+
+- **Artifact SCHEMA equal to the live version** — proceeds normally; nothing
+  to migrate.
+- **Artifact SCHEMA behind the live version** — refused outright, always: that
+  binary would run against a newer schema than it knows.
+- **Artifact SCHEMA ahead of the live version** — refused unless the script
+  was invoked with `--allow-migration`. The automatic `workflow_run` deploy
+  path never passes this.
+
+To deploy a build that migrates the schema, trigger `deploy.yml` by hand with
+`allow_migration` set:
+
+```bash
+gh workflow run deploy.yml -R 1xmint/cortex \
+  -f build_run_id=<run-id-of-a-build-release-run> \
+  -f allow_migration=true
+```
+
+Only do this once you've confirmed the migration is safe to run against
+production — there's still no automatic schema rollback if the deploy fails
+after migrating.
+
 ## Rolling back by hand
 
 `deploy-receive.sh` already rolls back automatically if a new release fails

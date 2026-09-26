@@ -315,6 +315,15 @@ pub struct CodeRedemption {
 
 const RUN_RESOURCE_LEASE_TTL_MS: i64 = 24 * 60 * 60 * 1000;
 
+/// The version the migration chain below ends at. Deploy tooling compares
+/// this against the live database's `schema_version` to refuse an automatic
+/// deploy that would migrate the schema (see `scripts/deploy/deploy-receive.sh`
+/// and `.github/workflows/build-release.yml`'s `out/SCHEMA`).
+///
+/// Next migration author: bump this to match the new highest `migrate_vN`
+/// when you add one (see CONTRIBUTING.md's migration-counter section).
+pub const SCHEMA_VERSION: u32 = 71;
+
 fn apply_migrations(conn: &Connection) {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS schema_version (
@@ -13672,6 +13681,24 @@ mod tests {
     pub(super) fn test_db() -> Database {
         let dir = tempfile::tempdir().unwrap().keep();
         Database::open(&dir.join("cortex.sqlite"))
+    }
+
+    /// `SCHEMA_VERSION` is deploy tooling's source of truth for how far the
+    /// migration chain goes; it must always equal the version the server's own
+    /// boot-time migration path actually lands on, or the deploy-refusal check
+    /// it feeds trusts a stale number.
+    #[test]
+    fn schema_version_const_matches_what_migrations_actually_produce() {
+        let db = test_db();
+        let version: i64 = db
+            .conn()
+            .query_row("SELECT MAX(version) FROM schema_version", [], |r| r.get(0))
+            .expect("schema_version table must have a row after migrations run");
+        assert_eq!(
+            version,
+            i64::from(SCHEMA_VERSION),
+            "SCHEMA_VERSION const is out of sync with the migration chain"
+        );
     }
 
     /// A panic while the database lock is held used to poison the mutex, which
