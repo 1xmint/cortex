@@ -895,6 +895,7 @@ dependencies = [
  "axum",
  "cortex-api",
  "socket2",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",

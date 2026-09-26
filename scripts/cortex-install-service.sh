@@ -23,8 +23,16 @@ CORTEX_PORT=$CORTEX_PORT
 CORTEX_WORKSPACE=/home/$CORTEX_USER/claw-net
 CORTEX_ALLOWED_ORIGINS=https://cortex.heyvera.org
 RUST_LOG=info
-# Auth — set these to enable real user accounts
-# CLERK_SECRET_KEY=
+# CORTEX_ENV=production tells the API it is running in production, which is
+# what makes it refuse to start without a complete Clerk auth config below.
+# Without it the server runs as a local/dev instance and serves every
+# request as user "local". Do not remove this line.
+CORTEX_ENV=production
+# Auth — required in production; the server refuses to start without all
+# three of these set (see deploy/README.md)
+CLERK_SECRET_KEY=
+CLERK_ISSUER=
+CLERK_AUTHORIZED_PARTY=
 # VITE_CLERK_PUBLISHABLE_KEY=
 # Billing — set these to enable subscriptions
 # STRIPE_SECRET_KEY=

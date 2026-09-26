@@ -118,11 +118,20 @@ CORTEX_ALLOWED_ORIGINS=https://cortex.heyvera.org
 # from the same host, so relative /api paths reach the backend directly.
 RUST_LOG=info
 
+# CORTEX_ENV=production is the signal the API checks at startup to decide
+# whether it is running in production. Without it, the server treats itself
+# as a local/dev instance and starts even with no Clerk auth configured,
+# serving every request as user "local". Do not remove this line.
+CORTEX_ENV=production
+
 # Database
 # CORTEX_DATABASE_URL=postgresql://user:pass@localhost/cortex
 
-# Authentication (configure as needed)
-# CLERK_SECRET_KEY=your_clerk_secret_key
+# Authentication (required in production; the server refuses to start
+# without all three of these -- see deploy/README.md)
+CLERK_SECRET_KEY=
+CLERK_ISSUER=
+CLERK_AUTHORIZED_PARTY=
 
 # GitHub integration (optional)
 # GITHUB_TOKEN=your_github_token

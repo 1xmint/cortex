@@ -231,6 +231,26 @@ left in a file.
 
 Once both are set, delete any local copy of the OAuth secret.
 
+## The API refuses to start without a production auth config
+
+None of this workflow's own steps write the API's `.env`/`EnvironmentFile` on
+the deploy host — that file is set up once, by hand, alongside whichever
+`cortex-server` unit is running there. Whatever sets it up must include four
+variables, or the API exits non-zero on the next restart instead of serving
+traffic:
+
+- `CORTEX_ENV=production` — the signal the API's startup check looks for. Any
+  process env that lacks it is treated as local/dev, which starts fine with
+  no Clerk config at all and serves every request as user `"local"`.
+- `CLERK_SECRET_KEY`, `CLERK_ISSUER`, `CLERK_AUTHORIZED_PARTY` — required once
+  `CORTEX_ENV=production` is set; the server logs which one is missing or
+  malformed and exits rather than falling back to an unauthenticated mode.
+
+See `deploy/README.md`'s "Production auth is fail-closed" section for the
+full description of each variable, and `deploy/cortex-api.service` /
+`deploy/deploy-production.sh` / `scripts/cortex-install-service.sh` for the
+templates that set `CORTEX_ENV=production` for that install path.
+
 ## Triggering a deploy manually
 
 Deploys normally happen automatically after a successful `Build release` run

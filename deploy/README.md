@@ -84,8 +84,13 @@ CORTEX_ALLOWED_ORIGINS=https://cortex.heyvera.org
 # Database (optional - defaults to SQLite)
 CORTEX_DATABASE_URL=postgresql://user:pass@localhost/cortex
 
-# Authentication
+# Production signal (required) — see "Production auth is fail-closed" below
+CORTEX_ENV=production
+
+# Authentication (all three required once CORTEX_ENV=production is set)
 CLERK_SECRET_KEY=your_clerk_secret_key
+CLERK_ISSUER=https://your-clerk-instance.clerk.accounts.dev
+CLERK_AUTHORIZED_PARTY=https://cortex.heyvera.org
 
 # GitHub Integration
 GITHUB_TOKEN=your_github_token
@@ -94,6 +99,32 @@ GITHUB_TOKEN=your_github_token
 STRIPE_SECRET_KEY=your_stripe_secret_key
 STRIPE_WEBHOOK_SECRET=your_webhook_secret
 ```
+
+### Production auth is fail-closed
+
+The API refuses to start when it detects a production runtime with an
+incomplete Clerk configuration, rather than falling back to treating every
+request as user `"local"`. Four environment variables control this:
+
+- **`CORTEX_ENV`** — set to `production` to tell the API it is running in
+  production. This is the signal the startup check looks for
+  (`HEYVERA_REQUIRE_AUTH=1` also counts). Nothing in this repository's
+  production templates sets it implicitly: a deploy that forgets it runs as
+  an unauthenticated local/dev instance without warning.
+- **`CLERK_SECRET_KEY`** — the Clerk backend API secret. Required once
+  `CORTEX_ENV=production` is set; startup exits non-zero if it is missing or
+  blank.
+- **`CLERK_ISSUER`** — the Clerk instance's issuer URL (a non-empty `https://`
+  URL). Required in production; used to validate incoming JWTs.
+- **`CLERK_AUTHORIZED_PARTY`** — the `https://` origin (no path, query, or
+  fragment) that Clerk-issued tokens must have been authorized for. Required
+  in production.
+
+`deploy/deploy-production.sh` and `scripts/cortex-install-service.sh` both
+write out a `.env` file with `CORTEX_ENV=production` and empty `CLERK_*`
+lines already present — fill in the three Clerk values before starting the
+service, or the server exits immediately with a message naming the missing
+variable.
 
 ### SSL Certificates
 

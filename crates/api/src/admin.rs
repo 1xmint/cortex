@@ -1086,6 +1086,43 @@ mod provider_holds_tests {
         assert!(!local_dev_admin_bypass(true, true, true));
     }
 
+    /// The pure `local_dev_admin_bypass` test above proves the decision
+    /// function is correct, but proves nothing about whether
+    /// `authorize_admin` actually calls `is_production_runtime()` at its call
+    /// site rather than, say, a hard-coded `false`. This drives the real
+    /// `authorize_admin` with `CORTEX_ENV=production` set so a regression in
+    /// the wiring -- not just in the pure helper -- fails a test. It mutates
+    /// the process-wide `CORTEX_ENV` variable and restores it before
+    /// returning, matching the save/restore pattern used for
+    /// `CORTEX_SINGLE_NODE` in `verification_dispatcher::tests`.
+    #[tokio::test]
+    async fn authorize_admin_denies_the_keyless_bypass_in_production() {
+        let saved_env = std::env::var("CORTEX_ENV").ok();
+        let saved_clerk_key = std::env::var("CLERK_SECRET_KEY").ok();
+        std::env::remove_var("CORTEX_ADMIN_EMAILS");
+        std::env::remove_var("CORTEX_ADMIN_USERS");
+        std::env::remove_var("CLERK_SECRET_KEY");
+        std::env::set_var("CORTEX_ENV", "production");
+
+        let (_dir, state) = test_state().await;
+        let result = authorize_admin(&state, &admin_user()).await;
+
+        match saved_env {
+            Some(value) => std::env::set_var("CORTEX_ENV", value),
+            None => std::env::remove_var("CORTEX_ENV"),
+        }
+        match saved_clerk_key {
+            Some(value) => std::env::set_var("CLERK_SECRET_KEY", value),
+            None => std::env::remove_var("CLERK_SECRET_KEY"),
+        }
+
+        let err = result.expect_err(
+            "production must never grant the keyless local-dev admin bypass, \
+             even when the admin list, state key, and env key are all absent",
+        );
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+    }
+
     #[test]
     fn local_dev_admin_bypass_fires_only_when_keyless_everywhere_and_not_production() {
         assert!(local_dev_admin_bypass(true, true, false));

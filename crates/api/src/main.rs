@@ -195,14 +195,15 @@ async fn main() {
             tracing::info!("auth: Clerk JWT verification enabled");
         }
         cortex_api::clerk::HeyVeraAuthMode::LocalDevelopment => {
-            let cause = if std::env::var("CLERK_SECRET_KEY")
-                .ok()
-                .filter(|s| !s.is_empty())
-                .is_none()
-            {
-                "no CLERK_SECRET_KEY set"
-            } else {
-                "CORTEX_AUTH_DISABLED"
+            // `load_heyvera_auth_config` trims `CLERK_SECRET_KEY` before
+            // deciding the mode, so a whitespace-only value lands here too.
+            // Blaming `CORTEX_AUTH_DISABLED` in that case would be wrong: the
+            // operator may not have set it at all, and the real cause is the
+            // blank key.
+            let cause = match std::env::var("CLERK_SECRET_KEY").ok() {
+                None => "no CLERK_SECRET_KEY set",
+                Some(value) if value.trim().is_empty() => "CLERK_SECRET_KEY is blank",
+                Some(_) => "CORTEX_AUTH_DISABLED",
             };
             tracing::info!(
                 "auth: local development mode ({cause}) — all requests treated as user \"local\""
