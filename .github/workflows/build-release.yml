@@ -102,6 +102,26 @@ jobs:
             exit 1
           fi
           schema_version="${schema_versions[0]}"
+
+          # SCHEMA_VERSION is only trustworthy if it actually matches the
+          # migration chain: a migration added without bumping the const would
+          # leave deploy-receive.sh comparing a stale number (see
+          # CONTRIBUTING.md's migration-counter section, and the
+          # schema_version_const_matches_what_migrations_actually_produce and
+          # schema_fingerprint_matches_pinned_value tests in
+          # crates/api/src/db/mod.rs, which catch the same drift at test time).
+          # Fail the build here too, before an artifact carrying a stale
+          # SCHEMA ever ships.
+          highest_migration="$(grep -oE 'fn migrate_v[0-9]+' crates/api/src/db/mod.rs | grep -oE '[0-9]+' | sort -n | tail -1)"
+          if [ -z "$highest_migration" ]; then
+            echo "::error::found no 'fn migrate_vN' functions in crates/api/src/db/mod.rs"
+            exit 1
+          fi
+          if [ "$highest_migration" != "$schema_version" ]; then
+            echo "::error::SCHEMA_VERSION ($schema_version) does not match the highest migrate_vN (migrate_v$highest_migration) in crates/api/src/db/mod.rs — bump SCHEMA_VERSION to match"
+            exit 1
+          fi
+
           echo "$schema_version" > out/SCHEMA
 
           (cd out && sha256sum bin/* COMMIT SCHEMA > SHA256SUMS)
