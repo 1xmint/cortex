@@ -20,13 +20,30 @@
 #   c. artifact SCHEMA equal to the fixture DB's version -> proceeds.
 #   d. equal SCHEMA, but the health check fails after the swap -> the old
 #      bin/ and COMMIT come back and the script exits non-zero.
+#   e. artifact SCHEMA (71) behind the fixture DB's version (72), no flag ->
+#      refused.
+#   f. same as (e), with --allow-migration -> still refused (behind-live is
+#      never allowed).
+#   g. no existing DB file, no flag -> refused as a 0->N migration.
+#   h. DB file present but the sqlite3 stub exits non-zero -> refused with a
+#      "could not read" message, both with and without --allow-migration.
+#   i. sqlite3 stub prints a header line before the version number (as a real
+#      sqlite3 does when ~/.sqliterc sets headers on) -> refused, not treated
+#      as schema 0.
+#   j. artifact SCHEMA file missing, or containing non-numeric text -> refused.
+#
+# Each refusal scenario asserts COMMIT and bin/ are left untouched.
+#
+# Set SCRIPT to point the harness at a different deploy-receive.sh (e.g. to
+# confirm an old version of the script fails scenario (i)):
+#   SCRIPT=/path/to/old/deploy-receive.sh bash scripts/deploy/test-deploy-receive.sh
 #
 # Usage: bash scripts/deploy/test-deploy-receive.sh
 # ---------------------------------------------------------------------------
 set -euo pipefail
 
 REPO_ROOT="$(cd -- "$(dirname -- "$(readlink -f -- "$0")")/../.." && pwd)"
-SCRIPT_SRC="$REPO_ROOT/scripts/deploy/deploy-receive.sh"
+SCRIPT_SRC="${SCRIPT:-$REPO_ROOT/scripts/deploy/deploy-receive.sh}"
 
 TMPROOT="$(mktemp -d)"
 trap 'rm -rf -- "$TMPROOT"' EXIT
@@ -71,14 +88,43 @@ cat >"$STUBBIN/sqlite3" <<'EOF'
 # Fixture stub for `sqlite3 <db> <sql>`. The fixture "database" is a plain
 # text file whose content is the live schema version. A `.backup` call just
 # copies it to the requested backup path; a schema_version SELECT cats it.
-db="$1"
-sql="${2:-}"
+#
+# SQLITE_MODE switches behaviour per scenario:
+#   normal (default) - behaves as described above.
+#   fail             - exits non-zero, simulating a read failure (permission
+#                       denied, corrupt db, sqlite3 missing, etc).
+#   header           - prints a header line before the version number, as a
+#                       real sqlite3 does when ~/.sqliterc turns on headers.
+mode="${SQLITE_MODE:-normal}"
+if [ "$mode" = "fail" ]; then
+  exit 1
+fi
+# deploy-receive.sh's read-only query passes flags (-batch -noheader
+# -readonly -init /dev/null) before the db path; its .backup call doesn't.
+# Either way, the db path and the SQL are the last two positional args; skip
+# known flags and -init's value argument to find them.
+args=()
+skip_value_for_next=0
+for a in "$@"; do
+  if [ "$skip_value_for_next" -eq 1 ]; then
+    skip_value_for_next=0
+    continue
+  fi
+  case "$a" in
+    -init) skip_value_for_next=1 ;;
+    -*) ;;
+    *) args+=("$a") ;;
+  esac
+done
+db="${args[0]:-}"
+sql="${args[1]:-}"
 case "$sql" in
   *".backup"*)
     target="$(printf '%s' "$sql" | sed -n "s/.*\.backup '\(.*\)'.*/\1/p")"
     [ -n "$target" ] && cp -- "$db" "$target"
     ;;
   *"schema_version"*)
+    [ "$mode" = "header" ] && echo "COALESCE(MAX(version), 0)"
     if [ -s "$db" ]; then cat -- "$db"; else echo 0; fi
     ;;
   *)
@@ -152,6 +198,22 @@ make_artifact() {
   rm -rf "$work"
 }
 
+# Like make_artifact, but the tar has no SCHEMA file at all (scenario j).
+make_artifact_no_schema() {
+  local commit="$1" outfile="$2"
+  local work
+  work="$(mktemp -d)"
+  mkdir -p "$work/bin" "$work/www"
+  echo "new binary $commit" >"$work/bin/cortex-server"
+  echo "new binary $commit" >"$work/bin/cortex-worker"
+  echo "new binary $commit" >"$work/bin/cortex-worker-key"
+  echo "new index" >"$work/www/index.html"
+  printf '%s' "$commit" >"$work/COMMIT"
+  (cd "$work" && sha256sum bin/* COMMIT >SHA256SUMS)
+  tar czf "$outfile" -C "$work" COMMIT SHA256SUMS bin www
+  rm -rf "$work"
+}
+
 # Runs deploy-receive.sh with the artifact on stdin; prints its exit code and
 # leaves combined stdout+stderr in $TMPROOT/out.log.
 run_deploy() {
@@ -161,6 +223,7 @@ run_deploy() {
   PATH="$STUBBIN:$PATH" \
     HEALTH_TIMEOUT_SECS=6 HEALTH_POLL_INTERVAL_SECS=1 POST_RESTART_SETTLE_SECS=1 \
     FIXTURE_DIR="$FIXTURE_DIR" \
+    SQLITE_MODE="${SQLITE_MODE:-normal}" \
     bash "$INSTALL_ROOT/deploy-receive.sh" "$@" <"$artifact" >"$TMPROOT/out.log" 2>&1 || rc=$?
   echo "$rc"
 }
@@ -231,6 +294,98 @@ assert_eq "$RC_D" "1" "d. exit code is non-zero"
 assert_contains "did not become healthy" "d. health-failure message printed"
 assert_eq "$(cat "$INSTALL_ROOT/COMMIT")" "$OLD_COMMIT" "d. COMMIT rolled back to old release"
 assert_eq "$(cat "$INSTALL_ROOT/bin/cortex-server")" "old binary $OLD_COMMIT" "d. bin/ rolled back to old release"
+
+# --- scenario e: artifact SCHEMA behind live, no flag -> refused ------------
+note "e. artifact SCHEMA (71) behind live (72), no flag -> refusal"
+setup_install_root 72
+ARTIFACT_E="$TMPROOT/e.tgz"
+make_artifact 71 "666666666666666666666666666666666666666e" "$ARTIFACT_E"
+printf '%s' "666666666666666666666666666666666666666e" >"$FIXTURE_DIR/expected_commit"
+RC_E="$(run_deploy "$ARTIFACT_E")"
+assert_eq "$RC_E" "1" "e. exit code is non-zero"
+assert_contains "is behind the live database's schema" "e. behind-live refusal message printed"
+assert_eq "$(cat "$INSTALL_ROOT/COMMIT")" "$OLD_COMMIT" "e. COMMIT untouched"
+assert_eq "$(cat "$INSTALL_ROOT/bin/cortex-server")" "old binary $OLD_COMMIT" "e. bin/ untouched"
+
+# --- scenario f: same, with --allow-migration -> still refused --------------
+note "f. same as (e), with --allow-migration -> still refused"
+setup_install_root 72
+ARTIFACT_F="$TMPROOT/f.tgz"
+make_artifact 71 "777777777777777777777777777777777777777f" "$ARTIFACT_F"
+printf '%s' "777777777777777777777777777777777777777f" >"$FIXTURE_DIR/expected_commit"
+RC_F="$(run_deploy "$ARTIFACT_F" --allow-migration)"
+assert_eq "$RC_F" "1" "f. exit code is non-zero"
+assert_contains "is behind the live database's schema" "f. behind-live refusal message printed even with --allow-migration"
+assert_eq "$(cat "$INSTALL_ROOT/COMMIT")" "$OLD_COMMIT" "f. COMMIT untouched"
+assert_eq "$(cat "$INSTALL_ROOT/bin/cortex-server")" "old binary $OLD_COMMIT" "f. bin/ untouched"
+
+# --- scenario g: no existing DB, no flag -> refused as a 0->N migration -----
+note "g. DB absent, no flag -> refused as 0->N"
+setup_install_root 71
+rm -f "$INSTALL_ROOT/data/cortex.db"
+ARTIFACT_G="$TMPROOT/g.tgz"
+make_artifact 5 "8888888888888888888888888888888888888888" "$ARTIFACT_G"
+printf '%s' "8888888888888888888888888888888888888888" >"$FIXTURE_DIR/expected_commit"
+RC_G="$(run_deploy "$ARTIFACT_G")"
+assert_eq "$RC_G" "1" "g. exit code is non-zero"
+assert_contains "migrate schema 0->5" "g. refusal reports 0->5 migration"
+assert_eq "$(cat "$INSTALL_ROOT/COMMIT")" "$OLD_COMMIT" "g. COMMIT untouched"
+assert_eq "$(cat "$INSTALL_ROOT/bin/cortex-server")" "old binary $OLD_COMMIT" "g. bin/ untouched"
+
+# --- scenario h: DB present but sqlite3 stub exits 1 -> refused -------------
+note "h. sqlite3 read fails (exit 1), no flag -> refused"
+setup_install_root 71
+ARTIFACT_H="$TMPROOT/h.tgz"
+make_artifact 72 "9999999999999999999999999999999999999999" "$ARTIFACT_H"
+printf '%s' "9999999999999999999999999999999999999999" >"$FIXTURE_DIR/expected_commit"
+RC_H1="$(SQLITE_MODE=fail run_deploy "$ARTIFACT_H")"
+assert_eq "$RC_H1" "1" "h. exit code is non-zero (no flag)"
+assert_contains "could not read schema_version from" "h. could-not-read message printed (no flag)"
+assert_eq "$(cat "$INSTALL_ROOT/COMMIT")" "$OLD_COMMIT" "h. COMMIT untouched (no flag)"
+assert_eq "$(cat "$INSTALL_ROOT/bin/cortex-server")" "old binary $OLD_COMMIT" "h. bin/ untouched (no flag)"
+
+note "h. sqlite3 read fails (exit 1), with --allow-migration -> still refused"
+setup_install_root 71
+RC_H2="$(SQLITE_MODE=fail run_deploy "$ARTIFACT_H" --allow-migration)"
+assert_eq "$RC_H2" "1" "h. exit code is non-zero (--allow-migration)"
+assert_contains "could not read schema_version from" "h. could-not-read message printed (--allow-migration)"
+assert_eq "$(cat "$INSTALL_ROOT/COMMIT")" "$OLD_COMMIT" "h. COMMIT untouched (--allow-migration)"
+assert_eq "$(cat "$INSTALL_ROOT/bin/cortex-server")" "old binary $OLD_COMMIT" "h. bin/ untouched (--allow-migration)"
+
+# --- scenario i: sqlite3 prints a header line before the version number -----
+note "i. sqlite3 stub prints a header line -> refused, not treated as schema 0"
+setup_install_root 71
+ARTIFACT_I="$TMPROOT/i.tgz"
+make_artifact 72 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" "$ARTIFACT_I"
+printf '%s' "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" >"$FIXTURE_DIR/expected_commit"
+RC_I="$(SQLITE_MODE=header run_deploy "$ARTIFACT_I")"
+assert_eq "$RC_I" "1" "i. exit code is non-zero"
+assert_contains "could not read live schema version from" "i. could-not-read-live-schema message printed"
+assert_eq "$(cat "$INSTALL_ROOT/COMMIT")" "$OLD_COMMIT" "i. COMMIT untouched"
+assert_eq "$(cat "$INSTALL_ROOT/bin/cortex-server")" "old binary $OLD_COMMIT" "i. bin/ untouched"
+
+# --- scenario j: SCHEMA file missing, or non-numeric -----------------------
+note "j. SCHEMA file missing -> refused"
+setup_install_root 71
+ARTIFACT_J1="$TMPROOT/j1.tgz"
+make_artifact_no_schema "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" "$ARTIFACT_J1"
+printf '%s' "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" >"$FIXTURE_DIR/expected_commit"
+RC_J1="$(run_deploy "$ARTIFACT_J1")"
+assert_eq "$RC_J1" "1" "j. exit code is non-zero (SCHEMA missing)"
+assert_contains "artifact is missing SCHEMA" "j. missing-SCHEMA message printed"
+assert_eq "$(cat "$INSTALL_ROOT/COMMIT")" "$OLD_COMMIT" "j. COMMIT untouched (SCHEMA missing)"
+assert_eq "$(cat "$INSTALL_ROOT/bin/cortex-server")" "old binary $OLD_COMMIT" "j. bin/ untouched (SCHEMA missing)"
+
+note "j. SCHEMA file non-numeric -> refused"
+setup_install_root 71
+ARTIFACT_J2="$TMPROOT/j2.tgz"
+make_artifact "abc" "cccccccccccccccccccccccccccccccccccccccc" "$ARTIFACT_J2"
+printf '%s' "cccccccccccccccccccccccccccccccccccccccc" >"$FIXTURE_DIR/expected_commit"
+RC_J2="$(run_deploy "$ARTIFACT_J2")"
+assert_eq "$RC_J2" "1" "j. exit code is non-zero (SCHEMA non-numeric)"
+assert_contains "SCHEMA is not a positive integer" "j. non-numeric-SCHEMA message printed"
+assert_eq "$(cat "$INSTALL_ROOT/COMMIT")" "$OLD_COMMIT" "j. COMMIT untouched (SCHEMA non-numeric)"
+assert_eq "$(cat "$INSTALL_ROOT/bin/cortex-server")" "old binary $OLD_COMMIT" "j. bin/ untouched (SCHEMA non-numeric)"
 
 note "summary"
 echo "$PASS passed, $FAIL failed"

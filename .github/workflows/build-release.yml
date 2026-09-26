@@ -96,11 +96,12 @@ jobs:
           # production (see docs/DEPLOY.md). Fail loudly if it can't be found
           # rather than silently shipping an artifact deploy tooling can't
           # reason about.
-          schema_version="$(grep -oE 'pub const SCHEMA_VERSION: u32 = [0-9]+' crates/api/src/db/mod.rs | grep -oE '[0-9]+$')"
-          if [ -z "$schema_version" ]; then
-            echo "::error::could not extract SCHEMA_VERSION from crates/api/src/db/mod.rs"
+          mapfile -t schema_versions < <(grep -E '^pub const SCHEMA_VERSION: u32 = [0-9]+;' crates/api/src/db/mod.rs | grep -oE '[0-9]+')
+          if [ "${#schema_versions[@]}" -ne 1 ]; then
+            echo "::error::expected exactly one SCHEMA_VERSION const in crates/api/src/db/mod.rs, found ${#schema_versions[@]}"
             exit 1
           fi
+          schema_version="${schema_versions[0]}"
           echo "$schema_version" > out/SCHEMA
 
           (cd out && sha256sum bin/* COMMIT SCHEMA > SHA256SUMS)

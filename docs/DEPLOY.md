@@ -277,6 +277,25 @@ Only do this once you've confirmed the migration is safe to run against
 production — there's still no automatic schema rollback if the deploy fails
 after migrating.
 
+A few things worth knowing about this check before you rely on it:
+
+- **Builds made before this change have no `SCHEMA` file at all** and cannot
+  be deployed through `deploy.yml` — `deploy-receive.sh` refuses any artifact
+  missing `SCHEMA`. To bring one of those older builds back, use
+  "Rolling back by hand" below instead.
+- **A build whose `SCHEMA` is behind the live database's schema can never go
+  through `deploy.yml`, with or without `allow_migration`.** That refusal is
+  unconditional: an artifact behind the live schema is refused outright
+  regardless of the flag, since that binary would run against a newer schema
+  than it knows.
+- **This check lives entirely in the deploy host's own copy of
+  `deploy-receive.sh`**, which CI does not ship — `deploy.yml` invokes the
+  copy already installed at `~/cortex-next/deploy-receive.sh` over SSH, not
+  anything from the workflow run. If you haven't reinstalled it since this
+  change landed (setup step 3, above), the host is still running the old,
+  fail-open script and this protection does not exist yet. Reinstall it
+  before relying on this check in production.
+
 ## Rolling back by hand
 
 `deploy-receive.sh` already rolls back automatically if a new release fails

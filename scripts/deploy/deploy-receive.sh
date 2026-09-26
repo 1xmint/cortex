@@ -50,14 +50,6 @@
 set -euo pipefail
 trap '' PIPE HUP
 
-ALLOW_MIGRATION=0
-for arg in "$@"; do
-  case "$arg" in
-    --allow-migration) ALLOW_MIGRATION=1 ;;
-    *) ;;
-  esac
-done
-
 INSTALL_ROOT="$(cd -- "$(dirname -- "$(readlink -f -- "$0")")" && pwd)"
 cd "$INSTALL_ROOT"
 export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
@@ -71,6 +63,14 @@ fail() {
   log "ERROR: $1"
   exit 1
 }
+
+ALLOW_MIGRATION=0
+for arg in "$@"; do
+  case "$arg" in
+    --allow-migration) ALLOW_MIGRATION=1 ;;
+    *) fail "unknown argument: '$arg'" ;;
+  esac
+done
 
 TS="$(date -u +%Y%m%dT%H%M%SZ)"
 LOCK_FILE="$INSTALL_ROOT/.deploy.lock"
@@ -201,9 +201,10 @@ fi
 # outright, since that binary would run against a newer schema than it knows.
 DB_PATH="$INSTALL_ROOT/data/cortex.db"
 if [ -f "$DB_PATH" ]; then
-  LIVE_SCHEMA="$(sqlite3 "$DB_PATH" "SELECT COALESCE(MAX(version), 0) FROM schema_version;" 2>/dev/null || echo 0)"
+  LIVE_SCHEMA="$(sqlite3 -batch -noheader -readonly -init /dev/null "$DB_PATH" "SELECT COALESCE(MAX(version), 0) FROM schema_version;" 2>/dev/null)" \
+    || fail "could not read schema_version from $DB_PATH; refusing"
   LIVE_SCHEMA="$(tr -d '[:space:]' <<<"$LIVE_SCHEMA")"
-  [ -n "$LIVE_SCHEMA" ] || LIVE_SCHEMA=0
+  printf '%s' "$LIVE_SCHEMA" | grep -Eq '^[0-9]+$' || fail "could not read live schema version from $DB_PATH: '$LIVE_SCHEMA'"
 else
   log "no existing database at $DB_PATH; treating live schema version as 0"
   LIVE_SCHEMA=0
