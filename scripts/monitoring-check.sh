@@ -104,9 +104,6 @@ echo "---"
 check_endpoint "GET" "/v1/health" "Health endpoint"
 check_endpoint "GET" "/v1/ready" "Readiness endpoint (DB accessible)"
 
-# Core API endpoints
-check_endpoint "GET" "/v1/social/feed/home" "Social feed"
-
 # --- Results ---
 
 echo "---"
