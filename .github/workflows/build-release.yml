@@ -89,7 +89,42 @@ jobs:
           cp target/release/cortex-server target/release/cortex-worker target/release/cortex-worker-key out/bin/
           cp -r cortex/dist out/www
           git rev-parse HEAD > out/COMMIT
-          (cd out && sha256sum bin/* > SHA256SUMS)
+
+          # The schema the migration chain on this commit ends at. deploy.yml
+          # and deploy-receive.sh compare this against the live database's
+          # schema_version to refuse an automatic deploy that would migrate
+          # production (see docs/DEPLOY.md). Fail loudly if it can't be found
+          # rather than silently shipping an artifact deploy tooling can't
+          # reason about.
+          mapfile -t schema_versions < <(grep -E '^pub const SCHEMA_VERSION: u32 = [0-9]+;' crates/api/src/db/mod.rs | grep -oE '[0-9]+')
+          if [ "${#schema_versions[@]}" -ne 1 ]; then
+            echo "::error::expected exactly one SCHEMA_VERSION const in crates/api/src/db/mod.rs, found ${#schema_versions[@]}"
+            exit 1
+          fi
+          schema_version="${schema_versions[0]}"
+
+          # SCHEMA_VERSION is only trustworthy if it actually matches the
+          # migration chain: a migration added without bumping the const would
+          # leave deploy-receive.sh comparing a stale number (see
+          # CONTRIBUTING.md's migration-counter section, and the
+          # schema_version_const_matches_what_migrations_actually_produce and
+          # schema_fingerprint_matches_pinned_value tests in
+          # crates/api/src/db/mod.rs, which catch the same drift at test time).
+          # Fail the build here too, before an artifact carrying a stale
+          # SCHEMA ever ships.
+          highest_migration="$(grep -oE 'fn migrate_v[0-9]+' crates/api/src/db/mod.rs | grep -oE '[0-9]+' | sort -n | tail -1)"
+          if [ -z "$highest_migration" ]; then
+            echo "::error::found no 'fn migrate_vN' functions in crates/api/src/db/mod.rs"
+            exit 1
+          fi
+          if [ "$highest_migration" != "$schema_version" ]; then
+            echo "::error::SCHEMA_VERSION ($schema_version) does not match the highest migrate_vN (migrate_v$highest_migration) in crates/api/src/db/mod.rs — bump SCHEMA_VERSION to match"
+            exit 1
+          fi
+
+          echo "$schema_version" > out/SCHEMA
+
+          (cd out && sha256sum bin/* COMMIT SCHEMA > SHA256SUMS)
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:

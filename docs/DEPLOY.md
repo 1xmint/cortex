@@ -242,6 +242,81 @@ gh workflow run deploy.yml -R 1xmint/cortex -f build_run_id=<run-id-of-a-build-r
 
 Find the run ID with `gh run list -R 1xmint/cortex --workflow=build-release.yml`.
 
+## A migrating deploy must be a human's choice
+
+Migrations run in-process at server boot (`crates/api/src/db/mod.rs`), and
+`deploy-receive.sh` can roll back the binaries and web app on a failed health
+check but cannot roll back the schema. If an automatic deploy migrated the
+database and then failed its health check, the database would be left ahead
+of the rolled-back binary — a state nothing here can safely repair on its
+own.
+
+So the build carries the schema version its migration chain ends at
+(`SCHEMA_VERSION` in `crates/api/src/db/mod.rs`, written to `out/SCHEMA` by
+`build-release.yml`), and `deploy-receive.sh` compares that single number
+against the live database's `schema_version` before swapping anything in.
+This is a version-number comparison, not a diff of the schema itself — the
+guard trusts that `SCHEMA_VERSION` was bumped whenever the schema changed. Two
+tests hold up that trust: `schema_version_const_matches_what_migrations_actually_produce`
+and `schema_fingerprint_matches_pinned_value` in
+`crates/api/src/db/mod.rs` hash the whole schema a fresh boot produces
+(including `ensure_social_tables` and `ensure_social_posts_fts`, which run
+unconditionally on every boot outside the numbered migration chain) and fail
+the build if it drifts from a pinned fingerprint without `SCHEMA_VERSION`
+moving too.
+
+- **Artifact SCHEMA equal to the live version** — proceeds normally. This
+  means the two numbers match, not that the schemas were independently
+  verified identical; the fingerprint tests above are what keep a same-number
+  schema drift from happening in the first place.
+- **Artifact SCHEMA behind the live version** — refused outright, always: that
+  binary would run against a newer schema than it knows.
+- **Artifact SCHEMA ahead of the live version** — refused unless the script
+  was invoked with `--allow-migration`. The automatic `workflow_run` deploy
+  path never passes this.
+
+`routing.db` (`crates/engine/src/store.rs`, opened by `crates/api/src/state.rs`)
+is a second SQLite database outside this guard entirely: it has no
+`SCHEMA_VERSION`-style counter, is not part of `out/SCHEMA`, and is not backed
+up by `deploy-receive.sh`. Its own schema is pinned the same way, by
+`schema_fingerprint_matches_pinned_value` in `crates/engine/src/store.rs`, but
+a change there is never checked or refused automatically at deploy time — an
+edit to `routing.db`'s schema must be deployed manually (`gh workflow run
+deploy.yml ... -f allow_migration=true`, as below) and the deploy confirmed by
+hand, the same way a change to `cortex.db` past this guard would be.
+
+To deploy a build that migrates the schema, trigger `deploy.yml` by hand with
+`allow_migration` set:
+
+```bash
+gh workflow run deploy.yml -R 1xmint/cortex \
+  -f build_run_id=<run-id-of-a-build-release-run> \
+  -f allow_migration=true
+```
+
+Only do this once you've confirmed the migration is safe to run against
+production — there's still no automatic schema rollback if the deploy fails
+after migrating.
+
+A few things worth knowing about this check before you rely on it:
+
+- **Builds made before this change have no `SCHEMA` file at all** and cannot
+  be deployed through `deploy.yml` — `deploy-receive.sh` refuses any artifact
+  missing `SCHEMA`. To bring one of those older builds back, use
+  "Rolling back by hand" below instead.
+- **A build whose `SCHEMA` is behind the live database's schema can never go
+  through `deploy.yml`, with or without `allow_migration`.** That refusal is
+  unconditional: an artifact behind the live schema is refused outright
+  regardless of the flag, since that binary would run against a newer schema
+  than it knows.
+- **This check lives entirely in the deploy host's own copy of
+  `deploy-receive.sh`**, which CI does not ship — `deploy.yml` invokes the
+  copy already installed at `~/cortex-next/deploy-receive.sh` over SSH, not
+  anything from the workflow run. If you haven't reinstalled it since this
+  change landed (setup step 3, above), the host is still running the old,
+  fail-open script and this protection does not exist yet. Reinstall it
+  before relying on this check in production.
+
 ## Rolling back by hand
 
 `deploy-receive.sh` already rolls back automatically if a new release fails
