@@ -1526,6 +1526,9 @@ dev snapshot over production and never restores the live one. The safe path is
 `git fetch` (refs only, never touches the working tree), a separate
 `git worktree` at `origin/main`, build there, `sudo cp` the binary.
 
+That script has since been deleted. Deploys now run through
+`.github/workflows/deploy.yml`; see `docs/DEPLOY.md`.
+
 ### F11. There is no worker credential a service can hold *(closed 2026-09-25, see PR #54)*
 
 **Closed.** [PR #54](https://github.com/1xmint/cortex/pull/54), "ci(release):
