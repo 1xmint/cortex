@@ -70,8 +70,13 @@ is the part the extraction put at risk and nothing had checked until now.
   `testing/stub-provider/claude` drives the direction that delivers nothing, and
   asserts `NothingDelivered` with no receipt.
 - **Phases 27–30** — the capability mechanism, and the falsification test that
-  has to exist before any "better than a single model" claim does. Nothing is
-  built.
+  has to exist before any "better than a single model" claim does. In scope
+  for "done" (Josh, 2026-09-26, M-D-0020). Not "nothing built": ~16 Phase
+  28–30 type modules exist in `crates/core` (EXECUTION-STATE ~2773–2807), but
+  none is wired into `api`/`worker`/`engine` except `diff_surface`, which never
+  fires because every contract defaults to `Authored`. The phase exit gates
+  are measurements that need paid model runs; no capability claim is made
+  until those exist.
 - **`bollard` is pinned at 0.18 and cannot move without work.** 0.21 relocates
   the container and network option types and makes `container::Config`
   private, so `crates/worker/src/sandbox/container.rs` and `sandbox/egress.rs`
@@ -122,8 +127,10 @@ on pull requests only. Those two go together: with no run on `main`, the only
 thing making the merged tree the tested tree is the up-to-date requirement.
 Turning it off means a pull request can be tested against a `main` that has
 moved, and nothing ever tests the result — which is how a red commit reached
-`main` unnoticed on 2026-09-20. The repository auto-updates branches, so a
-stale pull request with auto-merge armed updates itself rather than stalling.
+`main` unnoticed on 2026-09-20. The repository does **not** auto-update
+branches: `allow_update_branch` only enables the manual "Update branch" button,
+so a stale pull request with auto-merge armed sits at `BEHIND` until someone
+updates it (see CONTRIBUTING.md, "Branch protection is strict").
 
 `stub-provider-e2e` and `live-model` are `workflow_dispatch` only. The first is
 cheap and safe to run on a branch; the second spends money and is the only
