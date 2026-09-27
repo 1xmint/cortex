@@ -1746,6 +1746,12 @@ mod validate_run_for_pr_tests {
         let (_dir, state) = test_state().await;
         let db = state.db.as_ref().unwrap();
         let run_id = make_run(db, "user-1", "step-1");
+        // The step is actually mid-verification (`verifying`) right up until
+        // its verdict seals, same as in production -- setting this is what
+        // makes the assertion below exercise the `delivered`/`verifying`
+        // pending filter instead of vacuously passing because the step was
+        // never in either status.
+        set_step_status(db, "step-1", "verifying");
         seal_verification(db, &run_id, "step-1", Verdict::Verified);
 
         let (_goal, branch) = match validate_run_for_pr(db, "user-1", &run_id) {
@@ -1767,6 +1773,7 @@ mod validate_run_for_pr_tests {
         let (_dir, state) = test_state().await;
         let db = state.db.as_ref().unwrap();
         let run_id = make_run(db, "user-1", "step-1");
+        set_step_status(db, "step-1", "verifying");
         seal_verification_attempt(db, &run_id, "step-1", 1, Verdict::Failed);
         seal_verification_attempt(db, &run_id, "step-1", 2, Verdict::Verified);
 

@@ -15,24 +15,22 @@ import type { RunStep } from '../../lib/cortexApi';
 // here -- this only answers "did a step fail", not "was it a verification
 // verdict" (see `hasFailedVerificationStep` for that distinction).
 export function hasFailedStep(steps: RunStep[]): boolean {
-  return steps.some(
-    (step) =>
-      step.status === 'failed' ||
-      step.verification_status === 'failed' ||
-      step.verifier_verdict === 'failed',
-  );
+  return steps.some((step) => step.status === 'failed');
 }
 
 // Whether any failed step's failure is specifically a verification verdict,
 // as opposed to an execution failure that never reached verification.
-// `verification_status` / `verifier_verdict` are only ever populated by
-// `record_verification_outcome`, so their reading `failed` is what tells
-// the two apart -- a step whose `status` is `failed` with neither of those
-// set failed during execution, not verification. Callers use this to pick
-// copy: "failed verification" is only accurate for the former.
+// `deliver_attempt` (crates/api/src/db/mod.rs ~10578) sets the step's
+// `latest_attempt.status` to `delivered`, and a verdict landing afterward
+// never changes it -- only `fail_step` does, by calling `fail_attempt`
+// (which sets `latest_attempt.status` to `failed`). So a step that is
+// `status: 'failed'` with a `latest_attempt.status` of `delivered` failed
+// after delivery, i.e. during verification; one whose `latest_attempt.status`
+// is `failed` failed during execution, before delivery. Callers use this to
+// pick copy: "failed verification" is only accurate for the former.
 export function hasFailedVerificationStep(steps: RunStep[]): boolean {
   return steps.some(
-    (step) => step.verification_status === 'failed' || step.verifier_verdict === 'failed',
+    (step) => step.status === 'failed' && step.latest_attempt?.status === 'delivered',
   );
 }
 

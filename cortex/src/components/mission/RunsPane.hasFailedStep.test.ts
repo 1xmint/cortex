@@ -20,18 +20,6 @@ describe('hasFailedStep', () => {
     expect(hasFailedStep([makeStep(), makeStep({ id: 's-2', status: 'failed' })])).toBe(true);
   });
 
-  it('is true when only verification_status reads failed', () => {
-    expect(
-      hasFailedStep([makeStep({ status: 'verified', verification_status: 'failed' })]),
-    ).toBe(true);
-  });
-
-  it('is true when only verifier_verdict reads failed', () => {
-    expect(hasFailedStep([makeStep({ status: 'verified', verifier_verdict: 'failed' })])).toBe(
-      true,
-    );
-  });
-
   it('is false for an empty run', () => {
     expect(hasFailedStep([])).toBe(false);
   });
@@ -49,19 +37,19 @@ describe('hasFailedVerificationStep', () => {
     expect(hasFailedVerificationStep([makeStep(), makeStep({ id: 's-2' })])).toBe(false);
   });
 
-  it('is false for a step that failed execution, not verification', () => {
-    expect(hasFailedVerificationStep([makeStep({ status: 'failed' })])).toBe(false);
+  it('is false for a step that failed execution, before delivery -- fail_attempt set latest_attempt.status to failed', () => {
+    expect(
+      hasFailedVerificationStep([
+        makeStep({ status: 'failed', latest_attempt: { status: 'failed' } }),
+      ]),
+    ).toBe(false);
   });
 
-  it('is true when verification_status reads failed', () => {
+  it('is true for a step that failed after delivery -- deliver_attempt set latest_attempt.status to delivered and the verdict never changes it', () => {
     expect(
-      hasFailedVerificationStep([makeStep({ status: 'failed', verification_status: 'failed' })]),
-    ).toBe(true);
-  });
-
-  it('is true when verifier_verdict reads failed', () => {
-    expect(
-      hasFailedVerificationStep([makeStep({ status: 'failed', verifier_verdict: 'failed' })]),
+      hasFailedVerificationStep([
+        makeStep({ status: 'failed', latest_attempt: { status: 'delivered' } }),
+      ]),
     ).toBe(true);
   });
 

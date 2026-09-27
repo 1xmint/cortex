@@ -1776,9 +1776,13 @@ mod tests {
     #[test]
     fn a_step_with_no_frozen_specs_is_not_pending() {
         // A step with no verification requested at all (e.g. a read-only
-        // step) must not be mistaken for one still being verified.
+        // step) must not be mistaken for one still being verified. Status is
+        // set to `verifying` so this actually exercises the "no frozen
+        // specs" branch rather than being short-circuited by the
+        // `delivered`/`verifying` status filter first.
         let db = test_db();
         insert_run_and_step(&db, "run-no-checks", "step-no-checks");
+        set_step_status(&db, "step-no-checks", "verifying");
 
         assert!(!db.run_has_pending_verification("run-no-checks"));
     }
@@ -1787,6 +1791,7 @@ mod tests {
     fn a_sealed_step_is_not_pending() {
         let db = test_db();
         insert_run_and_step(&db, "run-sealed", "step-sealed");
+        set_step_status(&db, "step-sealed", "verifying");
         seal_verification(&db, "run-sealed", "step-sealed", Verdict::Verified);
 
         assert!(!db.run_has_pending_verification("run-sealed"));

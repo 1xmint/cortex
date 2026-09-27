@@ -122,6 +122,20 @@ jobs:
       # (`fail_step` landing a step on `failed` before verification ever ran)
       # from an actual failed verdict, so the copy shown for the former stops
       # calling it "failed verification".
+      #
+      # 41 -> 38: `hasFailedStep`/`hasFailedVerificationStep` never read
+      # `verification_status`/`verifier_verdict` -- production never writes
+      # them (`run_payload.rs` only sets them from a `verifier_reports` row,
+      # and nothing seals one to `failed`; ws.rs's own verdicts are
+      # `pass`/`needs_evidence`/`fail`/`blocked`). The real signal is
+      # `latest_attempt.status`: `deliver_attempt` (crates/api/src/db/mod.rs)
+      # sets it to `delivered` and no verdict changes it afterward, so
+      # `status: 'failed'` with `latest_attempt.status: 'delivered'` is a
+      # verification failure, and with `latest_attempt.status: 'failed'` is
+      # an execution failure (`fail_attempt`). Removing the dead clauses and
+      # their tests, and rewriting the verification-vs-execution tests
+      # against `latest_attempt.status`, took the file from fifteen tests to
+      # twelve.
       - name: Test Cortex
         run: |
           set -euo pipefail
@@ -131,8 +145,8 @@ jobs:
           echo "$output"
           passed=$(echo "$output" | grep -oE "Tests +[0-9]+ passed" | grep -oE "[0-9]+" | tail -1)
           echo "cortex tests passed: ${passed:-0}"
-          if [ "${passed:-0}" -lt 41 ]; then
-            echo "::error::expected at least 41 Cortex tests to run, saw ${passed:-0}"
+          if [ "${passed:-0}" -lt 38 ]; then
+            echo "::error::expected at least 38 Cortex tests to run, saw ${passed:-0}"
             exit 1
           fi
 
