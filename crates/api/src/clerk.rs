@@ -75,12 +75,20 @@ fn valid_https_origin(value: &str) -> bool {
 fn validate_auth_config_values(
     production: bool,
     local_auth_requested: bool,
+    anonymous_worker_requested: bool,
     clerk_secret_key: Option<&str>,
     clerk_issuer: Option<&str>,
     clerk_authorized_party: Option<&str>,
 ) -> Result<HeyVeraAuthMode, String> {
     if production && local_auth_requested {
         return Err("CORTEX_AUTH_DISABLED is forbidden in HeyVera production".into());
+    }
+
+    if production && anonymous_worker_requested {
+        return Err(format!(
+            "{} is forbidden in HeyVera production",
+            crate::worker_key::ALLOW_ANONYMOUS_WORKER_ENV
+        ));
     }
 
     if production {
@@ -115,6 +123,7 @@ pub fn load_heyvera_auth_config() -> Result<HeyVeraAuthConfig, String> {
     let mode = validate_auth_config_values(
         is_production_runtime(),
         env_flag("CORTEX_AUTH_DISABLED"),
+        crate::worker_key::anonymous_worker_allowed_from_env(),
         clerk_secret_key.as_deref(),
         clerk_issuer.as_deref(),
         clerk_authorized_party.as_deref(),
@@ -613,36 +622,49 @@ mod tests {
     #[test]
     fn production_auth_requires_every_trust_anchor() {
         assert_eq!(
-            validate_auth_config_values(true, false, SECRET, ISSUER, AUTHORIZED_PARTY),
+            validate_auth_config_values(true, false, false, SECRET, ISSUER, AUTHORIZED_PARTY),
             Ok(HeyVeraAuthMode::Clerk)
         );
 
         let missing_secret =
-            validate_auth_config_values(true, false, None, ISSUER, AUTHORIZED_PARTY)
+            validate_auth_config_values(true, false, false, None, ISSUER, AUTHORIZED_PARTY)
                 .expect_err("production must require the Clerk secret");
         assert!(missing_secret.contains("CLERK_SECRET_KEY"));
 
         let missing_issuer =
-            validate_auth_config_values(true, false, SECRET, None, AUTHORIZED_PARTY)
+            validate_auth_config_values(true, false, false, SECRET, None, AUTHORIZED_PARTY)
                 .expect_err("production must require the issuer");
         assert!(missing_issuer.contains("CLERK_ISSUER"));
 
-        let missing_party = validate_auth_config_values(true, false, SECRET, ISSUER, None)
+        let missing_party = validate_auth_config_values(true, false, false, SECRET, ISSUER, None)
             .expect_err("production must require the authorized party");
         assert!(missing_party.contains("CLERK_AUTHORIZED_PARTY"));
     }
 
     #[test]
     fn production_auth_rejects_local_override() {
-        let error = validate_auth_config_values(true, true, SECRET, ISSUER, AUTHORIZED_PARTY)
-            .expect_err("local auth must never override production");
+        let error =
+            validate_auth_config_values(true, true, false, SECRET, ISSUER, AUTHORIZED_PARTY)
+                .expect_err("local auth must never override production");
         assert!(error.contains("CORTEX_AUTH_DISABLED"));
+    }
+
+    /// `CORTEX_ALLOW_ANONYMOUS_WORKER=1` re-opens the same no-credential hole
+    /// as `CORTEX_AUTH_DISABLED` and must be refused the same way in
+    /// production, regardless of whether Clerk itself is fully configured.
+    #[test]
+    fn production_auth_rejects_anonymous_worker_override() {
+        let error =
+            validate_auth_config_values(true, false, true, SECRET, ISSUER, AUTHORIZED_PARTY)
+                .expect_err("anonymous worker override must never apply in production");
+        assert!(error.contains("CORTEX_ALLOW_ANONYMOUS_WORKER"), "{error}");
     }
 
     #[test]
     fn production_auth_requires_https_trust_anchors() {
         let issuer_error = validate_auth_config_values(
             true,
+            false,
             false,
             SECRET,
             Some("http://clerk.invalid"),
@@ -651,9 +673,15 @@ mod tests {
         .expect_err("issuer must use https");
         assert!(issuer_error.contains("https URL"));
 
-        let party_error =
-            validate_auth_config_values(true, false, SECRET, ISSUER, Some("http://heyvera.org"))
-                .expect_err("authorized party must use https");
+        let party_error = validate_auth_config_values(
+            true,
+            false,
+            false,
+            SECRET,
+            ISSUER,
+            Some("http://heyvera.org"),
+        )
+        .expect_err("authorized party must use https");
         assert!(party_error.contains("https origin"));
 
         for invalid in [
@@ -673,11 +701,11 @@ mod tests {
     #[test]
     fn development_keeps_explicit_local_mode_available() {
         assert_eq!(
-            validate_auth_config_values(false, true, None, None, None),
+            validate_auth_config_values(false, true, false, None, None, None),
             Ok(HeyVeraAuthMode::LocalDevelopment)
         );
         assert_eq!(
-            validate_auth_config_values(false, false, SECRET, None, None),
+            validate_auth_config_values(false, false, false, SECRET, None, None),
             Ok(HeyVeraAuthMode::Clerk)
         );
     }

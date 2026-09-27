@@ -24,18 +24,29 @@ fn admin_set() -> HashSet<String> {
         .collect()
 }
 
+/// Pure decision for the local-dev admin bypass: only when the key is
+/// absent from BOTH the state and the environment, and the runtime is not
+/// production. main.rs turns an empty `CLERK_SECRET_KEY=""` into a `None`
+/// state, and that must stay fail-closed here, so the env check is kept.
+/// The state check lets tests that build a keyed `AppState` exercise the
+/// real path without touching the env. The production check ensures a
+/// misconfigured production deploy (keyless, but no CORTEX_AUTH_DISABLED
+/// override) still denies admin access rather than granting it.
+fn local_dev_admin_bypass(state_keyless: bool, env_key_absent: bool, production: bool) -> bool {
+    state_keyless && env_key_absent && !production
+}
+
 pub async fn authorize_admin(
     state: &AppState,
     user: &ClerkUser,
 ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
     let admins = admin_set();
     if admins.is_empty() {
-        // Local-dev bypass only when the key is absent from BOTH the state
-        // and the environment. main.rs turns an empty `CLERK_SECRET_KEY=""`
-        // into a `None` state, and that must stay fail-closed here, so the
-        // env check is kept. The state check lets tests that build a keyed
-        // `AppState` exercise the real path without touching the env.
-        if state.clerk_secret_key.is_none() && std::env::var("CLERK_SECRET_KEY").is_err() {
+        if local_dev_admin_bypass(
+            state.clerk_secret_key.is_none(),
+            std::env::var("CLERK_SECRET_KEY").is_err(),
+            crate::clerk::is_production_runtime(),
+        ) {
             return Ok(());
         }
         return Err((
@@ -1064,5 +1075,26 @@ mod provider_holds_tests {
         assert_eq!(details["reason"], "stuck after crash");
         assert_eq!(details["reserved_micro_usd"], 1_000);
         assert_eq!(details["prior_status"], "reserved");
+    }
+
+    /// The local-dev admin bypass (empty admin list, no key in state or env)
+    /// must not fire in production. This is a pure unit test of the
+    /// decision function so it cannot race other tests in this lib binary
+    /// over the process-wide `CORTEX_ENV` variable.
+    #[test]
+    fn production_denies_the_keyless_local_dev_admin_bypass() {
+        assert!(!local_dev_admin_bypass(true, true, true));
+    }
+
+    #[test]
+    fn local_dev_admin_bypass_fires_only_when_keyless_everywhere_and_not_production() {
+        assert!(local_dev_admin_bypass(true, true, false));
+        assert!(!local_dev_admin_bypass(false, true, false));
+        assert!(!local_dev_admin_bypass(true, false, false));
+        assert!(!local_dev_admin_bypass(false, false, false));
+        assert!(!local_dev_admin_bypass(true, true, true));
+        assert!(!local_dev_admin_bypass(false, true, true));
+        assert!(!local_dev_admin_bypass(true, false, true));
+        assert!(!local_dev_admin_bypass(false, false, true));
     }
 }

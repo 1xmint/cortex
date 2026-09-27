@@ -3204,3 +3204,26 @@ Decided by Josh, 2026-09-26, unless marked otherwise.
 - **The final run tests charging and refunds** and is the very last step. The
   first price list is proposed then, for Josh's approval; without one,
   `freeze_step_quote` dispatches unquoted and uncharged.
+
+## 2026-09-26 M-D-0021 — Cortex never loses money on a task; plan receipt approval
+
+Decided by Josh, 2026-09-26. Supersedes the refund parts of M-D-0020.
+
+- **Cortex does not pay out of pocket, anywhere in the product.** Josh: "customer
+  pays for what they use, across the entire repo this should be true, cortex does
+  not pay out of pocket for anything, cortex does not eat or lose money."
+- **A failed task costs the customer the raw model cost, no markup.** A verified
+  task costs full price. The "refund" on failure returns only Cortex's markup, not
+  the model spend. This replaces "a failed task is refunded in full" (M-D-0020,
+  VISION.md, CREDITS.md). It needs the actual model cost of every step metered.
+- **Every price is floored at actual cost.** The `authored` half price (M-D-0020)
+  can never charge less than what the models cost.
+- **Retries and repairs are paid by the customer**, as used, inside the amount
+  approved on the plan receipt. Cortex does not absorb them.
+- **Credits are held at approval.** Approving a plan receipt reserves the approved
+  amount; whatever is not used, or is returned on failure, is released.
+- **A step with no derivable check** is sold at full price, labelled Unverified,
+  with no refund promise (current behaviour, kept).
+- **The plan receipt (PLAN-RECEIPT.md) is in scope for "done".** It was specified
+  but never built: today `POST /api/runs` spends with no preview. It must show
+  price and grading class before spend, and the customer approves it.
