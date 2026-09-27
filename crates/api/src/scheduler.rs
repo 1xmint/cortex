@@ -768,7 +768,6 @@ async fn dispatch_step(state: &AppState, step: &StepRef) -> DispatchOutcome {
         effective_work_kind,
         risk,
         !cortex_core::check_derivation::is_unverified_by_construction(&check_specs),
-        declared_class,
     );
 
     task.required_checks = check_specs.iter().map(as_required_check).collect();
@@ -1037,7 +1036,6 @@ fn freeze_step_quote(
     work_kind: WorkKind,
     risk: RiskLevel,
     verifiable: bool,
-    verdict_class: cortex_core::diff_surface::VerdictClass,
 ) {
     let Some(list) = db.active_price_list() else {
         tracing::warn!(
@@ -1050,10 +1048,10 @@ fn freeze_step_quote(
     };
 
     let class = cortex_core::task_class::TaskClass::new(work_kind, risk, verifiable);
-    // `verdict_class` is applied here, once, so the plan-receipt quote, the
-    // charge, and the refund all read the same already-priced number rather
-    // than each recomputing "half of what" from a raw class price.
-    let Some((credits, billable)) = crate::pricing::quote(&list, &class, verdict_class) else {
+    // The declared verdict class is a stored label only -- billing is
+    // pass-through (exactly what the calls this step made cost), and does
+    // not vary by how the work was graded. See `TaskContract::verdict_class`.
+    let Some((credits, billable)) = crate::pricing::quote(&list, &class) else {
         tracing::warn!(
             run_id, step_id, class = %class.key(), price_list_version = list.version,
             "the published price list does not price this class; dispatched without a quote"

@@ -1,13 +1,13 @@
-//! Billing at the ledger, not just the quote: an `authored` task is charged
-//! `credits_for_verdict_class` — ceil(full/2) — of what a `strong` task would
-//! pay for the same class, and a failed task of either class is refunded
-//! exactly what it was charged. `pricing::quote` already asserts the halved
-//! number in isolation; this asserts the money actually moves that way
-//! through `deduct_credits`/`refund_credits`, the same calls
+//! Billing at the ledger, not just the quote: billing is pass-through and does
+//! not vary by `verdict_class` -- `strong` and `authored` steps of the same
+//! task class are charged and refunded identically. `verdict_class` is a
+//! stored label only, surfaced on the plan receipt and the verification
+//! receipt; it is never a pricing input. This asserts the money actually
+//! moves through `deduct_credits`/`refund_credits`, the same calls
 //! `verification_driver::finish_and_bill` makes.
 
 use cortex_api::db::Database;
-use cortex_api::pricing::{self, credits_for_verdict_class, PriceStatus, StepQuote};
+use cortex_api::pricing::{self, PriceStatus, StepQuote};
 use cortex_core::billing_binding::{ChargeKey, RefundKey};
 use cortex_core::diff_surface::VerdictClass;
 use cortex_core::task_class::TaskClass;
@@ -36,15 +36,18 @@ fn billable_list(db: &Database) -> (cortex_api::pricing::PriceList, TaskClass) {
     (list, class)
 }
 
+/// Freezes a quote for the class. `verdict_class` is accepted only so callers
+/// can record which label the step declared -- it plays no part in the price,
+/// which `pricing::quote` computes from the class alone.
 fn freeze(
     db: &Database,
     run_id: &str,
     step_id: &str,
     list: &cortex_api::pricing::PriceList,
     class: &TaskClass,
-    verdict_class: VerdictClass,
+    _verdict_class: VerdictClass,
 ) -> i64 {
-    let (credits, billable) = pricing::quote(list, class, verdict_class).expect("priced");
+    let (credits, billable) = pricing::quote(list, class).expect("priced");
     assert!(billable, "test fixture must be billable");
     let quote = StepQuote {
         quote_id: Uuid::new_v4().to_string(),
@@ -62,24 +65,19 @@ fn freeze(
 }
 
 #[test]
-fn an_authored_task_is_charged_half_of_strong_rounded_up() {
+fn authored_and_strong_are_charged_the_same_price() {
+    // Billing is pass-through: the declared class is a stored label, not a
+    // pricing input. A class that costs the same to run costs the same
+    // whether the step was declared `strong` or `authored`.
     let (_dir, db) = db();
     let (list, class) = billable_list(&db);
 
-    let strong_credits = pricing::quote(&list, &class, VerdictClass::Strong)
-        .expect("priced")
-        .0;
-    let authored_credits = pricing::quote(&list, &class, VerdictClass::Authored)
-        .expect("priced")
-        .0;
-
+    let strong_credits = pricing::quote(&list, &class).expect("priced").0;
+    let authored_credits = pricing::quote(&list, &class).expect("priced").0;
     assert_eq!(
-        authored_credits,
-        credits_for_verdict_class(strong_credits, VerdictClass::Authored)
+        strong_credits, authored_credits,
+        "quote() takes no verdict_class and must not vary by declared class"
     );
-    // The halving actually rounds up rather than down, otherwise this test
-    // would pass for a class whose price happens to already be even.
-    assert_eq!(authored_credits, (strong_credits + 1) / 2);
 
     let user = "user_authored_charge";
     db.init_credit_balance(user, 10_000).expect("init balance");
@@ -103,7 +101,7 @@ fn an_authored_task_is_charged_half_of_strong_rounded_up() {
     assert_eq!(
         sub_total + pack_total,
         -authored_credits,
-        "the ledger must show exactly the halved amount, not the full price"
+        "the ledger must show the full class price, not a discounted one"
     );
 }
 

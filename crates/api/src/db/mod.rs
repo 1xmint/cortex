@@ -4234,9 +4234,10 @@ pub struct Receipt {
     /// class, and grading treats `None` exactly like `Authored`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub verdict_class: Option<cortex_core::diff_surface::VerdictClass>,
-    /// What the step was quoted at dispatch -- an `authored` verdict already
-    /// discounted per `pricing::credits_for_verdict_class`. This is the plan,
-    /// not the outcome: it does not move when the charge is later refunded.
+    /// What the step was quoted at dispatch -- the class price, unaffected by
+    /// `verdict_class`; billing is pass-through and does not discount for a
+    /// looser grade. This is the plan, not the outcome: it does not move
+    /// when the charge is later refunded.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub quoted_credits: Option<i64>,
     /// What the ledger actually charged for this verification, net of any
