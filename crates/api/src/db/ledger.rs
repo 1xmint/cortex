@@ -1134,13 +1134,15 @@ impl Database {
     /// Whether the latest **sealed** verdict for any step of this run is
     /// `Failed`.
     ///
-    /// A run whose latest sealed verdict for any step is `Failed` must not be
-    /// delivered through a pull request, whatever the ledger says about
-    /// billing — billing is a separate concern (today a failed verdict is
-    /// simply unbilled; that is expected to change to charging raw cost, and
-    /// this gate must not depend on which of those is currently true). This
-    /// walks every step the run ever had and reads each one's *latest* sealed
-    /// verdict straight from the `verification_runs` row
+    /// A run whose latest sealed verdict for any step is `Failed` is still
+    /// delivered — the customer paid for the calls the attempt used and gets
+    /// the work either way — but `create_pr_core` (`crate::routes`) opens it
+    /// as a draft PR titled with a `[failed checks]` prefix instead of a
+    /// normal one, whatever the ledger says about billing (today a failed
+    /// verdict is simply unbilled; that is expected to change to charging raw
+    /// cost, and this gate must not depend on which of those is currently
+    /// true). This walks every step the run ever had and reads each one's
+    /// *latest* sealed verdict straight from the `verification_runs` row
     /// (`get_sealed_verdict`), falling back to recomputing it from the frozen
     /// specs and recorded executions (the way `get_receipt` does) only when
     /// no sealed value is stored at all — that keeps this gate from trusting
@@ -1150,9 +1152,9 @@ impl Database {
     /// then retried to a `Verified` attempt reads as `Verified` here, not
     /// `Failed` — latest attempt wins.
     ///
-    /// One step's latest verdict reading `Failed` blocks the whole run's
-    /// PR — a run is a single deliverable, so partial delivery is not offered
-    /// as a fallback.
+    /// One step's latest verdict reading `Failed` marks the whole run's PR
+    /// as a draft with failed checks — a run is a single deliverable, so a
+    /// partial marking is not offered as a fallback.
     pub fn run_has_failed_step(&self, run_id: &str) -> bool {
         for (step_id, _status) in self.get_all_step_statuses(run_id) {
             let verdict = match self.get_sealed_verdict(run_id, &step_id) {
@@ -1169,6 +1171,31 @@ impl Database {
             }
         }
         false
+    }
+
+    /// The check spec ids that failed on the latest sealed attempt of every
+    /// step whose sealed verdict is `Failed`, for the "failed checks" line on
+    /// a draft PR's body. Best-effort: a step counted `Failed` by
+    /// `run_has_failed_step`'s recompute fallback but with no receipt
+    /// available here (which should not happen in practice — the fallback
+    /// itself comes from `get_receipt`) simply contributes no names rather
+    /// than erroring.
+    pub fn run_failed_check_names(&self, run_id: &str) -> Vec<String> {
+        let mut names = Vec::new();
+        for (step_id, _status) in self.get_all_step_statuses(run_id) {
+            let Some(receipt) = self.get_receipt(run_id, &step_id) else {
+                continue;
+            };
+            if receipt.gate.verdict != Verdict::Failed {
+                continue;
+            }
+            for execution in &receipt.executions {
+                if !matches!(execution.outcome, CheckOutcome::Passed) {
+                    names.push(execution.spec_id.clone());
+                }
+            }
+        }
+        names
     }
 
     /// Whether any step of this run has frozen check specs and verification

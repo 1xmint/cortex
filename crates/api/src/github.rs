@@ -30,6 +30,10 @@ impl GitHubClient {
     }
 
     /// Create a pull request via the GitHub REST API.
+    ///
+    /// `draft` opens the PR in draft state — used when the run's latest
+    /// sealed verdict for a step is `Failed`: the work is still delivered,
+    /// just flagged for review before it can be merged.
     pub async fn create_pull_request(
         &self,
         owner: &str,
@@ -38,6 +42,7 @@ impl GitHubClient {
         body: &str,
         head: &str,
         base: &str,
+        draft: bool,
     ) -> Result<PrResponse, String> {
         let url = format!("https://api.github.com/repos/{owner}/{repo}/pulls");
 
@@ -46,6 +51,7 @@ impl GitHubClient {
             "body": body,
             "head": head,
             "base": base,
+            "draft": draft,
         });
 
         let resp = self

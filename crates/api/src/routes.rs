@@ -862,10 +862,18 @@ fn build_pr_body(
     branch: &str,
     db: &crate::db::Database,
     authority_scope_id: Option<&str>,
+    failed_checks: &[String],
 ) -> String {
     let steps = db.get_all_step_statuses(run_id);
     let mut body =
         format!("## Cortex Run `{run_id}`\n\n**Goal:** {goal}\n\n**Branch:** `{branch}`\n");
+
+    if !failed_checks.is_empty() {
+        body.push_str(&format!(
+            "\n> **Delivered as a draft with failed checks.** This attempt failed verification; the following checks did not pass: {}. The work is still delivered — review before merging.\n",
+            failed_checks.join(", ")
+        ));
+    }
 
     // Step summary table
     if !steps.is_empty() {
@@ -970,6 +978,18 @@ fn build_pr_body(
     body
 }
 
+/// The `[failed checks]` title prefix a draft deliverable for a sealed
+/// `Failed` verdict gets. No code in this repo creates GitHub labels
+/// (checked: nothing here calls the labels API), so the title prefix is the
+/// visible "failed checks" marker instead of a label.
+fn failed_pr_title(title: String, is_failed: bool) -> String {
+    if is_failed {
+        format!("[failed checks] {title}")
+    } else {
+        title
+    }
+}
+
 /// Truncate a string, appending "..." if it exceeds `max_len`.
 fn truncate_str(s: &str, max_len: usize) -> String {
     if s.len() <= max_len {
@@ -987,6 +1007,11 @@ fn truncate_str(s: &str, max_len: usize) -> String {
 /// `agent_pending_actions` — refusing up front, with no pending row created,
 /// rather than only discovering the run can't be PR'd after the user has
 /// already tapped Confirm.
+///
+/// A run with a sealed `Failed` verdict passes this check — it is still
+/// delivered, just as a draft PR (see `create_pr_core`). Only a step still
+/// mid-verification is refused here, since there is nothing sealed yet to
+/// deliver either way.
 ///
 /// Returns `(goal, branch)` on success — both are needed to build the PR
 /// title/body.
@@ -1017,26 +1042,13 @@ pub(crate) fn validate_run_for_pr(
 
     validate_pr_authority(db, user_id, run_id)?;
 
-    // A failed task's changes are not delivered, whatever billing decided to
-    // do about it. If the latest sealed verdict for any step of this run is
-    // `Failed`, the whole PR is refused — a run is one deliverable, and a
-    // partially-verified run does not get shipped piecemeal. The failure
-    // report (verdict, failed checks, their output) is still reachable
-    // through GET /api/runs/{run_id}/steps/{step_id}/receipt.
-    if db.run_has_failed_step(run_id) {
-        return Err((
-            StatusCode::CONFLICT,
-            Json(ErrorResponse {
-                error: "verification_failed: this task failed verification; its changes are not delivered. See the failure report.".into(),
-            }),
-        ));
-    }
-
-    // A step whose verification hasn't sealed yet could still come back
-    // Failed, so the run cannot be delivered while one is in flight either.
-    // Checked after the Failed case above so a step that already has a
-    // sealed Failed verdict reports as failed, not pending, even if a retry
-    // for it is currently running.
+    // A run whose latest sealed verdict for any step is `Failed` is still
+    // delivered — the customer paid for the calls the attempt used and gets
+    // the work either way. `create_pr_core` opens it as a draft PR titled
+    // with a `[failed checks]` prefix instead of refusing it outright; see
+    // `run_has_failed_step` there. Only a step still mid-verification (below)
+    // is withheld, because it could still land on Failed or Verified and
+    // there is nothing to deliver yet either way.
     if db.run_has_pending_verification(run_id) {
         return Err((
             StatusCode::CONFLICT,
@@ -1073,6 +1085,15 @@ pub(crate) async fn create_pr_core(
 ) -> Result<CreatePrResponse, (StatusCode, Json<ErrorResponse>)> {
     let (goal, branch) = validate_run_for_pr(db, user_id, run_id)?;
 
+    // A sealed `Failed` verdict on any step still gets delivered, just as a
+    // draft PR clearly marked as such — the customer paid for the calls the
+    // attempt used and gets the work either way. `validate_run_for_pr` above
+    // already refused a run with a step still mid-verification, so a `false`
+    // here means every step that has a sealed verdict at all came back
+    // `Verified` (or had no verification requested).
+    let is_failed = db.run_has_failed_step(run_id);
+    let failed_checks = db.run_failed_check_names(run_id);
+
     // Push the branch to origin
     let push_output = std::process::Command::new("git")
         .args(["push", "-u", "origin", &branch])
@@ -1098,17 +1119,24 @@ pub(crate) async fn create_pr_core(
     }
 
     // Build PR metadata
-    let title = title.unwrap_or_else(|| format!("cortex: {goal}"));
+    let title = failed_pr_title(title.unwrap_or_else(|| format!("cortex: {goal}")), is_failed);
     let authority_scope_id = db
         .get_run_pr_authority_context(run_id, user_id)
         .and_then(|ctx| ctx.authority_scope_id);
-    let body = build_pr_body(run_id, &goal, &branch, db, authority_scope_id.as_deref());
+    let body = build_pr_body(
+        run_id,
+        &goal,
+        &branch,
+        db,
+        authority_scope_id.as_deref(),
+        &failed_checks,
+    );
 
     // Try GitHub API first, fall back to gh CLI
     if let Some(gh_client) = &state.github_client {
         if let Some((owner, repo)) = github::parse_github_remote(&state.workspace_dir) {
             match gh_client
-                .create_pull_request(&owner, &repo, &title, &body, &branch, base)
+                .create_pull_request(&owner, &repo, &title, &body, &branch, base, is_failed)
                 .await
             {
                 Ok(pr) => {
@@ -1129,10 +1157,14 @@ pub(crate) async fn create_pr_core(
     }
 
     // Fallback: create PR via gh CLI
+    let mut gh_args = vec![
+        "pr", "create", "--title", &title, "--body", &body, "--base", base, "--head", &branch,
+    ];
+    if is_failed {
+        gh_args.push("--draft");
+    }
     let pr_output = std::process::Command::new("gh")
-        .args([
-            "pr", "create", "--title", &title, "--body", &body, "--base", base, "--head", &branch,
-        ])
+        .args(&gh_args)
         .current_dir(&state.workspace_dir)
         .output()
         .map_err(|e| {
@@ -1724,20 +1756,37 @@ mod validate_run_for_pr_tests {
             .expect("set step status");
     }
 
+    /// The owner's settled rule: a customer pays for the calls a failed
+    /// attempt used and receives the work as a draft PR labelled "failed
+    /// checks" — `validate_run_for_pr` must not refuse a sealed `Failed`
+    /// verdict, and `create_pr_core`'s draft/title/body logic (exercised here
+    /// via its building blocks, since the real function pushes to git and
+    /// calls out to GitHub) must mark the deliverable as such.
     #[tokio::test]
-    async fn a_failed_run_is_refused_with_409() {
+    async fn a_failed_run_is_delivered_as_a_draft_marked_failed_checks() {
         let (_dir, state) = test_state().await;
         let db = state.db.as_ref().unwrap();
         let run_id = make_run(db, "user-1", "step-1");
         seal_verification(db, &run_id, "step-1", Verdict::Failed);
 
-        let err = validate_run_for_pr(db, "user-1", &run_id)
-            .expect_err("a failed run's changes must not be handed over");
-        assert_eq!(err.0, StatusCode::CONFLICT);
+        let (goal, branch) = validate_run_for_pr(db, "user-1", &run_id)
+            .expect("a failed run's changes are still delivered, not withheld");
+        assert_eq!(branch, "cortex/do-the-thing");
+
+        assert!(db.run_has_failed_step(&run_id));
+        let failed_checks = db.run_failed_check_names(&run_id);
+        assert_eq!(failed_checks, vec!["check-1".to_string()]);
+
+        let title = failed_pr_title(format!("cortex: {goal}"), db.run_has_failed_step(&run_id));
         assert!(
-            err.1 .0.error.starts_with("verification_failed:"),
-            "got: {}",
-            err.1 .0.error
+            title.starts_with("[failed checks] "),
+            "got: {title}"
+        );
+
+        let body = build_pr_body(&run_id, &goal, &branch, db, None, &failed_checks);
+        assert!(
+            body.contains("Delivered as a draft with failed checks") && body.contains("check-1"),
+            "body must name the failed checks: {body}"
         );
     }
 

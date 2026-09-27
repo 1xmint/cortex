@@ -433,20 +433,25 @@ export default function RunsPane() {
                       request is the moment this run's work leaves the machine
                       and asks a person to look at it, so what was and was not
                       checked belongs above the button, not after it. */}
-                  {detail.status && SHIPPABLE.has(detail.status) && hasFailedStep(detail.steps) && (
-                    <p className="t-micro mt-3 rounded-lg border border-[var(--err-line)] bg-[var(--err-soft)] px-3 py-2.5 text-[var(--err-strong)]">
-                      {hasFailedVerificationStep(detail.steps) ? (
-                        <>
-                          This task failed verification; its changes are not delivered. See the
-                          failure report.
-                        </>
-                      ) : (
-                        <>A step failed; this task's changes are not delivered.</>
-                      )}
-                    </p>
-                  )}
                   {detail.status &&
                     SHIPPABLE.has(detail.status) &&
+                    hasFailedStep(detail.steps) &&
+                    !hasFailedVerificationStep(detail.steps) && (
+                      <p className="t-micro mt-3 rounded-lg border border-[var(--err-line)] bg-[var(--err-soft)] px-3 py-2.5 text-[var(--err-strong)]">
+                        A step failed; this task's changes are not delivered.
+                      </p>
+                    )}
+                  {detail.status &&
+                    SHIPPABLE.has(detail.status) &&
+                    hasFailedVerificationStep(detail.steps) && (
+                      <p className="t-micro mt-3 rounded-lg border border-[var(--err-line)] bg-[var(--err-soft)] px-3 py-2.5 text-[var(--err-strong)]">
+                        This task failed verification. It is delivered as a draft pull request
+                        marked "failed checks" — see the failure report before merging.
+                      </p>
+                    )}
+                  {detail.status &&
+                    SHIPPABLE.has(detail.status) &&
+                    !hasFailedVerificationStep(detail.steps) &&
                     !hasFailedStep(detail.steps) &&
                     hasPendingVerification(detail.steps) && (
                       <p className="t-micro mt-3 rounded-lg border border-[var(--line)] bg-[var(--surface)] px-3 py-2.5 text-[var(--muted)]">
@@ -456,7 +461,7 @@ export default function RunsPane() {
                     )}
                   {detail.status &&
                     SHIPPABLE.has(detail.status) &&
-                    !hasFailedStep(detail.steps) &&
+                    !(hasFailedStep(detail.steps) && !hasFailedVerificationStep(detail.steps)) &&
                     !hasPendingVerification(detail.steps) && (
                     <div className="mt-3 rounded-lg border border-[var(--line)] bg-[var(--surface)] px-3 py-2.5">
                       {pr?.runId === detail.id ? (

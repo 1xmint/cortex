@@ -46,6 +46,11 @@ describe('hasFailedVerificationStep', () => {
   });
 
   it('is true for a step that failed after delivery -- deliver_attempt set latest_attempt.status to delivered and the verdict never changes it', () => {
+    // RunsPane uses this to show "delivered as a draft pull request marked
+    // failed checks" copy -- the backend still opens the PR (as a draft) for
+    // this case, it does not withhold it. `hasFailedStep` without this
+    // distinction (an execution failure) still gets the neutral
+    // "not delivered" copy, since execution failures deliver nothing.
     expect(
       hasFailedVerificationStep([
         makeStep({ status: 'failed', latest_attempt: { status: 'delivered' } }),

@@ -2,11 +2,11 @@ import type { RunStep } from '../../lib/cortexApi';
 
 // A run's own status can read "completed" while a step underneath it was
 // independently verified as `Failed` -- verification finishes after
-// execution does. The backend is the real gate (POST .../pr answers 409 for
-// exactly this, keyed on the latest sealed verdict, not on whether a refund
-// landed), but showing an "Open pull request" button that is certain to be
-// refused is its own kind of lie. Same rule the backend applies: any step's
-// latest verdict reading `failed` withholds the whole run's PR.
+// execution does. The backend still delivers this: `POST .../pr` opens a
+// draft PR titled `[failed checks] ...` for exactly this case (keyed on the
+// latest sealed verdict, not on whether a refund landed) rather than
+// refusing it. Callers use this to show the "delivered as a draft" copy
+// instead of promising a clean "Open pull request".
 //
 // `status: 'failed'` on a step is not only a verification verdict, though:
 // `fail_step` (crates/api/src/db/mod.rs) also lands a step on `failed`
