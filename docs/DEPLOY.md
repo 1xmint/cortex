@@ -330,6 +330,12 @@ after migrating.
 
 ### What this guard does not cover
 
+- **Boot-time statements that change data but not table shape are not seen.**
+  The fingerprint hashes a freshly built database, which never contains old
+  tables or rows. A `DROP TABLE IF EXISTS legacy_x`, or a `DELETE`/`UPDATE`
+  added to `ensure_social_tables`, leaves the fingerprint unchanged and would
+  auto-deploy. Review any boot-time SQL that is not `CREATE ... IF NOT EXISTS`
+  by hand.
 - **`routing.db`'s schema is fingerprinted (`ROUTING_SCHEMA_FINGERPRINT`,
   above) but has no version-number check**: it has no `SCHEMA_VERSION`-style
   counter of its own, and unlike `cortex.db` it is not backed up by

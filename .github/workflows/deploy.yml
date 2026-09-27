@@ -167,7 +167,7 @@ jobs:
 
       - name: Package artifact for transport
         if: steps.secrets.outputs.ok == 'true' && steps.guard.outputs.proceed == 'true'
-        run: tar czf artifact.tgz -C release COMMIT SCHEMA SHA256SUMS bin www
+        run: tar czf artifact.tgz -C release COMMIT SCHEMA SCHEMA_FINGERPRINT ROUTING_SCHEMA_FINGERPRINT SHA256SUMS bin www
 
       # Tailscale SSH (not a deploy private key) authenticates the connection
       # below: the tailnet ACL grants tag:ci an "ssh" rule to reach guardian on
