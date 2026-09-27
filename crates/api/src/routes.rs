@@ -1004,13 +1004,7 @@ fn pr_title_and_draft(base_title: String, is_failed: bool) -> (String, bool) {
 
 /// Build the `gh pr create` argv for the CLI fallback path. Pulled out so the
 /// draft flag's wiring can be asserted directly, without shelling out to `gh`.
-fn gh_pr_create_args(
-    title: &str,
-    body: &str,
-    base: &str,
-    head: &str,
-    draft: bool,
-) -> Vec<String> {
+fn gh_pr_create_args(title: &str, body: &str, base: &str, head: &str, draft: bool) -> Vec<String> {
     let mut args = vec![
         "pr".to_string(),
         "create".to_string(),

@@ -92,7 +92,7 @@ pub(crate) fn pr_payload(
 }
 
 #[cfg(test)]
-mod tests {
+mod pr_payload_tests {
     use super::*;
 
     #[test]
