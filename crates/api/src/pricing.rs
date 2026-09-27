@@ -54,6 +54,7 @@ use cortex_core::routing::RiskLevel;
 use cortex_core::task::WorkKind;
 use cortex_core::task_class::TaskClass;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 /// Micros per US dollar. Prices are integers throughout: money that
 /// round-trips through an `f64` disagrees with itself at the third decimal, and
@@ -805,7 +806,7 @@ pub fn cost_micro_usd(rate: &ModelPrice, usage: &UsageTokens) -> u64 {
 /// missing or non-numeric field reads as `0` rather than failing the parse:
 /// a usage object that omits cache fields entirely (no caching used) is
 /// common and must not become a refusal.
-pub fn parse_usage(usage: &serde_json::Value) -> UsageTokens {
+pub fn parse_usage(usage: &Value) -> UsageTokens {
     let field = |name: &str| usage.get(name).and_then(Value::as_i64).unwrap_or(0);
     let input_tokens = field("input_tokens");
     let output_tokens = field("output_tokens");
