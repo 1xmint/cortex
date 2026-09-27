@@ -1,5 +1,0 @@
-- Fixed the E0277 compile error in routes.rs (expect on ErrorResponse) with match/panic pattern
-- Pulled draft-flag decision into pr_title_and_draft, gh_pr_create_args (routes.rs) and pr_payload (github.rs), with tests for failed/verified on each path
-- Passed is_failed into build_pr_body, always show banner when true, added empty-check-names fallback text + test
-- Renamed stale "withhold" test names in ledger.rs, fixed stale ci.yml comment
-- Next: push branch, watch CI (rust, no-default-features, fmt, cortex jobs), fix any failures
