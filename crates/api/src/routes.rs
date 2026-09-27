@@ -1738,7 +1738,10 @@ mod validate_run_for_pr_tests {
         let (_goal, branch) = match validate_run_for_pr(db, "user-1", &run_id) {
             Ok(ok) => ok,
             Err((status, body)) => {
-                panic!("a verified run must clear the gate: {status} {}", body.0.error)
+                panic!(
+                    "a verified run must clear the gate: {status} {}",
+                    body.0.error
+                )
             }
         };
         assert_eq!(branch, "cortex/do-the-thing");

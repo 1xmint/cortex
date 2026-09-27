@@ -1629,8 +1629,14 @@ mod tests {
         insert_run_and_step(&db, "run-pending", "step-pending");
         db.save_check_specs("run-pending", "step-pending", &[verdict_spec("check-1")])
             .expect("freeze specs");
-        db.claim_verification("run-pending", "step-pending", 1, "tree-hash", "img@sha256:1")
-            .expect("claim verification");
+        db.claim_verification(
+            "run-pending",
+            "step-pending",
+            1,
+            "tree-hash",
+            "img@sha256:1",
+        )
+        .expect("claim verification");
 
         assert!(db.run_has_pending_verification("run-pending"));
         assert!(
