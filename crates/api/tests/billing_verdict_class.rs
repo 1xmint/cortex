@@ -25,8 +25,14 @@ fn db() -> (tempfile::TempDir, Database) {
 fn billable_list(db: &Database) -> (cortex_api::pricing::PriceList, TaskClass) {
     let mut list = db.active_price_list().expect("seed list publishes");
     list.status = PriceStatus::Committed;
-    list.classes[0].status = PriceStatus::Committed;
     let class = TaskClass::all()[0];
+    let key = class.key();
+    let priced = list
+        .classes
+        .iter_mut()
+        .find(|c| c.task_class == key)
+        .expect("seed list prices every class");
+    priced.status = PriceStatus::Committed;
     (list, class)
 }
 
