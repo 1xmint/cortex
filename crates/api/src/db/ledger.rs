@@ -1097,6 +1097,40 @@ impl Database {
         })
     }
 
+    /// The verdict `finish_verification` actually sealed for the latest
+    /// finished attempt of a step, read straight from the `verification_runs`
+    /// row rather than recomputed.
+    ///
+    /// `record_check_execution` failures are only logged (see
+    /// `verification_driver.rs`), so the executions recomputing a verdict
+    /// would read from can be missing a row the runner believes it wrote —
+    /// recomputing in that case can turn a sealed `Failed` into
+    /// `Inconclusive` and let a run through that should have been blocked.
+    /// The sealed column is what the runner actually decided and is not
+    /// subject to that gap, so it is the one this gate trusts.
+    ///
+    /// `None` when there is no sealed attempt, or (defensively) when the
+    /// stored string is not one `verdict_str` ever writes.
+    fn get_sealed_verdict(&self, run_id: &str, step_id: &str) -> Option<Verdict> {
+        let conn = self.conn();
+        let raw: Option<String> = conn
+            .query_row(
+                "SELECT verdict FROM verification_runs
+                 WHERE run_id = ?1 AND step_id = ?2 AND finished_at IS NOT NULL
+                 ORDER BY attempt DESC LIMIT 1",
+                params![run_id, step_id],
+                |r| r.get(0),
+            )
+            .ok();
+        raw.and_then(|s| match s.as_str() {
+            "verified" => Some(Verdict::Verified),
+            "failed" => Some(Verdict::Failed),
+            "inconclusive" => Some(Verdict::Inconclusive),
+            "unverified" => Some(Verdict::Unverified),
+            _ => None,
+        })
+    }
+
     /// Whether the latest **sealed** verdict for any step of this run is
     /// `Failed`.
     ///
@@ -1105,10 +1139,13 @@ impl Database {
     /// billing — billing is a separate concern (today a failed verdict is
     /// simply unbilled; that is expected to change to charging raw cost, and
     /// this gate must not depend on which of those is currently true). This
-    /// walks every step the run ever had and recomputes each one's *latest*
-    /// verdict the same way `get_receipt` does (from the frozen specs and
-    /// recorded executions, never from a status column that could drift):
-    /// `get_receipt` already orders by `attempt DESC` over sealed
+    /// walks every step the run ever had and reads each one's *latest* sealed
+    /// verdict straight from the `verification_runs` row
+    /// (`get_sealed_verdict`), falling back to recomputing it from the frozen
+    /// specs and recorded executions (the way `get_receipt` does) only when
+    /// no sealed value is stored at all — that keeps this gate from trusting
+    /// a recomputation that a partially-recorded execution set could have
+    /// gotten wrong. Either path orders by `attempt DESC` over sealed
     /// (`finished_at IS NOT NULL`) attempts, so a step that failed and was
     /// then retried to a `Verified` attempt reads as `Verified` here, not
     /// `Failed` — latest attempt wins.
@@ -1118,26 +1155,45 @@ impl Database {
     /// as a fallback.
     pub fn run_has_failed_step(&self, run_id: &str) -> bool {
         for (step_id, _status) in self.get_all_step_statuses(run_id) {
-            let Some(receipt) = self.get_receipt(run_id, &step_id) else {
-                continue;
+            let verdict = match self.get_sealed_verdict(run_id, &step_id) {
+                Some(verdict) => verdict,
+                None => {
+                    let Some(receipt) = self.get_receipt(run_id, &step_id) else {
+                        continue;
+                    };
+                    receipt.gate.verdict
+                }
             };
-            if receipt.gate.verdict == Verdict::Failed {
+            if verdict == Verdict::Failed {
                 return true;
             }
         }
         false
     }
 
-    /// Whether any step of this run has frozen check specs but no sealed
-    /// verdict yet — i.e. verification is still in flight for it.
+    /// Whether any step of this run has frozen check specs and verification
+    /// actually in flight for it — i.e. the step could still land on
+    /// `Failed`.
     ///
-    /// A run must not be delivered while a step's verification could still
-    /// land on `Failed`. `load_check_specs` is non-empty exactly when a
-    /// verification was requested for the step (specs are frozen before the
-    /// first attempt is claimed); `get_receipt` returning `None` despite that
-    /// means no attempt has sealed yet.
+    /// Specs are frozen at dispatch, before the first attempt is claimed
+    /// (`load_check_specs` is non-empty exactly when a verification was
+    /// requested for the step). But specs surviving on a step is not the same
+    /// as that step's verification being unresolved: a heal
+    /// (`try_heal`) can flip the original step to `recovered` and spin up a
+    /// new retry step id for the same work, or a step can be `cancelled`
+    /// after dispatch — in both cases the *original* step keeps its frozen
+    /// specs forever, never gets a receipt, and would otherwise block the
+    /// run's PR indefinitely even though the retry (or nothing) is what
+    /// actually determines the outcome now. So this only counts a step as
+    /// pending when its own status says verification is currently running
+    /// for it (`delivered`, about to be handed to the verifier, or
+    /// `verifying`, already with it) — any other status, sealed or not, is
+    /// not "in flight" and must not block delivery.
     pub fn run_has_pending_verification(&self, run_id: &str) -> bool {
-        for (step_id, _status) in self.get_all_step_statuses(run_id) {
+        for (step_id, status) in self.get_all_step_statuses(run_id) {
+            if !matches!(status.as_str(), "delivered" | "verifying") {
+                continue;
+            }
             if self.load_check_specs(run_id, &step_id).is_empty() {
                 continue;
             }
@@ -1561,6 +1617,19 @@ mod tests {
         .expect("insert step");
     }
 
+    /// Sets a step's status directly, bypassing the lifecycle CAS in
+    /// `transition_verification` — tests use this to plant the step in
+    /// whatever state a scenario needs without wiring up a whole heal or
+    /// cancellation path.
+    fn set_step_status(db: &Database, step_id: &str, status: &str) {
+        db.conn()
+            .execute(
+                "UPDATE steps SET status = ?1 WHERE id = ?2",
+                params![status, step_id],
+            )
+            .expect("set step status");
+    }
+
     /// Seals `attempt` for the given step with the given verdict, driving the
     /// real claim/record/finish path, and returns the verification id.
     fn seal_verification_attempt(
@@ -1627,6 +1696,7 @@ mod tests {
     fn a_step_with_frozen_specs_and_no_sealed_verdict_is_pending() {
         let db = test_db();
         insert_run_and_step(&db, "run-pending", "step-pending");
+        set_step_status(&db, "step-pending", "verifying");
         db.save_check_specs("run-pending", "step-pending", &[verdict_spec("check-1")])
             .expect("freeze specs");
         db.claim_verification(
@@ -1643,6 +1713,60 @@ mod tests {
             !db.run_has_failed_step("run-pending"),
             "an unsealed attempt must not read as a failed verdict"
         );
+    }
+
+    /// A heal (`try_heal`) flips the original failed step to `recovered` and
+    /// mints a new retry step id for the same work. The original keeps its
+    /// frozen specs forever with no receipt, but its verification is not "in
+    /// flight" any more — the retry's is. This is the F1 regression: before
+    /// the fix, the recovered original blocked the run's PR forever even
+    /// though the retry sealed `Verified` and was charged.
+    #[test]
+    fn a_recovered_step_does_not_block_the_run_once_its_retry_is_verified() {
+        let db = test_db();
+        insert_run_and_step(&db, "run-healed", "step-original");
+        db.save_check_specs("run-healed", "step-original", &[verdict_spec("check-1")])
+            .expect("freeze specs on the original, as scheduler.rs does at dispatch");
+        set_step_status(&db, "step-original", "verifying");
+
+        // The worker reports StepFailed; try_heal marks the original
+        // recovered without ever sealing a verdict for it.
+        set_step_status(&db, "step-original", "recovered");
+
+        // The heal chain's new retry step, sealed Verified.
+        let conn = db.conn();
+        conn.execute(
+            "INSERT INTO steps (id, run_id, kind, tier, risk, objective, created_at, updated_at)
+             VALUES ('step-retry', 'run-healed', 'execute', 'standard', 'low', 'o', 0, 0)",
+            [],
+        )
+        .expect("insert retry step");
+        drop(conn);
+        seal_verification(&db, "run-healed", "step-retry", Verdict::Verified);
+
+        assert!(
+            !db.run_has_pending_verification("run-healed"),
+            "the recovered original must not read as still verifying"
+        );
+        assert!(
+            !db.run_has_failed_step("run-healed"),
+            "neither the recovered original (never sealed) nor the verified retry blocks the PR"
+        );
+    }
+
+    /// A step cancelled after dispatch keeps its frozen specs too, and must
+    /// not block delivery either.
+    #[test]
+    fn a_cancelled_step_with_frozen_specs_does_not_block_the_run() {
+        let db = test_db();
+        insert_run_and_step(&db, "run-cancelled", "step-cancelled");
+        db.save_check_specs("run-cancelled", "step-cancelled", &[verdict_spec("check-1")])
+            .expect("freeze specs");
+        set_step_status(&db, "step-cancelled", "verifying");
+        set_step_status(&db, "step-cancelled", "cancelled");
+
+        assert!(!db.run_has_pending_verification("run-cancelled"));
+        assert!(!db.run_has_failed_step("run-cancelled"));
     }
 
     #[test]

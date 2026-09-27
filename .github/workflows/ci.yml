@@ -112,6 +112,16 @@ jobs:
       # while a step is still verifying -- the frontend half of withholding a
       # failed task's deliverable (POST /api/runs/{id}/pr enforces the same
       # rule server-side and answers 409 for both cases).
+      #
+      # 33 -> 41 with eight more in the same file: `hasPendingVerification`
+      # now only counts a `delivered` or `verifying` step as in flight, so a
+      # `recovered` step (a heal's original, once its retry exists) does not
+      # hide the button or read as pending -- mirrors the backend fix to
+      # `run_has_pending_verification` (crates/api/src/db/ledger.rs). And
+      # `hasFailedVerificationStep` separates an execution failure
+      # (`fail_step` landing a step on `failed` before verification ever ran)
+      # from an actual failed verdict, so the copy shown for the former stops
+      # calling it "failed verification".
       - name: Test Cortex
         run: |
           set -euo pipefail
@@ -121,8 +131,8 @@ jobs:
           echo "$output"
           passed=$(echo "$output" | grep -oE "Tests +[0-9]+ passed" | grep -oE "[0-9]+" | tail -1)
           echo "cortex tests passed: ${passed:-0}"
-          if [ "${passed:-0}" -lt 33 ]; then
-            echo "::error::expected at least 33 Cortex tests to run, saw ${passed:-0}"
+          if [ "${passed:-0}" -lt 41 ]; then
+            echo "::error::expected at least 41 Cortex tests to run, saw ${passed:-0}"
             exit 1
           fi
 

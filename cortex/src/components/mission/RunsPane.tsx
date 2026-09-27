@@ -23,7 +23,7 @@ import {
   type RunSummary,
 } from '../../lib/cortexApi';
 import { EmptyState, ErrorState, PaneHeader, SkeletonRows, StatusChip, StatusIcon } from './ui';
-import { hasFailedStep, hasPendingVerification } from './runVerdict';
+import { hasFailedStep, hasFailedVerificationStep, hasPendingVerification } from './runVerdict';
 
 /**
  * Runs — pane one of mission control (SURFACE.md).
@@ -435,8 +435,14 @@ export default function RunsPane() {
                       checked belongs above the button, not after it. */}
                   {detail.status && SHIPPABLE.has(detail.status) && hasFailedStep(detail.steps) && (
                     <p className="t-micro mt-3 rounded-lg border border-[var(--err-line)] bg-[var(--err-soft)] px-3 py-2.5 text-[var(--err-strong)]">
-                      This task failed verification; its changes are not delivered. See the
-                      failure report.
+                      {hasFailedVerificationStep(detail.steps) ? (
+                        <>
+                          This task failed verification; its changes are not delivered. See the
+                          failure report.
+                        </>
+                      ) : (
+                        <>A step failed; this task's changes are not delivered.</>
+                      )}
                     </p>
                   )}
                   {detail.status &&

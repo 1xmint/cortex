@@ -1711,6 +1711,19 @@ mod validate_run_for_pr_tests {
         seal_verification_attempt(db, run_id, step_id, 1, verdict)
     }
 
+    /// Sets a step's status directly, bypassing the lifecycle CAS —
+    /// tests use this to plant a step in whatever state (`verifying`,
+    /// `recovered`, `cancelled`, ...) a scenario needs without wiring up a
+    /// whole delivery, heal, or cancellation path.
+    fn set_step_status(db: &Database, step_id: &str, status: &str) {
+        db.conn()
+            .execute(
+                "UPDATE steps SET status = ?1 WHERE id = ?2",
+                rusqlite::params![status, step_id],
+            )
+            .expect("set step status");
+    }
+
     #[tokio::test]
     async fn a_failed_run_is_refused_with_409() {
         let (_dir, state) = test_state().await;
@@ -1772,9 +1785,12 @@ mod validate_run_for_pr_tests {
         let (_dir, state) = test_state().await;
         let db = state.db.as_ref().unwrap();
         let run_id = make_run(db, "user-1", "step-1");
-        // Specs frozen and an attempt claimed, but never sealed.
+        // Specs frozen and an attempt claimed, but never sealed, with the
+        // step actually mid-verification (as it is by the time a job can be
+        // claimed in production).
         db.save_check_specs(&run_id, "step-1", &[verdict_spec("check-1")])
             .expect("freeze specs");
+        set_step_status(db, "step-1", "verifying");
         db.claim_verification(&run_id, "step-1", 1, "tree-hash", "img@sha256:1")
             .expect("claim verification");
 
@@ -1785,6 +1801,74 @@ mod validate_run_for_pr_tests {
             err.1 .0.error.starts_with("verification_pending:"),
             "got: {}",
             err.1 .0.error
+        );
+    }
+
+    /// F1 regression: after a heal, the original step is flipped to
+    /// `recovered` with its frozen specs (from dispatch) still in place and
+    /// no receipt ever sealed for it. The retry step id the heal chain
+    /// created is what actually gets verified and charged. Before the fix,
+    /// the recovered original's frozen-but-unsealed specs read as pending
+    /// forever and the run could never get a PR.
+    #[tokio::test]
+    async fn a_healed_run_clears_the_gate_once_the_retry_is_verified() {
+        let (_dir, state) = test_state().await;
+        let db = state.db.as_ref().unwrap();
+        let run_id = make_run(db, "user-1", "step-original");
+
+        // scheduler.rs freezes specs at dispatch, before the worker runs.
+        db.save_check_specs(&run_id, "step-original", &[verdict_spec("check-1")])
+            .expect("freeze specs on the original at dispatch");
+        set_step_status(db, "step-original", "verifying");
+
+        // The worker reports StepFailed; `mark_step_recovered` requires the
+        // step to be `failed` first (as try_heal's caller leaves it after the
+        // failure report), then flips it to `recovered` and the heal chain
+        // mints a new retry step id -- no verdict is ever sealed for the
+        // original.
+        set_step_status(db, "step-original", "failed");
+        assert!(
+            db.mark_step_recovered("step-original"),
+            "mark_step_recovered should succeed from `failed`"
+        );
+
+        // The heal chain's retry step, sealed Verified.
+        db.conn()
+            .execute(
+                "INSERT INTO steps (id, run_id, kind, tier, risk, objective, created_at, updated_at)
+                 VALUES ('step-retry', ?1, 'execute', 'standard', 'low', 'o', 0, 0)",
+                rusqlite::params![run_id],
+            )
+            .expect("insert retry step");
+        seal_verification(db, &run_id, "step-retry", Verdict::Verified);
+
+        let (_goal, branch) = match validate_run_for_pr(db, "user-1", &run_id) {
+            Ok(ok) => ok,
+            Err((status, body)) => panic!(
+                "a healed run whose retry is verified must clear the gate: {status} {}",
+                body.0.error
+            ),
+        };
+        assert_eq!(branch, "cortex/do-the-thing");
+    }
+
+    /// A step cancelled after dispatch keeps its frozen specs too (dispatch
+    /// froze them before the cancellation could happen), and must not block
+    /// delivery either.
+    #[tokio::test]
+    async fn a_cancelled_step_with_frozen_specs_does_not_block_the_run() {
+        let (_dir, state) = test_state().await;
+        let db = state.db.as_ref().unwrap();
+        let run_id = make_run(db, "user-1", "step-1");
+        db.save_check_specs(&run_id, "step-1", &[verdict_spec("check-1")])
+            .expect("freeze specs");
+        set_step_status(db, "step-1", "verifying");
+        set_step_status(db, "step-1", "cancelled");
+
+        let result = validate_run_for_pr(db, "user-1", &run_id);
+        assert!(
+            !matches!(result, Err((StatusCode::CONFLICT, _))),
+            "a cancelled step with frozen specs must not withhold the PR: {result:?}"
         );
     }
 }
