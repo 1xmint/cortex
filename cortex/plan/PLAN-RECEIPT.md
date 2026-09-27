@@ -1,7 +1,17 @@
 # The Plan Receipt
 
-Status: specified, not built. Depends on V3 (persisted verdicts + refunds) and on
-a task-class price list, which is Josh's decision (see CREDITS.md).
+Status: specified, not built. Depends on V3 (persisted verdicts). **Updated
+2026-09-27, M-D-0022:** no longer depends on a task-class price list or on
+refunds — pass-through billing (see `EXECUTION-STATE.md` M-D-0022,
+`CREDITS.md`) replaces both with an estimate shown at approval and a
+per-call exact-cost charge as each call settles, regardless of verdict.
+**There is no credit hold** — decided by Josh, 2026-09-27: no locking of
+credits, no hold multiplier. If the balance cannot cover the next call's
+upper-bound reservation, the run pauses with "top up to continue" and resumes
+after top-up. The retry allowance a prior decision (M-D-0021) put "inside the
+amount approved on the plan receipt" becomes, under M-D-0022, retries charged
+the same way as any other call, against the live balance, with the same
+top-up pause if it runs out before they finish.
 
 ---
 
@@ -40,9 +50,18 @@ The decomposition of a goal into steps, presented for approval like a pull
 request, where every step carries four properties. All four are load-bearing;
 drop any one and this degrades into `tasks.md`.
 
-1. **Priced.** Each step shows its cost in whole credits, by task class, before
-   anything runs. The total is what the customer agrees to. (CREDITS.md: price
-   the class, absorb the variance, never quote tokens.)
+1. **Priced.** **Updated 2026-09-27, M-D-0022:** each step shows an *estimate*
+   in credits (from the class's observed-cost history, or the class's old
+   `quoted_credits` as a seed until history exists), shown and approved before
+   anything runs — but it is an estimate, not a fixed price, and **there is no
+   credit hold on it**. Each call is charged exactly what it cost as it
+   settles, against the live balance; if the balance cannot cover the next
+   call's upper-bound reservation, the run pauses with "top up to continue"
+   and resumes after top-up. ~~The total is what the customer agrees to, and it
+   is the price. (CREDITS.md: price the class, absorb the variance, never
+   quote tokens.)~~ Never quoting tokens is still the rule; pricing the class
+   and absorbing the variance is not — pass-through charges the variance to
+   whoever the calls were made for.
 
 2. **Checked.** Each step shows the `CheckSpec`s it will be graded against —
    the actual argv, derived from the ecosystem, the contract and the risk level.
@@ -68,10 +87,16 @@ vocabulary, so a customer can lay them side by side.
 
 Not "hard to copy" — structurally unavailable, for a specific reason each.
 
-- **Pricing a step requires being willing to refund it.** A vendor metering
+- ~~**Pricing a step requires being willing to refund it.** A vendor metering
   tokens, effort or attempts cannot quote a fixed price per step, because their
-  margin story depends on passing variance to the customer. Quoting a fixed price
-  is a promise to absorb that variance. The 2026 category went the other way.
+  margin story depends on passing variance to the customer. Quoting a fixed
+  price is a promise to absorb that variance.~~ **Superseded 2026-09-27,
+  M-D-0022:** Cortex no longer quotes a fixed price per step or refunds on
+  failure — it estimates and charges exact cost as each call settles, with no
+  credit hold. What still differentiates the Plan Receipt is showing that
+  estimate before anything runs, and charging the customer nothing they were
+  not shown a
+  number for in advance.
 
 - **Showing the checks up front requires deriving them without the model.**
   Cortex's derivation is pure and runs before the worker sees the task
@@ -117,13 +142,27 @@ After the run, the same rows gain their verdicts, so the plan becomes the receip
 
 ## Open decisions
 
-- **The task-class price list is Josh's.** CREDITS.md deliberately does not set
-  prices ("setting a price before the cost curve is known is precisely the
-  mistake that produced every public repricing of 2025–26"). The Plan Receipt
-  cannot ship without one, and must not invent one.
-- **What happens when a step is `Unverified`.** VERIFIER.md prices it at task
-  rate without the verified badge and without the refund promise. The plan must
-  say so at approval time, per step, or the badge means nothing.
-- **Re-planning mid-run.** A step that fails and is re-planned needs either a
-  new approval or a stated allowance. Silent re-planning would void the binding
-  property, which is the whole point.
+- ~~**The task-class price list is Josh's.**~~ **Resolved 2026-09-27,
+  M-D-0022:** there is no task-class price list to set. Estimates are seeded
+  from each class's `quoted_credits` only until observed-cost history exists
+  for that class, then from that history; the customer is charged exact
+  observed cost regardless, so this decision no longer blocks the Plan
+  Receipt.
+- ~~**What happens when a step is `Unverified`.** VERIFIER.md prices it at task
+  rate without the verified badge and without the refund promise.~~
+  **Resolved 2026-09-27, M-D-0022:** there is no refund promise for any
+  verdict, so nothing changes for `Unverified` specifically — every verdict is
+  charged the same way (exact cost of the calls made) and differs only in the
+  label shown on the receipt.
+- **Still open — re-planning mid-run.** A step that fails and is re-planned
+  needs either a new approval or a stated allowance. Silent re-planning would
+  void the binding property, which is the whole point. M-D-0022 does not
+  resolve this on its own: with no credit hold, a re-planned step is simply
+  charged as its calls settle like any other step, but whether it needs a
+  fresh estimate shown to the customer, or can proceed silently under the
+  original estimate, is not decided.
+- ~~**Hold sizing.**~~ **Resolved 2026-09-27, M-D-0022:** moot — Josh decided
+  there is no credit hold (no locking of credits, no multiplier). Each call is
+  charged as it settles against the live balance; the run pauses with
+  "top up to continue" if the balance cannot cover the next call's
+  upper-bound reservation, and resumes after top-up.
