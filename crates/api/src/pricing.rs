@@ -284,18 +284,27 @@ pub fn seed_provisional(
     now: i64,
     models: Vec<ModelPrice>,
 ) -> PriceList {
-    let margin_bp = 4_000; // 40% over expected provider spend.
+    // M-D-0022/M-D-0023: pass-through means there is no margin and no
+    // rounding up in anything that produces a customer charge or estimate.
+    // `margin_bp` is kept at 0, and the field itself is kept on `ClassPrice`
+    // only because `db/ledger.rs`'s existing store/load round-trip and the
+    // legacy `PriceList`/`ClassPrice`/`quote()` callers (class-based quoting,
+    // still used to seed a *provisional*, never-billed estimate row before a
+    // class has committed history) still read/write it — not because a
+    // margin is charged. This list is always published `Provisional`, and
+    // `PriceStatus::may_bill` refuses to charge a provisional class, so these
+    // numbers are quotes only, never a ledger amount.
+    let margin_bp = 0;
 
     let classes = TaskClass::all()
         .into_iter()
         .map(|class| {
             let spend = modelled_spend_micros(&class);
-            let with_margin = spend * (BP_PER_WHOLE + margin_bp) / BP_PER_WHOLE;
-            // Round up to a whole credit, and never to zero: a task that costs
-            // nothing is not a task, and a zero-credit class would make a
-            // billable verdict a silent no-op later.
-            let credits =
-                ((with_margin + SEED_MICROS_PER_CREDIT - 1) / SEED_MICROS_PER_CREDIT).max(1);
+            // No rounding up: floor to whole credits. A class whose modelled
+            // spend is below one credit quotes 0 rather than being pushed up
+            // to 1 — this list never charges (see above), so there is no
+            // "free verdict" risk from a zero quote here.
+            let credits = spend / SEED_MICROS_PER_CREDIT;
             ClassPrice {
                 task_class: class.key(),
                 quoted_credits: credits,
@@ -315,7 +324,8 @@ pub fn seed_provisional(
         basis: format!(
             "Seeded, not measured. Per-class expected provider spend is modelled from a \
              per-WorkKind token profile, a risk multiplier, and an unverifiable discount; \
-             margin {margin_bp}bp over that; rounded up to whole credits at \
+             no margin (pass-through, M-D-0022) and no rounding up — floored to whole \
+             credits at \
              {SEED_MICROS_PER_CREDIT} micros per credit — a seed chosen so the modelled \
              spread survives rounding, NOT a commercial decision about what a credit is \
              worth. sample_count is 0 on every class, so every class is provisional: \
@@ -400,17 +410,87 @@ pub fn seed_models() -> Vec<ModelPrice> {
     }
 
     vec![
-        // The engine's currently routed Claude model ids. These provisional
-        // rows intentionally share the conservative seeded rates below; live
-        // observations, not this stub wiring change, own publishing revisions.
+        // Anthropic list prices, verified against
+        // https://platform.claude.com/docs/en/about-claude/pricing, checked
+        // 2026-09-27 (M-D-0023). USD per million tokens, converted to micros
+        // per 1k tokens (`dollars_per_million * 1_000`). `cache_read_bp` is
+        // basis points of the input rate charged for a cache read (1_000 =
+        // the standard 0.1x / 90% discount; see the pinned test below for the
+        // two models that discount further).
+        //
+        // These rows previously carried stale rates that were wrong in both
+        // directions: Opus was seeded at $15/$75 (list is $5/$25, a 3x
+        // customer overcharge) and Haiku at $0.8/$4 (list is $1/$5, a 20%
+        // undercharge — Cortex was losing money on every Haiku call). See
+        // `pinned_anthropic_rates_match_the_published_price_list` for the
+        // full table this seed must match.
+        //
+        // Cache *writes* (5-minute 1.25x input, 1-hour 2x input) are not a
+        // per-model rate — the multiplier is the same for every model — so
+        // there is no field for it here; `cost_micro_usd` (below) applies the
+        // fixed multiplier directly against `input_micros_per_1k`.
         m(
             "claude",
-            "claude-opus-4-6",
-            15_000,
-            75_000,
+            "claude-opus-5-5",
+            4_000,
+            20_000,
+            500,
+            200_000,
+            "frontier",
+        ),
+        m(
+            "claude",
+            "claude-opus-5",
+            5_000,
+            25_000,
             1_000,
             200_000,
             "frontier",
+        ),
+        m(
+            "claude",
+            "claude-opus-4-8",
+            5_000,
+            25_000,
+            1_000,
+            200_000,
+            "frontier",
+        ),
+        m(
+            "claude",
+            "claude-opus-4-7",
+            5_000,
+            25_000,
+            1_000,
+            200_000,
+            "frontier",
+        ),
+        m(
+            "claude",
+            "claude-opus-4-6",
+            5_000,
+            25_000,
+            1_000,
+            200_000,
+            "frontier",
+        ),
+        m(
+            "claude",
+            "claude-opus-4-5",
+            5_000,
+            25_000,
+            1_000,
+            200_000,
+            "frontier",
+        ),
+        m(
+            "claude",
+            "claude-sonnet-5",
+            2_000,
+            10_000,
+            1_000,
+            200_000,
+            "balanced",
         ),
         m(
             "claude",
@@ -423,25 +503,7 @@ pub fn seed_models() -> Vec<ModelPrice> {
         ),
         m(
             "claude",
-            "claude-haiku-4-5",
-            800,
-            4_000,
-            1_000,
-            200_000,
-            "fast",
-        ),
-        m(
-            "claude",
-            "claude-opus-5",
-            15_000,
-            75_000,
-            1_000,
-            200_000,
-            "frontier",
-        ),
-        m(
-            "claude",
-            "claude-sonnet-5",
+            "claude-sonnet-4-5",
             3_000,
             15_000,
             1_000,
@@ -450,18 +512,60 @@ pub fn seed_models() -> Vec<ModelPrice> {
         ),
         m(
             "claude",
-            "claude-haiku-4-5-20251001",
-            800,
-            4_000,
+            "claude-haiku-4-5",
+            1_000,
+            5_000,
             1_000,
             200_000,
             "fast",
+        ),
+        m(
+            "claude",
+            "claude-haiku-4-5-20251001",
+            1_000,
+            5_000,
+            1_000,
+            200_000,
+            "fast",
+        ),
+        // Fable: $10/$50 per million, the most expensive tier on the list.
+        // 5.1's cache read discounts further, to 0.025x, than the 0.1x
+        // standard (or 5's own, unchanged, rate).
+        m(
+            "claude",
+            "claude-fable-5",
+            10_000,
+            50_000,
+            1_000,
+            200_000,
+            "frontier",
+        ),
+        m(
+            "claude",
+            "claude-fable-5-1",
+            10_000,
+            50_000,
+            250,
+            200_000,
+            "frontier",
         ),
         // Rates verified against https://developers.openai.com/api/docs/pricing
         // on 2026-09-21 (published per-1M rates divided by 1,000, in micros):
         // gpt-5.5 $5/$30 per 1M, gpt-5.4 $2.50/$15 per 1M, gpt-5-mini $0.25/$2
         // per 1M. The prior rows here were 2x the published input rate for
         // gpt-5.5 and gpt-5.4, and both rates for gpt-5-mini.
+        //
+        // UNVERIFIED (M-D-0023 left this alone rather than guess): whether
+        // OpenAI reasoning tokens are counted inside `output_tokens` by
+        // `supplier_openai.rs`'s usage parse. If they are billed separately
+        // by OpenAI but folded into `output_tokens` here, this rate
+        // undercharges reasoning-heavy calls. Punch-list: re-check
+        // `supplier_openai.rs:168-182` against OpenAI's usage object and this
+        // page before OpenAI pass-through is trusted at the same "exact"
+        // standard as the Anthropic rows below. The `cache_read_bp` (5_000 =
+        // 50% off) below is also unverified against the same page — it was
+        // carried over from the prior row rather than checked against a
+        // published cached-input rate.
         m(
             "openai", "gpt-5.5", 5_000, 30_000, 5_000, 400_000, "frontier",
         ),
@@ -475,7 +579,10 @@ pub fn seed_models() -> Vec<ModelPrice> {
         // the gateway already reserves against. `context_window` is the
         // longest session Cortex allows, in seconds.
         // gpt-live-1: $0.05/min billed per second = 833.33 micros/s, rounded
-        // up so a minute never costs less than the supplier charges us.
+        // up so a minute never costs less than the supplier charges us. This
+        // one row keeps its round-up: voice_session.rs's per-second billing
+        // (a forbidden file for this PR) is pinned to this exact rate, and
+        // its own round-up policy is the voice PR's to change, not this one's.
         m("openai", "gpt-live-1", 833_334, 0, 0, 7_200, "voice"),
         // gpt-4o-mini-transcribe: $0.003/min = 50 micros/s.
         m(
@@ -613,6 +720,100 @@ pub fn class_index(list: &PriceList) -> BTreeMap<&str, &ClassPrice> {
         .collect()
 }
 
+/// Basis points of `input_micros_per_1k` a 5-minute cache write costs: 1.25x.
+pub const CACHE_WRITE_5M_BP: i64 = 12_500;
+/// Basis points of `input_micros_per_1k` a 1-hour cache write costs: 2x.
+pub const CACHE_WRITE_1H_BP: i64 = 20_000;
+
+/// Every token count one settled model call can carry, split by the rate
+/// that applies to it. Deliberately separate from [`ModelPrice::cost_micros`]
+/// (which callers outside this PR's scope already call with a 3-argument
+/// shape): this is the pass-through-complete accounting, cache writes
+/// included, for [`cost_micro_usd`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct UsageTokens {
+    /// Total input tokens, including any that were served from cache. A
+    /// cache *read* is still an input token for billing purposes — it is
+    /// discounted, not free — so this is the full input count, not just the
+    /// uncached remainder.
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    /// Of `input_tokens`, how many were served from a previously written
+    /// cache entry (Anthropic's `cache_read_input_tokens`).
+    pub cache_read_tokens: i64,
+    /// Tokens newly written to a 5-minute cache entry this call
+    /// (`cache_creation.ephemeral_5m_input_tokens`, or the whole of
+    /// `cache_creation_input_tokens` when the supplier does not split it).
+    pub cache_write_5m_tokens: i64,
+    /// Tokens newly written to a 1-hour cache entry this call
+    /// (`cache_creation.ephemeral_1h_input_tokens`).
+    pub cache_write_1h_tokens: i64,
+}
+
+/// The exact cost of one settled call, in micro-USD, integer arithmetic end
+/// to end (see [`MICROS_PER_USD`]'s reasoning: money that round-trips through
+/// an `f64` disagrees with itself, and these numbers get multiplied by token
+/// counts in the millions).
+///
+/// Pure and DB-free by design (M-D-0023): this is the one place pass-through
+/// cost math lives, so it can be pinned by a unit test without a database,
+/// and so `charge` below can be tested against it without a gateway.
+///
+/// A cache write is priced as a multiple of the model's own
+/// `input_micros_per_1k` (1.25x for a 5-minute write, 2x for a 1-hour write —
+/// the same multiplier for every model on the published list, so there is no
+/// per-model field for it). A cache read is priced at `cache_read_bp` of the
+/// input rate, same as [`ModelPrice::cost_micros`]. Regular (uncached, not a
+/// write) input is `input_tokens - cache_read_tokens`, floored at zero so a
+/// caller's mismatched counts cannot underflow.
+pub fn cost_micro_usd(rate: &ModelPrice, usage: &UsageTokens) -> u64 {
+    let regular_in = (usage.input_tokens - usage.cache_read_tokens).max(0);
+    let regular = regular_in * rate.input_micros_per_1k / 1_000;
+    let cached = usage.cache_read_tokens * rate.input_micros_per_1k * rate.cache_read_bp
+        / (1_000 * BP_PER_WHOLE);
+    let write_5m = usage.cache_write_5m_tokens * rate.input_micros_per_1k * CACHE_WRITE_5M_BP
+        / (1_000 * BP_PER_WHOLE);
+    let write_1h = usage.cache_write_1h_tokens * rate.input_micros_per_1k * CACHE_WRITE_1H_BP
+        / (1_000 * BP_PER_WHOLE);
+    let out = usage.output_tokens * rate.output_micros_per_1k / 1_000;
+    let total = regular + cached + write_5m + write_1h + out;
+    total.max(0) as u64
+}
+
+/// Pass-through charge arithmetic (M-D-0023): deduct exactly the whole
+/// credits a settled cost is worth, given whatever fraction of a credit
+/// (`carry_micro_usd`) an earlier call could not express as a whole credit,
+/// and keep the new remainder for next time. A user's total deduction across
+/// any sequence of calls, plus the final carry, always equals the exact sum
+/// of costs — never more, and the fraction owed is never dropped in either
+/// direction.
+///
+/// `u128` internally so a legitimate balance and a legitimate single-call
+/// cost cannot overflow the intermediate sum; both inputs and both outputs
+/// stay `u64`; real balances and real call costs are nowhere near the range
+/// where a `u128` sum could itself overflow.
+pub fn charge(carry_micro: u64, cost_micro: u64, micros_per_credit: u64) -> (u64, u64) {
+    let total = u128::from(carry_micro) + u128::from(cost_micro);
+    // A zero `micros_per_credit` would be a division by zero, not a valid
+    // exchange rate. Refuse to deduct anything and carry the whole amount
+    // forward rather than panicking a caller on bad configuration.
+    if micros_per_credit == 0 {
+        return (0, carry_micro.saturating_add(cost_micro));
+    }
+    let mpc = u128::from(micros_per_credit);
+    let credits = (total / mpc) as u64;
+    let new_carry = (total % mpc) as u64;
+    (credits, new_carry)
+}
+
+/// Formats micro-USD as a dollar string with exactly 2 decimals, e.g.
+/// `1_234_567` micro-USD -> `"$1.23"`. Truncates (does not round) the third
+/// decimal and beyond, matching "no rounding up in a customer-facing number".
+pub fn micro_usd_to_dollars_display(micro_usd: u64) -> String {
+    let cents = micro_usd / 10_000; // 1_000_000 micros per dollar / 100 cents.
+    format!("${}.{:02}", cents / 100, cents % 100)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -637,10 +838,16 @@ mod tests {
         // The graduation gate, and the most important test in this file. A
         // seeded list has zero outcome samples behind it. It publishes a
         // number so the number can be argued with; it must not move money.
+        //
+        // M-D-0023: the seeded quote no longer rounds up to at least one
+        // credit (pass-through means no rounding up anywhere a customer
+        // charge or estimate comes from), so a cheap class can honestly quote
+        // zero credits. That is not the dangerous direction — a zero quote
+        // still cannot bill, which is the only thing this test guards.
         let list = seeded();
         for class in TaskClass::all() {
             let (credits, billable) = quote(&list, &class).expect("priced");
-            assert!(credits > 0, "{} quoted zero credits", class.key());
+            assert!(credits >= 0, "{} quoted a negative amount", class.key());
             assert!(
                 !billable,
                 "{} would charge from a list with no measured outcomes",
@@ -666,10 +873,22 @@ mod tests {
         // The positive direction. Without this the test above passes for a
         // module that can never charge at all, which would be a different bug
         // wearing the same green tick.
+        //
+        // Picks the most expensive class (refactor/critical/verifiable)
+        // rather than `classes[0]` — M-D-0023 floors the seeded quote instead
+        // of rounding up to at least one credit, so a cheap class can quote
+        // zero, which would make this "bills" test indistinguishable from a
+        // module that never charges. The point here is that a real, nonzero
+        // amount moves once both the class and the list are committed.
         let mut list = seeded();
         list.status = PriceStatus::Committed;
-        list.classes[0].status = PriceStatus::Committed;
-        let class = TaskClass::all()[0];
+        let class = TaskClass::new(WorkKind::Refactor, RiskLevel::Critical, true);
+        let idx = list
+            .classes
+            .iter()
+            .position(|c| c.task_class == class.key())
+            .expect("refactor/critical/verifiable is always seeded");
+        list.classes[idx].status = PriceStatus::Committed;
         let (credits, billable) = quote(&list, &class).expect("priced");
         assert!(billable);
         assert!(credits > 0);
@@ -776,12 +995,22 @@ mod tests {
     }
 
     #[test]
-    fn no_class_is_ever_free() {
-        // A zero-credit class turns a billable verdict into a silent no-op, and
-        // a silent no-op in the money path is indistinguishable from the bug
-        // this whole module exists to fix.
+    fn seeded_classes_never_bill_so_a_zero_quote_is_honest_not_dangerous() {
+        // Pre-M-D-0023 this list rounded every class up to at least 1 credit
+        // so a billable verdict could never be a silent no-op. Under
+        // pass-through there is no rounding up and no margin (M-D-0022/0023):
+        // a class whose modelled spend floors to 0 credits now quotes 0
+        // rather than being pushed to 1. That is safe *only* because this
+        // list is always published `Provisional`, and `PriceStatus::may_bill`
+        // refuses to charge a provisional class — asserted here so the two
+        // facts stay tied together.
         let list = seeded();
-        assert!(list.classes.iter().all(|c| c.quoted_credits >= 1));
+        assert_eq!(list.status, PriceStatus::Provisional);
+        assert!(list.classes.iter().all(|c| c.quoted_credits >= 0));
+        assert!(
+            list.classes.iter().all(|c| !c.status.may_bill()),
+            "a provisional class must never be billable, zero-quote or not"
+        );
     }
 
     #[test]
@@ -793,14 +1022,16 @@ mod tests {
             .unwrap();
         assert_eq!(model.model_id, "claude-sonnet-5");
 
+        // Sonnet 5 list price: $2/$10 per million = 2_000/10_000 micros per 1k
+        // (platform.claude.com/docs/en/about-claude/pricing, 2026-09-27).
         // 1k uncached in + 1k out.
-        assert_eq!(model.cost_micros(1_000, 0, 1_000), 3_000 + 15_000);
+        assert_eq!(model.cost_micros(1_000, 0, 1_000), 2_000 + 10_000);
 
         // The same input, entirely cached, at 1_000bp = 10% of the input rate.
-        assert_eq!(model.cost_micros(1_000, 1_000, 0), 300);
+        assert_eq!(model.cost_micros(1_000, 1_000, 0), 200);
 
         // Cached tokens are not double-counted as uncached.
-        assert_eq!(model.cost_micros(2_000, 1_000, 0), 300 + 3_000);
+        assert_eq!(model.cost_micros(2_000, 1_000, 0), 200 + 2_000);
     }
 
     #[test]
@@ -838,8 +1069,11 @@ mod tests {
                 .find(|m| m.provider == "openai" && m.model_id == id)
                 .unwrap()
         };
-        // One minute of gpt-live-1 is $0.05 = 50_000 micros, rounded up by at
-        // most one micro.
+        // One minute of gpt-live-1 is $0.05 = 50_000 micros. The per-second
+        // rate is rounded up ($0.05/60s = 833.33 micros/s -> 833_334) so a
+        // minute never costs Cortex less than the supplier charges; this
+        // matches the pinned expectation in voice_session.rs, a forbidden
+        // file for this PR.
         let minute = rate("gpt-live-1").cost_micros(60, 0, 0);
         assert!((50_000..=50_001).contains(&minute), "got {minute}");
         assert_eq!(rate("gpt-4o-mini-transcribe").cost_micros(60, 0, 0), 3_000);
@@ -859,5 +1093,166 @@ mod tests {
         ids.sort();
         ids.dedup();
         assert_eq!(ids.len(), total, "a model is priced twice");
+    }
+
+    /// M-D-0023: pins every Anthropic rate the packet specified against
+    /// https://platform.claude.com/docs/en/about-claude/pricing, checked
+    /// 2026-09-27. `input_micros_per_1k` / `output_micros_per_1k` are USD per
+    /// million tokens * 1_000; `cache_read_bp` is basis points of the input
+    /// rate (1_000 = the standard 0.1x discount). This test is meant to go
+    /// red the moment a seed row drifts from the published list — it is the
+    /// whole point of moving rates out of a `match` arm and into data with a
+    /// test that can name its source.
+    #[test]
+    fn pinned_anthropic_rates_match_the_published_price_list_2026_09_27() {
+        // (model_id, input $/1M * 1_000, output $/1M * 1_000, cache_read_bp)
+        let table: &[(&str, i64, i64, i64)] = &[
+            ("claude-opus-5-5", 4_000, 20_000, 500),
+            ("claude-opus-5", 5_000, 25_000, 1_000),
+            ("claude-opus-4-8", 5_000, 25_000, 1_000),
+            ("claude-opus-4-7", 5_000, 25_000, 1_000),
+            ("claude-opus-4-6", 5_000, 25_000, 1_000),
+            ("claude-opus-4-5", 5_000, 25_000, 1_000),
+            ("claude-sonnet-5", 2_000, 10_000, 1_000),
+            ("claude-sonnet-4-6", 3_000, 15_000, 1_000),
+            ("claude-sonnet-4-5", 3_000, 15_000, 1_000),
+            ("claude-haiku-4-5", 1_000, 5_000, 1_000),
+            ("claude-haiku-4-5-20251001", 1_000, 5_000, 1_000),
+            ("claude-fable-5", 10_000, 50_000, 1_000),
+            ("claude-fable-5-1", 10_000, 50_000, 250),
+        ];
+        let models = seed_models();
+        for (model_id, input, output, cache_read_bp) in table {
+            let row = models
+                .iter()
+                .find(|m| m.provider == "claude" && &m.model_id == model_id)
+                .unwrap_or_else(|| panic!("no seed row for {model_id}"));
+            assert_eq!(
+                row.input_micros_per_1k, *input,
+                "{model_id} input rate drifted from the pricing page"
+            );
+            assert_eq!(
+                row.output_micros_per_1k, *output,
+                "{model_id} output rate drifted from the pricing page"
+            );
+            assert_eq!(
+                row.cache_read_bp, *cache_read_bp,
+                "{model_id} cache-read discount drifted from the pricing page"
+            );
+        }
+    }
+
+    #[test]
+    fn cache_write_multipliers_are_1_25x_for_5m_and_2x_for_1h_input() {
+        // Not a per-model rate (see the comment on `seed_models`): the
+        // multiplier over the model's own input rate is fixed across every
+        // model on the published price list.
+        let rate = seed_models()
+            .into_iter()
+            .find(|m| m.model_id == "claude-sonnet-5")
+            .unwrap();
+        let usage = UsageTokens {
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_read_tokens: 0,
+            cache_write_5m_tokens: 1_000,
+            cache_write_1h_tokens: 0,
+        };
+        // 1k tokens at the 5m write multiplier: 2_000 micros * 1.25.
+        assert_eq!(cost_micro_usd(&rate, &usage), 2_500);
+
+        let usage_1h = UsageTokens {
+            cache_write_5m_tokens: 0,
+            cache_write_1h_tokens: 1_000,
+            ..usage
+        };
+        // 1k tokens at the 1h write multiplier: 2_000 micros * 2.
+        assert_eq!(cost_micro_usd(&rate, &usage_1h), 4_000);
+    }
+
+    #[test]
+    fn cost_micro_usd_sums_every_token_kind_with_no_double_counting() {
+        let rate = seed_models()
+            .into_iter()
+            .find(|m| m.model_id == "claude-sonnet-5")
+            .unwrap();
+        let usage = UsageTokens {
+            input_tokens: 3_000,
+            output_tokens: 1_000,
+            cache_read_tokens: 1_000,
+            cache_write_5m_tokens: 500,
+            cache_write_1h_tokens: 200,
+        };
+        // uncached input: (3_000 - 1_000) tokens * 2_000 micros/1k = 4_000
+        // cache read: 1_000 * 2_000 * 0.1 / 1k = 200
+        // cache write 5m: 500 * 2_000 * 1.25 / 1k = 1_250
+        // cache write 1h: 200 * 2_000 * 2 / 1k = 800
+        // output: 1_000 * 10_000 / 1k = 10_000
+        let expected = 4_000 + 200 + 1_250 + 800 + 10_000;
+        assert_eq!(cost_micro_usd(&rate, &usage), expected as u64);
+    }
+
+    #[test]
+    fn charge_pins_the_worked_example_from_the_packet() {
+        // carry 0, cost 250_000, mpc 100_000 -> 2 credits, carry 50_000.
+        assert_eq!(
+            charge(0, 250_000, SEED_MICROS_PER_CREDIT as u64),
+            (2, 50_000)
+        );
+        // then cost 60_000 on that carry -> 1 credit, carry 10_000.
+        assert_eq!(
+            charge(50_000, 60_000, SEED_MICROS_PER_CREDIT as u64),
+            (1, 10_000)
+        );
+    }
+
+    #[test]
+    fn charge_never_deducts_more_than_the_exact_sum_across_calls() {
+        // Property: summing (credits * mpc) plus the final carry always equals
+        // the sum of costs fed in, for any sequence — a user is never charged
+        // for more than what the calls actually cost, and the fraction of a
+        // credit that could not be deducted is never lost, only carried.
+        let mpc = SEED_MICROS_PER_CREDIT as u64;
+        let mut carry = 0u64;
+        let mut total_cost = 0u64;
+        let mut total_credits = 0u64;
+        // A small deterministic LCG in place of a `rand` dependency this
+        // pure-function test does not need.
+        let mut state: u64 = 0x2545_F491_4F6C_DD1D;
+        for _ in 0..1_000 {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1);
+            let cost = state % 1_000_000; // up to ~$1.00 per call
+            total_cost += cost;
+            let (credits, new_carry) = charge(carry, cost, mpc);
+            total_credits += credits;
+            carry = new_carry;
+            assert!(
+                carry < mpc,
+                "carry must stay less than one credit after every call, not just the last"
+            );
+        }
+        assert_eq!(total_credits * mpc + carry, total_cost);
+    }
+
+    #[test]
+    fn charge_is_idempotent_shaped_never_rounds_up() {
+        // A cost smaller than the whole carry+cost total's remainder must
+        // never be rounded up into an extra credit: pass-through charges
+        // exactly, never a cent more.
+        let mpc = SEED_MICROS_PER_CREDIT as u64;
+        let (credits, carry) = charge(0, 99_999, mpc);
+        assert_eq!((credits, carry), (0, 99_999));
+    }
+
+    #[test]
+    fn micro_usd_display_formats_two_decimals_of_a_dollar() {
+        assert_eq!(micro_usd_to_dollars_display(1_234_567), "$1.23");
+        assert_eq!(micro_usd_to_dollars_display(0), "$0.00");
+        assert_eq!(micro_usd_to_dollars_display(1_000_000), "$1.00");
+        assert_eq!(micro_usd_to_dollars_display(10_000), "$0.01");
+        // Truncates, does not round: just under a cent stays at zero.
+        assert_eq!(micro_usd_to_dollars_display(9_999), "$0.00");
     }
 }

@@ -10,6 +10,8 @@ use cortex_api::db::Database;
 use cortex_api::pricing::{self, PriceStatus, StepQuote};
 use cortex_core::billing_binding::{ChargeKey, RefundKey};
 use cortex_core::diff_surface::VerdictClass;
+use cortex_core::routing::RiskLevel;
+use cortex_core::task::WorkKind;
 use cortex_core::task_class::TaskClass;
 use uuid::Uuid;
 
@@ -19,13 +21,14 @@ fn db() -> (tempfile::TempDir, Database) {
     (dir, db)
 }
 
-/// A price list committed enough to bill, with its first class committed too
-/// — the same shape `a_committed_class_in_a_committed_list_bills` in
-/// `pricing.rs` uses to get a billable quote out of `quote()`.
+/// A price list committed enough to bill, with a class dear enough that its
+/// floored pass-through quote is at least one credit, committed too — the
+/// same shape `a_committed_class_in_a_committed_list_bills` in `pricing.rs`
+/// uses to get a billable quote out of `quote()`.
 fn billable_list(db: &Database) -> (cortex_api::pricing::PriceList, TaskClass) {
     let mut list = db.active_price_list().expect("seed list publishes");
     list.status = PriceStatus::Committed;
-    let class = TaskClass::all()[0];
+    let class = TaskClass::new(WorkKind::Refactor, RiskLevel::Critical, true);
     let key = class.key();
     let priced = list
         .classes

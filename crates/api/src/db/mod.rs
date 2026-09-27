@@ -318,7 +318,7 @@ const RUN_RESOURCE_LEASE_TTL_MS: i64 = 24 * 60 * 60 * 1000;
 ///
 /// Next migration author: bump this to match the new highest `migrate_vN`
 /// when you add one (see CONTRIBUTING.md's migration-counter section).
-pub const SCHEMA_VERSION: u32 = 71;
+pub const SCHEMA_VERSION: u32 = 72;
 
 /// A hash of the whole schema `open()` actually produces (every table, index,
 /// trigger and view in `sqlite_master`), pinned so a schema change that does
@@ -328,7 +328,7 @@ pub const SCHEMA_VERSION: u32 = 71;
 /// `SCHEMA_VERSION` alone cannot catch that: it only advances when someone
 /// remembers to bump it. See `schema_fingerprint_matches_pinned_value` in
 /// this module's tests, which is what computes and checks this value.
-pub const SCHEMA_FINGERPRINT: u64 = 0x2b96ad201c8fdb1a;
+pub const SCHEMA_FINGERPRINT: u64 = 0x65d388252c823520;
 
 fn apply_migrations(conn: &Connection) {
     conn.execute_batch(
@@ -570,6 +570,9 @@ fn apply_migrations(conn: &Connection) {
     if current < 71 {
         migrate_v71(conn);
     }
+    if current < 72 {
+        migrate_v72(conn);
+    }
 }
 
 fn migrate_v68(conn: &Connection) {
@@ -801,6 +804,37 @@ fn migrate_v71(conn: &Connection) {
 
     tracing::info!(
         "applied migration v71: user_provider_device_keys (split-key BYOK, no server master key)"
+    );
+}
+
+fn migrate_v72(conn: &Connection) {
+    // M-D-0023: pass-through billing needs two new columns, not a new table.
+    //
+    // `credit_transactions` is the customer-facing ledger (`credit_ledger` in
+    // the plan doc); `cost_micro_usd` records the exact settled provider cost
+    // a charge row is for, in micro-USD, alongside the existing `amount`
+    // (credits). NULL for legacy rows and any row that is not a pass-through
+    // model-call charge (e.g. a purchase or a promo grant).
+    //
+    // `credit_balances.carry_micro_usd` is the per-user remainder that a
+    // charge could not express as a whole credit: `1 credit = $0.10 =
+    // 100_000 micro-USD` and pass-through charges the exact cost, so any
+    // amount that does not divide evenly into whole credits must be kept
+    // somewhere rather than rounded away in either direction (owner:
+    // "the remainder carries per user", M-D-0022). `NOT NULL DEFAULT 0` so
+    // every existing balance starts with no carry; `CHECK (>= 0)` because a
+    // negative carry would mean a customer was charged less than their calls
+    // cost, silently.
+    conn.execute_batch(
+        "ALTER TABLE credit_transactions ADD COLUMN cost_micro_usd INTEGER;
+        ALTER TABLE credit_balances ADD COLUMN carry_micro_usd INTEGER NOT NULL DEFAULT 0
+            CHECK (carry_micro_usd >= 0);
+        UPDATE schema_version SET version = 72;",
+    )
+    .expect("migration v72 failed adding cost_micro_usd and carry_micro_usd");
+
+    tracing::info!(
+        "applied migration v72: credit_transactions.cost_micro_usd, credit_balances.carry_micro_usd"
     );
 }
 
@@ -5688,6 +5722,14 @@ impl Database {
             ("openai", "gpt-5.4"),
             ("openai", "gpt-5-mini"),
         ];
+        // M-D-0023: every Anthropic row is list-price, not a measured rate, so
+        // the seed is always authoritative for `provider == "claude"` — an
+        // installation must never keep a stale Anthropic rate (the bug this
+        // whole revision function exists to close). OpenAI/other providers
+        // keep the narrower `CORRECTED` allowlist above until their rates are
+        // similarly pinned to a cited source. Because claude rows follow the
+        // seed on every boot, an Anthropic price change must be a code change
+        // to `pricing::seed_models`, never a hand edit of the database.
         let Some(mut list) = self.active_price_list() else {
             return;
         };
@@ -5703,9 +5745,12 @@ impl Database {
                     changed = true;
                 }
                 Some(row)
-                    if CORRECTED.contains(&(seed.provider.as_str(), seed.model_id.as_str()))
+                    if (seed.provider == "claude"
+                        || CORRECTED
+                            .contains(&(seed.provider.as_str(), seed.model_id.as_str())))
                         && (row.input_micros_per_1k != seed.input_micros_per_1k
-                            || row.output_micros_per_1k != seed.output_micros_per_1k) =>
+                            || row.output_micros_per_1k != seed.output_micros_per_1k
+                            || row.cache_read_bp != seed.cache_read_bp) =>
                 {
                     *row = seed;
                     changed = true;
