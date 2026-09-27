@@ -91,7 +91,7 @@ const DEFAULT_SESSION_CONTROLS: ChatSessionControls = {
 const SESSION_CONTROLS_STORAGE_KEY = 'cortex:session-controls';
 const RUN_PROFILE_STORAGE_KEY = 'cortex:run-profile';
 const FREE_TIER_ACCESS_STATES = new Set<BillingAccessState>(['needs_checkout', 'needs_phone', 'cancelled']);
-type SettingsTab = 'integrations' | 'modelKeys' | 'spend' | 'billing' | 'account';
+type SettingsTab = 'integrations' | 'spend' | 'billing' | 'account';
 
 function deploymentBadgeTitle(status: DeploymentStatus): string {
   const backend = status.commits.backend_commit_short ?? status.backend.commit_short ?? 'unknown';
@@ -475,9 +475,6 @@ function CortexShell() {
     isLoadingConversation,
     conversationNotFound,
     activeConversationTitle,
-    selectedModel,
-    onModelChange,
-    zenKeyError,
     setDraft,
     sendMessage,
     stopStreaming,
@@ -543,10 +540,6 @@ function CortexShell() {
     setSettingsOpen(true);
     setSidebarOpen(false);
   }, []);
-
-  const handleOpenModelSettings = useCallback(() => {
-    handleOpenSettings('modelKeys');
-  }, [handleOpenSettings]);
 
   const handleOpenAdmin = useCallback(() => {
     setAdminOpen(true);
@@ -999,10 +992,6 @@ function CortexShell() {
             onVoiceConfirmRequired={handleVoiceConfirmRequired}
             onVoiceSpokenWindow={handleVoiceSpokenWindow}
             onVoiceConfirmResolved={handleVoiceConfirmResolved}
-            selectedModel={selectedModel}
-            onModelChange={onModelChange}
-            onOpenModelSettings={handleOpenModelSettings}
-            zenKeyError={zenKeyError}
           />
 
           <div className="hidden lg:flex">
