@@ -95,10 +95,12 @@ and what proves it. Strike an item only when its PR has merged.
     Neither file has a `plan.name` field or similar. Leaving this open rather
     than asserting a bug that does not reproduce; needs a fresh look at
     whatever state (e.g. a specific `access_state`) the original report meant.
-11. **Estimate shows tokens, not credits.** `routes.rs:1319-1420`
+11. **Estimate shows tokens.** `routes.rs:1319-1420`
     (`/api/runs/estimate`) and `agent_tools.rs:171,332` (`run_estimate`) return
-    token counts and dollar amounts to the customer — a customer-facing token
-    count, which both the old and the new (M-D-0022) pricing model forbid.
+    token counts to the customer. Under M-D-0022 the customer sees cost, not
+    tokens: the frontend shows dollars and the backend keeps credits. Keep the
+    dollar figure, drop the token count, and derive the dollar figure from
+    the corrected list-price rates (item 7), not the old seed table.
 12. **RunsPane SHIPPABLE status mismatch.** `RunsPane.tsx:69` treats
     `verified | manual_override | completed` as shippable, but the engine's
     actual run statuses are `succeeded | failed | …` (`captain.rs:27-32`) — a
@@ -121,3 +123,11 @@ and what proves it. Strike an item only when its PR has merged.
 15. **Impact re-index has no rate limit.** `context_api.rs:318-377` lets
     repeated impact requests each trigger a re-sync with no debounce or rate
     limit inside the request window.
+16. **Settings panel crashes without Clerk configured.** `SettingsPanel.tsx`
+    imports `useUser` from `@clerk/clerk-react` and calls it unconditionally
+    inside `AccountTab` (`SettingsPanel.tsx:3,139`). `main.tsx:19-46` renders
+    the whole app without a `ClerkProvider` in the tree whenever
+    `VITE_CLERK_PUBLISHABLE_KEY` is unset (the local-dev path). `useUser`
+    throws outside a `ClerkProvider`, so opening the Settings panel's Account
+    tab in local dev — no publishable key set — crashes instead of showing a
+    local-user placeholder.
