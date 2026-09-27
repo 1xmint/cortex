@@ -105,19 +105,52 @@ jobs:
       # sides of the wire can't drift the way `expires_at` did (server Unix
       # seconds, browser expecting ms/ISO) without a test failing here.
       #
-      # 26 -> 29 with the three in `src/components/mission/Receipt.test.tsx`,
+      # 26 -> 33 with the seven in
+      # `src/components/mission/RunsPane.hasFailedStep.test.ts`, which cover
+      # the guards that mark "Open pull request" as delivering a draft PR
+      # titled `[failed checks] ...` for a run with a step whose latest
+      # verdict is `Failed`, and that show a pending message instead while a
+      # step is still verifying -- the frontend half of the same rule
+      # `POST /api/runs/{id}/pr` enforces server-side: a failed verdict still
+      # gets delivered (as a draft), only a still-pending verdict answers 409.
+      #
+      # 33 -> 41 with eight more in the same file: `hasPendingVerification`
+      # now only counts a `delivered` or `verifying` step as in flight, so a
+      # `recovered` step (a heal's original, once its retry exists) does not
+      # hide the button or read as pending -- mirrors the backend fix to
+      # `run_has_pending_verification` (crates/api/src/db/ledger.rs). And
+      # `hasFailedVerificationStep` separates an execution failure
+      # (`fail_step` landing a step on `failed` before verification ever ran)
+      # from an actual failed verdict, so the copy shown for the former stops
+      # calling it "failed verification".
+      #
+      # 41 -> 38: `hasFailedStep`/`hasFailedVerificationStep` never read
+      # `verification_status`/`verifier_verdict` -- production never writes
+      # them (`run_payload.rs` only sets them from a `verifier_reports` row,
+      # and nothing seals one to `failed`; ws.rs's own verdicts are
+      # `pass`/`needs_evidence`/`fail`/`blocked`). The real signal is
+      # `latest_attempt.status`: `deliver_attempt` (crates/api/src/db/mod.rs)
+      # sets it to `delivered` and no verdict changes it afterward, so
+      # `status: 'failed'` with `latest_attempt.status: 'delivered'` is a
+      # verification failure, and with `latest_attempt.status: 'failed'` is
+      # an execution failure (`fail_attempt`). Removing the dead clauses and
+      # their tests, and rewriting the verification-vs-execution tests
+      # against `latest_attempt.status`, took the file from fifteen tests to
+      # twelve.
+      #
+      # 38 -> 41 with the three in `src/components/mission/Receipt.test.tsx`,
       # which render `ReceiptCard` for a `strong` and an `authored` verdict
       # class and assert the plain-language disclosure text a customer sees
       # before disputing a charge, plus that a pre-verdict-class receipt still
       # renders with neither badge nor charged-credits line.
       #
-      # 29 -> 30 with one more in `src/components/mission/Receipt.test.tsx`,
+      # 41 -> 42 with one more in `src/components/mission/Receipt.test.tsx`,
       # which renders a `strong`-declared step whose verdict is `failed` and
       # asserts the class copy stops short of anything a reader could take
       # for "independently verified" -- the battery existed before the task,
       # but this attempt did not pass it.
       #
-      # 30 -> 31 with one more in `src/components/mission/Receipt.test.tsx`,
+      # 42 -> 43 with one more in `src/components/mission/Receipt.test.tsx`,
       # which renders a `strong`-declared step whose verdict is `inconclusive`
       # and asserts the copy reads as "not graded" rather than "did not pass" --
       # an inconclusive step never ran its checks, so there is nothing it
@@ -131,8 +164,8 @@ jobs:
           echo "$output"
           passed=$(echo "$output" | grep -oE "Tests +[0-9]+ passed" | grep -oE "[0-9]+" | tail -1)
           echo "cortex tests passed: ${passed:-0}"
-          if [ "${passed:-0}" -lt 31 ]; then
-            echo "::error::expected at least 31 Cortex tests to run, saw ${passed:-0}"
+          if [ "${passed:-0}" -lt 43 ]; then
+            echo "::error::expected at least 43 Cortex tests to run, saw ${passed:-0}"
             exit 1
           fi
 

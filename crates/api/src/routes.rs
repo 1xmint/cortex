@@ -862,10 +862,23 @@ fn build_pr_body(
     branch: &str,
     db: &crate::db::Database,
     authority_scope_id: Option<&str>,
+    is_failed: bool,
+    failed_checks: &[String],
 ) -> String {
     let steps = db.get_all_step_statuses(run_id);
     let mut body =
         format!("## Cortex Run `{run_id}`\n\n**Goal:** {goal}\n\n**Branch:** `{branch}`\n");
+
+    if is_failed {
+        let checks = if failed_checks.is_empty() {
+            "check names unavailable; see the verification receipt".to_string()
+        } else {
+            failed_checks.join(", ")
+        };
+        body.push_str(&format!(
+            "\n> **Delivered as a draft with failed checks.** This attempt failed verification; the following checks did not pass: {checks}. The work is still delivered — review before merging.\n",
+        ));
+    }
 
     // Step summary table
     if !steps.is_empty() {
@@ -970,6 +983,46 @@ fn build_pr_body(
     body
 }
 
+/// The `[failed checks]` title prefix a draft deliverable for a sealed
+/// `Failed` verdict gets. No code in this repo creates GitHub labels
+/// (checked: nothing here calls the labels API), so the title prefix is the
+/// visible "failed checks" marker instead of a label.
+fn failed_pr_title(title: String, is_failed: bool) -> String {
+    if is_failed {
+        format!("[failed checks] {title}")
+    } else {
+        title
+    }
+}
+
+/// Derive the PR title and draft flag together from whether the run has a
+/// failed step: `create_pr_core` uses this single decision point rather than
+/// letting the title prefix and the draft flag drift apart.
+fn pr_title_and_draft(base_title: String, is_failed: bool) -> (String, bool) {
+    (failed_pr_title(base_title, is_failed), is_failed)
+}
+
+/// Build the `gh pr create` argv for the CLI fallback path. Pulled out so the
+/// draft flag's wiring can be asserted directly, without shelling out to `gh`.
+fn gh_pr_create_args(title: &str, body: &str, base: &str, head: &str, draft: bool) -> Vec<String> {
+    let mut args = vec![
+        "pr".to_string(),
+        "create".to_string(),
+        "--title".to_string(),
+        title.to_string(),
+        "--body".to_string(),
+        body.to_string(),
+        "--base".to_string(),
+        base.to_string(),
+        "--head".to_string(),
+        head.to_string(),
+    ];
+    if draft {
+        args.push("--draft".to_string());
+    }
+    args
+}
+
 /// Truncate a string, appending "..." if it exceeds `max_len`.
 fn truncate_str(s: &str, max_len: usize) -> String {
     if s.len() <= max_len {
@@ -987,6 +1040,11 @@ fn truncate_str(s: &str, max_len: usize) -> String {
 /// `agent_pending_actions` — refusing up front, with no pending row created,
 /// rather than only discovering the run can't be PR'd after the user has
 /// already tapped Confirm.
+///
+/// A run with a sealed `Failed` verdict passes this check — it is still
+/// delivered, just as a draft PR (see `create_pr_core`). Only a step still
+/// mid-verification is refused here, since there is nothing sealed yet to
+/// deliver either way.
 ///
 /// Returns `(goal, branch)` on success — both are needed to build the PR
 /// title/body.
@@ -1017,6 +1075,22 @@ pub(crate) fn validate_run_for_pr(
 
     validate_pr_authority(db, user_id, run_id)?;
 
+    // A run whose latest sealed verdict for any step is `Failed` is still
+    // delivered — the customer paid for the calls the attempt used and gets
+    // the work either way. `create_pr_core` opens it as a draft PR titled
+    // with a `[failed checks]` prefix instead of refusing it outright; see
+    // `run_has_failed_step` there. Only a step still mid-verification (below)
+    // is withheld, because it could still land on Failed or Verified and
+    // there is nothing to deliver yet either way.
+    if db.run_has_pending_verification(run_id) {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(ErrorResponse {
+                error: "verification_pending: this run's verification has not finished yet; try again once it completes.".into(),
+            }),
+        ));
+    }
+
     // Get the branch
     let branch = db.get_run_branch(run_id).ok_or_else(|| {
         (
@@ -1044,6 +1118,15 @@ pub(crate) async fn create_pr_core(
 ) -> Result<CreatePrResponse, (StatusCode, Json<ErrorResponse>)> {
     let (goal, branch) = validate_run_for_pr(db, user_id, run_id)?;
 
+    // A sealed `Failed` verdict on any step still gets delivered, just as a
+    // draft PR clearly marked as such — the customer paid for the calls the
+    // attempt used and gets the work either way. `validate_run_for_pr` above
+    // already refused a run with a step still mid-verification, so a `false`
+    // here means every step that has a sealed verdict at all came back
+    // `Verified` (or had no verification requested).
+    let is_failed = db.run_has_failed_step(run_id);
+    let failed_checks = db.run_failed_check_names(run_id);
+
     // Push the branch to origin
     let push_output = std::process::Command::new("git")
         .args(["push", "-u", "origin", &branch])
@@ -1069,17 +1152,28 @@ pub(crate) async fn create_pr_core(
     }
 
     // Build PR metadata
-    let title = title.unwrap_or_else(|| format!("cortex: {goal}"));
+    let (title, draft) = pr_title_and_draft(
+        title.unwrap_or_else(|| format!("cortex: {goal}")),
+        is_failed,
+    );
     let authority_scope_id = db
         .get_run_pr_authority_context(run_id, user_id)
         .and_then(|ctx| ctx.authority_scope_id);
-    let body = build_pr_body(run_id, &goal, &branch, db, authority_scope_id.as_deref());
+    let body = build_pr_body(
+        run_id,
+        &goal,
+        &branch,
+        db,
+        authority_scope_id.as_deref(),
+        is_failed,
+        &failed_checks,
+    );
 
     // Try GitHub API first, fall back to gh CLI
     if let Some(gh_client) = &state.github_client {
         if let Some((owner, repo)) = github::parse_github_remote(&state.workspace_dir) {
             match gh_client
-                .create_pull_request(&owner, &repo, &title, &body, &branch, base)
+                .create_pull_request(&owner, &repo, &title, &body, &branch, base, draft)
                 .await
             {
                 Ok(pr) => {
@@ -1100,10 +1194,9 @@ pub(crate) async fn create_pr_core(
     }
 
     // Fallback: create PR via gh CLI
+    let gh_args = gh_pr_create_args(&title, &body, base, &branch, draft);
     let pr_output = std::process::Command::new("gh")
-        .args([
-            "pr", "create", "--title", &title, "--body", &body, "--base", base, "--head", &branch,
-        ])
+        .args(&gh_args)
         .current_dir(&state.workspace_dir)
         .output()
         .map_err(|e| {
@@ -1555,4 +1648,393 @@ pub async fn get_deployment_adapters(
     Ok(Json(serde_json::json!({
         "adapters": statuses,
     })))
+}
+
+#[cfg(test)]
+mod validate_run_for_pr_tests {
+    use super::*;
+    use crate::db::{Database, ResourceLeaseRequest};
+    use cortex_core::verification::{
+        CheckExecution, CheckOutcome, CheckSource, CheckSpec, Verdict,
+    };
+
+    /// Real `AppState` (own tempdir, own sqlite database) -- same shortcut
+    /// `admin::provider_holds_tests::test_state` and
+    /// `agent_confirm::tests::test_state` use.
+    async fn test_state() -> (tempfile::TempDir, std::sync::Arc<AppState>) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".cortex")).unwrap();
+        let state = AppState::new(
+            dir.path().join(".cortex/ledger.jsonl"),
+            dir.path().to_path_buf(),
+            None,
+        )
+        .await;
+        (dir, state)
+    }
+
+    fn write_lease(path: &str) -> ResourceLeaseRequest {
+        ResourceLeaseRequest {
+            resource_type: "path".to_string(),
+            repo_key: "default".to_string(),
+            resource_key: path.to_string(),
+            mode: "write".to_string(),
+            reason: Some("test".to_string()),
+            metadata: serde_json::json!({}),
+        }
+    }
+
+    /// A run with one step under it, a write lease so `validate_pr_authority`
+    /// clears (the personal-scope authority check is otherwise auto-granted
+    /// by `get_authority_scope_for_user`), and a recorded branch so the run
+    /// looks like one that actually produced changes.
+    fn make_run(db: &Database, user_id: &str, step_id: &str) -> String {
+        let run_id = db
+            .create_run_with_steps_and_resource_leases(
+                user_id,
+                "do the thing",
+                "auto",
+                &["src/lib.rs".to_string()],
+                None,
+                None,
+                None,
+                &[write_lease("src/lib.rs")],
+                &[(
+                    step_id.to_string(),
+                    "execute".to_string(),
+                    "modify".to_string(),
+                    None,
+                    "standard".to_string(),
+                    "low".to_string(),
+                    "o".to_string(),
+                    0,
+                )],
+                &[],
+            )
+            .expect("create run");
+        db.record_run_branch(&run_id, "cortex/do-the-thing");
+        run_id
+    }
+
+    fn verdict_spec(id: &str) -> CheckSpec {
+        CheckSpec {
+            id: id.to_string(),
+            source: CheckSource::Contract,
+            command: vec!["cargo".into(), "test".into()],
+            timeout_secs: 60,
+            required: true,
+        }
+    }
+
+    fn verdict_execution(spec_id: &str, outcome: CheckOutcome) -> CheckExecution {
+        CheckExecution {
+            spec_id: spec_id.to_string(),
+            exit_code: if matches!(outcome, CheckOutcome::Passed) {
+                Some(0)
+            } else {
+                Some(1)
+            },
+            outcome,
+            duration_ms: 1200,
+            output_digest: "sha256:deadbeef".to_string(),
+            output_tail: "ok".to_string(),
+            runner_image: "cortex/runner@sha256:abc".to_string(),
+        }
+    }
+
+    /// Seals `attempt` for `step_id` with the given verdict, driving the real
+    /// claim/record/finish path rather than hand-seeding ledger rows. Billing
+    /// is deliberately not touched here: a `Failed` verdict is unbilled in
+    /// production (`billing_binding::BillingEffect::None`), and the gate
+    /// under test must not depend on billing state either way.
+    fn seal_verification_attempt(
+        db: &Database,
+        run_id: &str,
+        step_id: &str,
+        attempt: i64,
+        verdict: Verdict,
+    ) -> String {
+        let specs = vec![verdict_spec("check-1")];
+        db.save_check_specs(run_id, step_id, &specs)
+            .expect("freeze specs");
+        let vid = db
+            .claim_verification(run_id, step_id, attempt, "tree-hash", "img@sha256:1")
+            .expect("claim verification");
+        let outcome = if matches!(verdict, Verdict::Failed) {
+            CheckOutcome::Failed
+        } else {
+            CheckOutcome::Passed
+        };
+        db.record_check_execution(&vid, &specs[0], &verdict_execution("check-1", outcome))
+            .expect("record execution");
+        db.finish_verification(&vid, verdict).expect("seal");
+        vid
+    }
+
+    fn seal_verification(db: &Database, run_id: &str, step_id: &str, verdict: Verdict) -> String {
+        seal_verification_attempt(db, run_id, step_id, 1, verdict)
+    }
+
+    /// Sets a step's status directly, bypassing the lifecycle CAS —
+    /// tests use this to plant a step in whatever state (`verifying`,
+    /// `recovered`, `cancelled`, ...) a scenario needs without wiring up a
+    /// whole delivery, heal, or cancellation path.
+    fn set_step_status(db: &Database, step_id: &str, status: &str) {
+        db.conn()
+            .execute(
+                "UPDATE steps SET status = ?1 WHERE id = ?2",
+                rusqlite::params![status, step_id],
+            )
+            .expect("set step status");
+    }
+
+    /// The owner's settled rule: a customer pays for the calls a failed
+    /// attempt used and receives the work as a draft PR labelled "failed
+    /// checks" — `validate_run_for_pr` must not refuse a sealed `Failed`
+    /// verdict, and `create_pr_core`'s draft/title/body logic (exercised here
+    /// via its building blocks, since the real function pushes to git and
+    /// calls out to GitHub) must mark the deliverable as such.
+    #[tokio::test]
+    async fn a_failed_run_is_delivered_as_a_draft_marked_failed_checks() {
+        let (_dir, state) = test_state().await;
+        let db = state.db.as_ref().unwrap();
+        let run_id = make_run(db, "user-1", "step-1");
+        seal_verification(db, &run_id, "step-1", Verdict::Failed);
+
+        let (goal, branch) = match validate_run_for_pr(db, "user-1", &run_id) {
+            Ok(ok) => ok,
+            Err((status, body)) => panic!(
+                "a failed run must still be delivered: {status} {}",
+                body.0.error
+            ),
+        };
+        assert_eq!(branch, "cortex/do-the-thing");
+
+        assert!(db.run_has_failed_step(&run_id));
+        let failed_checks = db.run_failed_check_names(&run_id);
+        assert_eq!(failed_checks, vec!["check-1".to_string()]);
+
+        let title = failed_pr_title(format!("cortex: {goal}"), db.run_has_failed_step(&run_id));
+        assert!(title.starts_with("[failed checks] "), "got: {title}");
+
+        let body = build_pr_body(&run_id, &goal, &branch, db, None, true, &failed_checks);
+        assert!(
+            body.contains("Delivered as a draft with failed checks") && body.contains("check-1"),
+            "body must name the failed checks: {body}"
+        );
+    }
+
+    /// When a step failed but no check names were recorded (e.g. an
+    /// execution-level failure with nothing sealed to name), the body must
+    /// still show the draft banner, pointing at the verification receipt
+    /// instead of an empty list.
+    #[tokio::test]
+    async fn a_failed_run_with_no_named_checks_points_at_the_verification_receipt() {
+        let (_dir, state) = test_state().await;
+        let db = state.db.as_ref().unwrap();
+        let run_id = make_run(db, "user-1", "step-1");
+
+        let body = build_pr_body(
+            &run_id,
+            "do the thing",
+            "cortex/do-the-thing",
+            db,
+            None,
+            true,
+            &[],
+        );
+        assert!(
+            body.contains("check names unavailable; see the verification receipt"),
+            "body must fall back to the receipt pointer when no check names are known: {body}"
+        );
+    }
+
+    /// `pr_title_and_draft` is the single decision point `create_pr_core`
+    /// uses for both the title prefix and the draft flag -- this test fails
+    /// if either half of that wiring is removed.
+    #[test]
+    fn pr_title_and_draft_marks_a_failed_run_as_a_draft_with_the_failed_checks_prefix() {
+        let (title, draft) = pr_title_and_draft("cortex: do the thing".to_string(), true);
+        assert!(title.starts_with("[failed checks] "), "got: {title}");
+        assert!(draft, "a failed run must open as a draft PR");
+    }
+
+    #[test]
+    fn pr_title_and_draft_leaves_a_verified_run_as_a_normal_pr() {
+        let (title, draft) = pr_title_and_draft("cortex: do the thing".to_string(), false);
+        assert_eq!(title, "cortex: do the thing");
+        assert!(!draft, "a verified run must not open as a draft PR");
+    }
+
+    /// `create_pr_core`'s `gh` CLI fallback path -- asserts the exact argv
+    /// so a dropped `--draft` push is caught here, not in production.
+    #[test]
+    fn gh_pr_create_args_includes_draft_flag_for_a_failed_run() {
+        let args = gh_pr_create_args(
+            "[failed checks] cortex: do the thing",
+            "body",
+            "main",
+            "cortex/do-the-thing",
+            true,
+        );
+        assert!(
+            args.iter().any(|a| a == "--draft"),
+            "failed run's argv must request a draft PR: {args:?}"
+        );
+    }
+
+    #[test]
+    fn gh_pr_create_args_omits_draft_flag_for_a_verified_run() {
+        let args = gh_pr_create_args(
+            "cortex: do the thing",
+            "body",
+            "main",
+            "cortex/do-the-thing",
+            false,
+        );
+        assert!(
+            !args.iter().any(|a| a == "--draft"),
+            "verified run's argv must not request a draft PR: {args:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_verified_run_clears_the_gate() {
+        let (_dir, state) = test_state().await;
+        let db = state.db.as_ref().unwrap();
+        let run_id = make_run(db, "user-1", "step-1");
+        // The step is actually mid-verification (`verifying`) right up until
+        // its verdict seals, same as in production -- setting this is what
+        // makes the assertion below exercise the `delivered`/`verifying`
+        // pending filter instead of vacuously passing because the step was
+        // never in either status.
+        set_step_status(db, "step-1", "verifying");
+        seal_verification(db, &run_id, "step-1", Verdict::Verified);
+
+        let (_goal, branch) = match validate_run_for_pr(db, "user-1", &run_id) {
+            Ok(ok) => ok,
+            Err((status, body)) => {
+                panic!(
+                    "a verified run must clear the gate: {status} {}",
+                    body.0.error
+                )
+            }
+        };
+        assert_eq!(branch, "cortex/do-the-thing");
+    }
+
+    #[tokio::test]
+    async fn a_step_failed_then_retried_to_verified_clears_the_gate() {
+        // Latest attempt wins: a step that failed once but was retried to a
+        // sealed `Verified` attempt must not withhold the run.
+        let (_dir, state) = test_state().await;
+        let db = state.db.as_ref().unwrap();
+        let run_id = make_run(db, "user-1", "step-1");
+        set_step_status(db, "step-1", "verifying");
+        seal_verification_attempt(db, &run_id, "step-1", 1, Verdict::Failed);
+        seal_verification_attempt(db, &run_id, "step-1", 2, Verdict::Verified);
+
+        let (_goal, branch) = match validate_run_for_pr(db, "user-1", &run_id) {
+            Ok(ok) => ok,
+            Err((status, body)) => panic!(
+                "a retried, now-verified step must clear the gate: {status} {}",
+                body.0.error
+            ),
+        };
+        assert_eq!(branch, "cortex/do-the-thing");
+    }
+
+    #[tokio::test]
+    async fn a_step_mid_verification_is_refused_as_pending_with_409() {
+        let (_dir, state) = test_state().await;
+        let db = state.db.as_ref().unwrap();
+        let run_id = make_run(db, "user-1", "step-1");
+        // Specs frozen and an attempt claimed, but never sealed, with the
+        // step actually mid-verification (as it is by the time a job can be
+        // claimed in production).
+        db.save_check_specs(&run_id, "step-1", &[verdict_spec("check-1")])
+            .expect("freeze specs");
+        set_step_status(db, "step-1", "verifying");
+        db.claim_verification(&run_id, "step-1", 1, "tree-hash", "img@sha256:1")
+            .expect("claim verification");
+
+        let err = validate_run_for_pr(db, "user-1", &run_id)
+            .expect_err("a run mid-verification must not be handed over");
+        assert_eq!(err.0, StatusCode::CONFLICT);
+        assert!(
+            err.1 .0.error.starts_with("verification_pending:"),
+            "got: {}",
+            err.1 .0.error
+        );
+    }
+
+    /// F1 regression: after a heal, the original step is flipped to
+    /// `recovered` with its frozen specs (from dispatch) still in place and
+    /// no receipt ever sealed for it. The retry step id the heal chain
+    /// created is what actually gets verified and charged. Before the fix,
+    /// the recovered original's frozen-but-unsealed specs read as pending
+    /// forever and the run could never get a PR.
+    #[tokio::test]
+    async fn a_healed_run_clears_the_gate_once_the_retry_is_verified() {
+        let (_dir, state) = test_state().await;
+        let db = state.db.as_ref().unwrap();
+        let run_id = make_run(db, "user-1", "step-original");
+
+        // scheduler.rs freezes specs at dispatch, before the worker runs.
+        db.save_check_specs(&run_id, "step-original", &[verdict_spec("check-1")])
+            .expect("freeze specs on the original at dispatch");
+        set_step_status(db, "step-original", "verifying");
+
+        // The worker reports StepFailed; `mark_step_recovered` requires the
+        // step to be `failed` first (as try_heal's caller leaves it after the
+        // failure report), then flips it to `recovered` and the heal chain
+        // mints a new retry step id -- no verdict is ever sealed for the
+        // original.
+        set_step_status(db, "step-original", "failed");
+        assert!(
+            db.mark_step_recovered("step-original"),
+            "mark_step_recovered should succeed from `failed`"
+        );
+
+        // The heal chain's retry step, sealed Verified.
+        db.conn()
+            .execute(
+                "INSERT INTO steps (id, run_id, kind, tier, risk, objective, created_at, updated_at)
+                 VALUES ('step-retry', ?1, 'execute', 'standard', 'low', 'o', 0, 0)",
+                rusqlite::params![run_id],
+            )
+            .expect("insert retry step");
+        seal_verification(db, &run_id, "step-retry", Verdict::Verified);
+
+        let (_goal, branch) = match validate_run_for_pr(db, "user-1", &run_id) {
+            Ok(ok) => ok,
+            Err((status, body)) => panic!(
+                "a healed run whose retry is verified must clear the gate: {status} {}",
+                body.0.error
+            ),
+        };
+        assert_eq!(branch, "cortex/do-the-thing");
+    }
+
+    /// A step cancelled after dispatch keeps its frozen specs too (dispatch
+    /// froze them before the cancellation could happen), and must not block
+    /// delivery either.
+    #[tokio::test]
+    async fn a_cancelled_step_with_frozen_specs_does_not_block_the_run() {
+        let (_dir, state) = test_state().await;
+        let db = state.db.as_ref().unwrap();
+        let run_id = make_run(db, "user-1", "step-1");
+        db.save_check_specs(&run_id, "step-1", &[verdict_spec("check-1")])
+            .expect("freeze specs");
+        set_step_status(db, "step-1", "verifying");
+        set_step_status(db, "step-1", "cancelled");
+
+        match validate_run_for_pr(db, "user-1", &run_id) {
+            Ok(_) => {}
+            Err((status, body)) => panic!(
+                "a cancelled step with frozen specs must not withhold the PR: {status} {}",
+                body.0.error
+            ),
+        }
+    }
 }
