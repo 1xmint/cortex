@@ -5744,7 +5744,8 @@ impl Database {
                 }
                 Some(row)
                     if (seed.provider == "claude"
-                        || CORRECTED.contains(&(seed.provider.as_str(), seed.model_id.as_str())))
+                        || CORRECTED
+                            .contains(&(seed.provider.as_str(), seed.model_id.as_str())))
                         && (row.input_micros_per_1k != seed.input_micros_per_1k
                             || row.output_micros_per_1k != seed.output_micros_per_1k
                             || row.cache_read_bp != seed.cache_read_bp) =>

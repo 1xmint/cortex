@@ -125,8 +125,11 @@ fn a_balance_row_that_predates_migration_v72_gets_a_zero_carry_not_a_null() {
         [],
     )
     .expect("insert a balance row as if it existed before v72");
-    conn.execute("ALTER TABLE credit_balances DROP COLUMN carry_micro_usd", [])
-        .expect("roll the column back to simulate the pre-migration shape");
+    conn.execute(
+        "ALTER TABLE credit_balances DROP COLUMN carry_micro_usd",
+        [],
+    )
+    .expect("roll the column back to simulate the pre-migration shape");
     conn.execute("UPDATE schema_version SET version = 71", [])
         .expect("rewind the version marker so migrate_v72 runs again on reopen");
     drop(conn);
@@ -212,12 +215,14 @@ fn a_stale_installed_anthropic_rate_is_corrected_on_reopen_not_kept_forever() {
         .into_iter()
         .filter(|m| m.provider == "claude")
     {
-        let row = active.model(&seed.provider, &seed.model_id).unwrap_or_else(|| {
-            panic!(
-                "{}/{} missing from the corrected active list",
-                seed.provider, seed.model_id
-            )
-        });
+        let row = active
+            .model(&seed.provider, &seed.model_id)
+            .unwrap_or_else(|| {
+                panic!(
+                    "{}/{} missing from the corrected active list",
+                    seed.provider, seed.model_id
+                )
+            });
         assert_eq!(
             row.input_micros_per_1k, seed.input_micros_per_1k,
             "{} input rate was not corrected on reopen",
