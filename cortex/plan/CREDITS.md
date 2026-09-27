@@ -8,19 +8,38 @@
 
 ## The decision
 
-**A credit buys a unit of completed work, not a quantity of tokens.**
+> **Superseded 2026-09-27 (M-D-0022, `cortex/plan/EXECUTION-STATE.md`).** "A
+> credit buys a verified task, never tokens" is no longer the pricing model.
+> The owner's chosen model is **pass-through**: customers are charged the
+> provider cost of the calls made for them, exactly, shown per message, plan,
+> or task in credits — never a fixed price per task class, never a per-token
+> price. Tokens are still never the thing sold or displayed; the unit of truth
+> for a charge is micro-USD, and the customer-facing unit is still the credit.
+> The historical argument below (§D.4, resale vs. product) is kept for
+> context; the "fixed price per action absorbs variance" reasoning it
+> supported no longer applies, since a pass-through charge is defined *as* the
+> observed cost, not as a flat price around it. `pulse.rs` was deleted after
+> this section was written; the citation below is dead and kept only as
+> history — see the note under "What already exists".
+
+**A credit buys a unit of completed work, not a quantity of tokens.** *(as
+originally decided; see the supersession note above for what replaces this)*
 
 Tokens are a cost input. They are never the customer-facing unit, never quoted in
 the UI, and never the denomination of a balance.
 
-The good news, established by reading the code rather than assuming: **this is
-already how the system works.** `PULSE_DRAFT_CREDIT_COST: f64 = 1.0`
-(`crates/api/src/pulse.rs:185`) charges one credit per draft created — a fixed
-price per product action, with token cost invisible to the user. The only
-production caller of `deduct_credits` already follows the rule.
+The good news, established by reading the code rather than assuming, at the
+time this was written: **this is already how the system works.**
+`PULSE_DRAFT_CREDIT_COST: f64 = 1.0` charged one credit per draft created — a
+fixed price per product action, with token cost invisible to the user. The
+only production caller of `deduct_credits` already followed the rule. (The
+`pulse.rs` module this cited no longer exists on `cortex/main` — the file and
+the specific line citation are gone, not just moved.)
 
-So this is not a redesign. It is an extension of an existing convention to LLM
-work, plus four defects that must be fixed before real money flows through it.
+So this was not, at the time, a redesign. It was an extension of an existing
+convention to LLM work, plus four defects that had to be fixed before real
+money flowed through it. Under pass-through (M-D-0022), the "fixed price per
+action" convention itself is superseded — see the note above.
 
 ---
 
@@ -112,6 +131,15 @@ The primitive to fix it already exists and is unused here: `check_idempotency` /
 
 Fix: every deduction carries a caller-supplied key. For task work the natural key
 is `(run_id, step_id, attempt_id)` — Brain-minted and already unique per attempt.
+
+> **2026-09-27 (M-D-0022) — the shipped keys.** Chat idempotency is
+> `chat-reply:{reply_id}` (`chat_paid.rs:297`); task attempts key on
+> `attempt:{attempt_id}`, reused by a re-grade; a Cortex-fault absorb writes a
+> zero-credit row keyed the same way with reason `attempt_absorbed_{cause}`.
+> `verify:{verdict_id}` / `refund:{verdict_id}` (billing_binding.rs) are legacy
+> names from the fixed-price/refund model above and stop being written once
+> pass-through ships — there is no refund row in the live flow, because a
+> failed attempt is charged for its calls, not refunded.
 
 ### 3. The mutable balance is authoritative; the ledger is a side-log
 
@@ -248,7 +276,25 @@ so nothing routes a Zen authorization against Cortex's own money.
 
 ## Pricing
 
-**Not decided here, and deliberately so.**
+> **Superseded 2026-09-27 (M-D-0022).** The section below (task-class fixed
+> prices, refund-on-failure) is void. Kept for history; do not build against
+> it. The owner's chosen model is pass-through: **customers are charged the
+> provider cost of the calls made for them, shown per message, plan, or task
+> in credits; tokens are never the thing sold or displayed.** There is no
+> class price list to calibrate and no refund on failure — a failed attempt is
+> charged for the calls it made and delivered as a draft PR labelled "failed
+> checks"; a Cortex-caused failure (outage refused up front, or machinery
+> failure mid-task) is not charged. **There is no credit hold**: each call is
+> charged as it settles against the live balance, and a run pauses with
+> "top up to continue" if the balance cannot cover the next call's
+> upper-bound reservation. The frontend may show a dollar figure; the backend
+> stays in credits. Sandbox compute is covered by the subscription/package
+> fee, not charged per task. **How Cortex earns money:** the subscription fee
+> is Cortex's income; credits are pure pass-through at exact cost, covering
+> only the model calls. See `EXECUTION-STATE.md` M-D-0022 for the full model.
+
+**Not decided here, and deliberately so.** *(historical — see supersession
+note above)*
 
 Prices must be calibrated against measured cost. That measurement does not exist
 yet — task 1.4 in [PLAN-2026-08.md](PLAN-2026-08.md), roughly $300 to instrument
@@ -262,7 +308,7 @@ refunds, Copilot's Opus multiplier going 7.5× → 27×, Replit's move to effort
 Each followed the same arc: price set on intuition, agentic usage exceeded it,
 emergency repricing, trust damage.
 
-What *is* decided:
+What *was* decided, before M-D-0022:
 
 - Credits are integers. A task costs a whole number of them.
 - Task classes are priced, not tasks. A small fixed set — a user should be able to
@@ -274,6 +320,9 @@ What *is* decided:
 - The monthly allotment stays (`subscription_remaining`, currently 200) and packs
   stay (`pack_remaining`). Spend order stays: allotment first.
 
+Under M-D-0022, credits are still integers and the monthly-allotment-first spend
+order is unchanged; the fixed class price and the refund promise are gone.
+
 ---
 
 ## Consequences to accept
@@ -283,11 +332,21 @@ revenue and may fall under US state unclaimed-property law. Recognising breakage
 early is a restatement risk. Talk to an accountant before designing expiry — cheap
 now, expensive after an audit.
 
-**Refunds make the verifier load-bearing.** If verification is weak, refunds either
-leak money (false failures refunded after real spend) or erode trust (false passes
-charged). Today `infer_required_checks` (`crates/api/src/scheduler.rs:619`) returns
-empty for Execute steps below High risk, so "verified" currently means "the CLI
-exited 0". **Refund-on-failure must not ship before that is fixed.**
+**The verdict is a label, not a refund trigger (M-D-0022, 2026-09-27).**
+*(Supersedes "Refunds make the verifier load-bearing" below.)* Because a failed
+attempt is charged for its calls rather than refunded, a weak verifier no longer
+creates a leak-money-or-erode-trust bind on the ledger — it only affects whether
+the customer sees "verified" or "failed checks" on work they are charged for
+either way. `infer_required_checks` (`crates/api/src/scheduler.rs:619`) still
+returns empty for Execute steps below High risk, so "verified" still currently
+means "the CLI exited 0"; that remains worth fixing for trust, just not as a
+billing gate.
+
+**Historical, superseded — refunds made the verifier load-bearing.** If
+verification is weak, refunds either leak money (false failures refunded after
+real spend) or erode trust (false passes charged). **Refund-on-failure must not
+ship before that is fixed** — moot under M-D-0022, since there is no
+refund-on-failure to ship.
 
 **Margin is not SaaS margin.** Roughly 45–55% gross before infrastructure and
 35–45% after, and it compresses as model prices fall. That is a real business, and
@@ -298,14 +357,24 @@ it is not the business a flat-rate SaaS plan describes.
 ## What not to do
 
 - Do not quote tokens in the UI, in receipts, or in the API. Not "you used 40k
-  tokens" — "this task cost 3 credits".
-- Do not compute credit cost as a function of observed token usage. That is
-  token resale with an exchange rate. Price the class; absorb the variance. If a
-  class's variance is unbearable, split the class.
+  tokens" — "this task cost 3 credits" (or, under M-D-0022, the exact credits
+  the calls cost).
+- ~~Do not compute credit cost as a function of observed token usage.~~
+  **Superseded 2026-09-27 (M-D-0022):** the owner's chosen model *is* to charge
+  exactly the observed cost of the calls made, converted to credits. What still
+  holds from this bullet: never display or sell a token count itself, and never
+  let the customer buy "N tokens" as the unit — see `EXECUTION-STATE.md`
+  M-D-0022 and the Anthropic §D.4 approval gate below.
 - Do not let `provider_spend` and `credit_ledger` share a table, a unit, or a
   migration.
-- Do not enable refund-on-failure until the verifier gates on real checks.
+- ~~Do not enable refund-on-failure until the verifier gates on real checks.~~
+  Moot under M-D-0022: there is no refund-on-failure in the pass-through model,
+  so nothing gates on it. The verifier gate itself (`infer_required_checks`,
+  `scheduler.rs:619`) is still worth fixing for the "verified" label's honesty.
 - Do not ship any of this on SQLite's current `Mutex<Connection>`
   (`ARCHITECTURE.md` §13 specifies a write-actor and read pool; the code has
   neither — 376 blocking lock sites). Two replicas would double-dispatch: pay
   twice, bill once.
+- **Do not sign the first paying customer before Anthropic's written approval**
+  (Commercial Terms §D.4) that pass-through billing of model calls is not a
+  resale of the Services (M-D-0022 launch gate).

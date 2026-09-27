@@ -236,17 +236,24 @@ Once both are set, delete any local copy of the OAuth secret.
 None of this workflow's own steps write the API's `.env`/`EnvironmentFile` on
 the deploy host — that file is set up once, by hand, alongside whichever
 `cortex-server` unit is running there. Whatever sets it up must include four
-variables, or the API exits non-zero on the next restart instead of serving
-traffic:
+variables, or the API silently starts in development mode (see below) instead
+of the production auth mode a deploy host needs:
 
 - **`CORTEX_ENV`** — set to `production` to tell the API it is running in
-  production. This is the signal the startup check looks for
-  (`HEYVERA_REQUIRE_AUTH=1` also counts). Nothing in this repository's
-  production templates sets it implicitly: a deploy that forgets it runs as
-  an unauthenticated local/dev instance without warning.
+  production. `is_production_env` (`crates/api/src/lib.rs:331-343`) treats any
+  of `HEYVERA_ENV`, `CORTEX_ENV`, `APP_ENV`, `RUST_ENV`, or `ENVIRONMENT` set to
+  `production` or `prod` (case-insensitive) as production — `CORTEX_ENV` is
+  only one of five names it checks (`HEYVERA_REQUIRE_AUTH=1` also forces
+  production auth requirements, independently of this list). **If none of
+  these are set, the API does not exit — it starts in development/local-auth
+  mode**, treating every request as user `"local"`
+  (`crates/api/src/main.rs:192-197`; `HeyVeraAuthMode::LocalDevelopment`).
+  Nothing in this repository's production templates sets any of these
+  implicitly: a deploy that forgets them runs as an unauthenticated local/dev
+  instance without warning, not as a service that refuses to start.
 - **`CLERK_SECRET_KEY`** — the Clerk backend API secret. Required once
-  `CORTEX_ENV=production` is set; startup exits non-zero if it is missing or
-  blank.
+  production is detected (any of the five vars above); startup exits non-zero
+  if it is missing or blank while production is on.
 - **`CLERK_ISSUER`** — the Clerk instance's issuer URL (a non-empty `https://`
   URL). Required in production; used to validate incoming JWTs.
 - **`CLERK_AUTHORIZED_PARTY`** — the `https://` origin (no path, query, or
@@ -259,6 +266,19 @@ lines already present — fill in the three Clerk values before starting the
 service, or the server exits immediately with a message naming the missing
 variable. See `deploy/cortex-api.service` for the systemd unit that sets
 `CORTEX_ENV=production` for that install path.
+
+**`CORTEX_AUTH_DISABLED` and `CORTEX_ALLOW_ANONYMOUS_WORKER` are refused in
+production, not merely ignored.** `validate_auth_config_values`
+(`crates/api/src/clerk.rs:74-92`) returns `Err("CORTEX_AUTH_DISABLED is
+forbidden in HeyVera production")` when production is detected and
+`CORTEX_AUTH_DISABLED` is set (`clerk.rs:74-76`), and
+`Err("CORTEX_ALLOW_ANONYMOUS_WORKER is forbidden in HeyVera production")` when
+production is detected and anonymous-worker access is requested
+(`clerk.rs:78-82`). Either error propagates out of `load_heyvera_auth_config`
+(`clerk.rs:119-136`) and `main.rs` exits the process with status 1 on it
+(`crates/api/src/main.rs:184-190`) — so setting either flag on a production
+deploy host does not quietly re-open the hole, it stops the server from
+starting.
 
 ## Triggering a deploy manually
 

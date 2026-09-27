@@ -45,8 +45,79 @@ and what proves it. Strike an item only when its PR has merged.
    `crates/api/src/db/mod.rs` ~685-744 are stale. Needs a deliberate deploy (the
    auto-deploy refuses migrating builds once PR #71 lands).
 
-## Done in this change
+## Not actually done — corrected 2026-09-27 (M-D-0022 docs PR)
 
-- CREDITS.md §2 (retry double-charge) and the "refunds make the verifier
-  load-bearing" note, plus VISION.md's refund warning, described code that no longer
-  exists. Updated to the current mechanism.
+- **This section's claim was false.** CREDITS.md §2, the "refunds make the
+  verifier load-bearing" note, and VISION.md's refund warning were *not*
+  updated by whatever change first wrote this line — they still described the
+  original fixed-price/refund-on-failure model verbatim until the M-D-0022 docs
+  pass (this PR) marked them superseded and rewrote the surrounding text. Do
+  not trust a "done in this change" line without checking the diff it claims.
+
+## New items (M-D-0022 docs pass, 2026-09-27)
+
+7. **Seed price list is wrong in both directions vs. Anthropic's list prices,
+   and blocks pass-through billing.** `pricing.rs:377+` `seed_models` charges
+   claude-opus-4-6 and claude-opus-5 at $15/$75 per MTok in/out against a list
+   price of $5/$25 (customer overcharged 3x); claude-sonnet-5 at $3/$15 against
+   $2/$10 (overcharged 1.5x); claude-haiku-4-5(-20251001) at $0.8/$4 against
+   $1/$5 (**undercharged 20%, Cortex loses money on every call**); an Opus 5.5
+   row is missing entirely. claude-sonnet-4-6 at $3/$15 matches list price.
+   Verified against https://platform.claude.com/docs/en/about-claude/pricing,
+   fetched 2026-09-27. Also: `pricing.rs`'s `margin_bp = 4_000` applies a 40%
+   margin on top of these rates for `quoted_credits`, which must not carry into
+   anything customer-charged under pass-through, and the seed table only bills
+   cache reads — cache-write tokens (`cache_creation_input_tokens`) are not
+   billed at all. Which price list is live in production (this seed, or a
+   later one published through `publish_price_list`, `db/ledger.rs:631`) is
+   not verified. Not a code change here — a PR 2 (M-D-0023) blocker.
+8. **Buying a credit pack grants no credits.** `add_pack_credits`
+   (`crates/api/src/db/ledger.rs:1134`) is called only from tests
+   (`db/ledger.rs:1230,1246,1268,1377,1428,1450`; `voice_session.rs:3858`, also
+   a test) — never from the Stripe webhook (`billing.rs`). The webhook's
+   `checkout.session.completed` handler calls `should_init_credits_on_checkout`
+   (`billing.rs:996-998`, "Only subscription mode (not one-time payment
+   packs)") and only inits a *subscription* balance
+   (`db.init_credit_balance`, `billing.rs:1311`) — there is no handling of a
+   one-time pack purchase anywhere in `stripe_webhook` that credits
+   `pack_remaining`. A customer who buys a one-time credit pack today pays and
+   receives nothing.
+9. **Chat "unavailable" dead end.** `chat.rs:318` returns a plain "unavailable"
+   message when `PaidReplyError::Unavailable` fires (gateway off or no rate),
+   with no retry path or explanation for the customer.
+10. **TrialBanner / BillingPage "blank plan name" — could not confirm on
+    current `cortex/main`.** The brief for this punch item cited
+    `TrialBanner.tsx:75` and `BillingPage.tsx` ~140-160 for a blank
+    interpolated plan name. Read on `cortex/main`: `TrialBanner.tsx:75` renders
+    a static "Preview mode" string with no plan-name interpolation, and
+    `BillingPage.tsx:166` builds `planLabel` as `` `Cortex Pro ${plan_type ===
+    'annual' ? 'Annual' : 'Monthly'}` `` — deterministic, not blank-prone.
+    Neither file has a `plan.name` field or similar. Leaving this open rather
+    than asserting a bug that does not reproduce; needs a fresh look at
+    whatever state (e.g. a specific `access_state`) the original report meant.
+11. **Estimate shows tokens, not credits.** `routes.rs:1319-1420`
+    (`/api/runs/estimate`) and `agent_tools.rs:171,332` (`run_estimate`) return
+    token counts and dollar amounts to the customer — a customer-facing token
+    count, which both the old and the new (M-D-0022) pricing model forbid.
+12. **RunsPane SHIPPABLE status mismatch.** `RunsPane.tsx:69` treats
+    `verified | manual_override | completed` as shippable, but the engine's
+    actual run statuses are `succeeded | failed | …` (`captain.rs:27-32`) — a
+    `succeeded` run does not match any of the three strings `RunsPane` checks
+    for, so it is not recognized as shippable. Taken from the brief, not
+    independently re-read here; a red test is the way to confirm it.
+13. **Stuck verification after a crashed claim.** `reclaim_expired_verification_jobs`
+    (`db/verification_queue.rs:148-165`) re-queues an expired `claimed`
+    verification job, but `claim_verification(...)?`
+    (`verification_driver.rs:152-158`) returns `None` when the crashed
+    attempt's `verifications` row already exists, and the dispatcher
+    (`verification_dispatcher.rs` ~276) treats a `None` claim as "declined, job
+    done" — likely leaving the run with no verdict forever. Strongly
+    suspected from reading the code; not yet confirmed by a red test.
+14. **Impact `SKIP_DIRS` hang.** `crates/context/src/extract.rs:24-33,199`
+    walks directories against a hardcoded `SKIP_DIRS` list instead of
+    respecting `.gitignore`, so a large ignored directory (e.g. a shared
+    `target/` or `node_modules/`) not in that hardcoded list can hang or
+    slow the walk on a large repo.
+15. **Impact re-index has no rate limit.** `context_api.rs:318-377` lets
+    repeated impact requests each trigger a re-sync with no debounce or rate
+    limit inside the request window.

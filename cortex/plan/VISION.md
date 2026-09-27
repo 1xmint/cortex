@@ -19,9 +19,10 @@ shows you the tests that prove it.**
 
 You describe a task. Cortex decomposes it, routes each piece to whichever model
 suits that piece, executes in an isolated sandbox, and **runs real checks against
-the result** before calling it done. You pay in credits, per unit of completed
-work. You never see a token count, never manage an API key, and are not billed for
-a task that failed its checks.
+the result** before calling it done. **You pay what the model calls cost, shown
+before you approve; failed work is still delivered, labelled by its verdict**
+(M-D-0022, 2026-09-27 — replaces "you ... are not billed for a task that
+failed its checks"). You never see a token count and never manage an API key.
 
 ## What Cortex is not
 
@@ -62,13 +63,21 @@ cheaper models become good enough — which is also what makes the economics wor
 So verification is not a feature bolted onto a router. **It is the thing that
 makes the router safe to point at a cheaper model.**
 
-This carries a pricing consequence, deliberately accepted: **a task that fails
-verification is refunded.** That is what stops "verified" from being a marketing
-word, and it aligns incentives — routing cheap and failing costs Cortex twice.
+**Superseded 2026-09-27, M-D-0022:** the refund-on-failure promise below is
+removed. A task that fails verification is charged for the calls it made and
+delivered as a draft PR labelled "failed checks" — no refund. What stops
+"verified" from being a marketing word is now the label itself, shown before
+spend and attached to the delivered work, not a refund mechanism.
 
-⚠️ Refund-on-failure must not ship before the verifier gates on real checks.
-Today `infer_required_checks` (`crates/api/src/scheduler.rs:619`) returns empty for
-Execute steps below High risk, so "verified" currently means "the CLI exited 0".
+~~This carries a pricing consequence, deliberately accepted: **a task that
+fails verification is refunded.** That is what stops "verified" from being a
+marketing word, and it aligns incentives — routing cheap and failing costs
+Cortex twice.~~
+
+`infer_required_checks` (`crates/api/src/scheduler.rs:619`) still returns empty
+for Execute steps below High risk, so "verified" currently means "the CLI
+exited 0" — still worth fixing for the honesty of the label, though it is no
+longer a billing gate now that nothing is refunded on failure.
 
 ---
 
@@ -97,8 +106,9 @@ engine, not three products.
 ### 1. Project chat — private, per user, per project
 
 Where you work. Talk about the codebase, argue about approach, ask for things.
-Cortex classifies intent and routes accordingly: conversation is cheap, real work
-costs credits and says so before spending them.
+Cortex classifies intent and routes accordingly: a chat reply costs exactly what
+its model calls cost, in credits, shown in the conversation (M-D-0022); real
+work — a task attempt — is estimated and approved before it spends.
 
 Code work runs in isolated branches and never touches `main` directly.
 
