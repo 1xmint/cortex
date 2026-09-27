@@ -3122,14 +3122,7 @@ mod tests {
         let run_id = scheduler_seed_run_and_step(&db, "step-1");
         let specs = vec![required_check("cargo:test")];
 
-        let class = decide_verdict_class(
-            &db,
-            &run_id,
-            "step-1",
-            None,
-            &specs,
-            WorkKind::Refactor,
-        );
+        let class = decide_verdict_class(&db, &run_id, "step-1", None, &specs, WorkKind::Refactor);
 
         assert_eq!(
             class,
