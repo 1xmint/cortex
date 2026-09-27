@@ -105,12 +105,13 @@ jobs:
       # sides of the wire can't drift the way `expires_at` did (server Unix
       # seconds, browser expecting ms/ISO) without a test failing here.
       #
-      # 26 -> 31 with the five in
-      # `src/components/mission/RunsPane.hasFailedRefundedStep.test.ts`, which
-      # cover the guard that hides "Open pull request" for a run with a
-      # failed-and-refunded step -- the frontend half of withholding a
-      # refunded task's deliverable (POST /api/runs/{id}/pr enforces the same
-      # rule server-side and answers 409).
+      # 26 -> 33 with the seven in
+      # `src/components/mission/RunsPane.hasFailedStep.test.ts`, which cover
+      # the guards that hide "Open pull request" for a run with a step whose
+      # latest verdict is `Failed`, and that show a pending message instead
+      # while a step is still verifying -- the frontend half of withholding a
+      # failed task's deliverable (POST /api/runs/{id}/pr enforces the same
+      # rule server-side and answers 409 for both cases).
       - name: Test Cortex
         run: |
           set -euo pipefail
@@ -120,8 +121,8 @@ jobs:
           echo "$output"
           passed=$(echo "$output" | grep -oE "Tests +[0-9]+ passed" | grep -oE "[0-9]+" | tail -1)
           echo "cortex tests passed: ${passed:-0}"
-          if [ "${passed:-0}" -lt 31 ]; then
-            echo "::error::expected at least 31 Cortex tests to run, saw ${passed:-0}"
+          if [ "${passed:-0}" -lt 33 ]; then
+            echo "::error::expected at least 33 Cortex tests to run, saw ${passed:-0}"
             exit 1
           fi
 

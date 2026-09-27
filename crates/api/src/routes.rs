@@ -1017,16 +1017,31 @@ pub(crate) fn validate_run_for_pr(
 
     validate_pr_authority(db, user_id, run_id)?;
 
-    // A refunded task's changes are not delivered. If any step of this run
-    // failed verification and was refunded, the whole PR is refused — a run
-    // is one deliverable, and a partially-verified run does not get shipped
-    // piecemeal. The failure report (verdict, failed checks, their output) is
-    // still reachable through GET /api/runs/{run_id}/steps/{step_id}/receipt.
-    if db.run_has_failed_refunded_step(run_id) {
+    // A failed task's changes are not delivered, whatever billing decided to
+    // do about it. If the latest sealed verdict for any step of this run is
+    // `Failed`, the whole PR is refused — a run is one deliverable, and a
+    // partially-verified run does not get shipped piecemeal. The failure
+    // report (verdict, failed checks, their output) is still reachable
+    // through GET /api/runs/{run_id}/steps/{step_id}/receipt.
+    if db.run_has_failed_step(run_id) {
         return Err((
             StatusCode::CONFLICT,
             Json(ErrorResponse {
-                error: "This task failed verification and was refunded; its changes are not delivered. See the failure report.".into(),
+                error: "verification_failed: this task failed verification; its changes are not delivered. See the failure report.".into(),
+            }),
+        ));
+    }
+
+    // A step whose verification hasn't sealed yet could still come back
+    // Failed, so the run cannot be delivered while one is in flight either.
+    // Checked after the Failed case above so a step that already has a
+    // sealed Failed verdict reports as failed, not pending, even if a retry
+    // for it is currently running.
+    if db.run_has_pending_verification(run_id) {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(ErrorResponse {
+                error: "verification_pending: this run's verification has not finished yet; try again once it completes.".into(),
             }),
         ));
     }
@@ -1663,12 +1678,23 @@ mod validate_run_for_pr_tests {
         }
     }
 
-    fn seal_verification(db: &Database, run_id: &str, step_id: &str, verdict: Verdict) -> String {
+    /// Seals `attempt` for `step_id` with the given verdict, driving the real
+    /// claim/record/finish path rather than hand-seeding ledger rows. Billing
+    /// is deliberately not touched here: a `Failed` verdict is unbilled in
+    /// production (`billing_binding::BillingEffect::None`), and the gate
+    /// under test must not depend on billing state either way.
+    fn seal_verification_attempt(
+        db: &Database,
+        run_id: &str,
+        step_id: &str,
+        attempt: i64,
+        verdict: Verdict,
+    ) -> String {
         let specs = vec![verdict_spec("check-1")];
         db.save_check_specs(run_id, step_id, &specs)
             .expect("freeze specs");
         let vid = db
-            .claim_verification(run_id, step_id, 1, "tree-hash", "img@sha256:1")
+            .claim_verification(run_id, step_id, attempt, "tree-hash", "img@sha256:1")
             .expect("claim verification");
         let outcome = if matches!(verdict, Verdict::Failed) {
             CheckOutcome::Failed
@@ -1681,62 +1707,81 @@ mod validate_run_for_pr_tests {
         vid
     }
 
+    fn seal_verification(db: &Database, run_id: &str, step_id: &str, verdict: Verdict) -> String {
+        seal_verification_attempt(db, run_id, step_id, 1, verdict)
+    }
+
     #[tokio::test]
-    async fn a_failed_and_refunded_run_is_refused_with_409() {
+    async fn a_failed_run_is_refused_with_409() {
         let (_dir, state) = test_state().await;
         let db = state.db.as_ref().unwrap();
         let run_id = make_run(db, "user-1", "step-1");
-        let vid = seal_verification(db, &run_id, "step-1", Verdict::Failed);
-
-        db.init_credit_balance("user-1", 100).expect("balance");
-        let charge = cortex_core::billing_binding::ChargeKey::for_verification(&vid);
-        db.deduct_credits("user-1", 30, "work", &charge)
-            .expect("charge");
-        db.refund_credits(
-            "user-1",
-            &charge,
-            &cortex_core::billing_binding::RefundKey::for_verification(&vid),
-            "failed",
-        )
-        .expect("refund");
+        seal_verification(db, &run_id, "step-1", Verdict::Failed);
 
         let err = validate_run_for_pr(db, "user-1", &run_id)
-            .expect_err("a refunded run's changes must not be handed over");
+            .expect_err("a failed run's changes must not be handed over");
         assert_eq!(err.0, StatusCode::CONFLICT);
-        assert_eq!(
-            err.1 .0.error,
-            "This task failed verification and was refunded; its changes are not delivered. See the failure report."
+        assert!(
+            err.1 .0.error.starts_with("verification_failed:"),
+            "got: {}",
+            err.1 .0.error
         );
     }
 
     #[tokio::test]
-    async fn a_verified_and_charged_run_clears_the_refund_gate() {
+    async fn a_verified_run_clears_the_gate() {
         let (_dir, state) = test_state().await;
         let db = state.db.as_ref().unwrap();
         let run_id = make_run(db, "user-1", "step-1");
-        let vid = seal_verification(db, &run_id, "step-1", Verdict::Verified);
+        seal_verification(db, &run_id, "step-1", Verdict::Verified);
 
-        db.init_credit_balance("user-1", 100).expect("balance");
-        db.deduct_credits(
-            "user-1",
-            30,
-            "work",
-            &cortex_core::billing_binding::ChargeKey::for_verification(&vid),
-        )
-        .expect("charge");
+        let (_goal, branch) = match validate_run_for_pr(db, "user-1", &run_id) {
+            Ok(ok) => ok,
+            Err((status, body)) => {
+                panic!("a verified run must clear the gate: {status} {}", body.0.error)
+            }
+        };
+        assert_eq!(branch, "cortex/do-the-thing");
+    }
 
-        // The gate this test protects is specifically the 409 for a failed
-        // and refunded run. A verified, charged run may still fail later for
-        // reasons unrelated to this fix (no GitHub token, say) -- that a call
-        // was rejected here does not tell us this gate is broken, only
-        // that a 409 must never be it.
-        match validate_run_for_pr(db, "user-1", &run_id) {
-            Ok((_goal, branch)) => assert_eq!(branch, "cortex/do-the-thing"),
-            Err((status, _)) => assert_ne!(
-                status,
-                StatusCode::CONFLICT,
-                "a verified, charged run must never be withheld as though it were refunded"
+    #[tokio::test]
+    async fn a_step_failed_then_retried_to_verified_clears_the_gate() {
+        // Latest attempt wins: a step that failed once but was retried to a
+        // sealed `Verified` attempt must not withhold the run.
+        let (_dir, state) = test_state().await;
+        let db = state.db.as_ref().unwrap();
+        let run_id = make_run(db, "user-1", "step-1");
+        seal_verification_attempt(db, &run_id, "step-1", 1, Verdict::Failed);
+        seal_verification_attempt(db, &run_id, "step-1", 2, Verdict::Verified);
+
+        let (_goal, branch) = match validate_run_for_pr(db, "user-1", &run_id) {
+            Ok(ok) => ok,
+            Err((status, body)) => panic!(
+                "a retried, now-verified step must clear the gate: {status} {}",
+                body.0.error
             ),
-        }
+        };
+        assert_eq!(branch, "cortex/do-the-thing");
+    }
+
+    #[tokio::test]
+    async fn a_step_mid_verification_is_refused_as_pending_with_409() {
+        let (_dir, state) = test_state().await;
+        let db = state.db.as_ref().unwrap();
+        let run_id = make_run(db, "user-1", "step-1");
+        // Specs frozen and an attempt claimed, but never sealed.
+        db.save_check_specs(&run_id, "step-1", &[verdict_spec("check-1")])
+            .expect("freeze specs");
+        db.claim_verification(&run_id, "step-1", 1, "tree-hash", "img@sha256:1")
+            .expect("claim verification");
+
+        let err = validate_run_for_pr(db, "user-1", &run_id)
+            .expect_err("a run mid-verification must not be handed over");
+        assert_eq!(err.0, StatusCode::CONFLICT);
+        assert!(
+            err.1 .0.error.starts_with("verification_pending:"),
+            "got: {}",
+            err.1 .0.error
+        );
     }
 }

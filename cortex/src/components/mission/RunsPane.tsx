@@ -23,7 +23,7 @@ import {
   type RunSummary,
 } from '../../lib/cortexApi';
 import { EmptyState, ErrorState, PaneHeader, SkeletonRows, StatusChip, StatusIcon } from './ui';
-import { hasFailedRefundedStep } from './runVerdict';
+import { hasFailedStep, hasPendingVerification } from './runVerdict';
 
 /**
  * Runs — pane one of mission control (SURFACE.md).
@@ -433,13 +433,25 @@ export default function RunsPane() {
                       request is the moment this run's work leaves the machine
                       and asks a person to look at it, so what was and was not
                       checked belongs above the button, not after it. */}
-                  {detail.status && SHIPPABLE.has(detail.status) && hasFailedRefundedStep(detail.steps) && (
+                  {detail.status && SHIPPABLE.has(detail.status) && hasFailedStep(detail.steps) && (
                     <p className="t-micro mt-3 rounded-lg border border-[var(--err-line)] bg-[var(--err-soft)] px-3 py-2.5 text-[var(--err-strong)]">
-                      This task failed verification and was refunded; its changes are not
-                      delivered. See the failure report.
+                      This task failed verification; its changes are not delivered. See the
+                      failure report.
                     </p>
                   )}
-                  {detail.status && SHIPPABLE.has(detail.status) && !hasFailedRefundedStep(detail.steps) && (
+                  {detail.status &&
+                    SHIPPABLE.has(detail.status) &&
+                    !hasFailedStep(detail.steps) &&
+                    hasPendingVerification(detail.steps) && (
+                      <p className="t-micro mt-3 rounded-lg border border-[var(--line)] bg-[var(--surface)] px-3 py-2.5 text-[var(--muted)]">
+                        Verification is still running for this task; the pull request can't be
+                        opened until it finishes.
+                      </p>
+                    )}
+                  {detail.status &&
+                    SHIPPABLE.has(detail.status) &&
+                    !hasFailedStep(detail.steps) &&
+                    !hasPendingVerification(detail.steps) && (
                     <div className="mt-3 rounded-lg border border-[var(--line)] bg-[var(--surface)] px-3 py-2.5">
                       {pr?.runId === detail.id ? (
                         <a

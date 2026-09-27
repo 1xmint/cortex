@@ -1097,34 +1097,51 @@ impl Database {
         })
     }
 
-    /// Whether any step of this run was refunded because its independent
-    /// verdict was `Failed`.
+    /// Whether the latest **sealed** verdict for any step of this run is
+    /// `Failed`.
     ///
-    /// A refunded task's work must not still reach the customer through a
-    /// pull request — that would let them collect both the refund and the
-    /// deliverable. This walks every step the run ever had, recomputes each
-    /// one's verdict the same way `get_receipt` does (from the frozen specs
-    /// and recorded executions, never from a status column that could drift),
-    /// and asks the ledger — not a status flag — whether a refund actually
-    /// landed for it. Both facts have to agree: a `Failed` verdict that for
-    /// some reason was never refunded (a ledger write failure, say) does not
-    /// trip this, because the owner's rule is specifically about failed *and*
-    /// refunded work, and a false block would need its own report.
+    /// A run whose latest sealed verdict for any step is `Failed` must not be
+    /// delivered through a pull request, whatever the ledger says about
+    /// billing — billing is a separate concern (today a failed verdict is
+    /// simply unbilled; that is expected to change to charging raw cost, and
+    /// this gate must not depend on which of those is currently true). This
+    /// walks every step the run ever had and recomputes each one's *latest*
+    /// verdict the same way `get_receipt` does (from the frozen specs and
+    /// recorded executions, never from a status column that could drift):
+    /// `get_receipt` already orders by `attempt DESC` over sealed
+    /// (`finished_at IS NOT NULL`) attempts, so a step that failed and was
+    /// then retried to a `Verified` attempt reads as `Verified` here, not
+    /// `Failed` — latest attempt wins.
     ///
-    /// One step failing and refunding blocks the whole run's PR — a run is a
-    /// single deliverable, so partial delivery is not offered as a fallback.
-    pub fn run_has_failed_refunded_step(&self, run_id: &str) -> bool {
-        use cortex_core::billing_binding::RefundKey;
-
+    /// One step's latest verdict reading `Failed` blocks the whole run's
+    /// PR — a run is a single deliverable, so partial delivery is not offered
+    /// as a fallback.
+    pub fn run_has_failed_step(&self, run_id: &str) -> bool {
         for (step_id, _status) in self.get_all_step_statuses(run_id) {
             let Some(receipt) = self.get_receipt(run_id, &step_id) else {
                 continue;
             };
-            if receipt.gate.verdict != Verdict::Failed {
+            if receipt.gate.verdict == Verdict::Failed {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Whether any step of this run has frozen check specs but no sealed
+    /// verdict yet — i.e. verification is still in flight for it.
+    ///
+    /// A run must not be delivered while a step's verification could still
+    /// land on `Failed`. `load_check_specs` is non-empty exactly when a
+    /// verification was requested for the step (specs are frozen before the
+    /// first attempt is claimed); `get_receipt` returning `None` despite that
+    /// means no attempt has sealed yet.
+    pub fn run_has_pending_verification(&self, run_id: &str) -> bool {
+        for (step_id, _status) in self.get_all_step_statuses(run_id) {
+            if self.load_check_specs(run_id, &step_id).is_empty() {
                 continue;
             }
-            let refund_key = RefundKey::for_verification(&receipt.verification_id);
-            if self.ledger_has_key(refund_key.as_str()) {
+            if self.get_receipt(run_id, &step_id).is_none() {
                 return true;
             }
         }
@@ -1496,7 +1513,7 @@ mod tests {
         assert_eq!(balance.pack_remaining, 0);
     }
 
-    // --- run_has_failed_refunded_step ---
+    // --- run_has_failed_step / run_has_pending_verification ---
 
     fn verdict_spec(id: &str) -> CheckSpec {
         CheckSpec {
@@ -1524,8 +1541,8 @@ mod tests {
         }
     }
 
-    /// A run row and one step under it, the minimum
-    /// `run_has_failed_refunded_step` needs to have anything to walk --
+    /// A run row and one step under it, the minimum `run_has_failed_step` /
+    /// `run_has_pending_verification` need to have anything to walk --
     /// `get_all_step_statuses` reads from `steps`, not from the verification
     /// tables.
     fn insert_run_and_step(db: &Database, run_id: &str, step_id: &str) {
@@ -1544,15 +1561,20 @@ mod tests {
         .expect("insert step");
     }
 
-    /// Seals a verification for the given step with the given verdict and
-    /// returns its verification id, so a caller can then refund (or not)
-    /// against it.
-    fn seal_verification(db: &Database, run_id: &str, step_id: &str, verdict: Verdict) -> String {
+    /// Seals `attempt` for the given step with the given verdict, driving the
+    /// real claim/record/finish path, and returns the verification id.
+    fn seal_verification_attempt(
+        db: &Database,
+        run_id: &str,
+        step_id: &str,
+        attempt: i64,
+        verdict: Verdict,
+    ) -> String {
         let specs = vec![verdict_spec("check-1")];
         db.save_check_specs(run_id, step_id, &specs)
             .expect("freeze specs");
         let vid = db
-            .claim_verification(run_id, step_id, 1, "tree-hash", "img@sha256:1")
+            .claim_verification(run_id, step_id, attempt, "tree-hash", "img@sha256:1")
             .expect("claim verification");
         let outcome = if matches!(verdict, Verdict::Failed) {
             CheckOutcome::Failed
@@ -1565,45 +1587,74 @@ mod tests {
         vid
     }
 
-    #[test]
-    fn a_failed_step_that_was_never_refunded_does_not_withhold_the_pr() {
-        // The owner's rule is specifically about failed *and* refunded work.
-        // A `Failed` verdict that for some reason never got refunded (a
-        // ledger write failure, say) must not trip this -- a false block
-        // would need its own report, same as a false PR.
-        let db = test_db();
-        insert_run_and_step(&db, "run-unrefunded", "step-unrefunded");
-        seal_verification(&db, "run-unrefunded", "step-unrefunded", Verdict::Failed);
-
-        assert!(!db.run_has_failed_refunded_step("run-unrefunded"));
+    fn seal_verification(db: &Database, run_id: &str, step_id: &str, verdict: Verdict) -> String {
+        seal_verification_attempt(db, run_id, step_id, 1, verdict)
     }
 
     #[test]
-    fn a_failed_and_refunded_step_withholds_the_run_s_pr() {
+    fn a_failed_step_withholds_the_run_s_pr() {
+        // No billing state is seeded here: a `Failed` verdict is unbilled in
+        // production, and the gate must trip on the verdict alone.
         let db = test_db();
-        insert_run_and_step(&db, "run-refunded", "step-refunded");
-        let vid = seal_verification(&db, "run-refunded", "step-refunded", Verdict::Failed);
+        insert_run_and_step(&db, "run-failed", "step-failed");
+        seal_verification(&db, "run-failed", "step-failed", Verdict::Failed);
 
-        let user = subscriber(&db, 100);
-        let charge = ChargeKey::for_verification(&vid);
-        db.deduct_credits(user, 30, "work", &charge)
-            .expect("charge");
-        db.refund_credits(user, &charge, &RefundKey::for_verification(&vid), "failed")
-            .expect("refund");
-
-        assert!(db.run_has_failed_refunded_step("run-refunded"));
+        assert!(db.run_has_failed_step("run-failed"));
     }
 
     #[test]
-    fn a_verified_and_charged_step_does_not_withhold_the_run_s_pr() {
+    fn a_verified_step_does_not_withhold_the_run_s_pr() {
         let db = test_db();
         insert_run_and_step(&db, "run-verified", "step-verified");
-        let vid = seal_verification(&db, "run-verified", "step-verified", Verdict::Verified);
+        seal_verification(&db, "run-verified", "step-verified", Verdict::Verified);
 
-        let user = subscriber(&db, 100);
-        db.deduct_credits(user, 30, "work", &ChargeKey::for_verification(&vid))
-            .expect("charge");
+        assert!(!db.run_has_failed_step("run-verified"));
+    }
 
-        assert!(!db.run_has_failed_refunded_step("run-verified"));
+    #[test]
+    fn a_step_failed_then_retried_to_verified_does_not_withhold_the_run_s_pr() {
+        // Latest attempt wins: `get_receipt` orders by attempt DESC over
+        // sealed attempts, so a retried step reads as its newest verdict.
+        let db = test_db();
+        insert_run_and_step(&db, "run-retried", "step-retried");
+        seal_verification_attempt(&db, "run-retried", "step-retried", 1, Verdict::Failed);
+        seal_verification_attempt(&db, "run-retried", "step-retried", 2, Verdict::Verified);
+
+        assert!(!db.run_has_failed_step("run-retried"));
+    }
+
+    #[test]
+    fn a_step_with_frozen_specs_and_no_sealed_verdict_is_pending() {
+        let db = test_db();
+        insert_run_and_step(&db, "run-pending", "step-pending");
+        db.save_check_specs("run-pending", "step-pending", &[verdict_spec("check-1")])
+            .expect("freeze specs");
+        db.claim_verification("run-pending", "step-pending", 1, "tree-hash", "img@sha256:1")
+            .expect("claim verification");
+
+        assert!(db.run_has_pending_verification("run-pending"));
+        assert!(
+            !db.run_has_failed_step("run-pending"),
+            "an unsealed attempt must not read as a failed verdict"
+        );
+    }
+
+    #[test]
+    fn a_step_with_no_frozen_specs_is_not_pending() {
+        // A step with no verification requested at all (e.g. a read-only
+        // step) must not be mistaken for one still being verified.
+        let db = test_db();
+        insert_run_and_step(&db, "run-no-checks", "step-no-checks");
+
+        assert!(!db.run_has_pending_verification("run-no-checks"));
+    }
+
+    #[test]
+    fn a_sealed_step_is_not_pending() {
+        let db = test_db();
+        insert_run_and_step(&db, "run-sealed", "step-sealed");
+        seal_verification(&db, "run-sealed", "step-sealed", Verdict::Verified);
+
+        assert!(!db.run_has_pending_verification("run-sealed"));
     }
 }
