@@ -5727,7 +5727,9 @@ impl Database {
         // installation must never keep a stale Anthropic rate (the bug this
         // whole revision function exists to close). OpenAI/other providers
         // keep the narrower `CORRECTED` allowlist above until their rates are
-        // similarly pinned to a cited source.
+        // similarly pinned to a cited source. Because claude rows follow the
+        // seed on every boot, an Anthropic price change must be a code change
+        // to `pricing::seed_models`, never a hand edit of the database.
         let Some(mut list) = self.active_price_list() else {
             return;
         };

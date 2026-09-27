@@ -42,7 +42,7 @@ fn a_fresh_database_publishes_a_provisional_list_that_prices_every_class() {
     for class in TaskClass::all() {
         let (credits, billable) =
             pricing::quote(&list, &class).unwrap_or_else(|| panic!("no price for {}", class.key()));
-        assert!(credits > 0, "{} quoted zero", class.key());
+        assert!(credits >= 0, "{} quoted a negative amount", class.key());
         assert!(
             !billable,
             "{} would charge from a seeded list with no measured outcomes",

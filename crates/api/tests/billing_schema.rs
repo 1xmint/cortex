@@ -188,7 +188,9 @@ fn a_stale_installed_anthropic_rate_is_corrected_on_reopen_not_kept_forever() {
                  WHEN provider = 'claude' AND model_id = 'claude-sonnet-5' THEN 15000
                  WHEN provider = 'claude' AND model_id = 'claude-haiku-4-5' THEN 4000
                  ELSE output_micros_per_1k END,
-            cache_read_bp, context_window, capability_class
+            CASE WHEN provider = 'claude' AND model_id = 'claude-opus-5-5' THEN 1000
+                 ELSE cache_read_bp END,
+            context_window, capability_class
          FROM price_list_models WHERE price_list_id = (SELECT id FROM price_lists WHERE version = 1)",
         [],
     )
