@@ -1688,7 +1688,7 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_step_withholds_the_run_s_pr() {
+    fn a_failed_step_marks_the_run_for_a_draft_pr() {
         // No billing state is seeded here: a `Failed` verdict is unbilled in
         // production, and the gate must trip on the verdict alone.
         let db = test_db();
@@ -1699,7 +1699,7 @@ mod tests {
     }
 
     #[test]
-    fn a_verified_step_does_not_withhold_the_run_s_pr() {
+    fn a_verified_step_does_not_mark_the_run_for_a_draft_pr() {
         let db = test_db();
         insert_run_and_step(&db, "run-verified", "step-verified");
         seal_verification(&db, "run-verified", "step-verified", Verdict::Verified);
@@ -1708,7 +1708,7 @@ mod tests {
     }
 
     #[test]
-    fn a_step_failed_then_retried_to_verified_does_not_withhold_the_run_s_pr() {
+    fn a_step_failed_then_retried_to_verified_does_not_mark_the_run_for_a_draft_pr() {
         // Latest attempt wins: `get_receipt` orders by attempt DESC over
         // sealed attempts, so a retried step reads as its newest verdict.
         let db = test_db();

@@ -107,11 +107,12 @@ jobs:
       #
       # 26 -> 33 with the seven in
       # `src/components/mission/RunsPane.hasFailedStep.test.ts`, which cover
-      # the guards that hide "Open pull request" for a run with a step whose
-      # latest verdict is `Failed`, and that show a pending message instead
-      # while a step is still verifying -- the frontend half of withholding a
-      # failed task's deliverable (POST /api/runs/{id}/pr enforces the same
-      # rule server-side and answers 409 for both cases).
+      # the guards that mark "Open pull request" as delivering a draft PR
+      # titled `[failed checks] ...` for a run with a step whose latest
+      # verdict is `Failed`, and that show a pending message instead while a
+      # step is still verifying -- the frontend half of the same rule
+      # `POST /api/runs/{id}/pr` enforces server-side: a failed verdict still
+      # gets delivered (as a draft), only a still-pending verdict answers 409.
       #
       # 33 -> 41 with eight more in the same file: `hasPendingVerification`
       # now only counts a `delivered` or `verifying` step as in flight, so a

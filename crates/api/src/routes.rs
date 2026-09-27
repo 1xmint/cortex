@@ -862,16 +862,21 @@ fn build_pr_body(
     branch: &str,
     db: &crate::db::Database,
     authority_scope_id: Option<&str>,
+    is_failed: bool,
     failed_checks: &[String],
 ) -> String {
     let steps = db.get_all_step_statuses(run_id);
     let mut body =
         format!("## Cortex Run `{run_id}`\n\n**Goal:** {goal}\n\n**Branch:** `{branch}`\n");
 
-    if !failed_checks.is_empty() {
-        body.push_str(&format!(
-            "\n> **Delivered as a draft with failed checks.** This attempt failed verification; the following checks did not pass: {}. The work is still delivered — review before merging.\n",
+    if is_failed {
+        let checks = if failed_checks.is_empty() {
+            "check names unavailable; see the verification receipt".to_string()
+        } else {
             failed_checks.join(", ")
+        };
+        body.push_str(&format!(
+            "\n> **Delivered as a draft with failed checks.** This attempt failed verification; the following checks did not pass: {checks}. The work is still delivered — review before merging.\n",
         ));
     }
 
@@ -988,6 +993,40 @@ fn failed_pr_title(title: String, is_failed: bool) -> String {
     } else {
         title
     }
+}
+
+/// Derive the PR title and draft flag together from whether the run has a
+/// failed step: `create_pr_core` uses this single decision point rather than
+/// letting the title prefix and the draft flag drift apart.
+fn pr_title_and_draft(base_title: String, is_failed: bool) -> (String, bool) {
+    (failed_pr_title(base_title, is_failed), is_failed)
+}
+
+/// Build the `gh pr create` argv for the CLI fallback path. Pulled out so the
+/// draft flag's wiring can be asserted directly, without shelling out to `gh`.
+fn gh_pr_create_args(
+    title: &str,
+    body: &str,
+    base: &str,
+    head: &str,
+    draft: bool,
+) -> Vec<String> {
+    let mut args = vec![
+        "pr".to_string(),
+        "create".to_string(),
+        "--title".to_string(),
+        title.to_string(),
+        "--body".to_string(),
+        body.to_string(),
+        "--base".to_string(),
+        base.to_string(),
+        "--head".to_string(),
+        head.to_string(),
+    ];
+    if draft {
+        args.push("--draft".to_string());
+    }
+    args
 }
 
 /// Truncate a string, appending "..." if it exceeds `max_len`.
@@ -1119,7 +1158,7 @@ pub(crate) async fn create_pr_core(
     }
 
     // Build PR metadata
-    let title = failed_pr_title(
+    let (title, draft) = pr_title_and_draft(
         title.unwrap_or_else(|| format!("cortex: {goal}")),
         is_failed,
     );
@@ -1132,6 +1171,7 @@ pub(crate) async fn create_pr_core(
         &branch,
         db,
         authority_scope_id.as_deref(),
+        is_failed,
         &failed_checks,
     );
 
@@ -1139,7 +1179,7 @@ pub(crate) async fn create_pr_core(
     if let Some(gh_client) = &state.github_client {
         if let Some((owner, repo)) = github::parse_github_remote(&state.workspace_dir) {
             match gh_client
-                .create_pull_request(&owner, &repo, &title, &body, &branch, base, is_failed)
+                .create_pull_request(&owner, &repo, &title, &body, &branch, base, draft)
                 .await
             {
                 Ok(pr) => {
@@ -1160,12 +1200,7 @@ pub(crate) async fn create_pr_core(
     }
 
     // Fallback: create PR via gh CLI
-    let mut gh_args = vec![
-        "pr", "create", "--title", &title, "--body", &body, "--base", base, "--head", &branch,
-    ];
-    if is_failed {
-        gh_args.push("--draft");
-    }
+    let gh_args = gh_pr_create_args(&title, &body, base, &branch, draft);
     let pr_output = std::process::Command::new("gh")
         .args(&gh_args)
         .current_dir(&state.workspace_dir)
@@ -1772,8 +1807,13 @@ mod validate_run_for_pr_tests {
         let run_id = make_run(db, "user-1", "step-1");
         seal_verification(db, &run_id, "step-1", Verdict::Failed);
 
-        let (goal, branch) = validate_run_for_pr(db, "user-1", &run_id)
-            .expect("a failed run's changes are still delivered, not withheld");
+        let (goal, branch) = match validate_run_for_pr(db, "user-1", &run_id) {
+            Ok(ok) => ok,
+            Err((status, body)) => panic!(
+                "a failed run must still be delivered: {status} {}",
+                body.0.error
+            ),
+        };
         assert_eq!(branch, "cortex/do-the-thing");
 
         assert!(db.run_has_failed_step(&run_id));
@@ -1783,10 +1823,84 @@ mod validate_run_for_pr_tests {
         let title = failed_pr_title(format!("cortex: {goal}"), db.run_has_failed_step(&run_id));
         assert!(title.starts_with("[failed checks] "), "got: {title}");
 
-        let body = build_pr_body(&run_id, &goal, &branch, db, None, &failed_checks);
+        let body = build_pr_body(&run_id, &goal, &branch, db, None, true, &failed_checks);
         assert!(
             body.contains("Delivered as a draft with failed checks") && body.contains("check-1"),
             "body must name the failed checks: {body}"
+        );
+    }
+
+    /// When a step failed but no check names were recorded (e.g. an
+    /// execution-level failure with nothing sealed to name), the body must
+    /// still show the draft banner, pointing at the verification receipt
+    /// instead of an empty list.
+    #[tokio::test]
+    async fn a_failed_run_with_no_named_checks_points_at_the_verification_receipt() {
+        let (_dir, state) = test_state().await;
+        let db = state.db.as_ref().unwrap();
+        let run_id = make_run(db, "user-1", "step-1");
+
+        let body = build_pr_body(
+            &run_id,
+            "do the thing",
+            "cortex/do-the-thing",
+            db,
+            None,
+            true,
+            &[],
+        );
+        assert!(
+            body.contains("check names unavailable; see the verification receipt"),
+            "body must fall back to the receipt pointer when no check names are known: {body}"
+        );
+    }
+
+    /// `pr_title_and_draft` is the single decision point `create_pr_core`
+    /// uses for both the title prefix and the draft flag -- this test fails
+    /// if either half of that wiring is removed.
+    #[test]
+    fn pr_title_and_draft_marks_a_failed_run_as_a_draft_with_the_failed_checks_prefix() {
+        let (title, draft) = pr_title_and_draft("cortex: do the thing".to_string(), true);
+        assert!(title.starts_with("[failed checks] "), "got: {title}");
+        assert!(draft, "a failed run must open as a draft PR");
+    }
+
+    #[test]
+    fn pr_title_and_draft_leaves_a_verified_run_as_a_normal_pr() {
+        let (title, draft) = pr_title_and_draft("cortex: do the thing".to_string(), false);
+        assert_eq!(title, "cortex: do the thing");
+        assert!(!draft, "a verified run must not open as a draft PR");
+    }
+
+    /// `create_pr_core`'s `gh` CLI fallback path -- asserts the exact argv
+    /// so a dropped `--draft` push is caught here, not in production.
+    #[test]
+    fn gh_pr_create_args_includes_draft_flag_for_a_failed_run() {
+        let args = gh_pr_create_args(
+            "[failed checks] cortex: do the thing",
+            "body",
+            "main",
+            "cortex/do-the-thing",
+            true,
+        );
+        assert!(
+            args.iter().any(|a| a == "--draft"),
+            "failed run's argv must request a draft PR: {args:?}"
+        );
+    }
+
+    #[test]
+    fn gh_pr_create_args_omits_draft_flag_for_a_verified_run() {
+        let args = gh_pr_create_args(
+            "cortex: do the thing",
+            "body",
+            "main",
+            "cortex/do-the-thing",
+            false,
+        );
+        assert!(
+            !args.iter().any(|a| a == "--draft"),
+            "verified run's argv must not request a draft PR: {args:?}"
         );
     }
 
