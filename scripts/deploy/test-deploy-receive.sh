@@ -31,6 +31,17 @@
 #      sqlite3 does when ~/.sqliterc sets headers on) -> refused, not treated
 #      as schema 0.
 #   j. artifact SCHEMA file missing, or containing non-numeric text -> refused.
+#   k. artifact SCHEMA_FINGERPRINT differs from the recorded one, same SCHEMA
+#      version, no flag -> refused (catches a schema change that never bumped
+#      SCHEMA_VERSION).
+#   l. artifact fingerprints match the recorded ones -> proceeds, and the
+#      record is left holding those same fingerprints.
+#   m. no SCHEMA_DEPLOYED record at all (e.g. first deploy after this guard
+#      was added), no flag -> refused fail-closed.
+#   n. changed fingerprint, with --allow-migration -> proceeds, and
+#      SCHEMA_DEPLOYED is updated to the new fingerprints.
+#   o. changed fingerprint, with --allow-migration, but the health check
+#      fails after the swap -> rollback, and SCHEMA_DEPLOYED is NOT updated.
 #
 # Each refusal scenario asserts COMMIT and bin/ are left untouched.
 #
@@ -54,6 +65,15 @@ FIXTURE_DIR="$TMPROOT/fixture"
 mkdir -p "$STUBBIN" "$FIXTURE_DIR"
 
 OLD_COMMIT="111111111111111111111111111111111111111a"
+# Default fingerprints used by every scenario that isn't specifically testing
+# fingerprint behavior: make_artifact writes these unless told otherwise, and
+# setup_install_root records them as already-deployed, so scenarios a-j (which
+# are about SCHEMA version, not fingerprints) see a matching fingerprint and
+# are unaffected by the 2c check.
+FP_DEFAULT="0xaaaaaaaaaaaaaaaa"
+ROUTING_FP_DEFAULT="0xbbbbbbbbbbbbbbbb"
+FP_CHANGED="0xcccccccccccccccc"
+ROUTING_FP_CHANGED="0xdddddddddddddddd"
 PASS=0
 FAIL=0
 
@@ -177,6 +197,10 @@ setup_install_root() {
   printf '%s' "$OLD_COMMIT" >"$INSTALL_ROOT/COMMIT"
   (cd "$INSTALL_ROOT" && sha256sum bin/* COMMIT >SHA256SUMS)
   printf '%s' "$live_schema" >"$INSTALL_ROOT/data/cortex.db"
+  # Fixture stand-in for the previous deploy's recorded fingerprint (see
+  # deploy-receive.sh's 2c check and SCHEMA_DEPLOYED). Scenarios that
+  # specifically exercise the fingerprint guard overwrite or remove this.
+  printf '%s\n%s\n' "$FP_DEFAULT" "$ROUTING_FP_DEFAULT" >"$INSTALL_ROOT/SCHEMA_DEPLOYED"
   cp -- "$SCRIPT_SRC" "$INSTALL_ROOT/deploy-receive.sh"
   chmod +x "$INSTALL_ROOT/deploy-receive.sh"
   rm -f "$FIXTURE_DIR/health_fail"
@@ -184,6 +208,7 @@ setup_install_root() {
 
 make_artifact() {
   local schema="$1" commit="$2" outfile="$3"
+  local fp="${4:-$FP_DEFAULT}" routing_fp="${5:-$ROUTING_FP_DEFAULT}"
   local work
   work="$(mktemp -d)"
   mkdir -p "$work/bin" "$work/www"
@@ -193,8 +218,10 @@ make_artifact() {
   echo "new index" >"$work/www/index.html"
   printf '%s' "$commit" >"$work/COMMIT"
   printf '%s' "$schema" >"$work/SCHEMA"
-  (cd "$work" && sha256sum bin/* COMMIT SCHEMA >SHA256SUMS)
-  tar czf "$outfile" -C "$work" COMMIT SCHEMA SHA256SUMS bin www
+  printf '%s' "$fp" >"$work/SCHEMA_FINGERPRINT"
+  printf '%s' "$routing_fp" >"$work/ROUTING_SCHEMA_FINGERPRINT"
+  (cd "$work" && sha256sum bin/* COMMIT SCHEMA SCHEMA_FINGERPRINT ROUTING_SCHEMA_FINGERPRINT >SHA256SUMS)
+  tar czf "$outfile" -C "$work" COMMIT SCHEMA SCHEMA_FINGERPRINT ROUTING_SCHEMA_FINGERPRINT SHA256SUMS bin www
   rm -rf "$work"
 }
 
@@ -386,6 +413,71 @@ assert_eq "$RC_J2" "1" "j. exit code is non-zero (SCHEMA non-numeric)"
 assert_contains "SCHEMA is not a positive integer" "j. non-numeric-SCHEMA message printed"
 assert_eq "$(cat "$INSTALL_ROOT/COMMIT")" "$OLD_COMMIT" "j. COMMIT untouched (SCHEMA non-numeric)"
 assert_eq "$(cat "$INSTALL_ROOT/bin/cortex-server")" "old binary $OLD_COMMIT" "j. bin/ untouched (SCHEMA non-numeric)"
+
+# --- scenario k: fingerprint changed, same SCHEMA version, no flag ----------
+note "k. SCHEMA_FINGERPRINT changed, same SCHEMA version, no flag -> refusal"
+setup_install_root 71
+ARTIFACT_K="$TMPROOT/k.tgz"
+make_artifact 71 "dddddddddddddddddddddddddddddddddddddddd" "$ARTIFACT_K" "$FP_CHANGED" "$ROUTING_FP_CHANGED"
+printf '%s' "dddddddddddddddddddddddddddddddddddddddd" >"$FIXTURE_DIR/expected_commit"
+RC_K="$(run_deploy "$ARTIFACT_K")"
+assert_eq "$RC_K" "1" "k. exit code is non-zero"
+assert_contains "artifact schema fingerprint differs from the last deployed fingerprint" "k. fingerprint-mismatch refusal message printed"
+assert_eq "$(cat "$INSTALL_ROOT/COMMIT")" "$OLD_COMMIT" "k. COMMIT untouched"
+assert_eq "$(cat "$INSTALL_ROOT/bin/cortex-server")" "old binary $OLD_COMMIT" "k. bin/ untouched"
+assert_eq "$(cat "$INSTALL_ROOT/SCHEMA_DEPLOYED")" "$(printf '%s\n%s' "$FP_DEFAULT" "$ROUTING_FP_DEFAULT")" "k. SCHEMA_DEPLOYED record untouched"
+
+# --- scenario l: fingerprints match the recorded ones -> proceeds -----------
+note "l. SCHEMA_FINGERPRINT matches recorded value -> proceeds"
+setup_install_root 71
+ARTIFACT_L="$TMPROOT/l.tgz"
+NEW_COMMIT_L="eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+make_artifact 71 "$NEW_COMMIT_L" "$ARTIFACT_L"
+printf '%s' "$NEW_COMMIT_L" >"$FIXTURE_DIR/expected_commit"
+RC_L="$(run_deploy "$ARTIFACT_L")"
+assert_eq "$RC_L" "0" "l. exit code is 0"
+assert_eq "$(cat "$INSTALL_ROOT/COMMIT")" "$NEW_COMMIT_L" "l. COMMIT swapped in"
+assert_eq "$(cat "$INSTALL_ROOT/SCHEMA_DEPLOYED")" "$(printf '%s\n%s' "$FP_DEFAULT" "$ROUTING_FP_DEFAULT")" "l. SCHEMA_DEPLOYED still holds the matching fingerprints"
+
+# --- scenario m: no SCHEMA_DEPLOYED record at all, no flag -> refused -------
+note "m. no SCHEMA_DEPLOYED record, no flag -> refused fail-closed"
+setup_install_root 71
+rm -f "$INSTALL_ROOT/SCHEMA_DEPLOYED"
+ARTIFACT_M="$TMPROOT/m.tgz"
+make_artifact 71 "ffffffffffffffffffffffffffffffffffffffff" "$ARTIFACT_M"
+printf '%s' "ffffffffffffffffffffffffffffffffffffffff" >"$FIXTURE_DIR/expected_commit"
+RC_M="$(run_deploy "$ARTIFACT_M")"
+assert_eq "$RC_M" "1" "m. exit code is non-zero"
+assert_contains "no recorded schema fingerprint at" "m. no-record refusal message printed"
+assert_eq "$(cat "$INSTALL_ROOT/COMMIT")" "$OLD_COMMIT" "m. COMMIT untouched"
+[ -e "$INSTALL_ROOT/SCHEMA_DEPLOYED" ] && bad "m. SCHEMA_DEPLOYED should still not exist" || ok "m. SCHEMA_DEPLOYED still absent"
+
+# --- scenario n: changed fingerprint, --allow-migration -> proceeds, --------
+# and the record is updated to the new fingerprints.
+note "n. SCHEMA_FINGERPRINT changed, with --allow-migration -> proceeds and record updates"
+setup_install_root 71
+ARTIFACT_N="$TMPROOT/n.tgz"
+NEW_COMMIT_N="1111111111111111111111111111111111111111"
+make_artifact 71 "$NEW_COMMIT_N" "$ARTIFACT_N" "$FP_CHANGED" "$ROUTING_FP_CHANGED"
+printf '%s' "$NEW_COMMIT_N" >"$FIXTURE_DIR/expected_commit"
+RC_N="$(run_deploy "$ARTIFACT_N" --allow-migration)"
+assert_eq "$RC_N" "0" "n. exit code is 0"
+assert_eq "$(cat "$INSTALL_ROOT/COMMIT")" "$NEW_COMMIT_N" "n. COMMIT swapped in"
+assert_eq "$(cat "$INSTALL_ROOT/SCHEMA_DEPLOYED")" "$(printf '%s\n%s' "$FP_CHANGED" "$ROUTING_FP_CHANGED")" "n. SCHEMA_DEPLOYED updated to the new fingerprints"
+
+# --- scenario o: changed fingerprint + --allow-migration, but a failed ------
+# health check rolls back — the record must NOT be updated.
+note "o. changed fingerprint, --allow-migration, health check fails -> rollback, record untouched"
+setup_install_root 71
+ARTIFACT_O="$TMPROOT/o.tgz"
+NEW_COMMIT_O="2222222222222222222222222222222222222222"
+make_artifact 71 "$NEW_COMMIT_O" "$ARTIFACT_O" "$FP_CHANGED" "$ROUTING_FP_CHANGED"
+printf '%s' "$NEW_COMMIT_O" >"$FIXTURE_DIR/expected_commit"
+: >"$FIXTURE_DIR/health_fail"
+RC_O="$(run_deploy "$ARTIFACT_O" --allow-migration)"
+assert_eq "$RC_O" "1" "o. exit code is non-zero"
+assert_eq "$(cat "$INSTALL_ROOT/COMMIT")" "$OLD_COMMIT" "o. COMMIT rolled back to old release"
+assert_eq "$(cat "$INSTALL_ROOT/SCHEMA_DEPLOYED")" "$(printf '%s\n%s' "$FP_DEFAULT" "$ROUTING_FP_DEFAULT")" "o. SCHEMA_DEPLOYED not updated after a failed deploy"
 
 note "summary"
 echo "$PASS passed, $FAIL failed"

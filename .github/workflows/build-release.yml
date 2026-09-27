@@ -124,7 +124,33 @@ jobs:
 
           echo "$schema_version" > out/SCHEMA
 
-          (cd out && sha256sum bin/* COMMIT SCHEMA > SHA256SUMS)
+          # SCHEMA_VERSION only advances when a migration author remembers to
+          # bump it, but crates/api/src/db/mod.rs also runs unconditional
+          # bootstrap DDL (ensure_social_tables, ensure_social_posts_fts)
+          # outside the numbered migrate_vN chain, so a schema change there
+          # would ship without SCHEMA_VERSION moving at all. SCHEMA_FINGERPRINT
+          # hashes the whole live schema instead (see
+          # schema_fingerprint_matches_pinned_value in that file) and
+          # deploy-receive.sh compares it against the last deployed value to
+          # catch exactly that case. Same idea for routing.db via
+          # ROUTING_SCHEMA_FINGERPRINT in crates/engine/src/store.rs. Fail
+          # loudly if either const can't be found rather than silently
+          # shipping an artifact the deploy guard can't reason about.
+          mapfile -t schema_fingerprints < <(grep -E '^pub const SCHEMA_FINGERPRINT: u64 = 0x[0-9a-fA-F]+;' crates/api/src/db/mod.rs | grep -oE '0x[0-9a-fA-F]+')
+          if [ "${#schema_fingerprints[@]}" -ne 1 ]; then
+            echo "::error::expected exactly one SCHEMA_FINGERPRINT const in crates/api/src/db/mod.rs, found ${#schema_fingerprints[@]}"
+            exit 1
+          fi
+          echo "${schema_fingerprints[0]}" > out/SCHEMA_FINGERPRINT
+
+          mapfile -t routing_schema_fingerprints < <(grep -E '^pub const ROUTING_SCHEMA_FINGERPRINT: u64 = 0x[0-9a-fA-F]+;' crates/engine/src/store.rs | grep -oE '0x[0-9a-fA-F]+')
+          if [ "${#routing_schema_fingerprints[@]}" -ne 1 ]; then
+            echo "::error::expected exactly one ROUTING_SCHEMA_FINGERPRINT const in crates/engine/src/store.rs, found ${#routing_schema_fingerprints[@]}"
+            exit 1
+          fi
+          echo "${routing_schema_fingerprints[0]}" > out/ROUTING_SCHEMA_FINGERPRINT
+
+          (cd out && sha256sum bin/* COMMIT SCHEMA SCHEMA_FINGERPRINT ROUTING_SCHEMA_FINGERPRINT > SHA256SUMS)
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:

@@ -251,42 +251,72 @@ database and then failed its health check, the database would be left ahead
 of the rolled-back binary — a state nothing here can safely repair on its
 own.
 
-So the build carries the schema version its migration chain ends at
+The guard is two independent checks, both of which have to pass for an
+automatic deploy to proceed. Either one refusing requires `--allow-migration`
+(or `deploy.yml`'s `allow_migration` input) to override.
+
+### Check 1: `SCHEMA_VERSION` vs. the live database's version
+
+The build carries the schema version its migration chain ends at
 (`SCHEMA_VERSION` in `crates/api/src/db/mod.rs`, written to `out/SCHEMA` by
 `build-release.yml`), and `deploy-receive.sh` compares that single number
 against the live database's `schema_version` before swapping anything in.
-This is a version-number comparison, not a diff of the schema itself — the
-guard trusts that `SCHEMA_VERSION` was bumped whenever the schema changed. Two
-tests hold up that trust: `schema_version_const_matches_what_migrations_actually_produce`
-and `schema_fingerprint_matches_pinned_value` in
-`crates/api/src/db/mod.rs` hash the whole schema a fresh boot produces
-(including `ensure_social_tables` and `ensure_social_posts_fts`, which run
-unconditionally on every boot outside the numbered migration chain) and fail
-the build if it drifts from a pinned fingerprint without `SCHEMA_VERSION`
-moving too.
+This is a version-number comparison, not a diff of the schema itself, and by
+itself it only catches a schema change if whoever made it also remembered to
+bump `SCHEMA_VERSION`.
 
-- **Artifact SCHEMA equal to the live version** — proceeds normally. This
-  means the two numbers match, not that the schemas were independently
-  verified identical; the fingerprint tests above are what keep a same-number
-  schema drift from happening in the first place.
-- **Artifact SCHEMA behind the live version** — refused outright, always: that
-  binary would run against a newer schema than it knows.
+- **Artifact SCHEMA equal to the live version** — this check passes.
+- **Artifact SCHEMA behind the live version** — refused outright, always, with
+  or without `--allow-migration`: that binary would run against a newer
+  schema than it knows.
 - **Artifact SCHEMA ahead of the live version** — refused unless the script
   was invoked with `--allow-migration`. The automatic `workflow_run` deploy
   path never passes this.
 
-`routing.db` (`crates/engine/src/store.rs`, opened by `crates/api/src/state.rs`)
-is a second SQLite database outside this guard entirely: it has no
-`SCHEMA_VERSION`-style counter, is not part of `out/SCHEMA`, and is not backed
-up by `deploy-receive.sh`. Its own schema is pinned the same way, by
-`schema_fingerprint_matches_pinned_value` in `crates/engine/src/store.rs`, but
-a change there is never checked or refused automatically at deploy time — an
-edit to `routing.db`'s schema must be deployed manually (`gh workflow run
-deploy.yml ... -f allow_migration=true`, as below) and the deploy confirmed by
-hand, the same way a change to `cortex.db` past this guard would be.
+### Check 2: schema fingerprint vs. the last deployed fingerprint
 
-To deploy a build that migrates the schema, trigger `deploy.yml` by hand with
-`allow_migration` set:
+`SCHEMA_VERSION` is a number a migration author has to remember to move.
+`crates/api/src/db/mod.rs` also runs unconditional bootstrap DDL
+(`ensure_social_tables`, `ensure_social_posts_fts`, called from
+`apply_migrations` on every boot, outside the numbered `migrate_vN` chain)
+that can add or change a table or index without touching `SCHEMA_VERSION` at
+all — check 1 above would wave that straight through. So a second, independent
+check compares a fingerprint of the *entire* schema instead of a hand-maintained
+number:
+
+- `SCHEMA_FINGERPRINT` in `crates/api/src/db/mod.rs` and
+  `ROUTING_SCHEMA_FINGERPRINT` in `crates/engine/src/store.rs` each hash every
+  DDL statement `sqlite_master` reports for a fresh boot of `cortex.db` /
+  `routing.db` respectively. `schema_fingerprint_matches_pinned_value` in each
+  file fails the build if the live schema no longer matches the pinned
+  constant — see that test's failure message for what to do (update the
+  constant; this section is what to expect from the deploy guard once you do).
+- `build-release.yml` reads both constants and writes them to
+  `out/SCHEMA_FINGERPRINT` / `out/ROUTING_SCHEMA_FINGERPRINT` in the release
+  artifact, the same way it writes `out/SCHEMA`.
+- On the deploy host, `deploy-receive.sh` records the fingerprints of the last
+  successfully deployed build in `$INSTALL_ROOT/SCHEMA_DEPLOYED` (written only
+  after health and `/api/deploy-info` both confirm the new release is live —
+  a deploy that fails and rolls back never touches this file). Before
+  swapping anything in, it compares the artifact's fingerprints against that
+  record:
+  - **Fingerprints match the record** — this check passes, regardless of
+    whether `SCHEMA_VERSION` moved.
+  - **Fingerprints differ from the record** — refused unless invoked with
+    `--allow-migration`, even if `SCHEMA_VERSION` (check 1) did not change.
+    This is the case check 1 alone would miss.
+  - **No `SCHEMA_DEPLOYED` record exists yet** — refused unless invoked with
+    `--allow-migration`. This is fail-closed by design: the very first deploy
+    of `deploy-receive.sh` after this check was added has nothing to compare
+    against, so it needs one deliberate `--allow-migration` deploy to record
+    a baseline. Every deploy after that compares normally.
+
+Because check 2 is a whole-schema hash, not a version number, there is no
+partial credit for "the version matched" — a fingerprint mismatch refuses the
+deploy even when check 1 passed.
+
+To deploy a build that migrates the schema (or whose fingerprint changed),
+trigger `deploy.yml` by hand with `allow_migration` set:
 
 ```bash
 gh workflow run deploy.yml -R 1xmint/cortex \
@@ -298,11 +328,40 @@ Only do this once you've confirmed the migration is safe to run against
 production — there's still no automatic schema rollback if the deploy fails
 after migrating.
 
-A few things worth knowing about this check before you rely on it:
+### What this guard does not cover
 
-- **Builds made before this change have no `SCHEMA` file at all** and cannot
-  be deployed through `deploy.yml` — `deploy-receive.sh` refuses any artifact
-  missing `SCHEMA`. To bring one of those older builds back, use
+- **`routing.db`'s schema is fingerprinted (`ROUTING_SCHEMA_FINGERPRINT`,
+  above) but has no version-number check**: it has no `SCHEMA_VERSION`-style
+  counter of its own, and unlike `cortex.db` it is not backed up by
+  `deploy-receive.sh`. A fingerprint change there is refused by check 2 the
+  same as a `cortex.db` change would be.
+- **`crates/context/src/index.rs`'s DDL is not fingerprinted or checked at
+  all.** That index lives in its own SQLite file outside `cortex.db` and
+  `routing.db`; a schema change there ships through this guard completely
+  unguarded. Fingerprinting it would need its own pinned constant and test,
+  the same way `SCHEMA_FINGERPRINT` and `ROUTING_SCHEMA_FINGERPRINT` work
+  today — that has not been done.
+- **The guard reads `cortex.db` at `$INSTALL_ROOT/data/cortex.db`** (`DB_PATH`
+  in `deploy-receive.sh`). This has to be the same file the running
+  `cortex-next` service actually opens (`cortex_db_path()` in
+  `crates/api/src/state.rs`, which honors `$CORTEX_DB_PATH` with a fallback
+  under `$CORTEX_WORKSPACE`). If the unit that starts `cortex-next` on the
+  deploy host ever sets `CORTEX_DB_PATH` to something other than
+  `$INSTALL_ROOT/data/cortex.db`, the guard would be checking a different
+  database than the one the server migrates, defeating it silently — update
+  `DB_PATH` in `deploy-receive.sh` to match if that ever happens. (The
+  `deploy/cortex-api.service` example unit in this repo is not what runs on
+  the Tailscale-deployed host and does not set `CORTEX_DB_PATH`; the actual
+  `cortex-next`/`cortex-next-worker` user units live only on the deploy host,
+  outside this repo — confirm their environment matches `DB_PATH` when
+  setting up or auditing that host.)
+
+A few more things worth knowing about this guard before you rely on it:
+
+- **Builds made before `SCHEMA_VERSION` checking landed have no `SCHEMA` file
+  at all**, and builds made before this fingerprint check landed have no
+  `SCHEMA_FINGERPRINT` / `ROUTING_SCHEMA_FINGERPRINT` files — `deploy-receive.sh`
+  refuses any artifact missing any of them. To bring an older build back, use
   "Rolling back by hand" below instead.
 - **A build whose `SCHEMA` is behind the live database's schema can never go
   through `deploy.yml`, with or without `allow_migration`.** That refusal is
@@ -313,9 +372,11 @@ A few things worth knowing about this check before you rely on it:
   `deploy-receive.sh`**, which CI does not ship — `deploy.yml` invokes the
   copy already installed at `~/cortex-next/deploy-receive.sh` over SSH, not
   anything from the workflow run. If you haven't reinstalled it since this
-  change landed (setup step 3, above), the host is still running the old,
-  fail-open script and this protection does not exist yet. Reinstall it
-  before relying on this check in production.
+  change landed (setup step 3, above), the host is still running an older
+  script without the fingerprint check (or without any check at all) and this
+  protection does not exist yet. Reinstall it before relying on this check in
+  production — and expect the first deploy after reinstalling to need
+  `--allow-migration` once, to record a `SCHEMA_DEPLOYED` baseline.
 
 ## Rolling back by hand
 

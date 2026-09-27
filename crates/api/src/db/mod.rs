@@ -13771,9 +13771,12 @@ mod tests {
         let actual = schema_fingerprint(&db);
         assert_eq!(
             actual, SCHEMA_FINGERPRINT,
-            "schema changed — bump SCHEMA_VERSION and update SCHEMA_FINGERPRINT \
-             (computed fingerprint: {:#x})",
-            actual
+            "schema changed — update SCHEMA_FINGERPRINT to {actual:#x} in this file \
+             (and bump SCHEMA_VERSION if this change belongs in the numbered migration \
+             chain). Once SCHEMA_FINGERPRINT changes, deploy-receive.sh's fingerprint \
+             guard (see docs/DEPLOY.md) will refuse to auto-deploy this build; it needs \
+             a deliberate `--allow-migration` deploy \
+             (computed fingerprint: {actual:#x})",
         );
     }
 

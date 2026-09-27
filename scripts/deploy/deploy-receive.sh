@@ -14,7 +14,8 @@
 # job is safety (verify, back up, roll back), not access control.
 #
 # Input: a gzip'd tar of a build-release.yml artifact, on stdin. Contains:
-#   COMMIT, SCHEMA, SHA256SUMS, bin/{cortex-server,cortex-worker,cortex-worker-key}, www/
+#   COMMIT, SCHEMA, SCHEMA_FINGERPRINT, ROUTING_SCHEMA_FINGERPRINT, SHA256SUMS,
+#   bin/{cortex-server,cortex-worker,cortex-worker-key}, www/
 #
 # Install root is wherever this script actually lives (readlink -f "$0"'s
 # directory), so the same script works if the install root is ever renamed,
@@ -33,6 +34,11 @@
 #       in-process at server boot (crates/api/src/db/mod.rs) and this script
 #       cannot roll a schema back on failure, so a migrating deploy must be a
 #       human's explicit choice — see docs/DEPLOY.md.
+#   3c. refuse the deploy if SCHEMA_FINGERPRINT/ROUTING_SCHEMA_FINGERPRINT
+#       differ from what the last successful deploy recorded (or nothing was
+#       recorded yet), unless invoked with --allow-migration. Catches a
+#       schema change shipped through bootstrap DDL that never bumped SCHEMA
+#       — see docs/DEPLOY.md.
 #   4. back up the DB and the current bin/, COMMIT, SHA256SUMS, www/
 #   5. swap the new bin/, COMMIT, SHA256SUMS, www/ into place
 #   6. restart cortex-next, poll /api/health, then restart cortex-next-worker and
@@ -172,7 +178,7 @@ log "extracting artifact to $INCOMING_DIR"
 tar xzf "$ARTIFACT_TAR" -C "$INCOMING_DIR"
 rm -f "$ARTIFACT_TAR"
 
-for required in COMMIT SCHEMA SHA256SUMS bin www; do
+for required in COMMIT SCHEMA SCHEMA_FINGERPRINT ROUTING_SCHEMA_FINGERPRINT SHA256SUMS bin www; do
   [ -e "$INCOMING_DIR/$required" ] || fail "artifact is missing $required"
 done
 
@@ -199,6 +205,13 @@ fi
 # explicit --allow-migration for that case; a same-version deploy always
 # proceeds, and a deploy whose SCHEMA is *behind* the live database is refused
 # outright, since that binary would run against a newer schema than it knows.
+#
+# This must be the same file the running server actually opens — see
+# cortex_db_path() in crates/api/src/state.rs, which reads $CORTEX_DB_PATH
+# with a fallback of "$CORTEX_WORKSPACE/.cortex/cortex.db". If the unit that
+# starts cortex-next on the deploy host sets CORTEX_DB_PATH to something other
+# than "$INSTALL_ROOT/data/cortex.db", update DB_PATH below to match it (see
+# docs/DEPLOY.md).
 DB_PATH="$INSTALL_ROOT/data/cortex.db"
 if [ -f "$DB_PATH" ]; then
   LIVE_SCHEMA="$(sqlite3 -batch -noheader -readonly -init /dev/null "$DB_PATH" "SELECT COALESCE(MAX(version), 0) FROM schema_version;" 2>/dev/null)" \
@@ -217,6 +230,42 @@ fi
 
 if [ "$NEW_SCHEMA" -gt "$LIVE_SCHEMA" ] && [ "$ALLOW_MIGRATION" -ne 1 ]; then
   fail "deploy would migrate schema $LIVE_SCHEMA->$NEW_SCHEMA; automatic deploys refuse migrations; re-run deploy.yml by hand with allow_migration=true (or pass --allow-migration to this script)"
+fi
+
+# --- 2c. refuse an automatic deploy whose schema fingerprint changed --------
+# SCHEMA_VERSION only moves when a migration author remembers to bump it, but
+# crates/api/src/db/mod.rs also runs unconditional bootstrap DDL
+# (ensure_social_tables, ensure_social_posts_fts) outside the numbered
+# migrate_vN chain, so a schema change there can ship without SCHEMA_VERSION
+# moving at all — the 2b check above would then wave it straight through.
+# SCHEMA_FINGERPRINT/ROUTING_SCHEMA_FINGERPRINT hash the whole schema a fresh
+# boot produces (see schema_fingerprint_matches_pinned_value in
+# crates/api/src/db/mod.rs and crates/engine/src/store.rs), so comparing them
+# against what was last deployed catches that case too. Fail closed: no
+# recorded fingerprint (e.g. the first deploy after this guard was added)
+# refuses just like a changed one, unless the operator passes
+# --allow-migration.
+DEPLOYED_RECORD="$INSTALL_ROOT/SCHEMA_DEPLOYED"
+NEW_FINGERPRINT="$(tr -d '[:space:]' <"$INCOMING_DIR/SCHEMA_FINGERPRINT")"
+NEW_ROUTING_FINGERPRINT="$(tr -d '[:space:]' <"$INCOMING_DIR/ROUTING_SCHEMA_FINGERPRINT")"
+printf '%s' "$NEW_FINGERPRINT" | grep -Eq '^0x[0-9a-fA-F]+$' \
+  || fail "SCHEMA_FINGERPRINT is not a hex value: '$NEW_FINGERPRINT'"
+printf '%s' "$NEW_ROUTING_FINGERPRINT" | grep -Eq '^0x[0-9a-fA-F]+$' \
+  || fail "ROUTING_SCHEMA_FINGERPRINT is not a hex value: '$NEW_ROUTING_FINGERPRINT'"
+
+if [ -f "$DEPLOYED_RECORD" ]; then
+  DEPLOYED_FINGERPRINT="$(sed -n '1p' "$DEPLOYED_RECORD" | tr -d '[:space:]')"
+  DEPLOYED_ROUTING_FINGERPRINT="$(sed -n '2p' "$DEPLOYED_RECORD" | tr -d '[:space:]')"
+  log "artifact fingerprint=$NEW_FINGERPRINT/$NEW_ROUTING_FINGERPRINT deployed fingerprint=$DEPLOYED_FINGERPRINT/$DEPLOYED_ROUTING_FINGERPRINT"
+  if { [ "$NEW_FINGERPRINT" != "$DEPLOYED_FINGERPRINT" ] || [ "$NEW_ROUTING_FINGERPRINT" != "$DEPLOYED_ROUTING_FINGERPRINT" ]; } \
+     && [ "$ALLOW_MIGRATION" -ne 1 ]; then
+    fail "artifact schema fingerprint differs from the last deployed fingerprint (cortex.db $DEPLOYED_FINGERPRINT->$NEW_FINGERPRINT, routing.db $DEPLOYED_ROUTING_FINGERPRINT->$NEW_ROUTING_FINGERPRINT); this can change the schema even when SCHEMA_VERSION does not move; automatic deploys refuse migrations; re-run deploy.yml by hand with allow_migration=true (or pass --allow-migration to this script)"
+  fi
+else
+  log "no recorded fingerprint at $DEPLOYED_RECORD"
+  if [ "$ALLOW_MIGRATION" -ne 1 ]; then
+    fail "no recorded schema fingerprint at $DEPLOYED_RECORD; refusing automatic deploy fail-closed until one is recorded — deploy once by hand with --allow-migration to record the current fingerprint (see docs/DEPLOY.md)"
+  fi
 fi
 
 # --- 3. back up the current release and the database ------------------------
@@ -285,6 +334,13 @@ log "confirmed deploy-info reports commit $NEW_COMMIT"
 
 # Success: nothing to restore.
 RESTORE_NEEDED=0
+
+# Record what schema this deploy left the databases at, so the next deploy's
+# 2c check above has something to compare against. Written only here, after
+# health and deploy-info have both confirmed the new release is actually
+# live — a deploy that fails and rolls back must not update this record.
+printf '%s\n%s\n' "$NEW_FINGERPRINT" "$NEW_ROUTING_FINGERPRINT" >"$DEPLOYED_RECORD"
+log "recorded deployed schema fingerprint to $DEPLOYED_RECORD"
 
 # --- 7. prune old backups, keeping the newest 10 (and never LATEST's target) -
 ln -sfn "$BACKUP_DIR" "$INSTALL_ROOT/backups/LATEST"
