@@ -1162,7 +1162,10 @@ mod tests {
     #[test]
     fn charge_pins_the_worked_example_from_the_packet() {
         // carry 0, cost 250_000, mpc 100_000 -> 2 credits, carry 50_000.
-        assert_eq!(charge(0, 250_000, SEED_MICROS_PER_CREDIT as u64), (2, 50_000));
+        assert_eq!(
+            charge(0, 250_000, SEED_MICROS_PER_CREDIT as u64),
+            (2, 50_000)
+        );
         // then cost 60_000 on that carry -> 1 credit, carry 10_000.
         assert_eq!(
             charge(50_000, 60_000, SEED_MICROS_PER_CREDIT as u64),
@@ -1184,7 +1187,9 @@ mod tests {
         // pure-function test does not need.
         let mut state: u64 = 0x2545_F491_4F6C_DD1D;
         for _ in 0..1_000 {
-            state = state.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1);
             let cost = state % 1_000_000; // up to ~$1.00 per call
             total_cost += cost;
             let (credits, new_carry) = charge(carry, cost, mpc);
