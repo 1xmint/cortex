@@ -231,6 +231,35 @@ left in a file.
 
 Once both are set, delete any local copy of the OAuth secret.
 
+## The API refuses to start without a production auth config
+
+None of this workflow's own steps write the API's `.env`/`EnvironmentFile` on
+the deploy host — that file is set up once, by hand, alongside whichever
+`cortex-server` unit is running there. Whatever sets it up must include four
+variables, or the API exits non-zero on the next restart instead of serving
+traffic:
+
+- **`CORTEX_ENV`** — set to `production` to tell the API it is running in
+  production. This is the signal the startup check looks for
+  (`HEYVERA_REQUIRE_AUTH=1` also counts). Nothing in this repository's
+  production templates sets it implicitly: a deploy that forgets it runs as
+  an unauthenticated local/dev instance without warning.
+- **`CLERK_SECRET_KEY`** — the Clerk backend API secret. Required once
+  `CORTEX_ENV=production` is set; startup exits non-zero if it is missing or
+  blank.
+- **`CLERK_ISSUER`** — the Clerk instance's issuer URL (a non-empty `https://`
+  URL). Required in production; used to validate incoming JWTs.
+- **`CLERK_AUTHORIZED_PARTY`** — the `https://` origin (no path, query, or
+  fragment) that Clerk-issued tokens must have been authorized for. Required
+  in production.
+
+`deploy/deploy-production.sh` and `scripts/cortex-install-service.sh` both
+write out a `.env` file with `CORTEX_ENV=production` and empty `CLERK_*`
+lines already present — fill in the three Clerk values before starting the
+service, or the server exits immediately with a message naming the missing
+variable. See `deploy/cortex-api.service` for the systemd unit that sets
+`CORTEX_ENV=production` for that install path.
+
 ## Triggering a deploy manually
 
 Deploys normally happen automatically after a successful `Build release` run

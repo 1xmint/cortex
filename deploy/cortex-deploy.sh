@@ -139,7 +139,7 @@ if [[ "$SKIP_BACKEND" == "false" ]]; then
     fi
 
     echo -e "${YELLOW}🔨 Building backend...${NC}"
-    run_cmd cargo build --release --bin cortex-server
+    run_cmd cargo build --release -p cortex-api --bin cortex-server
 
     if [[ "$DRY_RUN" == "false" ]] && [[ ! -f "target/release/cortex-server" ]]; then
         echo -e "${RED}❌ Backend build failed${NC}"
