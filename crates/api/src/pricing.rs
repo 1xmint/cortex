@@ -737,7 +737,10 @@ mod tests {
             quote(&list, &class, VerdictClass::Strong).expect("priced");
         let (authored_credits, authored_billable) =
             quote(&list, &class, VerdictClass::Authored).expect("priced");
-        assert_eq!(authored_credits, credits_for_verdict_class(strong_credits, VerdictClass::Authored));
+        assert_eq!(
+            authored_credits,
+            credits_for_verdict_class(strong_credits, VerdictClass::Authored)
+        );
         assert_eq!(strong_billable, authored_billable);
     }
 

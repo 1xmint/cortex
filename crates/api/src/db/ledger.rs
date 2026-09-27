@@ -590,6 +590,51 @@ impl Database {
         count > 0
     }
 
+    /// What the ledger actually moved for one verification's charge and any
+    /// refund of it, net -- not the quote, and not a status column.
+    ///
+    /// `deduct_credits` writes negative amounts under
+    /// `verify:<id>:{subscription,pack}`; `refund_credits` mirrors them
+    /// positive under `refund:<id>:{subscription,pack}`. Summing all four and
+    /// negating gives the amount still standing against the customer: the
+    /// full charge while unrefunded, and exactly `0` once refunded, without
+    /// this function having to know which state it is in.
+    ///
+    /// `None` means no charge was ever written for this verification --
+    /// distinct from `Some(0)`, which means one was written and then refunded
+    /// in full.
+    pub fn ledger_net_charge_for_verification(&self, verification_id: &str) -> Option<i64> {
+        let charge_key = cortex_core::billing_binding::ChargeKey::for_verification(verification_id);
+        let refund_key = cortex_core::billing_binding::RefundKey::for_verification(verification_id);
+        let conn = self.conn();
+        let keys = [
+            format!("{}:subscription", charge_key.as_str()),
+            format!("{}:pack", charge_key.as_str()),
+            format!("{}:subscription", refund_key.as_str()),
+            format!("{}:pack", refund_key.as_str()),
+        ];
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM credit_transactions
+                 WHERE idempotency_key IN (?1, ?2, ?3, ?4)",
+                params![keys[0], keys[1], keys[2], keys[3]],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        if count == 0 {
+            return None;
+        }
+        let sum: i64 = conn
+            .query_row(
+                "SELECT COALESCE(SUM(amount), 0) FROM credit_transactions
+                 WHERE idempotency_key IN (?1, ?2, ?3, ?4)",
+                params![keys[0], keys[1], keys[2], keys[3]],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        Some(-sum)
+    }
+
     /// Freeze the derived checks for a step at dispatch time.
     ///
     /// Derivation must happen before the worker sees the task, and the checks
@@ -1094,7 +1139,15 @@ impl Database {
             .ok()
             .flatten()
             .map(|contract| contract.verdict_class);
-        let charged_credits = self.get_step_quote(run_id, step_id).map(|q| q.quoted_credits);
+        // What the step was quoted at dispatch, before any verdict existed.
+        let quoted_credits = self
+            .get_step_quote(run_id, step_id)
+            .map(|q| q.quoted_credits);
+        // What the ledger actually moved for this verification -- not the
+        // quote. A quote is a plan; `credit_transactions` is what happened.
+        // Reading the quote here would show a charge that was already
+        // refunded as still standing.
+        let charged_credits = self.ledger_net_charge_for_verification(&verification_id);
 
         Some(Receipt {
             verification_id,
@@ -1106,6 +1159,7 @@ impl Database {
             executions,
             egress,
             verdict_class,
+            quoted_credits,
             charged_credits,
         })
     }

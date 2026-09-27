@@ -4230,9 +4230,15 @@ pub struct Receipt {
     /// read; it is not a third class.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub verdict_class: Option<cortex_core::diff_surface::VerdictClass>,
-    /// What was actually charged for this step, and whether that charge was
-    /// discounted for an `authored` verdict. Both are the frozen quote's own
-    /// numbers, never recomputed here -- see `pricing::credits_for_verdict_class`.
+    /// What the step was quoted at dispatch -- an `authored` verdict already
+    /// discounted per `pricing::credits_for_verdict_class`. This is the plan,
+    /// not the outcome: it does not move when the charge is later refunded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quoted_credits: Option<i64>,
+    /// What the ledger actually charged for this verification, net of any
+    /// refund -- read from `credit_transactions`, not from the quote. `Some(0)`
+    /// means a charge was made and then fully refunded; `None` means no
+    /// charge was ever written (e.g. an inconclusive verdict).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub charged_credits: Option<i64>,
 }

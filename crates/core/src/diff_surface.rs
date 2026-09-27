@@ -484,7 +484,10 @@ mod tests {
         // A check minted from this task's own acceptance criteria is not
         // evidence the customer already had; `strong` over it would be exactly
         // the vacuous claim the module exists to prevent.
-        let checks = vec![ecosystem_check("cargo:test"), contract_check("acceptance-1")];
+        let checks = vec![
+            ecosystem_check("cargo:test"),
+            contract_check("acceptance-1"),
+        ];
         assert_eq!(
             declare_verdict_class(&checks, crate::task::WorkKind::Refactor),
             VerdictClass::Authored

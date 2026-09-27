@@ -72,6 +72,10 @@ export interface Receipt {
   executions: CheckExecution[];
   egress?: EgressReceipt;
   verdict_class?: VerdictClass;
+  /** Quoted at dispatch, before any verdict -- does not move on refund. */
+  quoted_credits?: number;
+  /** What the ledger actually charged, net of any refund. `0` means charged
+   * then fully refunded; absent means never charged. */
   charged_credits?: number;
 }
 
