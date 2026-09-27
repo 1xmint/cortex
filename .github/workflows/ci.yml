@@ -137,6 +137,24 @@ jobs:
       # their tests, and rewriting the verification-vs-execution tests
       # against `latest_attempt.status`, took the file from fifteen tests to
       # twelve.
+      #
+      # 38 -> 41 with the three in `src/components/mission/Receipt.test.tsx`,
+      # which render `ReceiptCard` for a `strong` and an `authored` verdict
+      # class and assert the plain-language disclosure text a customer sees
+      # before disputing a charge, plus that a pre-verdict-class receipt still
+      # renders with neither badge nor charged-credits line.
+      #
+      # 41 -> 42 with one more in `src/components/mission/Receipt.test.tsx`,
+      # which renders a `strong`-declared step whose verdict is `failed` and
+      # asserts the class copy stops short of anything a reader could take
+      # for "independently verified" -- the battery existed before the task,
+      # but this attempt did not pass it.
+      #
+      # 42 -> 43 with one more in `src/components/mission/Receipt.test.tsx`,
+      # which renders a `strong`-declared step whose verdict is `inconclusive`
+      # and asserts the copy reads as "not graded" rather than "did not pass" --
+      # an inconclusive step never ran its checks, so there is nothing it
+      # failed.
       - name: Test Cortex
         run: |
           set -euo pipefail
@@ -146,8 +164,8 @@ jobs:
           echo "$output"
           passed=$(echo "$output" | grep -oE "Tests +[0-9]+ passed" | grep -oE "[0-9]+" | tail -1)
           echo "cortex tests passed: ${passed:-0}"
-          if [ "${passed:-0}" -lt 38 ]; then
-            echo "::error::expected at least 38 Cortex tests to run, saw ${passed:-0}"
+          if [ "${passed:-0}" -lt 43 ]; then
+            echo "::error::expected at least 43 Cortex tests to run, saw ${passed:-0}"
             exit 1
           fi
 
@@ -449,6 +467,17 @@ jobs:
       # so a local `cargo clippy` sees exactly what CI sees.
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      # deploy-receive.sh's schema guard is what stands between an automatic
+      # deploy and a migrated production database (see docs/DEPLOY.md). This
+      # harness exercises it with stub sqlite3/flock/systemctl/curl, so a
+      # regression in the guard's refusal logic fails here instead of at the
+      # next real deploy.
+      - name: Install sqlite3 (if missing)
+        run: command -v sqlite3 >/dev/null || (sudo apt-get update && sudo apt-get install -y sqlite3)
+
+      - name: Test deploy-receive.sh's schema guard
+        run: bash scripts/deploy/test-deploy-receive.sh
 
 
   # A feature that is off by default is a feature nothing compiles, and a

@@ -52,6 +52,16 @@ export interface EgressReceipt {
   mediator_image?: string;
 }
 
+/**
+ * What kind of claim this verdict is, declared at plan time before the step
+ * ran. `strong` means the battery that graded the work is the battery the
+ * customer had before Cortex touched anything; `authored` means the task
+ * legitimately wrote or changed the exam. Both are real verdicts; they are
+ * not the same evidence, and the receipt says so rather than rendering them
+ * identically.
+ */
+export type VerdictClass = 'strong' | 'authored';
+
 export interface Receipt {
   verification_id: string;
   run_id: string;
@@ -61,6 +71,46 @@ export interface Receipt {
   gate: VerdictReport;
   executions: CheckExecution[];
   egress?: EgressReceipt;
+  verdict_class?: VerdictClass;
+  /** Quoted at dispatch, before any verdict -- does not move on refund. */
+  quoted_credits?: number;
+  /** What the ledger actually charged, net of any refund. `0` means charged
+   * then fully refunded; absent means never charged. */
+  charged_credits?: number;
+}
+
+const VERDICT_CLASS_COPY: Record<VerdictClass, { label: string; detail: string }> = {
+  strong: {
+    label: 'Strong',
+    detail: 'Graded by checks that existed before this task.',
+  },
+  authored: {
+    label: 'Authored',
+    detail: 'Graded by checks this task was allowed to change — the exam was not locked.',
+  },
+};
+
+/**
+ * The class badge's tooltip text, adjusted for the actual verdict.
+ *
+ * `strong`'s detail describes the battery, not the outcome — it must not read
+ * as a claim of success on a verdict that did not succeed. A failed `strong`
+ * step was graded by the customer's own checks and still did not pass them;
+ * saying anything that could be misread as "verified" here would overstate
+ * what happened. An `inconclusive` step never ran its checks at all, so
+ * "did not pass them" would overstate that too -- there is nothing to have
+ * passed or failed, only a grading that did not happen.
+ */
+function verdictClassDetail(receipt: Receipt): string | undefined {
+  const classCopy = receipt.verdict_class ? VERDICT_CLASS_COPY[receipt.verdict_class] : undefined;
+  if (!classCopy) return undefined;
+  if (receipt.verdict_class === 'strong' && receipt.gate.verdict === 'failed') {
+    return 'Graded by checks that existed before this task -- it did not pass them.';
+  }
+  if (receipt.verdict_class === 'strong' && receipt.gate.verdict === 'inconclusive') {
+    return 'Checks that existed before this task were not run -- no grade was given.';
+  }
+  return classCopy.detail;
 }
 
 const VERDICT_COPY: Record<Verdict, { label: string; detail: string; banner: string }> = {
@@ -145,15 +195,28 @@ export function CopyEvidenceButton({ payload, label = 'Copy evidence' }: { paylo
 
 export function ReceiptCard({ receipt }: { receipt: Receipt }) {
   const copy = VERDICT_COPY[receipt.gate.verdict];
+  const classCopy = receipt.verdict_class ? VERDICT_CLASS_COPY[receipt.verdict_class] : undefined;
+  const classDetail = verdictClassDetail(receipt);
 
   return (
     <div className="overflow-hidden rounded-lg border border-[var(--line)] bg-[var(--surface)]">
       {/* 1 — Verdict. The claim, stated where it cannot be missed. */}
       <div className={`flex flex-wrap items-center gap-x-3 gap-y-1 border-b px-3 py-2.5 ${copy.banner}`}>
         <span className="text-sm font-semibold tracking-wide">{copy.label}</span>
+        {classCopy && (
+          <span
+            className="rounded border border-current/40 px-1.5 py-0.5 t-micro font-medium uppercase tracking-wide opacity-90"
+            title={classDetail}
+          >
+            {classCopy.label}
+          </span>
+        )}
         <span className="t-micro t-mono opacity-90">
           {receipt.gate.required_passed}/{receipt.gate.required_total} required checks passed
         </span>
+        {typeof receipt.charged_credits === 'number' && (
+          <span className="t-micro t-mono opacity-90">{receipt.charged_credits} credits</span>
+        )}
         <span className="ml-auto">
           <CopyEvidenceButton payload={receipt} />
         </span>
@@ -162,6 +225,15 @@ export function ReceiptCard({ receipt }: { receipt: Receipt }) {
       <p className="t-micro border-b border-[var(--line-faint)] px-3 py-2 text-[var(--muted)]">
         {copy.detail}
       </p>
+      {/* The grade, in plain words, before the customer disputes anything —
+          the same rule that governs the verdict banner above applies here:
+          an `authored` verdict is real, and it is not rendered as though it
+          were the same claim as `strong`. */}
+      {classDetail && (
+        <p className="t-micro border-b border-[var(--line-faint)] px-3 py-2 text-[var(--muted)]">
+          {classDetail}
+        </p>
+      )}
 
       {/* 2 — Checks. Each row is one executed spec; no aggregation hides a failure. */}
       <ul>

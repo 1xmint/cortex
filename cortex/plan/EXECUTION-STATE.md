@@ -3204,3 +3204,88 @@ Decided by Josh, 2026-09-26, unless marked otherwise.
 - **The final run tests charging and refunds** and is the very last step. The
   first price list is proposed then, for Josh's approval; without one,
   `freeze_step_quote` dispatches unquoted and uncharged.
+
+## 2026-09-26 M-D-0021 — Cortex never loses money on a task; plan receipt approval
+
+Decided by Josh, 2026-09-26. Supersedes the refund parts of M-D-0020.
+
+- **Cortex does not pay out of pocket, anywhere in the product.** Josh: "customer
+  pays for what they use, across the entire repo this should be true, cortex does
+  not pay out of pocket for anything, cortex does not eat or lose money."
+- **A failed task costs the customer the raw model cost, no markup.** A verified
+  task costs full price. The "refund" on failure returns only Cortex's markup, not
+  the model spend. This replaces "a failed task is refunded in full" (M-D-0020,
+  VISION.md, CREDITS.md). It needs the actual model cost of every step metered.
+- **Every price is floored at actual cost.** The `authored` half price (M-D-0020)
+  can never charge less than what the models cost.
+- **Retries and repairs are paid by the customer**, as used, inside the amount
+  approved on the plan receipt. Cortex does not absorb them.
+- **Credits are held at approval.** Approving a plan receipt reserves the approved
+  amount; whatever is not used, or is returned on failure, is released.
+- **A step with no derivable check** is sold at full price, labelled Unverified,
+  with no refund promise (current behaviour, kept).
+- **The plan receipt (PLAN-RECEIPT.md) is in scope for "done".** It was specified
+  but never built: today `POST /api/runs` spends with no preview. It must show
+  price and grading class before spend, and the customer approves it.
+
+## 2026-09-27 M-D-0022 — pass-through billing replaces fixed price and refund-on-failure
+
+Decided by Josh, 2026-09-27. **Supersedes the fixed-price-per-task-class decision
+and the refund-on-failure decision (M-D-0020, M-D-0021, CREDITS.md "Pricing"),
+and the M-D-0021 "refund returns only Cortex's markup, floored at raw cost"
+nuance.** Those documents' code findings are otherwise reused where still true.
+
+- **Credits only, bought by subscription or package. No customer keys.**
+- **Every model call Cortex makes for a customer — chat, plan building, task
+  attempts, retries, voice — is charged at exactly what it cost.** Nothing else
+  is priced in. There is no fixed price per task class and no per-token resale.
+- **A failed attempt is charged for its calls**, delivered as a draft PR labelled
+  "failed checks" plus the failure report. No refund. (Replaces "a failed task
+  is refunded", M-D-0020/M-D-0021.)
+- **A Cortex outage is refused up front** ("try again later"), no charge.
+  **A Cortex machinery failure mid-task** (worker lost, runner or checking
+  service down — Inconclusive for Cortex reasons) is **absorbed by Cortex**: the
+  customer is not charged for calls made before the crash.
+- **An estimate in credits is shown before task spend. There is no credit
+  hold.** Decided by Josh, 2026-09-27, after an earlier draft of this entry
+  floated a hold: **no locking of credits, no hold multiplier.** Each call is
+  charged as it settles, against the live balance, not against a reservation
+  taken up front. If the balance cannot cover the next call's upper-bound
+  reservation, the run pauses with "top up to continue" and resumes once the
+  customer tops up. (This replaces every earlier mention in this plan of
+  "hold", "held credits", or an "estimate × 1.5" multiplier — there is no hold
+  to size.)
+- **The owner's own run is charged like a customer's.** No pricing run, no
+  price-list gate on task classes.
+- **Decided by Josh, 2026-09-27** (these four were floated as recommendations
+  pending the owner in an earlier draft of this entry; the owner has now
+  decided all four):
+  1. **The frontend shows dollars; the backend stays in credits.** Credits
+     remain the unit of truth in the ledger and the API; the customer-facing
+     UI is allowed to show a dollar figure (not just a bare credit count).
+  2. **No credit holds** — see above.
+  3. **Sandbox compute is covered by the subscription income, not charged per
+     task.** It is not metered and not billed to the customer per attempt.
+  4. **How Cortex itself earns money: the subscription fee is Cortex's
+     income.** Credits are pure pass-through at exact cost — they cover the
+     model calls and nothing else (no margin, no card-fee surcharge, no
+     compute surcharge). Card-processing fees, the server, sandbox compute,
+     and absorbed calls are covered by the subscription/package fee itself,
+     not by the per-call credit charge.
+- **Resolved by the lead from the owner's stated rules** (not separately put to
+  Josh, because they follow directly from §1 above): fractions of a credit are
+  tracked as an exact micro-USD carry per user and shown to 2 decimals of a
+  credit, never rounded up per item; a call whose cost never comes back
+  (timeout, missing usage) is not charged to the customer, is alerted, and is
+  settled by an operator within 24h or absorbed; an agent that tampers with
+  protected checks (exam-integrity Inconclusive) is charged and delivered as
+  "failed checks"; a customer cancelling mid-attempt is charged for the calls
+  already made.
+- **Dictation must be brokered and metered before launch.** Usage is not
+  observable today — the browser talks to OpenAI directly — so Cortex cannot
+  charge it at exact cost. This is a launch gate, not a settled "off in
+  production" behaviour.
+- **Legal gate before the first paying customer:** written approval from
+  Anthropic (Commercial Terms §D.4) that pass-through billing of model calls is
+  not a resale of the Services. Costs are shown per message/plan/task in
+  credits; Cortex never sells "N tokens" as the unit.

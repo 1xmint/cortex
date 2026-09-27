@@ -311,6 +311,25 @@ pub struct CodeRedemption {
 
 const RUN_RESOURCE_LEASE_TTL_MS: i64 = 24 * 60 * 60 * 1000;
 
+/// The version the migration chain below ends at. Deploy tooling compares
+/// this against the live database's `schema_version` to refuse an automatic
+/// deploy that would migrate the schema (see `scripts/deploy/deploy-receive.sh`
+/// and `.github/workflows/build-release.yml`'s `out/SCHEMA`).
+///
+/// Next migration author: bump this to match the new highest `migrate_vN`
+/// when you add one (see CONTRIBUTING.md's migration-counter section).
+pub const SCHEMA_VERSION: u32 = 71;
+
+/// A hash of the whole schema `open()` actually produces (every table, index,
+/// trigger and view in `sqlite_master`), pinned so a schema change that does
+/// *not* go through a numbered `migrate_vN` — `ensure_social_tables` and
+/// `ensure_social_posts_fts` below run unconditionally on every boot, outside
+/// the versioned chain — still fails a test instead of shipping unnoticed.
+/// `SCHEMA_VERSION` alone cannot catch that: it only advances when someone
+/// remembers to bump it. See `schema_fingerprint_matches_pinned_value` in
+/// this module's tests, which is what computes and checks this value.
+pub const SCHEMA_FINGERPRINT: u64 = 0x2b96ad201c8fdb1a;
+
 fn apply_migrations(conn: &Connection) {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS schema_version (
@@ -4224,6 +4243,27 @@ pub struct Receipt {
     /// different fact and the one a reader should be able to rely on.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub egress: Option<EgressReceipt>,
+    /// What kind of claim this verdict is, declared at plan time before this
+    /// step ran -- so the customer sees the grade before they spend, not
+    /// after. `None` for a receipt whose work contract could not be read, or
+    /// whose contract explicitly declared no class. Note this is *not* what a
+    /// pre-PR contract reads back as: `verdict_class` has serialized as the
+    /// literal `"authored"` since the root commit, so an old contract reads
+    /// back as `Some(Authored)`, not `None`. Either way it is not a third
+    /// class, and grading treats `None` exactly like `Authored`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verdict_class: Option<cortex_core::diff_surface::VerdictClass>,
+    /// What the step was quoted at dispatch -- the class price, unaffected by
+    /// `verdict_class`; the declared verdict class does not change the quote. This is the plan, not the outcome: it does not move
+    /// when the charge is later refunded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quoted_credits: Option<i64>,
+    /// What the ledger actually charged for this verification, net of any
+    /// refund -- read from `credit_transactions`, not from the quote. `Some(0)`
+    /// means a charge was made and then fully refunded; `None` means no
+    /// charge was ever written (e.g. an inconclusive verdict).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub charged_credits: Option<i64>,
 }
 
 /// The egress half of a receipt: what was asked for, and what was opened.
@@ -13668,6 +13708,97 @@ mod tests {
     pub(super) fn test_db() -> Database {
         let dir = tempfile::tempdir().unwrap().keep();
         Database::open(&dir.join("cortex.sqlite"))
+    }
+
+    /// `SCHEMA_VERSION` is deploy tooling's source of truth for how far the
+    /// migration chain goes; it must always equal the version the server's own
+    /// boot-time migration path actually lands on, or the deploy-refusal check
+    /// it feeds trusts a stale number.
+    #[test]
+    fn schema_version_const_matches_what_migrations_actually_produce() {
+        let db = test_db();
+        let version: i64 = db
+            .conn()
+            .query_row("SELECT MAX(version) FROM schema_version", [], |r| r.get(0))
+            .expect("schema_version table must have a row after migrations run");
+        assert_eq!(
+            version,
+            i64::from(SCHEMA_VERSION),
+            "SCHEMA_VERSION const is out of sync with the migration chain"
+        );
+    }
+
+    /// Normalises whitespace (including CRLF vs LF) in a `sqlite_master` dump
+    /// so the fingerprint below does not depend on incidental formatting of
+    /// the SQL text SQLite echoes back, only on the schema it describes.
+    fn normalize_schema_sql(sql: &str) -> String {
+        sql.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
+    /// FNV-1a: dependency-free, deterministic across processes and platforms,
+    /// which is all this needs — it is a change-detector, not a security hash.
+    fn fnv1a_64(bytes: &[u8]) -> u64 {
+        const OFFSET_BASIS: u64 = 0xcbf29ce484222325;
+        const PRIME: u64 = 0x100000001b3;
+        bytes.iter().fold(OFFSET_BASIS, |hash, &b| {
+            (hash ^ u64::from(b)).wrapping_mul(PRIME)
+        })
+    }
+
+    /// The full schema a fresh `Database::open` produces, hashed. Every DDL
+    /// statement counts, whether it arrived through a numbered `migrate_vN`
+    /// or through unconditional bootstrap code like `ensure_social_tables` —
+    /// unlike `SCHEMA_VERSION`, this cannot be forgotten because it is
+    /// computed from the live schema, not asserted by the migration author.
+    fn schema_fingerprint(db: &Database) -> u64 {
+        let conn = db.conn();
+        let mut stmt = conn
+            .prepare(
+                "SELECT type, name, tbl_name, sql FROM sqlite_master \
+                 ORDER BY type, name",
+            )
+            .expect("failed to query sqlite_master");
+        let rows: Vec<String> = stmt
+            .query_map([], |r| {
+                let kind: String = r.get(0)?;
+                let name: String = r.get(1)?;
+                let tbl_name: String = r.get(2)?;
+                let sql: Option<String> = r.get(3)?;
+                Ok(format!(
+                    "{}|{}|{}|{}",
+                    kind,
+                    name,
+                    tbl_name,
+                    normalize_schema_sql(sql.as_deref().unwrap_or(""))
+                ))
+            })
+            .expect("failed to map sqlite_master rows")
+            .collect::<Result<_, _>>()
+            .expect("failed to read sqlite_master row");
+        fnv1a_64(rows.join("\n").as_bytes())
+    }
+
+    /// `SCHEMA_VERSION` only advances when a migration author remembers to
+    /// bump it — but `ensure_social_tables` and `ensure_social_posts_fts`
+    /// (called unconditionally from `apply_migrations`, not behind a numbered
+    /// `migrate_vN`) can change the schema without touching that const at
+    /// all. This test hashes the schema a fresh boot actually produces and
+    /// pins it, so *any* schema edit — versioned or not — fails a build
+    /// instead of shipping a mismatch between `SCHEMA_VERSION` and reality
+    /// into `deploy-receive.sh`'s guard.
+    #[test]
+    fn schema_fingerprint_matches_pinned_value() {
+        let db = test_db();
+        let actual = schema_fingerprint(&db);
+        assert_eq!(
+            actual, SCHEMA_FINGERPRINT,
+            "schema changed — update SCHEMA_FINGERPRINT to {actual:#x} in this file \
+             (and bump SCHEMA_VERSION if this change belongs in the numbered migration \
+             chain). Once SCHEMA_FINGERPRINT changes, deploy-receive.sh's fingerprint \
+             guard (see docs/DEPLOY.md) will refuse to auto-deploy this build; it needs \
+             a deliberate `--allow-migration` deploy \
+             (computed fingerprint: {actual:#x})",
+        );
     }
 
     /// A panic while the database lock is held used to poison the mutex, which

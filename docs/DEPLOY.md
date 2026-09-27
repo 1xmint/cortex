@@ -231,6 +231,55 @@ left in a file.
 
 Once both are set, delete any local copy of the OAuth secret.
 
+## The API refuses to start without a production auth config
+
+None of this workflow's own steps write the API's `.env`/`EnvironmentFile` on
+the deploy host — that file is set up once, by hand, alongside whichever
+`cortex-server` unit is running there. Whatever sets it up must include four
+variables, or the API silently starts in development mode (see below) instead
+of the production auth mode a deploy host needs:
+
+- **`CORTEX_ENV`** — set to `production` to tell the API it is running in
+  production. `is_production_env` (`crates/api/src/lib.rs:331-343`) treats any
+  of `HEYVERA_ENV`, `CORTEX_ENV`, `APP_ENV`, `RUST_ENV`, or `ENVIRONMENT` set to
+  `production` or `prod` (case-insensitive) as production — `CORTEX_ENV` is
+  only one of five names it checks (`HEYVERA_REQUIRE_AUTH=1` also forces
+  production auth requirements, independently of this list). **If none of
+  these are set, the API does not exit — it starts in development/local-auth
+  mode**, treating every request as user `"local"`
+  (`crates/api/src/main.rs:192-197`; `HeyVeraAuthMode::LocalDevelopment`).
+  Nothing in this repository's production templates sets any of these
+  implicitly: a deploy that forgets them runs as an unauthenticated local/dev
+  instance without warning, not as a service that refuses to start.
+- **`CLERK_SECRET_KEY`** — the Clerk backend API secret. Required once
+  production is detected (any of the five vars above); startup exits non-zero
+  if it is missing or blank while production is on.
+- **`CLERK_ISSUER`** — the Clerk instance's issuer URL (a non-empty `https://`
+  URL). Required in production; used to validate incoming JWTs.
+- **`CLERK_AUTHORIZED_PARTY`** — the `https://` origin (no path, query, or
+  fragment) that Clerk-issued tokens must have been authorized for. Required
+  in production.
+
+`deploy/deploy-production.sh` and `scripts/cortex-install-service.sh` both
+write out a `.env` file with `CORTEX_ENV=production` and empty `CLERK_*`
+lines already present — fill in the three Clerk values before starting the
+service, or the server exits immediately with a message naming the missing
+variable. See `deploy/cortex-api.service` for the systemd unit that sets
+`CORTEX_ENV=production` for that install path.
+
+**`CORTEX_AUTH_DISABLED` and `CORTEX_ALLOW_ANONYMOUS_WORKER` are refused in
+production, not merely ignored.** `validate_auth_config_values`
+(`crates/api/src/clerk.rs:74-92`) returns `Err("CORTEX_AUTH_DISABLED is
+forbidden in HeyVera production")` when production is detected and
+`CORTEX_AUTH_DISABLED` is set (`clerk.rs:74-76`), and
+`Err("CORTEX_ALLOW_ANONYMOUS_WORKER is forbidden in HeyVera production")` when
+production is detected and anonymous-worker access is requested
+(`clerk.rs:78-82`). Either error propagates out of `load_heyvera_auth_config`
+(`clerk.rs:119-136`) and `main.rs` exits the process with status 1 on it
+(`crates/api/src/main.rs:184-190`) — so setting either flag on a production
+deploy host does not quietly re-open the hole, it stops the server from
+starting.
+
 ## Triggering a deploy manually
 
 Deploys normally happen automatically after a successful `Build release` run
@@ -241,6 +290,148 @@ gh workflow run deploy.yml -R 1xmint/cortex -f build_run_id=<run-id-of-a-build-r
 ```
 
 Find the run ID with `gh run list -R 1xmint/cortex --workflow=build-release.yml`.
+
+## A migrating deploy must be a human's choice
+
+Migrations run in-process at server boot (`crates/api/src/db/mod.rs`), and
+`deploy-receive.sh` can roll back the binaries and web app on a failed health
+check but cannot roll back the schema. If an automatic deploy migrated the
+database and then failed its health check, the database would be left ahead
+of the rolled-back binary — a state nothing here can safely repair on its
+own.
+
+The guard is two independent checks, both of which have to pass for an
+automatic deploy to proceed. Either one refusing requires `--allow-migration`
+(or `deploy.yml`'s `allow_migration` input) to override.
+
+### Check 1: `SCHEMA_VERSION` vs. the live database's version
+
+The build carries the schema version its migration chain ends at
+(`SCHEMA_VERSION` in `crates/api/src/db/mod.rs`, written to `out/SCHEMA` by
+`build-release.yml`), and `deploy-receive.sh` compares that single number
+against the live database's `schema_version` before swapping anything in.
+This is a version-number comparison, not a diff of the schema itself, and by
+itself it only catches a schema change if whoever made it also remembered to
+bump `SCHEMA_VERSION`.
+
+- **Artifact SCHEMA equal to the live version** — this check passes.
+- **Artifact SCHEMA behind the live version** — refused outright, always, with
+  or without `--allow-migration`: that binary would run against a newer
+  schema than it knows.
+- **Artifact SCHEMA ahead of the live version** — refused unless the script
+  was invoked with `--allow-migration`. The automatic `workflow_run` deploy
+  path never passes this.
+
+### Check 2: schema fingerprint vs. the last deployed fingerprint
+
+`SCHEMA_VERSION` is a number a migration author has to remember to move.
+`crates/api/src/db/mod.rs` also runs unconditional bootstrap DDL
+(`ensure_social_tables`, `ensure_social_posts_fts`, called from
+`apply_migrations` on every boot, outside the numbered `migrate_vN` chain)
+that can add or change a table or index without touching `SCHEMA_VERSION` at
+all — check 1 above would wave that straight through. So a second, independent
+check compares a fingerprint of the *entire* schema instead of a hand-maintained
+number:
+
+- `SCHEMA_FINGERPRINT` in `crates/api/src/db/mod.rs` and
+  `ROUTING_SCHEMA_FINGERPRINT` in `crates/engine/src/store.rs` each hash every
+  DDL statement `sqlite_master` reports for a fresh boot of `cortex.db` /
+  `routing.db` respectively. `schema_fingerprint_matches_pinned_value` in each
+  file fails the build if the live schema no longer matches the pinned
+  constant — see that test's failure message for what to do (update the
+  constant; this section is what to expect from the deploy guard once you do).
+- `build-release.yml` reads both constants and writes them to
+  `out/SCHEMA_FINGERPRINT` / `out/ROUTING_SCHEMA_FINGERPRINT` in the release
+  artifact, the same way it writes `out/SCHEMA`.
+- On the deploy host, `deploy-receive.sh` records the fingerprints of the last
+  successfully deployed build in `$INSTALL_ROOT/SCHEMA_DEPLOYED` (written only
+  after health and `/api/deploy-info` both confirm the new release is live —
+  a deploy that fails and rolls back never touches this file). Before
+  swapping anything in, it compares the artifact's fingerprints against that
+  record:
+  - **Fingerprints match the record** — this check passes, regardless of
+    whether `SCHEMA_VERSION` moved.
+  - **Fingerprints differ from the record** — refused unless invoked with
+    `--allow-migration`, even if `SCHEMA_VERSION` (check 1) did not change.
+    This is the case check 1 alone would miss.
+  - **No `SCHEMA_DEPLOYED` record exists yet** — refused unless invoked with
+    `--allow-migration`. This is fail-closed by design: the very first deploy
+    of `deploy-receive.sh` after this check was added has nothing to compare
+    against, so it needs one deliberate `--allow-migration` deploy to record
+    a baseline. Every deploy after that compares normally.
+
+Because check 2 is a whole-schema hash, not a version number, there is no
+partial credit for "the version matched" — a fingerprint mismatch refuses the
+deploy even when check 1 passed.
+
+To deploy a build that migrates the schema (or whose fingerprint changed),
+trigger `deploy.yml` by hand with `allow_migration` set:
+
+```bash
+gh workflow run deploy.yml -R 1xmint/cortex \
+  -f build_run_id=<run-id-of-a-build-release-run> \
+  -f allow_migration=true
+```
+
+Only do this once you've confirmed the migration is safe to run against
+production — there's still no automatic schema rollback if the deploy fails
+after migrating.
+
+### What this guard does not cover
+
+- **Boot-time statements that change data but not table shape are not seen.**
+  The fingerprint hashes a freshly built database, which never contains old
+  tables or rows. A `DROP TABLE IF EXISTS legacy_x`, or a `DELETE`/`UPDATE`
+  added to `ensure_social_tables`, leaves the fingerprint unchanged and would
+  auto-deploy. Review any boot-time SQL that is not `CREATE ... IF NOT EXISTS`
+  by hand.
+- **`routing.db`'s schema is fingerprinted (`ROUTING_SCHEMA_FINGERPRINT`,
+  above) but has no version-number check**: it has no `SCHEMA_VERSION`-style
+  counter of its own, and unlike `cortex.db` it is not backed up by
+  `deploy-receive.sh`. A fingerprint change there is refused by check 2 the
+  same as a `cortex.db` change would be.
+- **`crates/context/src/index.rs`'s DDL is not fingerprinted or checked at
+  all.** That index lives in its own SQLite file outside `cortex.db` and
+  `routing.db`; a schema change there ships through this guard completely
+  unguarded. Fingerprinting it would need its own pinned constant and test,
+  the same way `SCHEMA_FINGERPRINT` and `ROUTING_SCHEMA_FINGERPRINT` work
+  today — that has not been done.
+- **The guard reads `cortex.db` at `$INSTALL_ROOT/data/cortex.db`** (`DB_PATH`
+  in `deploy-receive.sh`). This has to be the same file the running
+  `cortex-next` service actually opens (`cortex_db_path()` in
+  `crates/api/src/state.rs`, which honors `$CORTEX_DB_PATH` with a fallback
+  under `$CORTEX_WORKSPACE`). If the unit that starts `cortex-next` on the
+  deploy host ever sets `CORTEX_DB_PATH` to something other than
+  `$INSTALL_ROOT/data/cortex.db`, the guard would be checking a different
+  database than the one the server migrates, defeating it silently — update
+  `DB_PATH` in `deploy-receive.sh` to match if that ever happens. (The
+  `deploy/cortex-api.service` example unit in this repo is not what runs on
+  the Tailscale-deployed host and does not set `CORTEX_DB_PATH`; the actual
+  `cortex-next`/`cortex-next-worker` user units live only on the deploy host,
+  outside this repo — confirm their environment matches `DB_PATH` when
+  setting up or auditing that host.)
+
+A few more things worth knowing about this guard before you rely on it:
+
+- **Builds made before `SCHEMA_VERSION` checking landed have no `SCHEMA` file
+  at all**, and builds made before this fingerprint check landed have no
+  `SCHEMA_FINGERPRINT` / `ROUTING_SCHEMA_FINGERPRINT` files — `deploy-receive.sh`
+  refuses any artifact missing any of them. To bring an older build back, use
+  "Rolling back by hand" below instead.
+- **A build whose `SCHEMA` is behind the live database's schema can never go
+  through `deploy.yml`, with or without `allow_migration`.** That refusal is
+  unconditional: an artifact behind the live schema is refused outright
+  regardless of the flag, since that binary would run against a newer schema
+  than it knows.
+- **This check lives entirely in the deploy host's own copy of
+  `deploy-receive.sh`**, which CI does not ship — `deploy.yml` invokes the
+  copy already installed at `~/cortex-next/deploy-receive.sh` over SSH, not
+  anything from the workflow run. If you haven't reinstalled it since this
+  change landed (setup step 3, above), the host is still running an older
+  script without the fingerprint check (or without any check at all) and this
+  protection does not exist yet. Reinstall it before relying on this check in
+  production — and expect the first deploy after reinstalling to need
+  `--allow-migration` once, to record a `SCHEMA_DEPLOYED` baseline.
 
 ## Rolling back by hand
 
