@@ -126,16 +126,31 @@ fn a_strong_task_is_charged_the_full_price() {
     assert_eq!(sub_total + pack_total, -strong_credits);
 }
 
+// The two tests this replaces hand-called `deduct_credits` then
+// `refund_credits` back to back to assert a net-zero ledger for a "failed"
+// task. That is not a shape `finish_and_bill` ever produces: per
+// `billing_binding::billing_effect`, `(Failed, Unbilled) => None` -- a step
+// that never got charged in the first place is never billed at all, so there
+// is nothing to refund and no ledger row is ever written for it. Charging
+// then immediately refunding under a `"task failed"` reason describes a state
+// transition production's terminal, once-per-verification verdict write can
+// never reach. These replacements assert the real invariant instead: a
+// `Failed` verdict from an unbilled state touches nothing, for either class.
 #[test]
-fn a_failed_authored_task_is_refunded_exactly_what_it_was_charged() {
+fn a_failed_task_from_an_unbilled_state_has_no_billing_effect_authored() {
+    use cortex_core::billing_binding::{billing_effect, BillingEffect, BillingState};
+    use cortex_core::verification::Verdict;
+
     let (_dir, db) = db();
     let (list, class) = billable_list(&db);
 
-    let user = "user_authored_refund";
+    let user = "user_authored_never_charged";
     db.init_credit_balance(user, 10_000).expect("init balance");
 
     let verification_id = "verify-authored-2";
-    let charged = freeze(
+    // Freezing the quote records what the step *would* cost; it is not a
+    // charge, and a `Failed` delivery must never turn it into one.
+    let _quoted = freeze(
         &db,
         "run-3",
         "step-3",
@@ -144,40 +159,39 @@ fn a_failed_authored_task_is_refunded_exactly_what_it_was_charged() {
         VerdictClass::Authored,
     );
 
-    let charge_key = ChargeKey::for_verification(verification_id);
-    let refund_key = RefundKey::for_verification(verification_id);
-
-    db.deduct_credits(user, charged, "authored verdict charge", &charge_key)
-        .expect("charge succeeds");
-    db.refund_credits(user, &charge_key, &refund_key, "task failed")
-        .expect("refund succeeds");
+    assert_eq!(
+        billing_effect(Verdict::Failed, BillingState::Unbilled, verification_id),
+        BillingEffect::None,
+        "a failed step that was never charged must not be refunded"
+    );
 
     let (sub_total, pack_total) = db.credit_ledger_totals(user);
     assert_eq!(
         sub_total + pack_total,
         0,
-        "a failed authored task must be refunded in full, leaving the ledger net zero"
+        "no ledger row exists for this verification, so the balance is untouched"
     );
 }
 
 #[test]
-fn a_failed_strong_task_is_refunded_exactly_what_it_was_charged() {
+fn a_failed_task_from_an_unbilled_state_has_no_billing_effect_strong() {
+    use cortex_core::billing_binding::{billing_effect, BillingEffect, BillingState};
+    use cortex_core::verification::Verdict;
+
     let (_dir, db) = db();
     let (list, class) = billable_list(&db);
 
-    let user = "user_strong_refund";
+    let user = "user_strong_never_charged";
     db.init_credit_balance(user, 10_000).expect("init balance");
 
     let verification_id = "verify-strong-2";
-    let charged = freeze(&db, "run-4", "step-4", &list, &class, VerdictClass::Strong);
+    let _quoted = freeze(&db, "run-4", "step-4", &list, &class, VerdictClass::Strong);
 
-    let charge_key = ChargeKey::for_verification(verification_id);
-    let refund_key = RefundKey::for_verification(verification_id);
-
-    db.deduct_credits(user, charged, "strong verdict charge", &charge_key)
-        .expect("charge succeeds");
-    db.refund_credits(user, &charge_key, &refund_key, "task failed")
-        .expect("refund succeeds");
+    assert_eq!(
+        billing_effect(Verdict::Failed, BillingState::Unbilled, verification_id),
+        BillingEffect::None,
+        "a failed step that was never charged must not be refunded"
+    );
 
     let (sub_total, pack_total) = db.credit_ledger_totals(user);
     assert_eq!(sub_total + pack_total, 0);

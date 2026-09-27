@@ -717,13 +717,6 @@ async fn dispatch_step(state: &AppState, step: &StepRef) -> DispatchOutcome {
         .work_kind
         .unwrap_or_else(|| work_kind_for_step(step.kind, &step.objective));
 
-    // Declare the verdict class here, at plan time, before the worker ever
-    // sees the task -- so delivery cannot choose the stronger claim after the
-    // fact. See `diff_surface::declare_verdict_class` for the rule (Phase 27,
-    // step 1: conservative, and stated as such).
-    task.verdict_class =
-        cortex_core::diff_surface::declare_verdict_class(&check_specs, effective_work_kind);
-
     // Freeze the exam here, at dispatch, before the worker sees the task.
     // Verification happens after delivery, and the `CheckSpec` argv needed to
     // run it does not survive the downgrade to `RequiredCheck` below — so if
@@ -731,6 +724,9 @@ async fn dispatch_step(state: &AppState, step: &StepRef) -> DispatchOutcome {
     // Only for steps that change trees. An empty set means this step is not
     // one verification attaches to, and freezing an empty row would make it
     // indistinguishable from a step whose checks failed to derive.
+    //
+    // `save_check_specs` is first-write-wins (see its doc comment): a retry of
+    // this step does not overwrite the exam a previous attempt already froze.
     if !check_specs.is_empty() {
         if let Err(e) = db.save_check_specs(&step.run_id, &step.step_id, &check_specs) {
             tracing::warn!(
@@ -741,6 +737,19 @@ async fn dispatch_step(state: &AppState, step: &StepRef) -> DispatchOutcome {
             );
         }
     }
+
+    // Declare the verdict class here, at plan time, before the worker ever
+    // sees the task -- so delivery cannot choose the stronger claim after the
+    // fact. See `decide_verdict_class` for the retry- and missing-base guards.
+    let declared_class = decide_verdict_class(
+        db,
+        &step.run_id,
+        &step.step_id,
+        base_commit.as_deref(),
+        &check_specs,
+        effective_work_kind,
+    );
+    task.verdict_class = Some(declared_class);
 
     // Freeze the price here too, and for the same reason the exam is frozen
     // here: a price resolved after execution is a price the work could have
@@ -759,7 +768,7 @@ async fn dispatch_step(state: &AppState, step: &StepRef) -> DispatchOutcome {
         effective_work_kind,
         risk,
         !cortex_core::check_derivation::is_unverified_by_construction(&check_specs),
-        task.verdict_class,
+        declared_class,
     );
 
     task.required_checks = check_specs.iter().map(as_required_check).collect();
@@ -772,6 +781,7 @@ async fn dispatch_step(state: &AppState, step: &StepRef) -> DispatchOutcome {
         base_commit.as_deref(),
         &task.required_checks,
         planner_seed.as_ref(),
+        declared_class,
     );
     task.acceptance_criteria = recipe
         .acceptance
@@ -1116,6 +1126,53 @@ fn infer_required_checks(
         .collect()
 }
 
+/// Declare the verdict class at dispatch, before the worker ever sees the
+/// task -- so delivery cannot choose the stronger claim after the fact. See
+/// `diff_surface::declare_verdict_class` for the underlying rule.
+///
+/// Two guards keep this from drifting on a retry:
+///
+/// - If this step already has a work contract from an earlier lease, its
+///   declared class is reused rather than recomputed. `save_check_specs` and
+///   `freeze_step_quote` are both first-write-wins, so recomputing the class
+///   from a fresh disk probe on retry could disagree with the quote and exam
+///   that are already frozen.
+/// - Otherwise, the class is derived from `load_check_specs`, i.e. the exam
+///   that was actually just frozen (or frozen by an earlier attempt), not
+///   from the freshly re-derived `check_specs` passed in -- those can differ
+///   if the workspace on disk changed between derivation and now.
+///
+/// A step with no reliable base commit (the first step of every run, since
+/// `get_run_latest_commit` only returns heads of verified steps) can never be
+/// declared `Strong`: there is nothing to diff the delivery against, so exam
+/// integrity could never be checked, and forcing `Authored` here is what
+/// keeps that step conclusive and billable instead of forever `Inconclusive`.
+fn decide_verdict_class(
+    db: &Database,
+    run_id: &str,
+    step_id: &str,
+    base_commit: Option<&str>,
+    check_specs: &[cortex_core::verification::CheckSpec],
+    work_kind: WorkKind,
+) -> cortex_core::diff_surface::VerdictClass {
+    match db
+        .get_latest_step_work_contract(step_id)
+        .and_then(|contract| contract.verdict_class)
+    {
+        Some(reused) => reused,
+        None if base_commit.is_none() => cortex_core::diff_surface::VerdictClass::Authored,
+        None => {
+            let frozen_specs = db.load_check_specs(run_id, step_id);
+            let specs_for_class = if frozen_specs.is_empty() {
+                check_specs
+            } else {
+                &frozen_specs
+            };
+            cortex_core::diff_surface::declare_verdict_class(specs_for_class, work_kind)
+        }
+    }
+}
+
 fn build_work_recipe(
     work_kind: WorkKind,
     objective: &str,
@@ -1125,6 +1182,7 @@ fn build_work_recipe(
     expected_base_commit: Option<&str>,
     required_checks: &[RequiredCheck],
     planner_seed: Option<&WorkRecipeSeed>,
+    verdict_class: cortex_core::diff_surface::VerdictClass,
 ) -> WorkRecipe {
     let mut constraints = vec![
         format!("risk={risk:?}"),
@@ -1134,6 +1192,14 @@ fn build_work_recipe(
     ];
     if let Some(base) = expected_base_commit {
         constraints.push(format!("expected_base_commit={base}"));
+    }
+    if verdict_class == cortex_core::diff_surface::VerdictClass::Strong {
+        constraints.push(
+            "verdict_class=strong: do not edit existing tests or check/fixture files -- \
+             this step is graded against the battery that already existed, and editing it \
+             is a contract violation, not a stronger result."
+                .to_string(),
+        );
     }
     if let Some(seed) = planner_seed {
         constraints.extend(seed.constraints.iter().cloned());
@@ -2606,6 +2672,7 @@ mod tests {
             Some("abc123"),
             &checks,
             None,
+            cortex_core::diff_surface::VerdictClass::Authored,
         );
 
         assert_eq!(recipe.kind, WorkKind::Test);
@@ -2619,6 +2686,32 @@ mod tests {
             .constraints
             .iter()
             .any(|c| c == "expected_base_commit=abc123"));
+    }
+
+    #[test]
+    fn strong_verdict_class_tells_the_agent_not_to_edit_the_exam() {
+        let checks = vec![RequiredCheck {
+            name: "cargo:test".to_string(),
+            command: "cargo test -p cortex-api".to_string(),
+            required: true,
+        }];
+
+        let recipe = build_work_recipe(
+            WorkKind::Refactor,
+            "refactor without touching tests",
+            RiskLevel::Medium,
+            Tier::Execute,
+            &["crates/api/src/lib.rs".to_string()],
+            Some("abc123"),
+            &checks,
+            None,
+            cortex_core::diff_surface::VerdictClass::Strong,
+        );
+
+        assert!(recipe
+            .constraints
+            .iter()
+            .any(|c| c.starts_with("verdict_class=strong")));
     }
 
     #[test]
@@ -2642,6 +2735,7 @@ mod tests {
             None,
             &[],
             Some(&seed),
+            cortex_core::diff_surface::VerdictClass::Authored,
         );
 
         assert_eq!(recipe.kind, WorkKind::Refactor);
@@ -2973,6 +3067,149 @@ mod tests {
             db.list_run_operations_events(&run_id, 25).len(),
             events_before,
             "no completion write means no new run-status event"
+        );
+    }
+
+    // --- decide_verdict_class ---
+
+    fn scheduler_test_db() -> Database {
+        let dir = tempfile::tempdir().unwrap().keep();
+        Database::open(&dir.join("cortex.sqlite"))
+    }
+
+    fn scheduler_seed_run_and_step(db: &Database, step_id: &str) -> String {
+        db.create_run_with_steps(
+            "user-1",
+            "do the thing",
+            "balanced",
+            &[],
+            None,
+            None,
+            None,
+            &[(
+                step_id.to_string(),
+                "execute".to_string(),
+                "modify".to_string(),
+                None,
+                "execute".to_string(),
+                "low".to_string(),
+                "do the thing".to_string(),
+                0,
+            )],
+            &[],
+        )
+    }
+
+    fn required_check(id: &str) -> cortex_core::verification::CheckSpec {
+        cortex_core::verification::CheckSpec {
+            id: id.to_string(),
+            source: cortex_core::verification::CheckSource::Contract,
+            command: vec!["true".to_string()],
+            timeout_secs: 5,
+            required: true,
+        }
+    }
+
+    /// Finding 1: the first step of every run has no reliable base commit
+    /// (`get_run_latest_commit` only returns heads of already-verified
+    /// steps). Without the fallback, `declare_verdict_class` would happily
+    /// call this `Strong` from the check specs alone, and the step would be
+    /// graded against a base that does not exist -- `Inconclusive`, forever,
+    /// on the very first step of the run.
+    #[test]
+    fn a_step_with_no_base_commit_is_never_declared_strong() {
+        let db = scheduler_test_db();
+        let run_id = scheduler_seed_run_and_step(&db, "step-1");
+        let specs = vec![required_check("cargo:test")];
+
+        let class = decide_verdict_class(
+            &db,
+            &run_id,
+            "step-1",
+            None,
+            &specs,
+            WorkKind::Refactor,
+        );
+
+        assert_eq!(
+            class,
+            cortex_core::diff_surface::VerdictClass::Authored,
+            "no base commit means no exam integrity can ever be checked"
+        );
+    }
+
+    /// Finding 2: `save_check_specs` and `freeze_step_quote` are first-write-
+    /// wins, so a retry that re-derives checks from a fresh disk probe and
+    /// recomputes the class could disagree with the quote and exam that are
+    /// already frozen from the first attempt. Once a work contract exists for
+    /// this step, its declared class must be reused verbatim, regardless of
+    /// what a fresh probe would say.
+    #[test]
+    fn a_retry_reuses_the_class_already_declared_on_the_first_attempt() {
+        let db = scheduler_test_db();
+        let run_id = scheduler_seed_run_and_step(&db, "step-1");
+
+        let mut contract = cortex_core::task::TaskContract::new(
+            "do the thing".to_string(),
+            Tier::Execute,
+            RiskLevel::Low,
+        );
+        contract.verdict_class = Some(cortex_core::diff_surface::VerdictClass::Strong);
+        contract.expected_base_commit = Some("deadbeef".to_string());
+        assert!(db.record_step_work_contract("step-1", &run_id, 1, &contract));
+
+        // A retry: a base commit is available, and a fresh disk probe found
+        // nothing but advisory checks, which alone would derive `Authored`.
+        // The frozen declaration from lease_gen 1 must win anyway.
+        let mut advisory = required_check("cargo:test");
+        advisory.required = false;
+        let fresh_specs = vec![advisory];
+
+        let class = decide_verdict_class(
+            &db,
+            &run_id,
+            "step-1",
+            Some("deadbeef"),
+            &fresh_specs,
+            WorkKind::Refactor,
+        );
+
+        assert_eq!(
+            class,
+            cortex_core::diff_surface::VerdictClass::Strong,
+            "the class frozen on the first attempt must not drift on retry"
+        );
+    }
+
+    /// With a base commit and no prior work contract, the class is derived
+    /// from the frozen exam (`load_check_specs`), not from whatever fresh
+    /// vector the caller happens to pass in.
+    #[test]
+    fn a_first_dispatch_derives_the_class_from_the_frozen_exam() {
+        let db = scheduler_test_db();
+        let run_id = scheduler_seed_run_and_step(&db, "step-1");
+        let frozen = vec![required_check("cargo:test")];
+        db.save_check_specs(&run_id, "step-1", &frozen).unwrap();
+
+        // A caller-supplied vector that disagrees with the frozen exam must
+        // be ignored once an exam has actually been frozen.
+        let mut advisory_only = required_check("cargo:test");
+        advisory_only.required = false;
+        let disagreeing_fresh_specs = vec![advisory_only];
+
+        let class = decide_verdict_class(
+            &db,
+            &run_id,
+            "step-1",
+            Some("deadbeef"),
+            &disagreeing_fresh_specs,
+            WorkKind::Refactor,
+        );
+
+        assert_eq!(
+            class,
+            cortex_core::diff_surface::VerdictClass::Strong,
+            "the frozen exam, not a fresh re-derivation, decides the class"
         );
     }
 }

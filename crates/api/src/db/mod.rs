@@ -4226,8 +4226,10 @@ pub struct Receipt {
     pub egress: Option<EgressReceipt>,
     /// What kind of claim this verdict is, declared at plan time before this
     /// step ran -- so the customer sees the grade before they spend, not
-    /// after. `None` only for a receipt whose work contract could not be
-    /// read; it is not a third class.
+    /// after. `None` for a receipt whose work contract could not be read, or
+    /// whose contract predates this field (`TaskContract::verdict_class` is
+    /// itself `Option`, `#[serde(default)]`) -- either way it is not a third
+    /// class, and grading treats it exactly like `Authored`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub verdict_class: Option<cortex_core::diff_surface::VerdictClass>,
     /// What the step was quoted at dispatch -- an `authored` verdict already

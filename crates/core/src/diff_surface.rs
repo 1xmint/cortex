@@ -152,7 +152,7 @@ pub fn declare_verdict_class(
     use crate::task::WorkKind;
     use crate::verification::CheckSource;
 
-    if checks.is_empty() {
+    if !checks.iter().any(|c| c.required) {
         return VerdictClass::Authored;
     }
 
@@ -532,6 +532,20 @@ mod tests {
         assert_eq!(
             declare_verdict_class(&checks, crate::task::WorkKind::Modify),
             VerdictClass::Strong
+        );
+    }
+
+    #[test]
+    fn a_non_empty_but_all_advisory_battery_cannot_be_declared_strong() {
+        // A non-empty check set with no *required* checks has no battery that
+        // actually decides anything -- `checks.is_empty()` would miss this
+        // case and manufacture a vacuous `Strong` claim.
+        let mut advisory = ecosystem_check("cargo:test");
+        advisory.required = false;
+        let checks = vec![advisory];
+        assert_eq!(
+            declare_verdict_class(&checks, crate::task::WorkKind::Refactor),
+            VerdictClass::Authored
         );
     }
 }

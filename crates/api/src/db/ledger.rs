@@ -613,25 +613,31 @@ impl Database {
             format!("{}:subscription", refund_key.as_str()),
             format!("{}:pack", refund_key.as_str()),
         ];
-        let count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM credit_transactions
-                 WHERE idempotency_key IN (?1, ?2, ?3, ?4)",
-                params![keys[0], keys[1], keys[2], keys[3]],
-                |r| r.get(0),
-            )
-            .unwrap_or(0);
+        // One query for both facts, so a torn read between "how many rows"
+        // and "what do they sum to" cannot happen. A DB error is logged and
+        // surfaced as `None` -- "no charge" and "could not read the ledger"
+        // must not look identical to a caller deciding whether to display a
+        // charge, so the difference has to at least reach the logs.
+        let row = conn.query_row(
+            "SELECT COUNT(*), COALESCE(SUM(amount), 0) FROM credit_transactions
+             WHERE idempotency_key IN (?1, ?2, ?3, ?4)",
+            params![keys[0], keys[1], keys[2], keys[3]],
+            |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
+        );
+        let (count, sum) = match row {
+            Ok(v) => v,
+            Err(err) => {
+                tracing::error!(
+                    verification_id,
+                    error = %err,
+                    "ledger_net_charge_for_verification: query failed"
+                );
+                return None;
+            }
+        };
         if count == 0 {
             return None;
         }
-        let sum: i64 = conn
-            .query_row(
-                "SELECT COALESCE(SUM(amount), 0) FROM credit_transactions
-                 WHERE idempotency_key IN (?1, ?2, ?3, ?4)",
-                params![keys[0], keys[1], keys[2], keys[3]],
-                |r| r.get(0),
-            )
-            .unwrap_or(0);
         Some(-sum)
     }
 
@@ -1138,7 +1144,7 @@ impl Database {
             .read_step_work_contract(step_id, attempt)
             .ok()
             .flatten()
-            .map(|contract| contract.verdict_class);
+            .and_then(|contract| contract.verdict_class);
         // What the step was quoted at dispatch, before any verdict existed.
         let quoted_credits = self
             .get_step_quote(run_id, step_id)

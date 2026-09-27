@@ -82,13 +82,31 @@ export interface Receipt {
 const VERDICT_CLASS_COPY: Record<VerdictClass, { label: string; detail: string }> = {
   strong: {
     label: 'Strong',
-    detail: 'Independently verified against the battery you already had.',
+    detail: 'Graded by checks that existed before this task.',
   },
   authored: {
     label: 'Authored',
     detail: 'Checked by tests the agent wrote — not independently verified.',
   },
 };
+
+/**
+ * The class badge's tooltip text, adjusted for the actual verdict.
+ *
+ * `strong`'s detail describes the battery, not the outcome — it must not read
+ * as a claim of success on a verdict that did not succeed. A failed `strong`
+ * step was graded by the customer's own checks and still did not pass them;
+ * saying anything that could be misread as "verified" here would overstate
+ * what happened.
+ */
+function verdictClassDetail(receipt: Receipt): string | undefined {
+  const classCopy = receipt.verdict_class ? VERDICT_CLASS_COPY[receipt.verdict_class] : undefined;
+  if (!classCopy) return undefined;
+  if (receipt.verdict_class === 'strong' && receipt.gate.verdict !== 'verified') {
+    return 'Graded by checks that existed before this task -- it did not pass them.';
+  }
+  return classCopy.detail;
+}
 
 const VERDICT_COPY: Record<Verdict, { label: string; detail: string; banner: string }> = {
   verified: {
@@ -173,6 +191,7 @@ export function CopyEvidenceButton({ payload, label = 'Copy evidence' }: { paylo
 export function ReceiptCard({ receipt }: { receipt: Receipt }) {
   const copy = VERDICT_COPY[receipt.gate.verdict];
   const classCopy = receipt.verdict_class ? VERDICT_CLASS_COPY[receipt.verdict_class] : undefined;
+  const classDetail = verdictClassDetail(receipt);
 
   return (
     <div className="overflow-hidden rounded-lg border border-[var(--line)] bg-[var(--surface)]">
@@ -182,7 +201,7 @@ export function ReceiptCard({ receipt }: { receipt: Receipt }) {
         {classCopy && (
           <span
             className="rounded border border-current/40 px-1.5 py-0.5 t-micro font-medium uppercase tracking-wide opacity-90"
-            title={classCopy.detail}
+            title={classDetail}
           >
             {classCopy.label}
           </span>
@@ -205,9 +224,9 @@ export function ReceiptCard({ receipt }: { receipt: Receipt }) {
           the same rule that governs the verdict banner above applies here:
           an `authored` verdict is real, and it is not rendered as though it
           were the same claim as `strong`. */}
-      {classCopy && (
+      {classDetail && (
         <p className="t-micro border-b border-[var(--line-faint)] px-3 py-2 text-[var(--muted)]">
-          {classCopy.detail}
+          {classDetail}
         </p>
       )}
 

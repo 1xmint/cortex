@@ -42,12 +42,44 @@ describe('ReceiptCard verdict class', () => {
     render(<ReceiptCard receipt={baseReceipt({ verdict_class: 'strong', charged_credits: 10 })} />);
     expect(screen.getByText('Strong')).toBeInTheDocument();
     expect(screen.queryByText('Authored')).not.toBeInTheDocument();
-    expect(
-      screen.getByText('Independently verified against the battery you already had.'),
-    ).toBeInTheDocument();
+    expect(screen.getByText('Graded by checks that existed before this task.')).toBeInTheDocument();
   });
 
-  it('renders no class badge or charged-credits line when the receipt predates the field', () => {
+  it('does not claim verification for a strong-declared step that failed', () => {
+    // `strong` describes the battery, not the outcome. A failed verdict must
+    // not read as though the checks were passed -- the copy has to say the
+    // grading happened and the checks were not passed, not something that
+    // could be misread as "independently verified".
+    render(
+      <ReceiptCard
+        receipt={baseReceipt({
+          verdict_class: 'strong',
+          gate: {
+            verdict: 'failed',
+            required_total: 2,
+            required_passed: 1,
+            failed: ['c2'],
+            not_executed: [],
+          },
+        })}
+      />,
+    );
+    expect(screen.getByText('Strong')).toBeInTheDocument();
+    expect(
+      screen.getByText('Graded by checks that existed before this task -- it did not pass them.'),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/independently verified/i)).not.toBeInTheDocument();
+  });
+
+  // `verdict_class` is `Option<VerdictClass>` on the backend
+  // (`TaskContract::verdict_class`, `#[serde(default)]`) and is skipped from
+  // the JSON entirely when `None` (`Receipt.verdict_class`,
+  // `skip_serializing_if = "Option::is_none"`). That is exactly what a
+  // pre-PR contract, and a contract whose work-contract row could not be
+  // read, both serialize as -- the frontend cannot and should not be able to
+  // tell those two apart, so the fixture below (no `verdict_class` key at
+  // all) is the real wire shape for either case, not a stand-in for it.
+  it('renders no class badge or charged-credits line when the contract never declared a verdict class', () => {
     render(<ReceiptCard receipt={baseReceipt()} />);
     expect(screen.queryByText('Strong')).not.toBeInTheDocument();
     expect(screen.queryByText('Authored')).not.toBeInTheDocument();

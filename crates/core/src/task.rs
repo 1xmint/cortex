@@ -30,11 +30,16 @@ pub struct TaskContract {
     /// at plan time, before approval -- so that delivery cannot choose it
     /// after the fact.
     ///
-    /// Defaults to `Authored`, the weaker claim. A contract written before
-    /// this field existed promised nothing about the exam, and defaulting to
-    /// `Strong` would retroactively put words in its mouth.
+    /// `None` means undeclared: either this contract predates the field, or
+    /// it was written by a path that never set it. Every grading and pricing
+    /// consumer treats `None` exactly like `Authored` -- the weaker claim --
+    /// because a contract written before this field existed promised nothing
+    /// about the exam, and defaulting to `Strong` would retroactively put
+    /// words in its mouth. Kept as an explicit `Option` rather than defaulting
+    /// the enum itself so a receipt can tell "undeclared" apart from "declared
+    /// Authored" when that distinction matters (e.g. an audit of pre-PR runs).
     #[serde(default)]
-    pub verdict_class: crate::diff_surface::VerdictClass,
+    pub verdict_class: Option<crate::diff_surface::VerdictClass>,
     #[serde(default)]
     pub autonomy: Option<String>,
     #[serde(default)]
@@ -209,9 +214,10 @@ impl TaskContract {
             allowed_paths: Vec::new(),
             forbidden_paths: Vec::new(),
             expected_base_commit: None,
-            // The weaker claim until a planner declares otherwise: a task
-            // constructed here has promised nothing about the exam.
-            verdict_class: crate::diff_surface::VerdictClass::Authored,
+            // Undeclared until a planner declares otherwise: a task
+            // constructed here has promised nothing about the exam. Every
+            // consumer treats `None` as `Authored`.
+            verdict_class: None,
             autonomy: None,
             approval: None,
             budget_limit: None,

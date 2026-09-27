@@ -110,6 +110,12 @@ jobs:
       # class and assert the plain-language disclosure text a customer sees
       # before disputing a charge, plus that a pre-verdict-class receipt still
       # renders with neither badge nor charged-credits line.
+      #
+      # 29 -> 30 with one more in `src/components/mission/Receipt.test.tsx`,
+      # which renders a `strong`-declared step whose verdict is `failed` and
+      # asserts the class copy stops short of anything a reader could take
+      # for "independently verified" -- the battery existed before the task,
+      # but this attempt did not pass it.
       - name: Test Cortex
         run: |
           set -euo pipefail
@@ -119,8 +125,8 @@ jobs:
           echo "$output"
           passed=$(echo "$output" | grep -oE "Tests +[0-9]+ passed" | grep -oE "[0-9]+" | tail -1)
           echo "cortex tests passed: ${passed:-0}"
-          if [ "${passed:-0}" -lt 29 ]; then
-            echo "::error::expected at least 29 Cortex tests to run, saw ${passed:-0}"
+          if [ "${passed:-0}" -lt 30 ]; then
+            echo "::error::expected at least 30 Cortex tests to run, saw ${passed:-0}"
             exit 1
           fi
 
