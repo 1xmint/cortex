@@ -34,10 +34,12 @@ fn column_names(conn: &rusqlite::Connection, table: &str) -> Vec<String> {
 #[test]
 fn a_fresh_database_reaches_v72_and_carries_the_new_columns() {
     let (_dir, db) = db();
-    assert!(
-        SCHEMA_VERSION >= 72,
-        "SCHEMA_VERSION const has not been bumped to include migration v72"
-    );
+    const {
+        assert!(
+            SCHEMA_VERSION >= 72,
+            "SCHEMA_VERSION const has not been bumped to include migration v72"
+        );
+    }
     assert_eq!(
         db.schema_version(),
         i64::from(SCHEMA_VERSION),
