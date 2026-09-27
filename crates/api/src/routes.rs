@@ -1119,7 +1119,10 @@ pub(crate) async fn create_pr_core(
     }
 
     // Build PR metadata
-    let title = failed_pr_title(title.unwrap_or_else(|| format!("cortex: {goal}")), is_failed);
+    let title = failed_pr_title(
+        title.unwrap_or_else(|| format!("cortex: {goal}")),
+        is_failed,
+    );
     let authority_scope_id = db
         .get_run_pr_authority_context(run_id, user_id)
         .and_then(|ctx| ctx.authority_scope_id);
@@ -1778,10 +1781,7 @@ mod validate_run_for_pr_tests {
         assert_eq!(failed_checks, vec!["check-1".to_string()]);
 
         let title = failed_pr_title(format!("cortex: {goal}"), db.run_has_failed_step(&run_id));
-        assert!(
-            title.starts_with("[failed checks] "),
-            "got: {title}"
-        );
+        assert!(title.starts_with("[failed checks] "), "got: {title}");
 
         let body = build_pr_body(&run_id, &goal, &branch, db, None, &failed_checks);
         assert!(
