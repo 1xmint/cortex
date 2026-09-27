@@ -328,7 +328,7 @@ pub const SCHEMA_VERSION: u32 = 72;
 /// `SCHEMA_VERSION` alone cannot catch that: it only advances when someone
 /// remembers to bump it. See `schema_fingerprint_matches_pinned_value` in
 /// this module's tests, which is what computes and checks this value.
-pub const SCHEMA_FINGERPRINT: u64 = 0x2b96ad201c8fdb1a;
+pub const SCHEMA_FINGERPRINT: u64 = 0x65d388252c823520;
 
 fn apply_migrations(conn: &Connection) {
     conn.execute_batch(
@@ -5722,6 +5722,12 @@ impl Database {
             ("openai", "gpt-5.4"),
             ("openai", "gpt-5-mini"),
         ];
+        // M-D-0023: every Anthropic row is list-price, not a measured rate, so
+        // the seed is always authoritative for `provider == "claude"` — an
+        // installation must never keep a stale Anthropic rate (the bug this
+        // whole revision function exists to close). OpenAI/other providers
+        // keep the narrower `CORRECTED` allowlist above until their rates are
+        // similarly pinned to a cited source.
         let Some(mut list) = self.active_price_list() else {
             return;
         };
@@ -5737,9 +5743,11 @@ impl Database {
                     changed = true;
                 }
                 Some(row)
-                    if CORRECTED.contains(&(seed.provider.as_str(), seed.model_id.as_str()))
+                    if (seed.provider == "claude"
+                        || CORRECTED.contains(&(seed.provider.as_str(), seed.model_id.as_str())))
                         && (row.input_micros_per_1k != seed.input_micros_per_1k
-                            || row.output_micros_per_1k != seed.output_micros_per_1k) =>
+                            || row.output_micros_per_1k != seed.output_micros_per_1k
+                            || row.cache_read_bp != seed.cache_read_bp) =>
                 {
                     *row = seed;
                     changed = true;

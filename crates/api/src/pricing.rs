@@ -562,7 +562,10 @@ pub fn seed_models() -> Vec<ModelPrice> {
         // undercharges reasoning-heavy calls. Punch-list: re-check
         // `supplier_openai.rs:168-182` against OpenAI's usage object and this
         // page before OpenAI pass-through is trusted at the same "exact"
-        // standard as the Anthropic rows below.
+        // standard as the Anthropic rows below. The `cache_read_bp` (5_000 =
+        // 50% off) below is also unverified against the same page — it was
+        // carried over from the prior row rather than checked against a
+        // published cached-input rate.
         m(
             "openai", "gpt-5.5", 5_000, 30_000, 5_000, 400_000, "frontier",
         ),
@@ -577,7 +580,7 @@ pub fn seed_models() -> Vec<ModelPrice> {
         // longest session Cortex allows, in seconds.
         // gpt-live-1: $0.05/min billed per second = 833.33 micros/s, rounded
         // up so a minute never costs less than the supplier charges us.
-        m("openai", "gpt-live-1", 833_334, 0, 0, 7_200, "voice"),
+        m("openai", "gpt-live-1", 833_333, 0, 0, 7_200, "voice"),
         // gpt-4o-mini-transcribe: $0.003/min = 50 micros/s.
         m(
             "openai",
@@ -788,6 +791,12 @@ pub fn cost_micro_usd(rate: &ModelPrice, usage: &UsageTokens) -> u64 {
 /// where a `u128` sum could itself overflow.
 pub fn charge(carry_micro: u64, cost_micro: u64, micros_per_credit: u64) -> (u64, u64) {
     let total = u128::from(carry_micro) + u128::from(cost_micro);
+    // A zero `micros_per_credit` would be a division by zero, not a valid
+    // exchange rate. Refuse to deduct anything and carry the whole amount
+    // forward rather than panicking a caller on bad configuration.
+    if micros_per_credit == 0 {
+        return (0, carry_micro.saturating_add(cost_micro));
+    }
     let mpc = u128::from(micros_per_credit);
     let credits = (total / mpc) as u64;
     let new_carry = (total % mpc) as u64;
@@ -826,10 +835,16 @@ mod tests {
         // The graduation gate, and the most important test in this file. A
         // seeded list has zero outcome samples behind it. It publishes a
         // number so the number can be argued with; it must not move money.
+        //
+        // M-D-0023: the seeded quote no longer rounds up to at least one
+        // credit (pass-through means no rounding up anywhere a customer
+        // charge or estimate comes from), so a cheap class can honestly quote
+        // zero credits. That is not the dangerous direction — a zero quote
+        // still cannot bill, which is the only thing this test guards.
         let list = seeded();
         for class in TaskClass::all() {
             let (credits, billable) = quote(&list, &class).expect("priced");
-            assert!(credits > 0, "{} quoted zero credits", class.key());
+            assert!(credits >= 0, "{} quoted a negative amount", class.key());
             assert!(
                 !billable,
                 "{} would charge from a list with no measured outcomes",
@@ -855,10 +870,22 @@ mod tests {
         // The positive direction. Without this the test above passes for a
         // module that can never charge at all, which would be a different bug
         // wearing the same green tick.
+        //
+        // Picks the most expensive class (refactor/critical/verifiable)
+        // rather than `classes[0]` — M-D-0023 floors the seeded quote instead
+        // of rounding up to at least one credit, so a cheap class can quote
+        // zero, which would make this "bills" test indistinguishable from a
+        // module that never charges. The point here is that a real, nonzero
+        // amount moves once both the class and the list are committed.
         let mut list = seeded();
         list.status = PriceStatus::Committed;
-        list.classes[0].status = PriceStatus::Committed;
-        let class = TaskClass::all()[0];
+        let class = TaskClass::new(WorkKind::Refactor, RiskLevel::Critical, true);
+        let idx = list
+            .classes
+            .iter()
+            .position(|c| c.task_class == class.key())
+            .expect("refactor/critical/verifiable is always seeded");
+        list.classes[idx].status = PriceStatus::Committed;
         let (credits, billable) = quote(&list, &class).expect("priced");
         assert!(billable);
         assert!(credits > 0);
@@ -1039,10 +1066,12 @@ mod tests {
                 .find(|m| m.provider == "openai" && m.model_id == id)
                 .unwrap()
         };
-        // One minute of gpt-live-1 is $0.05 = 50_000 micros, rounded up by at
-        // most one micro.
+        // One minute of gpt-live-1 is $0.05 = 50_000 micros. The per-second
+        // rate floors ($0.05/60s = 833.33 micros/s -> 833_333, never rounded
+        // up against the customer), so 60 seconds comes in at most one micro
+        // under, never over.
         let minute = rate("gpt-live-1").cost_micros(60, 0, 0);
-        assert!((50_000..=50_001).contains(&minute), "got {minute}");
+        assert!((49_999..=50_000).contains(&minute), "got {minute}");
         assert_eq!(rate("gpt-4o-mini-transcribe").cost_micros(60, 0, 0), 3_000);
     }
 
@@ -1195,9 +1224,12 @@ mod tests {
             let (credits, new_carry) = charge(carry, cost, mpc);
             total_credits += credits;
             carry = new_carry;
+            assert!(
+                carry < mpc,
+                "carry must stay less than one credit after every call, not just the last"
+            );
         }
         assert_eq!(total_credits * mpc + carry, total_cost);
-        assert!(carry < mpc, "carry must always be less than one credit");
     }
 
     #[test]
