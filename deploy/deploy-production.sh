@@ -128,7 +128,8 @@ CORTEX_ENV=production
 # CORTEX_DATABASE_URL=postgresql://user:pass@localhost/cortex
 
 # Authentication (required in production; the server refuses to start
-# without all three of these -- see deploy/README.md)
+# without all three of these -- see "The API refuses to start without a
+# production auth config" in docs/DEPLOY.md)
 CLERK_SECRET_KEY=
 CLERK_ISSUER=
 CLERK_AUTHORIZED_PARTY=

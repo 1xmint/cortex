@@ -29,7 +29,8 @@ RUST_LOG=info
 # request as user "local". Do not remove this line.
 CORTEX_ENV=production
 # Auth — required in production; the server refuses to start without all
-# three of these set (see deploy/README.md)
+# three of these set (see "The API refuses to start without a production
+# auth config" in docs/DEPLOY.md)
 CLERK_SECRET_KEY=
 CLERK_ISSUER=
 CLERK_AUTHORIZED_PARTY=
