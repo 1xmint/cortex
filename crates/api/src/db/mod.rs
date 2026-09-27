@@ -4243,6 +4243,27 @@ pub struct Receipt {
     /// different fact and the one a reader should be able to rely on.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub egress: Option<EgressReceipt>,
+    /// What kind of claim this verdict is, declared at plan time before this
+    /// step ran -- so the customer sees the grade before they spend, not
+    /// after. `None` for a receipt whose work contract could not be read, or
+    /// whose contract explicitly declared no class. Note this is *not* what a
+    /// pre-PR contract reads back as: `verdict_class` has serialized as the
+    /// literal `"authored"` since the root commit, so an old contract reads
+    /// back as `Some(Authored)`, not `None`. Either way it is not a third
+    /// class, and grading treats `None` exactly like `Authored`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verdict_class: Option<cortex_core::diff_surface::VerdictClass>,
+    /// What the step was quoted at dispatch -- the class price, unaffected by
+    /// `verdict_class`; the declared verdict class does not change the quote. This is the plan, not the outcome: it does not move
+    /// when the charge is later refunded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quoted_credits: Option<i64>,
+    /// What the ledger actually charged for this verification, net of any
+    /// refund -- read from `credit_transactions`, not from the quote. `Some(0)`
+    /// means a charge was made and then fully refunded; `None` means no
+    /// charge was ever written (e.g. an inconclusive verdict).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub charged_credits: Option<i64>,
 }
 
 /// The egress half of a receipt: what was asked for, and what was opened.

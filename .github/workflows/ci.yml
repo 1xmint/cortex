@@ -104,6 +104,24 @@ jobs:
       # browser's real chat-stream and live-voice ingest code, so the two
       # sides of the wire can't drift the way `expires_at` did (server Unix
       # seconds, browser expecting ms/ISO) without a test failing here.
+      #
+      # 26 -> 29 with the three in `src/components/mission/Receipt.test.tsx`,
+      # which render `ReceiptCard` for a `strong` and an `authored` verdict
+      # class and assert the plain-language disclosure text a customer sees
+      # before disputing a charge, plus that a pre-verdict-class receipt still
+      # renders with neither badge nor charged-credits line.
+      #
+      # 29 -> 30 with one more in `src/components/mission/Receipt.test.tsx`,
+      # which renders a `strong`-declared step whose verdict is `failed` and
+      # asserts the class copy stops short of anything a reader could take
+      # for "independently verified" -- the battery existed before the task,
+      # but this attempt did not pass it.
+      #
+      # 30 -> 31 with one more in `src/components/mission/Receipt.test.tsx`,
+      # which renders a `strong`-declared step whose verdict is `inconclusive`
+      # and asserts the copy reads as "not graded" rather than "did not pass" --
+      # an inconclusive step never ran its checks, so there is nothing it
+      # failed.
       - name: Test Cortex
         run: |
           set -euo pipefail
@@ -113,8 +131,8 @@ jobs:
           echo "$output"
           passed=$(echo "$output" | grep -oE "Tests +[0-9]+ passed" | grep -oE "[0-9]+" | tail -1)
           echo "cortex tests passed: ${passed:-0}"
-          if [ "${passed:-0}" -lt 26 ]; then
-            echo "::error::expected at least 26 Cortex tests to run, saw ${passed:-0}"
+          if [ "${passed:-0}" -lt 31 ]; then
+            echo "::error::expected at least 31 Cortex tests to run, saw ${passed:-0}"
             exit 1
           fi
 

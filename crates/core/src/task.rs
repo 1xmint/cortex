@@ -30,11 +30,19 @@ pub struct TaskContract {
     /// at plan time, before approval -- so that delivery cannot choose it
     /// after the fact.
     ///
-    /// Defaults to `Authored`, the weaker claim. A contract written before
-    /// this field existed promised nothing about the exam, and defaulting to
-    /// `Strong` would retroactively put words in its mouth.
+    /// `None` means undeclared: a path that constructs a contract without
+    /// setting this field. It does **not** mean "predates this field" --
+    /// the field has serialized as the literal string `"authored"` since the
+    /// root commit (it was a non-`Option` enum defaulting to `Authored`
+    /// before this change), so every contract stored before this PR reads
+    /// back as `Some(Authored)`, not `None`. Every grading and pricing
+    /// consumer treats `None` exactly like `Authored` anyway -- the weaker
+    /// claim -- so old and new "no real declaration" rows are graded the
+    /// same either way; the `Option` exists so a fresh contract that never
+    /// calls into planning can still be told apart from one that explicitly
+    /// declared `Authored`.
     #[serde(default)]
-    pub verdict_class: crate::diff_surface::VerdictClass,
+    pub verdict_class: Option<crate::diff_surface::VerdictClass>,
     #[serde(default)]
     pub autonomy: Option<String>,
     #[serde(default)]
@@ -209,9 +217,10 @@ impl TaskContract {
             allowed_paths: Vec::new(),
             forbidden_paths: Vec::new(),
             expected_base_commit: None,
-            // The weaker claim until a planner declares otherwise: a task
-            // constructed here has promised nothing about the exam.
-            verdict_class: crate::diff_surface::VerdictClass::Authored,
+            // Undeclared until a planner declares otherwise: a task
+            // constructed here has promised nothing about the exam. Every
+            // consumer treats `None` as `Authored`.
+            verdict_class: None,
             autonomy: None,
             approval: None,
             budget_limit: None,

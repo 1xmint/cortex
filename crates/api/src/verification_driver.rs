@@ -452,7 +452,10 @@ fn exam_integrity(db: &Database, facts: &DeliveryFacts) -> ExamIntegrity {
             };
         }
     };
-    if contract.verdict_class != VerdictClass::Strong {
+    // `None` (undeclared -- either a pre-PR contract or one written by a path
+    // that never set the field) is graded exactly like `Authored`: today's
+    // behaviour on `main`, before this field existed at all.
+    if contract.verdict_class != Some(VerdictClass::Strong) {
         return ExamIntegrity::PermittedAuthoredWork;
     }
 
@@ -728,6 +731,21 @@ mod tests {
         assert_eq!(receipt.executions.len(), 2);
         assert_eq!(receipt.gate.required_total, 2);
         assert_eq!(receipt.gate.required_passed, 2);
+        // This test is what guards `get_receipt` against the deadlock its
+        // trailing self.read_step_work_contract / self.get_step_quote /
+        // self.ledger_net_charge_for_verification calls could reintroduce: a
+        // regression there hangs this test rather than failing it, so the
+        // fields those calls actually populate need to be asserted here.
+        assert_eq!(
+            receipt.verdict_class,
+            Some(VerdictClass::Strong),
+            "read back from the frozen work contract declared above"
+        );
+        assert_eq!(
+            receipt.charged_credits, None,
+            "facts_for this test carries no quoted_credits, so finish_and_bill \
+             never charges and no ledger row exists to read back"
+        );
     }
 
     #[tokio::test]
@@ -961,7 +979,7 @@ mod tests {
             cortex_core::provider::Tier::Execute,
             cortex_core::routing::RiskLevel::Low,
         );
-        c.verdict_class = class;
+        c.verdict_class = Some(class);
         c.expected_base_commit = Some(base.to_string());
         c
     }
@@ -1028,6 +1046,26 @@ mod tests {
             exam_integrity(&db, &facts_for(&dir, &head, &run_id, "step-1")),
             ExamIntegrity::PermittedAuthoredWork,
             "an authored verdict is allowed to have written the exam"
+        );
+    }
+
+    #[test]
+    fn an_undeclared_verdict_class_is_graded_as_authored() {
+        // `verdict_class: None` is a pre-PR contract, or one written by a path
+        // that never set the field. It must be treated exactly like
+        // `Authored` -- today's behaviour on `main` -- rather than tripping
+        // the `strong` exam-integrity check it never opted into.
+        let db = test_db();
+        let (dir, base, head) = repo_with_base_and_delivery(&["src/lib.rs", "tests/e2e.rs"]);
+        let run_id = seed_run_and_step(&db, "step-1");
+        let mut contract = contract_declaring(VerdictClass::Authored, &base);
+        contract.verdict_class = None;
+        assert!(db.record_step_work_contract("step-1", &run_id, 1, &contract,));
+
+        assert_eq!(
+            exam_integrity(&db, &facts_for(&dir, &head, &run_id, "step-1")),
+            ExamIntegrity::PermittedAuthoredWork,
+            "undeclared reads back as authored, not as a broken strong contract"
         );
     }
 

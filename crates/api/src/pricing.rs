@@ -240,6 +240,10 @@ impl StepQuote {
 /// is the honest failure: a missing class means nobody decided what this work
 /// costs, and the correct behaviour is the one already in the driver — record
 /// the verdict, leave the ledger alone, say so.
+///
+/// Billing is pass-through: this does not vary by `verdict_class`. The
+/// declared class is a stored label surfaced on the plan receipt and the
+/// verification receipt, not a pricing input.
 pub fn quote(list: &PriceList, class: &TaskClass) -> Option<(i64, bool)> {
     let priced = list.class(class)?;
     // Both statuses must permit billing. A committed class inside a
