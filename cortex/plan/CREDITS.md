@@ -12,9 +12,10 @@
 > credit buys a verified task, never tokens" is no longer the pricing model.
 > The owner's chosen model is **pass-through**: customers are charged the
 > provider cost of the calls made for them, exactly, shown per message, plan,
-> or task in credits — never a fixed price per task class, never a per-token
-> price. Tokens are still never the thing sold or displayed; the unit of truth
-> for a charge is micro-USD, and the customer-facing unit is still the credit.
+> or task in dollars — never a fixed price per task class, never a per-token
+> price. Tokens are never the thing sold or displayed. The frontend shows
+> dollars; the backend accounts in credits (unit of truth for a charge:
+> micro-USD). The subscription fee is Cortex's income; credits are pure cost.
 > The historical argument below (§D.4, resale vs. product) is kept for
 > context; the "fixed price per action absorbs variance" reasoning it
 > supported no longer applies, since a pass-through charge is defined *as* the
