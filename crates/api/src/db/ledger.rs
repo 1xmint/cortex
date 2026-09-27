@@ -1121,16 +1121,18 @@ impl Database {
                             cortex_core::execution_job::CapabilityGrant::ResolveDependencies {
                                 registries,
                             } => registries.clone(),
-                            cortex_core::execution_job::CapabilityGrant::ReachProvider { .. }
+                            cortex_core::execution_job::CapabilityGrant::ReachProvider {
+                                ..
+                            }
                             | cortex_core::execution_job::CapabilityGrant::ReadSecret { .. } => {
                                 Vec::new()
                             }
                         })
                         .collect();
                     let granted_provider = grants.iter().find_map(|grant| match grant {
-                        cortex_core::execution_job::CapabilityGrant::ReachProvider {
-                            provider,
-                        } => Some(provider.clone()),
+                        cortex_core::execution_job::CapabilityGrant::ReachProvider { provider } => {
+                            Some(provider.clone())
+                        }
                         cortex_core::execution_job::CapabilityGrant::ResolveDependencies {
                             ..
                         }

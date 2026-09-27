@@ -3099,9 +3099,13 @@ mod tests {
     }
 
     fn required_check(id: &str) -> cortex_core::verification::CheckSpec {
+        // `Ecosystem`, not `Contract`: `declare_verdict_class` only counts a
+        // required check as preexisting evidence when it is not one the
+        // contract itself invented, so a `Contract`-sourced fixture here
+        // could never derive `Strong` regardless of which specs win.
         cortex_core::verification::CheckSpec {
             id: id.to_string(),
-            source: cortex_core::verification::CheckSource::Contract,
+            source: cortex_core::verification::CheckSource::Ecosystem,
             command: vec!["true".to_string()],
             timeout_secs: 5,
             required: true,
