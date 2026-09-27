@@ -1570,3 +1570,173 @@ pub async fn get_deployment_adapters(
         "adapters": statuses,
     })))
 }
+
+#[cfg(test)]
+mod validate_run_for_pr_tests {
+    use super::*;
+    use crate::db::{Database, ResourceLeaseRequest};
+    use cortex_core::verification::{
+        CheckExecution, CheckOutcome, CheckSource, CheckSpec, Verdict,
+    };
+
+    /// Real `AppState` (own tempdir, own sqlite database) -- same shortcut
+    /// `admin::provider_holds_tests::test_state` and
+    /// `agent_confirm::tests::test_state` use.
+    async fn test_state() -> (tempfile::TempDir, std::sync::Arc<AppState>) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".cortex")).unwrap();
+        let state = AppState::new(
+            dir.path().join(".cortex/ledger.jsonl"),
+            dir.path().to_path_buf(),
+            None,
+        )
+        .await;
+        (dir, state)
+    }
+
+    fn write_lease(path: &str) -> ResourceLeaseRequest {
+        ResourceLeaseRequest {
+            resource_type: "path".to_string(),
+            repo_key: "default".to_string(),
+            resource_key: path.to_string(),
+            mode: "write".to_string(),
+            reason: Some("test".to_string()),
+            metadata: serde_json::json!({}),
+        }
+    }
+
+    /// A run with one step under it, a write lease so `validate_pr_authority`
+    /// clears (the personal-scope authority check is otherwise auto-granted
+    /// by `get_authority_scope_for_user`), and a recorded branch so the run
+    /// looks like one that actually produced changes.
+    fn make_run(db: &Database, user_id: &str, step_id: &str) -> String {
+        let run_id = db
+            .create_run_with_steps_and_resource_leases(
+                user_id,
+                "do the thing",
+                "auto",
+                &["src/lib.rs".to_string()],
+                None,
+                None,
+                None,
+                &[write_lease("src/lib.rs")],
+                &[(
+                    step_id.to_string(),
+                    "execute".to_string(),
+                    "modify".to_string(),
+                    None,
+                    "standard".to_string(),
+                    "low".to_string(),
+                    "o".to_string(),
+                    0,
+                )],
+                &[],
+            )
+            .expect("create run");
+        db.record_run_branch(&run_id, "cortex/do-the-thing");
+        run_id
+    }
+
+    fn verdict_spec(id: &str) -> CheckSpec {
+        CheckSpec {
+            id: id.to_string(),
+            source: CheckSource::Contract,
+            command: vec!["cargo".into(), "test".into()],
+            timeout_secs: 60,
+            required: true,
+        }
+    }
+
+    fn verdict_execution(spec_id: &str, outcome: CheckOutcome) -> CheckExecution {
+        CheckExecution {
+            spec_id: spec_id.to_string(),
+            exit_code: if matches!(outcome, CheckOutcome::Passed) {
+                Some(0)
+            } else {
+                Some(1)
+            },
+            outcome,
+            duration_ms: 1200,
+            output_digest: "sha256:deadbeef".to_string(),
+            output_tail: "ok".to_string(),
+            runner_image: "cortex/runner@sha256:abc".to_string(),
+        }
+    }
+
+    fn seal_verification(db: &Database, run_id: &str, step_id: &str, verdict: Verdict) -> String {
+        let specs = vec![verdict_spec("check-1")];
+        db.save_check_specs(run_id, step_id, &specs)
+            .expect("freeze specs");
+        let vid = db
+            .claim_verification(run_id, step_id, 1, "tree-hash", "img@sha256:1")
+            .expect("claim verification");
+        let outcome = if matches!(verdict, Verdict::Failed) {
+            CheckOutcome::Failed
+        } else {
+            CheckOutcome::Passed
+        };
+        db.record_check_execution(&vid, &specs[0], &verdict_execution("check-1", outcome))
+            .expect("record execution");
+        db.finish_verification(&vid, verdict).expect("seal");
+        vid
+    }
+
+    #[tokio::test]
+    async fn a_failed_and_refunded_run_is_refused_with_409() {
+        let (_dir, state) = test_state().await;
+        let db = state.db.as_ref().unwrap();
+        let run_id = make_run(db, "user-1", "step-1");
+        let vid = seal_verification(db, &run_id, "step-1", Verdict::Failed);
+
+        db.init_credit_balance("user-1", 100).expect("balance");
+        let charge = cortex_core::billing_binding::ChargeKey::for_verification(&vid);
+        db.deduct_credits("user-1", 30, "work", &charge)
+            .expect("charge");
+        db.refund_credits(
+            "user-1",
+            &charge,
+            &cortex_core::billing_binding::RefundKey::for_verification(&vid),
+            "failed",
+        )
+        .expect("refund");
+
+        let err = validate_run_for_pr(db, "user-1", &run_id)
+            .expect_err("a refunded run's changes must not be handed over");
+        assert_eq!(err.0, StatusCode::CONFLICT);
+        assert_eq!(
+            err.1 .0.error,
+            "This task failed verification and was refunded; its changes are not delivered. See the failure report."
+        );
+    }
+
+    #[tokio::test]
+    async fn a_verified_and_charged_run_clears_the_refund_gate() {
+        let (_dir, state) = test_state().await;
+        let db = state.db.as_ref().unwrap();
+        let run_id = make_run(db, "user-1", "step-1");
+        let vid = seal_verification(db, &run_id, "step-1", Verdict::Verified);
+
+        db.init_credit_balance("user-1", 100).expect("balance");
+        db.deduct_credits(
+            "user-1",
+            30,
+            "work",
+            &cortex_core::billing_binding::ChargeKey::for_verification(&vid),
+        )
+        .expect("charge");
+
+        // The gate this test protects is specifically the 409 for a failed
+        // and refunded run. A verified, charged run may still fail later for
+        // reasons unrelated to this fix (no GitHub token, say) -- that a call
+        // was rejected here does not tell us this gate is broken, only
+        // that a 409 must never be it.
+        match validate_run_for_pr(db, "user-1", &run_id) {
+            Ok((_goal, branch)) => assert_eq!(branch, "cortex/do-the-thing"),
+            Err((status, _)) => assert_ne!(
+                status,
+                StatusCode::CONFLICT,
+                "a verified, charged run must never be withheld as though it were refunded"
+            ),
+        }
+    }
+}

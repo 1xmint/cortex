@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { hasFailedRefundedStep } from './RunsPane';
+import { hasFailedRefundedStep } from './runVerdict';
 import type { RunStep } from '../../lib/cortexApi';
 
 function makeStep(overrides: Partial<RunStep> = {}): RunStep {

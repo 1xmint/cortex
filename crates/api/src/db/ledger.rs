@@ -1495,4 +1495,115 @@ mod tests {
         assert_eq!(balance.subscription_remaining, 0);
         assert_eq!(balance.pack_remaining, 0);
     }
+
+    // --- run_has_failed_refunded_step ---
+
+    fn verdict_spec(id: &str) -> CheckSpec {
+        CheckSpec {
+            id: id.to_string(),
+            source: CheckSource::Contract,
+            command: vec!["cargo".into(), "test".into()],
+            timeout_secs: 60,
+            required: true,
+        }
+    }
+
+    fn verdict_execution(spec_id: &str, outcome: CheckOutcome) -> CheckExecution {
+        CheckExecution {
+            spec_id: spec_id.to_string(),
+            exit_code: if matches!(outcome, CheckOutcome::Passed) {
+                Some(0)
+            } else {
+                Some(1)
+            },
+            outcome,
+            duration_ms: 1200,
+            output_digest: "sha256:deadbeef".to_string(),
+            output_tail: "ok".to_string(),
+            runner_image: "cortex/runner@sha256:abc".to_string(),
+        }
+    }
+
+    /// A run row and one step under it, the minimum
+    /// `run_has_failed_refunded_step` needs to have anything to walk --
+    /// `get_all_step_statuses` reads from `steps`, not from the verification
+    /// tables.
+    fn insert_run_and_step(db: &Database, run_id: &str, step_id: &str) {
+        let conn = db.conn();
+        conn.execute(
+            "INSERT INTO runs (id, user_id, goal, created_at, updated_at)
+             VALUES (?1, 'user-1', 'g', 0, 0)",
+            params![run_id],
+        )
+        .expect("insert run");
+        conn.execute(
+            "INSERT INTO steps (id, run_id, kind, tier, risk, objective, created_at, updated_at)
+             VALUES (?1, ?2, 'execute', 'standard', 'low', 'o', 0, 0)",
+            params![step_id, run_id],
+        )
+        .expect("insert step");
+    }
+
+    /// Seals a verification for the given step with the given verdict and
+    /// returns its verification id, so a caller can then refund (or not)
+    /// against it.
+    fn seal_verification(db: &Database, run_id: &str, step_id: &str, verdict: Verdict) -> String {
+        let specs = vec![verdict_spec("check-1")];
+        db.save_check_specs(run_id, step_id, &specs)
+            .expect("freeze specs");
+        let vid = db
+            .claim_verification(run_id, step_id, 1, "tree-hash", "img@sha256:1")
+            .expect("claim verification");
+        let outcome = if matches!(verdict, Verdict::Failed) {
+            CheckOutcome::Failed
+        } else {
+            CheckOutcome::Passed
+        };
+        db.record_check_execution(&vid, &specs[0], &verdict_execution("check-1", outcome))
+            .expect("record execution");
+        db.finish_verification(&vid, verdict).expect("seal");
+        vid
+    }
+
+    #[test]
+    fn a_failed_step_that_was_never_refunded_does_not_withhold_the_pr() {
+        // The owner's rule is specifically about failed *and* refunded work.
+        // A `Failed` verdict that for some reason never got refunded (a
+        // ledger write failure, say) must not trip this -- a false block
+        // would need its own report, same as a false PR.
+        let db = test_db();
+        insert_run_and_step(&db, "run-unrefunded", "step-unrefunded");
+        seal_verification(&db, "run-unrefunded", "step-unrefunded", Verdict::Failed);
+
+        assert!(!db.run_has_failed_refunded_step("run-unrefunded"));
+    }
+
+    #[test]
+    fn a_failed_and_refunded_step_withholds_the_run_s_pr() {
+        let db = test_db();
+        insert_run_and_step(&db, "run-refunded", "step-refunded");
+        let vid = seal_verification(&db, "run-refunded", "step-refunded", Verdict::Failed);
+
+        let user = subscriber(&db, 100);
+        let charge = ChargeKey::for_verification(&vid);
+        db.deduct_credits(user, 30, "work", &charge)
+            .expect("charge");
+        db.refund_credits(user, &charge, &RefundKey::for_verification(&vid), "failed")
+            .expect("refund");
+
+        assert!(db.run_has_failed_refunded_step("run-refunded"));
+    }
+
+    #[test]
+    fn a_verified_and_charged_step_does_not_withhold_the_run_s_pr() {
+        let db = test_db();
+        insert_run_and_step(&db, "run-verified", "step-verified");
+        let vid = seal_verification(&db, "run-verified", "step-verified", Verdict::Verified);
+
+        let user = subscriber(&db, 100);
+        db.deduct_credits(user, 30, "work", &ChargeKey::for_verification(&vid))
+            .expect("charge");
+
+        assert!(!db.run_has_failed_refunded_step("run-verified"));
+    }
 }

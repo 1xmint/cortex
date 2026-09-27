@@ -23,6 +23,7 @@ import {
   type RunSummary,
 } from '../../lib/cortexApi';
 import { EmptyState, ErrorState, PaneHeader, SkeletonRows, StatusChip, StatusIcon } from './ui';
+import { hasFailedRefundedStep } from './runVerdict';
 
 /**
  * Runs — pane one of mission control (SURFACE.md).
@@ -66,22 +67,6 @@ const TERMINAL = new Set([
 // branch" when the run changed nothing -- but there is no reason to show a
 // button for a run that was cancelled or that crashed.
 const SHIPPABLE = new Set(['verified', 'manual_override', 'completed']);
-
-// A run's own status can read "completed" while a step underneath it was
-// independently verified as failed and refunded -- verification finishes
-// after execution does. The backend is the real gate (POST .../pr answers
-// 409 for exactly this), but showing an "Open pull request" button that is
-// certain to be refused, for work the customer was already refunded for, is
-// its own kind of lie. Same rule the backend applies: any step's terminal
-// verdict reading `failed` withholds the whole run's PR.
-export function hasFailedRefundedStep(steps: RunStep[]): boolean {
-  return steps.some(
-    (step) =>
-      step.status === 'failed' ||
-      step.verification_status === 'failed' ||
-      step.verifier_verdict === 'failed',
-  );
-}
 
 // A run is only worth offering a Cancel button while it can still spend
 // money or do work: once it is planning, running, or merely queued, there is
