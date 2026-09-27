@@ -1760,8 +1760,12 @@ mod tests {
     fn a_cancelled_step_with_frozen_specs_does_not_block_the_run() {
         let db = test_db();
         insert_run_and_step(&db, "run-cancelled", "step-cancelled");
-        db.save_check_specs("run-cancelled", "step-cancelled", &[verdict_spec("check-1")])
-            .expect("freeze specs");
+        db.save_check_specs(
+            "run-cancelled",
+            "step-cancelled",
+            &[verdict_spec("check-1")],
+        )
+        .expect("freeze specs");
         set_step_status(&db, "step-cancelled", "verifying");
         set_step_status(&db, "step-cancelled", "cancelled");
 

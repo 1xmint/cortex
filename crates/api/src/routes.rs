@@ -1865,10 +1865,12 @@ mod validate_run_for_pr_tests {
         set_step_status(db, "step-1", "verifying");
         set_step_status(db, "step-1", "cancelled");
 
-        let result = validate_run_for_pr(db, "user-1", &run_id);
-        assert!(
-            !matches!(result, Err((StatusCode::CONFLICT, _))),
-            "a cancelled step with frozen specs must not withhold the PR: {result:?}"
-        );
+        match validate_run_for_pr(db, "user-1", &run_id) {
+            Ok(_) => {}
+            Err((status, body)) => panic!(
+                "a cancelled step with frozen specs must not withhold the PR: {status} {}",
+                body.0.error
+            ),
+        }
     }
 }
