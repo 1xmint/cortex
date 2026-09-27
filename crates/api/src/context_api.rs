@@ -60,7 +60,7 @@ pub struct ContextBusConfigResponse {
     pub summarize_code: bool,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct TestContextQuery {
     pub run_id: String,
     pub user_goal: Option<String>,
@@ -68,12 +68,31 @@ pub struct TestContextQuery {
     pub max_total_tokens: Option<u32>,
 }
 
+/// Confirms `user_id` owns `run_id` before a context route hands back that
+/// run's artifacts. Returns 404 rather than 403 on mismatch, on purpose: a 403
+/// would confirm the run id exists at all, which is itself the leak for a
+/// caller probing ids that belong to another customer.
+fn require_run_owner(
+    db: &crate::db::Database,
+    run_id: &str,
+    user_id: &str,
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    if db.verify_run_owner(run_id, user_id) {
+        Ok(())
+    } else {
+        Err((
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "run not found" })),
+        ))
+    }
+}
+
 /// GET /api/context/runs/{run_id}/artifacts
 /// List all artifacts for a specific run
 pub async fn list_artifacts_for_run(
     State(state): State<Arc<AppState>>,
     Path(run_id): Path<String>,
-    _user: ClerkUser,
+    user: ClerkUser,
 ) -> impl IntoResponse {
     let Some(db) = state.db.as_ref() else {
         return (
@@ -83,6 +102,10 @@ pub async fn list_artifacts_for_run(
             })),
         );
     };
+
+    if let Err(err) = require_run_owner(db, &run_id, &user.user_id) {
+        return err;
+    }
 
     let artifacts = db.get_context_artifacts_for_run(&run_id);
 
@@ -125,8 +148,21 @@ pub async fn preview_context_for_run(
     State(state): State<Arc<AppState>>,
     Path(run_id): Path<String>,
     Query(params): Query<TestContextQuery>,
-    _user: ClerkUser,
+    user: ClerkUser,
 ) -> impl IntoResponse {
+    let Some(db) = state.db.as_ref() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error": "Database not available"
+            })),
+        );
+    };
+
+    if let Err(err) = require_run_owner(db, &run_id, &user.user_id) {
+        return err;
+    }
+
     let user_goal = params.user_goal.unwrap_or_else(|| "Test goal".to_string());
 
     // Create temporary config with query parameters
@@ -180,15 +216,21 @@ pub async fn preview_context_for_run(
         truncated_count,
     };
 
-    (StatusCode::OK, Json(response))
+    (StatusCode::OK, Json(serde_json::json!(response)))
 }
 
 /// GET /api/context/stats
-/// Pipeline statistics and health information
+/// Pipeline statistics and health information, aggregated across every
+/// customer's runs. Admin-only: `recent_runs_with_artifacts` lists run ids
+/// that do not belong to the caller, so this is not a per-user view.
 pub async fn get_context_stats(
     State(state): State<Arc<AppState>>,
-    _user: ClerkUser,
+    user: ClerkUser,
 ) -> impl IntoResponse {
+    if let Err((status, Json(err))) = crate::admin::authorize_admin(&state, &user).await {
+        return (status, Json(serde_json::json!({ "error": err.error })));
+    }
+
     let Some(db) = state.db.as_ref() else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -355,5 +397,173 @@ pub async fn get_impact_set(
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({ "error": error })),
         ),
+    }
+}
+
+#[cfg(test)]
+mod ownership_tests {
+    use super::*;
+    use crate::state::AppState;
+    use axum::response::IntoResponse;
+    use http_body_util::BodyExt;
+
+    /// Real `AppState` (own tempdir, own sqlite database), same shortcut
+    /// `admin::provider_holds_tests::test_state` uses. No `clerk_secret_key`,
+    /// so `authorize_admin`'s local-dev bypass applies to whichever
+    /// `ClerkUser` calls it -- fine here since the admin-gated test below
+    /// only asserts the non-admin path via a configured admin set.
+    async fn test_state() -> (tempfile::TempDir, std::sync::Arc<AppState>) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".cortex")).unwrap();
+        let state = AppState::new(
+            dir.path().join(".cortex/ledger.jsonl"),
+            dir.path().to_path_buf(),
+            None,
+        )
+        .await;
+        (dir, state)
+    }
+
+    fn user(id: &str) -> ClerkUser {
+        ClerkUser {
+            user_id: id.to_string(),
+        }
+    }
+
+    async fn status_and_body(response: impl IntoResponse) -> (StatusCode, serde_json::Value) {
+        let response = response.into_response();
+        let status = response.status();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let body = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+        (status, body)
+    }
+
+    #[tokio::test]
+    async fn list_artifacts_for_run_is_404_for_a_non_owner_and_200_for_the_owner() {
+        let (_dir, state) = test_state().await;
+        let run_id = state
+            .db
+            .as_ref()
+            .unwrap()
+            .create_run("user-a", "goal", "default", &[]);
+
+        let (status, _) = status_and_body(
+            list_artifacts_for_run(State(state.clone()), Path(run_id.clone()), user("user-b"))
+                .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        let (status, _) = status_and_body(
+            list_artifacts_for_run(State(state.clone()), Path(run_id.clone()), user("user-a"))
+                .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn list_artifacts_for_run_is_404_for_an_unknown_run() {
+        let (_dir, state) = test_state().await;
+
+        let (status, _) = status_and_body(
+            list_artifacts_for_run(
+                State(state.clone()),
+                Path("no-such-run".to_string()),
+                user("user-a"),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn preview_context_for_run_is_404_for_a_non_owner_and_200_for_the_owner() {
+        let (_dir, state) = test_state().await;
+        let run_id = state
+            .db
+            .as_ref()
+            .unwrap()
+            .create_run("user-a", "goal", "default", &[]);
+        let params = TestContextQuery {
+            run_id: run_id.clone(),
+            user_goal: None,
+            max_predecessors: None,
+            max_total_tokens: None,
+        };
+
+        let (status, _) = status_and_body(
+            preview_context_for_run(
+                State(state.clone()),
+                Path(run_id.clone()),
+                Query(params.clone()),
+                user("user-b"),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        let (status, _) = status_and_body(
+            preview_context_for_run(
+                State(state.clone()),
+                Path(run_id.clone()),
+                Query(params),
+                user("user-a"),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    /// `test_context_assembly` (`POST /api/context/test`) delegates straight
+    /// into `preview_context_for_run`, so a non-owner is refused the same way.
+    #[tokio::test]
+    async fn test_context_assembly_is_404_for_a_non_owner() {
+        let (_dir, state) = test_state().await;
+        let run_id = state
+            .db
+            .as_ref()
+            .unwrap()
+            .create_run("user-a", "goal", "default", &[]);
+        let params = TestContextQuery {
+            run_id: run_id.clone(),
+            user_goal: None,
+            max_predecessors: None,
+            max_total_tokens: None,
+        };
+
+        let (status, _) = status_and_body(
+            test_context_assembly(State(state), user("user-b"), Json(params)).await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    /// `get_context_stats` aggregates recent run ids across every customer,
+    /// so it is admin-only rather than owner-checked. A `clerk_secret_key` on
+    /// state (mirroring `agent_confirm_routes::router_as_non_premium_user`)
+    /// takes `authorize_admin` off its local-dev bypass, and with no admin
+    /// set configured, `admins.is_empty()` alone is not enough to pass --
+    /// exactly the case that matters here, without this test racing any
+    /// other test over a process-global `CORTEX_ADMIN_EMAILS`/`_USERS`.
+    #[tokio::test]
+    async fn get_context_stats_is_forbidden_for_a_non_admin() {
+        std::env::remove_var("CORTEX_ADMIN_EMAILS");
+        std::env::remove_var("CORTEX_ADMIN_USERS");
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".cortex")).unwrap();
+        let state = AppState::new(
+            dir.path().join(".cortex/ledger.jsonl"),
+            dir.path().to_path_buf(),
+            Some("sk_test_fake_for_context_api_tests".to_string()),
+        )
+        .await;
+
+        let (status, _) =
+            status_and_body(get_context_stats(State(state), user("user-a")).await).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
     }
 }
