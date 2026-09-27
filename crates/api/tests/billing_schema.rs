@@ -130,6 +130,11 @@ fn a_balance_row_that_predates_migration_v72_gets_a_zero_carry_not_a_null() {
         [],
     )
     .expect("roll the column back to simulate the pre-migration shape");
+    conn.execute(
+        "ALTER TABLE credit_transactions DROP COLUMN cost_micro_usd",
+        [],
+    )
+    .expect("roll the other v72 column back too, or migrate_v72 hits a duplicate column");
     conn.execute("UPDATE schema_version SET version = 71", [])
         .expect("rewind the version marker so migrate_v72 runs again on reopen");
     drop(conn);
