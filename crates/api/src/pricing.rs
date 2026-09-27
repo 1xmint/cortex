@@ -501,24 +501,26 @@ pub fn seed_models() -> Vec<ModelPrice> {
             1_000_000,
             "fast",
         ),
-        // Zen is bring-your-own-key only (see CREDITS.md, "Suppliers Cortex
-        // pays for vs. BYOK"): the gateway's `KNOWN_PROVIDERS` no longer
-        // includes `"zen"`, so these rows can never back a Cortex-funded
-        // authorization. They stay here, inert, because a published price
-        // list is immutable; removing them would be a new price-list
-        // version, not an edit to this one.
+        // Zen was bring-your-own-key only, and the OpenCode Zen BYOK chat
+        // feature (the `chat_zen`/`supplier_zen`/`provider_keys` modules) was
+        // removed 2026-09-25 by decision — OpenCode's terms only permit use
+        // for the customer's own internal use, not on a third party's behalf
+        // (see cortex/plan/CREDITS.md and EXECUTION-STATE M-D-0016). The
+        // gateway's `KNOWN_PROVIDERS` already excluded `"zen"`, so these rows
+        // could never back a Cortex-funded authorization even before that.
+        // They stay here, inert, because a published price list is
+        // immutable; removing them would be a new price-list version, not an
+        // edit to this one.
         //
         // OpenCode Zen (https://opencode.ai/docs/zen, "Pricing" table) and
         // https://opencode.ai/zen/v1/models for exact model ids, both read
         // 2026-09-21. This slice covers only the `/chat/completions` family
         // (DeepSeek, GLM, Kimi, MiniMax); Zen's Claude/GPT/Gemini/Grok
         // aliases are priced under their own provider rows already above and
-        // are not reachable through the Zen supplier. Every row here is a
-        // paid, non-free, non-training-data model from the explicit
-        // allowlist in `supplier_zen.rs`; nothing else may settle at this
-        // price list, and a model missing here cannot be reserved against at
-        // all (`GatewayError::MissingRate`) regardless of what the allowlist
-        // in `supplier_zen.rs` separately refuses.
+        // are not reachable through the (now-removed) Zen supplier path.
+        // Nothing reads these rows today; a model missing here would have
+        // been unable to be reserved against at all (`GatewayError::
+        // MissingRate`) back when the Zen supplier path existed.
         //
         // Rates are the published per-1M-token price divided by 1,000 (so
         // $0.14/1M input becomes 140 micros/1k). `cache_read_bp` is the

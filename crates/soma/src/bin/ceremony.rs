@@ -32,11 +32,11 @@ fn main() {
 
 fn print_usage() {
     eprintln!(
-        r#"soma-ceremony — HeyVera root heart bootstrap & lineage management
+        r#"soma-ceremony — Cortex root heart bootstrap & lineage management
 
 USAGE:
   soma-ceremony init [--path <dir>]
-      Create the HeyVera root heart. Generates a new Ed25519 keypair and
+      Create the Cortex root heart. Generates a new Ed25519 keypair and
       genome commitment. Saves to ~/.heyvera/root-heart.json (or --path).
 
   soma-ceremony issue-lineage --agent <name> --capabilities <caps> [--budget <credits>] [--ttl <hours>]

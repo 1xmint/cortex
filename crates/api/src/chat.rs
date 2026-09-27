@@ -3,7 +3,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use axum::extract::State;
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive, KeepAliveStream, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
@@ -19,10 +19,9 @@ use crate::clerk::ClerkUser;
 use crate::routes::ErrorResponse;
 use crate::state::{AppState, StepEvent};
 
-/// Both the Claude-tier path (below) and the Zen BYOK path
-/// (`chat_zen::chat`) build their SSE stream from `step_event_to_sse`, but
-/// each `async fn` gets its own anonymous `impl Stream` type -- boxing here
-/// is what lets `chat()` return either one from a single function signature.
+/// The Claude-tier path (below) builds its SSE stream from
+/// `step_event_to_sse`; boxing here is what lets `chat()` return an opaque
+/// `impl Stream` from a single function signature.
 pub(crate) type BoxedSseStream =
     KeepAliveStream<Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>>>;
 
@@ -51,9 +50,10 @@ pub struct ChatRequest {
     pub conversation_id: Option<String>,
     #[serde(default)]
     pub routing_preferences: Option<RoutingPreferences>,
-    /// `"zen:<model>"` to route this turn to an OpenCode Zen model on the
-    /// customer's own key (see `chat_zen.rs`). Absent means exactly today's
-    /// Claude-tier behaviour -- this field changes nothing when it is `None`.
+    /// OpenCode Zen BYOK chat was removed; a `"zen:"`-prefixed value here is
+    /// rejected with a clean 4xx rather than routed anywhere. Any other
+    /// non-empty value must be one of `claude_tier_model_values()`. Absent
+    /// means exactly today's Claude-tier behaviour.
     #[serde(default)]
     pub model: Option<String>,
 }
@@ -137,17 +137,9 @@ async fn resolve_provider(
     ProviderPath::None
 }
 
-/// The header carrying a BYOK unlock secret, `<device_id>.<base64url secret>`.
-/// Never logged: see `crate::lib`'s router construction comment.
-pub(crate) const KEY_UNLOCK_HEADER: &str = "x-cortex-key-unlock";
-/// The header carrying only a device id, for `GET /api/chat/models` to
-/// report that device's key status. Never carries a secret.
-pub(crate) const KEY_DEVICE_HEADER: &str = "x-cortex-key-device";
-
 pub async fn chat(
     State(state): State<Arc<AppState>>,
     user: ClerkUser,
-    headers: HeaderMap,
     Json(req): Json<ChatRequest>,
 ) -> Result<Sse<BoxedSseStream>, Response> {
     if req.message.len() > MAX_MESSAGE_LEN {
@@ -179,37 +171,24 @@ pub async fn chat(
 
     let intent = classify_intent(&req.message);
 
-    // Zen BYOK: a completely separate path from everything below (D3 in the
-    // BYOK plan) -- it never falls through to `ProviderPath::Cortex`, so
-    // Cortex never spends its own money when a customer has no Zen key.
-    if let Some(zen_model) = req
-        .model
-        .as_deref()
-        .and_then(|m| m.strip_prefix("zen:"))
-        .map(str::to_string)
-    {
-        let system_prompt = system_prompt_for_intent(intent).to_string();
-        let unlock_header = headers
-            .get(KEY_UNLOCK_HEADER)
-            .and_then(|v| v.to_str().ok())
-            .map(|v| zeroize::Zeroizing::new(v.to_string()));
-        return crate::chat_zen::chat(
-            State(state),
-            user,
-            req,
-            zen_model,
-            system_prompt,
-            unlock_header,
+    // OpenCode Zen BYOK chat was removed (2026-09-25, see
+    // cortex/plan/CREDITS.md). A client still naming a `"zen:"` model gets a
+    // clean 4xx rather than being routed anywhere.
+    if req.model.as_deref().is_some_and(|m| m.starts_with("zen:")) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "provider_not_available".into(),
+            }),
         )
-        .await;
+            .into_response());
     }
 
     // Billing hole guard: `/api/chat/models` is the only source of truth for
-    // what a client may echo back in `model`. A Zen id always carries the
-    // "zen:" prefix (handled above) and a Claude entry's `model` is always
-    // one of `claude_tier_model_values()` (see `chat_models` below). Any
-    // other non-empty value is unknown to this server -- accepting it here
-    // would fall through to the Claude-tier path below and bill Cortex
+    // what a client may echo back in `model`. A Claude entry's `model` is
+    // always one of `claude_tier_model_values()` (see `chat_models` below).
+    // Any other non-empty value is unknown to this server -- accepting it
+    // here would fall through to the Claude-tier path below and bill Cortex
     // credits for a model nobody offered at that price, or none at all.
     if let Some(model) = req.model.as_deref() {
         if !claude_tier_model_values().contains(&model) {
@@ -359,23 +338,17 @@ pub async fn chat(
     Ok(Sse::new(boxed).keep_alive(KeepAlive::default()))
 }
 
-/// `GET /api/chat/models`: the Claude tiers (always available, billed to
-/// Cortex credits) plus the OpenCode Zen models (D4 in the BYOK plan),
-/// billed to the customer's own key. The server is the authority on whether
-/// a Zen model is actually usable -- `chat_zen::chat` re-checks the same key
-/// state and refuses even if a stale client sends a Zen model this response
-/// marked unavailable.
-/// The exact `model` values `chat_models` returns for its Claude entries --
-/// the only values `chat()` accepts in `ChatRequest.model` besides a
-/// `"zen:"`-prefixed one. Kept as one array so the two can never drift.
+/// `GET /api/chat/models`: the Claude tiers, always available and billed to
+/// Cortex credits.
+/// The exact `model` values `chat_models` returns -- the only values
+/// `chat()` accepts in `ChatRequest.model`.
 fn claude_tier_model_values() -> [&'static str; 3] {
     ["fast", "balanced", "powerful"].map(|tier| crate::chat_paid::model_for_tier(Some(tier)))
 }
 
 pub async fn chat_models(
-    State(state): State<Arc<AppState>>,
-    user: ClerkUser,
-    headers: HeaderMap,
+    State(_state): State<Arc<AppState>>,
+    _user: ClerkUser,
 ) -> Json<ModelsResponse> {
     let mut models = Vec::new();
     for tier in ["fast", "balanced", "powerful"] {
@@ -386,36 +359,6 @@ pub async fn chat_models(
             billing: "credits".into(),
             available: true,
             unavailable_reason: None,
-        });
-    }
-
-    // BYOK is always available (no server-held master key to be missing);
-    // a device's key status is only known once that device names itself.
-    let device_id = headers
-        .get(KEY_DEVICE_HEADER)
-        .and_then(|v| v.to_str().ok())
-        .filter(|id| crate::byok::valid_device_id(id));
-    let key_status: Option<String> = match device_id {
-        Some(device_id) => state
-            .db
-            .as_ref()
-            .and_then(|db| db.get_provider_key_status(&user.user_id, "zen", device_id)),
-        None => None,
-    };
-
-    for model in crate::supplier_zen::allowed_models() {
-        let (available, reason) = match key_status.as_deref() {
-            Some("active") => (true, None),
-            Some("rejected") => (false, Some("key_rejected")),
-            _ => (false, Some("needs_key")),
-        };
-        models.push(ModelEntry {
-            provider: "zen".into(),
-            model: format!("zen:{model}"),
-            label: (*model).to_string(),
-            billing: "your_zen_key".into(),
-            available,
-            unavailable_reason: reason.map(str::to_string),
         });
     }
 

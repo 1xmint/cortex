@@ -1,6 +1,6 @@
 # State
 
-What is true now, and who each open thing is waiting on. Updated 2026-09-20.
+What is true now, and who each open thing is waiting on. Updated 2026-09-25.
 
 For *how* to work here, read [AGENTS.md](AGENTS.md) then
 [CONTRIBUTING.md](CONTRIBUTING.md). For why a thing is the way it is, read
@@ -38,11 +38,22 @@ is the part the extraction put at risk and nothing had checked until now.
    `docs/adr/ADR-0004-provider-credential.md` — shortest-lived key, narrowest
    scope, hard spend cap. Then run the `live model` workflow from the Actions
    tab. That run would be the first time Cortex completes a real task. Nothing
-   else blocks it.
-2. **A worker key on the host.** `cortex-worker-key` mints it;
-   `/etc/cortex/worker.env` holds it as `CORTEX_TOKEN`. Production is at v66,
+   else blocks it. As of 2026-09-25, `live-model.yml` has **zero runs** and no
+   `ANTHROPIC_API_KEY` repository secret exists — Cortex has never completed a
+   real task.
+2. **A worker key on the host.** [PR #54](https://github.com/1xmint/cortex/pull/54)
+   (merged 2026-09-23) ships `cortex-worker-key` to mint it and optional worker
+   images; `/etc/cortex/worker.env` holds the minted key as `CORTEX_TOKEN`. The
+   worker key must still be installed on the host — production is at v66,
    healthy, and cannot execute without it.
-3. ~~**Where the new repository lives, and whether it is public.**~~
+3. **Auto-deploy exists but has not moved production.** PR #67 added
+   `build-release.yml` → `deploy.yml`. The first Deploy run, 2026-09-24, is
+   [run 36072223296](https://github.com/1xmint/cortex/actions/runs/36072223296)
+   and completed **"success"**, but it only printed a `::notice::` and skipped
+   the actual deploy, because `TS_OAUTH_CLIENT_ID`/`TS_OAUTH_SECRET` are not
+   set in the GitHub `production` environment. Production has not moved by
+   auto-deploy yet.
+4. ~~**Where the new repository lives, and whether it is public.**~~
    **Answered 2026-09-20:** public, at
    [`1xmint/cortex`](https://github.com/1xmint/cortex). The split is finished
    and this repository is the result — one commit, no HeyVera history, 459
@@ -59,8 +70,13 @@ is the part the extraction put at risk and nothing had checked until now.
   `testing/stub-provider/claude` drives the direction that delivers nothing, and
   asserts `NothingDelivered` with no receipt.
 - **Phases 27–30** — the capability mechanism, and the falsification test that
-  has to exist before any "better than a single model" claim does. Nothing is
-  built.
+  has to exist before any "better than a single model" claim does. In scope
+  for "done" (Josh, 2026-09-26, M-D-0020). Not "nothing built": ~16 Phase
+  28–30 type modules exist in `crates/core` (EXECUTION-STATE ~2773–2807), but
+  none is wired into `api`/`worker`/`engine` except `diff_surface`, which never
+  fires because every contract defaults to `Authored`. The phase exit gates
+  are measurements that need paid model runs; no capability claim is made
+  until those exist.
 - **`bollard` is pinned at 0.18 and cannot move without work.** 0.21 relocates
   the container and network option types and makes `container::Config`
   private, so `crates/worker/src/sandbox/container.rs` and `sandbox/egress.rs`
@@ -69,14 +85,11 @@ is the part the extraction put at risk and nothing had checked until now.
   each attempt now fails its own checks and sits blocked, which is the right
   outcome but not a quiet one. Porting the sandbox to the 0.21 API is a change
   to the code that isolates untrusted work and wants its own review.
-- **`aes-gcm` is pinned at 0.10.3 for the same reason.** 0.11 stops re-exporting
-  `OsRng` from `aes_gcm::aead`, so `crates/api/src/crypto.rs` fails to compile
-  with `error[E0432]: unresolved import`. Dependabot's
-  [#7](https://github.com/1xmint/cortex/pull/7) is blocked on its own red `rust`
-  check, which is the system working. The line in question fills the nonce that
-  makes each encryption unique; reusing one breaks AES-GCM outright, so moving
-  the randomness to `rand_core` is a small edit that still wants reading
-  carefully.
+- ~~**`aes-gcm` is pinned at 0.10.3 for the same reason.**~~ **Done.**
+  Dependabot's [#7](https://github.com/1xmint/cortex/pull/7) (merged
+  2026-09-21) bumped `aes-gcm` to 0.11.1, moving nonce randomness off the
+  `OsRng` re-export that 0.11 dropped from `aes_gcm::aead`. `Cargo.lock` shows
+  `aes-gcm 0.11.1` on `main` as of 2026-09-25.
 
 ## The split, and what it unblocked
 
@@ -114,8 +127,10 @@ on pull requests only. Those two go together: with no run on `main`, the only
 thing making the merged tree the tested tree is the up-to-date requirement.
 Turning it off means a pull request can be tested against a `main` that has
 moved, and nothing ever tests the result — which is how a red commit reached
-`main` unnoticed on 2026-09-20. The repository auto-updates branches, so a
-stale pull request with auto-merge armed updates itself rather than stalling.
+`main` unnoticed on 2026-09-20. The repository does **not** auto-update
+branches: `allow_update_branch` only enables the manual "Update branch" button,
+so a stale pull request with auto-merge armed sits at `BEHIND` until someone
+updates it (see CONTRIBUTING.md, "Branch protection is strict").
 
 `stub-provider-e2e` and `live-model` are `workflow_dispatch` only. The first is
 cheap and safe to run on a branch; the second spends money and is the only

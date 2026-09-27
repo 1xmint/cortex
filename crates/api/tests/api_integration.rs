@@ -290,6 +290,31 @@ async fn test_chat_with_greeting() {
     );
 }
 
+/// OpenCode Zen BYOK chat was removed (2026-09-25). A request still naming a
+/// `"zen:"` model must get a clean 4xx, not a panic or a route to nowhere.
+#[tokio::test]
+async fn test_chat_rejects_zen_model_cleanly() {
+    let (app, _tmp) = test_app().await;
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/chat")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({"message": "hello", "model": "zen:some-model"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let json = body_json(resp).await;
+    assert_eq!(json["error"], "provider_not_available");
+}
+
 // ─── Rate Limiting ───────────────────────────────────────────────────────────
 
 #[tokio::test]

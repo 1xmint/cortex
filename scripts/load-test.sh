@@ -123,133 +123,6 @@ run_endpoint_test() {
 
 # Read-heavy: safe for production
 run_endpoint_test "GET" "/v1/health" "health"
-run_endpoint_test "GET" "/v1/social/feed/home" "feed_home"
-
-# Light write: create a test post (minimal impact)
-# Uses a clearly-marked load test payload
-run_endpoint_test "POST" "/v1/social/posts" "create_post" \
-  '{"content":"[load-test] automated test post — safe to delete","visibility":"private"}'
-
-# Like endpoint: use post ID 1 as a safe target
-run_endpoint_test "POST" "/v1/social/posts/1/like" "like_post"
-
-# --- Deep pagination test ---
-# Fetches pages 1-10 sequentially using cursor-based pagination.
-# Page 1 is fetched without a cursor; subsequent pages use the cursor
-# extracted from the previous response. Measures per-page and total time.
-
-run_deep_pagination_test() {
-  local feed_path="${1:-/v1/social/feed}"
-  local pages="${2:-10}"
-  local page_size="${3:-20}"
-
-  echo "--- Deep Pagination: GET ${feed_path} (pages 1-${pages}, limit=${page_size}) ---"
-
-  local page_errors=0
-  local pages_fetched=0
-  local cursor=""
-  local total_start total_end elapsed_total avg_per_page
-  local page_times_file="${RESULTS_DIR}/deep_pagination_times.txt"
-  : > "$page_times_file"
-
-  total_start="$(date +%s%N)"
-
-  for page in $(seq 1 "$pages"); do
-    # Build URL: omit cursor param on first page
-    local url
-    if [ -z "$cursor" ]; then
-      url="${BASE_URL}${feed_path}?limit=${page_size}"
-    else
-      url="${BASE_URL}${feed_path}?limit=${page_size}&cursor=${cursor}"
-    fi
-
-    local page_start page_end page_elapsed_ms response http_status
-    page_start="$(date +%s%N)"
-
-    # Capture HTTP status code separately via write-out
-    response="$(curl --silent --max-time 15 \
-      --write-out '\n__STATUS__%{http_code}' \
-      "$url" 2>/dev/null || echo "")"
-
-    page_end="$(date +%s%N)"
-    page_elapsed_ms=$(( (page_end - page_start) / 1000000 ))
-
-    # Split status from body
-    http_status="$(printf '%s' "$response" | grep -o '__STATUS__[0-9]*' | sed 's/__STATUS__//' || echo "000")"
-    response="$(printf '%s' "$response" | sed 's/__STATUS__[0-9]*$//')"
-
-    if [ -z "$response" ] || [ "$http_status" = "000" ]; then
-      echo "  [ERROR] Page ${page}: no response (url=${url})"
-      page_errors=$((page_errors + 1))
-      continue
-    fi
-
-    if [ "$http_status" -lt 200 ] || [ "$http_status" -ge 300 ] 2>/dev/null; then
-      echo "  [ERROR] Page ${page}: HTTP ${http_status} (url=${url})"
-      page_errors=$((page_errors + 1))
-      continue
-    fi
-
-    # Extract next cursor from response JSON.
-    # Supports: {"cursor":"<val>"}, {"next_cursor":"<val>"}, {"meta":{"cursor":"<val>"}}
-    local next_cursor
-    next_cursor="$(printf '%s' "$response" \
-      | grep -o '"next_cursor":"[^"]*"' \
-      | head -1 \
-      | sed 's/"next_cursor":"//;s/"//' 2>/dev/null || true)"
-
-    if [ -z "$next_cursor" ]; then
-      next_cursor="$(printf '%s' "$response" \
-        | grep -o '"cursor":"[^"]*"' \
-        | head -1 \
-        | sed 's/"cursor":"//;s/"//' 2>/dev/null || true)"
-    fi
-
-    # Count items returned (rough heuristic: count "id" occurrences)
-    local item_count
-    item_count="$(printf '%s' "$response" | grep -o '"id"' | wc -l || echo "?")"
-
-    printf '  Page %2d: HTTP %s | %d items | cursor=%s | %dms\n' \
-      "$page" "$http_status" "$item_count" "${next_cursor:-<none>}" "$page_elapsed_ms"
-
-    echo "$page_elapsed_ms" >> "$page_times_file"
-    pages_fetched=$((pages_fetched + 1))
-
-    # Advance cursor; stop early if no next cursor returned
-    if [ -n "$next_cursor" ]; then
-      cursor="$next_cursor"
-    else
-      echo "  [INFO] No next cursor returned at page ${page} — end of feed reached"
-      break
-    fi
-  done
-
-  total_end="$(date +%s%N)"
-  elapsed_total=$(( (total_end - total_start) / 1000000 ))
-
-  # Compute average ms per page
-  if [ "$pages_fetched" -gt 0 ]; then
-    avg_per_page="$(awk '{ sum += $1; n++ } END { if (n>0) printf "%d", sum/n; else print 0 }' "$page_times_file")"
-  else
-    avg_per_page=0
-  fi
-
-  echo ""
-  echo "  --- Deep Pagination Results ---"
-  printf '  Pages fetched:     %d / %d\n' "$pages_fetched" "$pages"
-  printf '  Page errors:       %d\n' "$page_errors"
-  printf '  Avg time per page: %dms\n' "$avg_per_page"
-  printf '  Total time:        %dms\n' "$elapsed_total"
-
-  if [ "$page_errors" -eq 0 ] && [ "$pages_fetched" -gt 0 ]; then
-    echo "  [OK] Deep pagination completed without errors"
-  elif [ "$page_errors" -gt 0 ]; then
-    echo "  [WARN] ${page_errors} page(s) returned errors — check feed endpoint and cursor logic"
-  fi
-  echo ""
-}
-
-run_deep_pagination_test "/v1/social/feed" 10 20
 
 # --- Summary ---
 
@@ -260,7 +133,7 @@ echo "========================================"
 total_requests=0
 total_errors=0
 
-for label in health feed_home create_post like_post; do
+for label in health; do
   t="$(wc -l < "${RESULTS_DIR}/${label}.times" 2>/dev/null || echo 0)"
   e="$(wc -l < "${RESULTS_DIR}/${label}.errors" 2>/dev/null || echo 0)"
   total_requests=$((total_requests + t))

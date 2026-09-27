@@ -116,8 +116,9 @@ half of this schema can restart at v1 rather than being migrated.
 Its step is still called "Deploy ClawNet", it deploys out of
 `/home/<user>/claw-net`, it runs `scripts/deploy.sh` (which builds and rsyncs
 the HeyVera SPA), and it health-checks `/v1/social/longform` on port 3001. It
-does not deploy Cortex. Cortex deploys through `deploy/cortex-deploy.sh` and
-`scripts/deploy-cortex.sh`.
+does not deploy Cortex. Cortex deployed through `deploy/cortex-deploy.sh` and
+`scripts/deploy-cortex.sh` at the time of this proposal; `scripts/deploy-cortex.sh`
+has since been deleted. See `docs/DEPLOY.md` for the current deploy path.
 
 The `claw-net` naming is stale throughout that path and is worth a separate
 cleanup; it is not load-bearing for the split.

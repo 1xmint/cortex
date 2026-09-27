@@ -89,14 +89,6 @@ pub enum RateLimitCategory {
     Read,
     /// General write endpoints (POST/PUT/PATCH/DELETE)
     Write,
-    /// Post creation — 10/hour
-    PostCreate,
-    /// Profile edits — 5/hour
-    ProfileEdit,
-    /// Follow/unfollow — 30/hour
-    FollowUnfollow,
-    /// Reactions (likes, bookmarks, reposts) — 60/hour
-    Reaction,
     /// API key reads (list keys) — 30/min
     KeyRead,
     /// API key writes (save/delete keys) — 10/hour
@@ -107,14 +99,10 @@ impl RateLimitCategory {
     /// (max_requests, window_seconds)
     fn limits(self) -> (u32, u64) {
         match self {
-            Self::Read => (120, 60),            // 120/min
-            Self::Write => (60, 60),            // 60/min
-            Self::PostCreate => (10, 3600),     // 10/hour
-            Self::ProfileEdit => (5, 3600),     // 5/hour
-            Self::FollowUnfollow => (30, 3600), // 30/hour
-            Self::Reaction => (60, 3600),       // 60/hour
-            Self::KeyRead => (30, 60),          // 30/min
-            Self::KeyWrite => (10, 3600),       // 10/hour
+            Self::Read => (120, 60),      // 120/min
+            Self::Write => (60, 60),      // 60/min
+            Self::KeyRead => (30, 60),    // 30/min
+            Self::KeyWrite => (10, 3600), // 10/hour
         }
     }
 }
@@ -127,40 +115,6 @@ fn classify_request(method: &Method, path: &str) -> RateLimitCategory {
             Method::GET | Method::HEAD | Method::OPTIONS => RateLimitCategory::KeyRead,
             _ => RateLimitCategory::KeyWrite,
         };
-    }
-
-    // Social-specific endpoints
-    if path.starts_with("/v1/social/posts")
-        && method == Method::POST
-        && !path.contains("/like")
-        && !path.contains("/bookmark")
-        && !path.contains("/repost")
-    {
-        return RateLimitCategory::PostCreate;
-    }
-    // Pulse draft create counts as post-like write pressure
-    if path == "/v1/pulse/drafts" && method == Method::POST {
-        return RateLimitCategory::PostCreate;
-    }
-    if (path.starts_with("/v1/social/profile")
-        || path.starts_with("/v1/social/profiles")
-        || path.starts_with("/v1/social/me/profile"))
-        && matches!(*method, Method::POST | Method::PUT | Method::PATCH)
-    {
-        return RateLimitCategory::ProfileEdit;
-    }
-    if path.starts_with("/v1/social/follows")
-        || path.contains("/follow")
-        || path.contains("/unfollow")
-    {
-        return RateLimitCategory::FollowUnfollow;
-    }
-    if path.contains("/like")
-        || path.contains("/bookmark")
-        || path.contains("/repost")
-        || path.contains("/react")
-    {
-        return RateLimitCategory::Reaction;
     }
 
     // General classification by method
@@ -496,26 +450,10 @@ mod tests {
     }
 
     #[test]
-    fn test_classify_post_create() {
-        assert_eq!(
-            classify_request(&Method::POST, "/v1/social/posts"),
-            RateLimitCategory::PostCreate
-        );
-    }
-
-    #[test]
     fn test_classify_read() {
         assert_eq!(
             classify_request(&Method::GET, "/api/health"),
             RateLimitCategory::Read
-        );
-    }
-
-    #[test]
-    fn test_classify_follow() {
-        assert_eq!(
-            classify_request(&Method::POST, "/v1/social/follow"),
-            RateLimitCategory::FollowUnfollow
         );
     }
 
@@ -535,14 +473,14 @@ mod tests {
     #[test]
     fn test_endpoint_specific_limits() {
         let limiter = RateLimiter::new(60, 60);
-        // Post creation: 10/hour
+        // Key writes: 10/hour
         for _ in 0..10 {
             assert!(limiter
-                .check_account("user1", RateLimitCategory::PostCreate)
+                .check_account("user1", RateLimitCategory::KeyWrite)
                 .is_ok());
         }
         assert!(limiter
-            .check_account("user1", RateLimitCategory::PostCreate)
+            .check_account("user1", RateLimitCategory::KeyWrite)
             .is_err());
         // But reads should still work for the same user
         assert!(limiter

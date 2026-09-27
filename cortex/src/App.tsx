@@ -48,6 +48,7 @@ import { AuthTokenRegistrar, useAuthGate } from './lib/useAuthGate';
 import { useSomaSession } from './lib/useSomaSession';
 import { useBilling } from './lib/useBilling';
 import { isOnboardingComplete } from './lib/onboarding';
+import { SHOW_PROJECTS_LINK } from './lib/featureFlags';
 import SignInScreen from './components/auth/SignInScreen';
 import OperationsRoom from './components/operations/OperationsRoom';
 import OnboardingFlow from './components/onboarding/OnboardingFlow';
@@ -90,7 +91,7 @@ const DEFAULT_SESSION_CONTROLS: ChatSessionControls = {
 const SESSION_CONTROLS_STORAGE_KEY = 'cortex:session-controls';
 const RUN_PROFILE_STORAGE_KEY = 'cortex:run-profile';
 const FREE_TIER_ACCESS_STATES = new Set<BillingAccessState>(['needs_checkout', 'needs_phone', 'cancelled']);
-type SettingsTab = 'integrations' | 'modelKeys' | 'spend' | 'billing' | 'account';
+type SettingsTab = 'integrations' | 'spend' | 'billing' | 'account';
 
 function deploymentBadgeTitle(status: DeploymentStatus): string {
   const backend = status.commits.backend_commit_short ?? status.backend.commit_short ?? 'unknown';
@@ -474,9 +475,6 @@ function CortexShell() {
     isLoadingConversation,
     conversationNotFound,
     activeConversationTitle,
-    selectedModel,
-    onModelChange,
-    zenKeyError,
     setDraft,
     sendMessage,
     stopStreaming,
@@ -542,10 +540,6 @@ function CortexShell() {
     setSettingsOpen(true);
     setSidebarOpen(false);
   }, []);
-
-  const handleOpenModelSettings = useCallback(() => {
-    handleOpenSettings('modelKeys');
-  }, [handleOpenSettings]);
 
   const handleOpenAdmin = useCallback(() => {
     setAdminOpen(true);
@@ -998,10 +992,6 @@ function CortexShell() {
             onVoiceConfirmRequired={handleVoiceConfirmRequired}
             onVoiceSpokenWindow={handleVoiceSpokenWindow}
             onVoiceConfirmResolved={handleVoiceConfirmResolved}
-            selectedModel={selectedModel}
-            onModelChange={onModelChange}
-            onOpenModelSettings={handleOpenModelSettings}
-            zenKeyError={zenKeyError}
           />
 
           <div className="hidden lg:flex">
@@ -1119,8 +1109,18 @@ export default function App() {
         <Route path="/app" element={<Navigate to="/" replace />} />
         <Route path="/app/groups/:groupId/tasks" element={<CortexShell />} />
         <Route path="/app/groups/:groupId/operations" element={<OperationsRoom />} />
-        <Route path="/projects" element={<ProjectsView />} />
-        <Route path="/projects/:projectId" element={<ProjectsView />} />
+        {/* Projects: hidden until Projects has a working backend (see SHOW_PROJECTS_LINK). */}
+        {SHOW_PROJECTS_LINK ? (
+          <>
+            <Route path="/projects" element={<ProjectsView />} />
+            <Route path="/projects/:projectId" element={<ProjectsView />} />
+          </>
+        ) : (
+          <>
+            <Route path="/projects" element={<NotFoundPage />} />
+            <Route path="/projects/:projectId" element={<NotFoundPage />} />
+          </>
+        )}
         {/* Legacy redirects */}
         <Route path="/groups/:groupId/tasks" element={<LegacyGroupRedirect />} />
         <Route path="*" element={<NotFoundPage />} />

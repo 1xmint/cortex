@@ -7405,10 +7405,10 @@ longer exists.
 - Cloudflare Pages deploys `cortex/` from `main` continuously via its own Git
   integration, independent of the backend — the web client can run ahead of the
   API. Account for that when shipping a frontend change that needs a new endpoint.
-- Confirm the current state of the deploy-safety work before triggering anything:
-  `scripts/deploy-cortex.sh` historically did `git reset --hard` plus
-  `git clean -fd` against a checkout that contained the live database as a tracked
-  file. Verify that is resolved on the current `main` rather than assuming it.
+- `scripts/deploy-cortex.sh` has been deleted; it historically did
+  `git reset --hard` plus `git clean -fd` against a checkout that contained
+  the live database as a tracked file. Deploys now run through
+  `.github/workflows/deploy.yml` — see `docs/DEPLOY.md`.
 
 **Do not.**
 

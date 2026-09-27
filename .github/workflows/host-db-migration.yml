@@ -1,6 +1,8 @@
 # One-time host migration for PR #411: move the live Cortex database out of the
 # git checkout.
 #
+# This is a one-time migration, kept here for reference rather than deleted.
+#
 # Why this exists as a workflow rather than a paste-into-a-terminal checklist:
 # the commands need SSH to the production host, and the only credentials for
 # that already live here (the repository's Tailscale OAuth pair). Running it
@@ -60,6 +62,11 @@ jobs:
     environment: production
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v5
+
+      - name: Warn that a live run leaves the service stopped
+        if: ${{ !inputs.dry_run }}
+        run: |
+          echo "::warning::This migration leaves the cortex service STOPPED on purpose. It must be started by hand (sudo systemctl start cortex) after merging and deploying #411 — see 'What happens next' below."
 
       - name: Refuse an unconfirmed live run
         if: ${{ !inputs.dry_run }}
@@ -171,3 +178,9 @@ jobs:
           echo "     on a binary that reads CORTEX_DB_PATH and friends."
           echo ""
           echo "Production has zero users, so the gap between 1 and 2 costs nothing."
+
+          if [ "${{ inputs.dry_run }}" = "false" ]; then
+            echo "### Service left stopped" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "The cortex service is intentionally STOPPED after this run and must be started by hand once #411 is merged and deployed: \`sudo systemctl start cortex\`" >> "$GITHUB_STEP_SUMMARY"
+          fi
