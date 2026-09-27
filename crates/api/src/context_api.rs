@@ -274,7 +274,11 @@ pub async fn test_context_assembly(
 }
 
 /// GET /api/context/health
-/// Health status of the Context-Flow Pipeline
+/// Health status of the Context-Flow Pipeline. Not gated by run ownership or
+/// admin: `ContextFlowHealth` carries only process-wide circuit-breaker state
+/// (open/closed, failure count, last failure time) and the pipeline's static
+/// config -- no run id, artifact, or customer data, so any signed-in user
+/// gets the same answer an admin would.
 pub async fn get_context_health(
     State(state): State<Arc<AppState>>,
     _user: ClerkUser,
@@ -319,6 +323,12 @@ pub struct ImpactResponse {
 ///
 /// The impact set for an edit surface: the bounded dependency closure a lease
 /// should claim, instead of the paths someone thought to list.
+///
+/// Not gated by run ownership or admin: this walks `state.workspace_dir`'s
+/// own source-file dependency graph (the repo Cortex is running against),
+/// not a customer's run or artifact data. There is no run id or user-scoped
+/// row involved, so there is nothing here for an owner or admin check to
+/// protect.
 pub async fn get_impact_set(
     State(state): State<Arc<AppState>>,
     Query(query): Query<ImpactQuery>,
