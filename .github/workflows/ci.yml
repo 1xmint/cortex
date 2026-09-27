@@ -417,6 +417,17 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
+      # deploy-receive.sh's schema guard is what stands between an automatic
+      # deploy and a migrated production database (see docs/DEPLOY.md). This
+      # harness exercises it with stub sqlite3/flock/systemctl/curl, so a
+      # regression in the guard's refusal logic fails here instead of at the
+      # next real deploy.
+      - name: Install sqlite3 (if missing)
+        run: command -v sqlite3 >/dev/null || (sudo apt-get update && sudo apt-get install -y sqlite3)
+
+      - name: Test deploy-receive.sh's schema guard
+        run: bash scripts/deploy/test-deploy-receive.sh
+
 
   # A feature that is off by default is a feature nothing compiles, and a
   # configuration nothing compiles is a configuration that rots. `otel` proved
