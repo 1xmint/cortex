@@ -30,14 +30,17 @@ pub struct TaskContract {
     /// at plan time, before approval -- so that delivery cannot choose it
     /// after the fact.
     ///
-    /// `None` means undeclared: either this contract predates the field, or
-    /// it was written by a path that never set it. Every grading and pricing
-    /// consumer treats `None` exactly like `Authored` -- the weaker claim --
-    /// because a contract written before this field existed promised nothing
-    /// about the exam, and defaulting to `Strong` would retroactively put
-    /// words in its mouth. Kept as an explicit `Option` rather than defaulting
-    /// the enum itself so a receipt can tell "undeclared" apart from "declared
-    /// Authored" when that distinction matters (e.g. an audit of pre-PR runs).
+    /// `None` means undeclared: a path that constructs a contract without
+    /// setting this field. It does **not** mean "predates this field" --
+    /// the field has serialized as the literal string `"authored"` since the
+    /// root commit (it was a non-`Option` enum defaulting to `Authored`
+    /// before this change), so every contract stored before this PR reads
+    /// back as `Some(Authored)`, not `None`. Every grading and pricing
+    /// consumer treats `None` exactly like `Authored` anyway -- the weaker
+    /// claim -- so old and new "no real declaration" rows are graded the
+    /// same either way; the `Option` exists so a fresh contract that never
+    /// calls into planning can still be told apart from one that explicitly
+    /// declared `Authored`.
     #[serde(default)]
     pub verdict_class: Option<crate::diff_surface::VerdictClass>,
     #[serde(default)]

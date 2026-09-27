@@ -86,7 +86,7 @@ const VERDICT_CLASS_COPY: Record<VerdictClass, { label: string; detail: string }
   },
   authored: {
     label: 'Authored',
-    detail: 'Checked by tests the agent wrote — not independently verified.',
+    detail: 'Graded by checks this task was allowed to change — the exam was not locked.',
   },
 };
 
@@ -97,13 +97,18 @@ const VERDICT_CLASS_COPY: Record<VerdictClass, { label: string; detail: string }
  * as a claim of success on a verdict that did not succeed. A failed `strong`
  * step was graded by the customer's own checks and still did not pass them;
  * saying anything that could be misread as "verified" here would overstate
- * what happened.
+ * what happened. An `inconclusive` step never ran its checks at all, so
+ * "did not pass them" would overstate that too -- there is nothing to have
+ * passed or failed, only a grading that did not happen.
  */
 function verdictClassDetail(receipt: Receipt): string | undefined {
   const classCopy = receipt.verdict_class ? VERDICT_CLASS_COPY[receipt.verdict_class] : undefined;
   if (!classCopy) return undefined;
-  if (receipt.verdict_class === 'strong' && receipt.gate.verdict !== 'verified') {
+  if (receipt.verdict_class === 'strong' && receipt.gate.verdict === 'failed') {
     return 'Graded by checks that existed before this task -- it did not pass them.';
+  }
+  if (receipt.verdict_class === 'strong' && receipt.gate.verdict === 'inconclusive') {
+    return 'Graded by checks that existed before this task -- the step was not graded.';
   }
   return classCopy.detail;
 }

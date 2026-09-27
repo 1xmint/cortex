@@ -116,6 +116,12 @@ jobs:
       # asserts the class copy stops short of anything a reader could take
       # for "independently verified" -- the battery existed before the task,
       # but this attempt did not pass it.
+      #
+      # 30 -> 31 with one more in `src/components/mission/Receipt.test.tsx`,
+      # which renders a `strong`-declared step whose verdict is `inconclusive`
+      # and asserts the copy reads as "not graded" rather than "did not pass" --
+      # an inconclusive step never ran its checks, so there is nothing it
+      # failed.
       - name: Test Cortex
         run: |
           set -euo pipefail
@@ -125,8 +131,8 @@ jobs:
           echo "$output"
           passed=$(echo "$output" | grep -oE "Tests +[0-9]+ passed" | grep -oE "[0-9]+" | tail -1)
           echo "cortex tests passed: ${passed:-0}"
-          if [ "${passed:-0}" -lt 30 ]; then
-            echo "::error::expected at least 30 Cortex tests to run, saw ${passed:-0}"
+          if [ "${passed:-0}" -lt 31 ]; then
+            echo "::error::expected at least 31 Cortex tests to run, saw ${passed:-0}"
             exit 1
           fi
 

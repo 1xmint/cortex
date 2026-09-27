@@ -1033,108 +1033,119 @@ impl Database {
     /// `None` rather than a preview of one.
     pub fn get_receipt(&self, run_id: &str, step_id: &str) -> Option<Receipt> {
         let specs = self.load_check_specs(run_id, step_id);
-        let conn = self.conn();
 
-        let (verification_id, attempt, tree_hash) = conn
-            .query_row(
-                "SELECT id, attempt, tree_hash FROM verification_runs
-                 WHERE run_id = ?1 AND step_id = ?2 AND finished_at IS NOT NULL
-                 ORDER BY attempt DESC LIMIT 1",
-                params![run_id, step_id],
-                |r| {
-                    Ok((
-                        r.get::<_, String>(0)?,
-                        r.get::<_, i64>(1)?,
-                        r.get::<_, String>(2)?,
-                    ))
-                },
-            )
-            .ok()?;
+        // Scoped so `conn` (a std MutexGuard, non-reentrant) drops before the
+        // later self.* calls below, each of which locks it again. Holding it
+        // across those calls deadlocked on this thread.
+        let (verification_id, attempt, tree_hash, executions, egress) = {
+            let conn = self.conn();
 
-        let mut stmt = conn
-            .prepare(
-                "SELECT spec_id, exit_code, outcome, duration_ms,
-                        output_digest, output_tail, runner_image
-                 FROM verification_checks WHERE verification_id = ?1",
-            )
-            .ok()?;
-        let executions: Vec<CheckExecution> = stmt
-            .query_map(params![verification_id], |r| {
-                Ok(CheckExecution {
-                    spec_id: r.get::<_, String>(0)?,
-                    exit_code: r.get::<_, Option<i32>>(1)?,
-                    outcome: check_outcome_from_str(&r.get::<_, String>(2)?),
-                    duration_ms: r.get::<_, i64>(3)? as u64,
-                    output_digest: r.get::<_, String>(4)?,
-                    output_tail: r.get::<_, String>(5)?,
-                    runner_image: r.get::<_, String>(6)?,
-                })
-            })
-            .ok()?
-            .filter_map(|row| row.ok())
-            .collect();
+            let (verification_id, attempt, tree_hash) = conn
+                .query_row(
+                    "SELECT id, attempt, tree_hash FROM verification_runs
+                     WHERE run_id = ?1 AND step_id = ?2 AND finished_at IS NOT NULL
+                     ORDER BY attempt DESC LIMIT 1",
+                    params![run_id, step_id],
+                    |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, i64>(1)?,
+                            r.get::<_, String>(2)?,
+                        ))
+                    },
+                )
+                .ok()?;
 
-        // The egress the sandbox actually ran under, read from the job rather
-        // than recomputed. Ordered by lease generation because a step that was
-        // re-leased ran more than once, and the last lease is the one whose
-        // sandbox produced the tree this verdict is about.
-        //
-        // A missing row is `None`, not an empty allowlist: a step executed
-        // before scoped egress existed has no record of what it reached, and
-        // reporting that as "reached nothing" would be a claim we cannot make.
-        let egress = conn
-            .query_row(
-                "SELECT capability_grants, effective_egress, egress_mediator
-                 FROM execution_jobs WHERE run_id = ?1 AND step_id = ?2
-                 ORDER BY lease_gen DESC, submitted_at DESC LIMIT 1",
-                params![run_id, step_id],
-                |r| {
-                    Ok((
-                        r.get::<_, String>(0)?,
-                        r.get::<_, Option<String>>(1)?,
-                        r.get::<_, Option<String>>(2)?,
-                    ))
-                },
-            )
-            .ok()
-            .and_then(|(grants_json, endpoints_json, mediator)| {
-                // Only a job that recorded its effective egress can produce a
-                // receipt for it. `NULL` predates the feature.
-                let endpoints: Vec<String> =
-                    serde_json::from_str(endpoints_json.as_deref()?).ok()?;
-                let grants: Vec<cortex_core::execution_job::CapabilityGrant> =
-                    serde_json::from_str(&grants_json).unwrap_or_default();
-                // The two grants are read out separately, from the same
-                // persisted list, because that list is where they stayed
-                // distinct. Flattening them into one set of names at any point
-                // between derivation and here would have made this
-                // unrecoverable.
-                let granted_registries = grants
-                    .iter()
-                    .flat_map(|grant| match grant {
-                        cortex_core::execution_job::CapabilityGrant::ResolveDependencies {
-                            registries,
-                        } => registries.clone(),
-                        cortex_core::execution_job::CapabilityGrant::ReachProvider { .. }
-                        | cortex_core::execution_job::CapabilityGrant::ReadSecret { .. } => {
-                            Vec::new()
-                        }
+            let mut stmt = conn
+                .prepare(
+                    "SELECT spec_id, exit_code, outcome, duration_ms,
+                            output_digest, output_tail, runner_image
+                     FROM verification_checks WHERE verification_id = ?1",
+                )
+                .ok()?;
+            let executions: Vec<CheckExecution> = stmt
+                .query_map(params![verification_id], |r| {
+                    Ok(CheckExecution {
+                        spec_id: r.get::<_, String>(0)?,
+                        exit_code: r.get::<_, Option<i32>>(1)?,
+                        outcome: check_outcome_from_str(&r.get::<_, String>(2)?),
+                        duration_ms: r.get::<_, i64>(3)? as u64,
+                        output_digest: r.get::<_, String>(4)?,
+                        output_tail: r.get::<_, String>(5)?,
+                        runner_image: r.get::<_, String>(6)?,
                     })
-                    .collect();
-                let granted_provider = grants.iter().find_map(|grant| match grant {
-                    cortex_core::execution_job::CapabilityGrant::ReachProvider { provider } => {
-                        Some(provider.clone())
-                    }
-                    cortex_core::execution_job::CapabilityGrant::ResolveDependencies { .. }
-                    | cortex_core::execution_job::CapabilityGrant::ReadSecret { .. } => None,
-                });
-                Some(EgressReceipt {
-                    granted_registries,
-                    granted_provider,
-                    endpoints,
-                    mediator_image: mediator,
                 })
-            });
+                .ok()?
+                .filter_map(|row| row.ok())
+                .collect();
+            drop(stmt);
+
+            // The egress the sandbox actually ran under, read from the job rather
+            // than recomputed. Ordered by lease generation because a step that was
+            // re-leased ran more than once, and the last lease is the one whose
+            // sandbox produced the tree this verdict is about.
+            //
+            // A missing row is `None`, not an empty allowlist: a step executed
+            // before scoped egress existed has no record of what it reached, and
+            // reporting that as "reached nothing" would be a claim we cannot make.
+            let egress = conn
+                .query_row(
+                    "SELECT capability_grants, effective_egress, egress_mediator
+                     FROM execution_jobs WHERE run_id = ?1 AND step_id = ?2
+                     ORDER BY lease_gen DESC, submitted_at DESC LIMIT 1",
+                    params![run_id, step_id],
+                    |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, Option<String>>(1)?,
+                            r.get::<_, Option<String>>(2)?,
+                        ))
+                    },
+                )
+                .ok()
+                .and_then(|(grants_json, endpoints_json, mediator)| {
+                    // Only a job that recorded its effective egress can produce a
+                    // receipt for it. `NULL` predates the feature.
+                    let endpoints: Vec<String> =
+                        serde_json::from_str(endpoints_json.as_deref()?).ok()?;
+                    let grants: Vec<cortex_core::execution_job::CapabilityGrant> =
+                        serde_json::from_str(&grants_json).unwrap_or_default();
+                    // The two grants are read out separately, from the same
+                    // persisted list, because that list is where they stayed
+                    // distinct. Flattening them into one set of names at any point
+                    // between derivation and here would have made this
+                    // unrecoverable.
+                    let granted_registries = grants
+                        .iter()
+                        .flat_map(|grant| match grant {
+                            cortex_core::execution_job::CapabilityGrant::ResolveDependencies {
+                                registries,
+                            } => registries.clone(),
+                            cortex_core::execution_job::CapabilityGrant::ReachProvider { .. }
+                            | cortex_core::execution_job::CapabilityGrant::ReadSecret { .. } => {
+                                Vec::new()
+                            }
+                        })
+                        .collect();
+                    let granted_provider = grants.iter().find_map(|grant| match grant {
+                        cortex_core::execution_job::CapabilityGrant::ReachProvider {
+                            provider,
+                        } => Some(provider.clone()),
+                        cortex_core::execution_job::CapabilityGrant::ResolveDependencies {
+                            ..
+                        }
+                        | cortex_core::execution_job::CapabilityGrant::ReadSecret { .. } => None,
+                    });
+                    Some(EgressReceipt {
+                        granted_registries,
+                        granted_provider,
+                        endpoints,
+                        mediator_image: mediator,
+                    })
+                });
+
+            (verification_id, attempt, tree_hash, executions, egress)
+        };
 
         // Declared at plan time, before this step ran -- read back from the
         // frozen work contract rather than re-derived, for the same reason

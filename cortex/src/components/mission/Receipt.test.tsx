@@ -33,7 +33,7 @@ describe('ReceiptCard verdict class', () => {
     render(<ReceiptCard receipt={baseReceipt({ verdict_class: 'authored', charged_credits: 5 })} />);
     expect(screen.getByText('Authored')).toBeInTheDocument();
     expect(
-      screen.getByText('Checked by tests the agent wrote — not independently verified.'),
+      screen.getByText('Graded by checks this task was allowed to change — the exam was not locked.'),
     ).toBeInTheDocument();
     expect(screen.getByText('5 credits')).toBeInTheDocument();
   });
@@ -71,14 +71,41 @@ describe('ReceiptCard verdict class', () => {
     expect(screen.queryByText(/independently verified/i)).not.toBeInTheDocument();
   });
 
+  it('uses neutral copy for a strong-declared step that never ran (inconclusive)', () => {
+    // Inconclusive means the required checks could not be run at all -- there
+    // is nothing to have "not passed". The `failed`-only copy above would
+    // overstate what happened, so this must read as "not graded", not as a
+    // loss.
+    render(
+      <ReceiptCard
+        receipt={baseReceipt({
+          verdict_class: 'strong',
+          gate: {
+            verdict: 'inconclusive',
+            required_total: 2,
+            required_passed: 0,
+            failed: [],
+            not_executed: ['c1', 'c2'],
+          },
+        })}
+      />,
+    );
+    expect(screen.getByText('Strong')).toBeInTheDocument();
+    expect(
+      screen.getByText('Graded by checks that existed before this task -- the step was not graded.'),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/it did not pass them/)).not.toBeInTheDocument();
+  });
+
   // `verdict_class` is `Option<VerdictClass>` on the backend
-  // (`TaskContract::verdict_class`, `#[serde(default)]`) and is skipped from
-  // the JSON entirely when `None` (`Receipt.verdict_class`,
-  // `skip_serializing_if = "Option::is_none"`). That is exactly what a
-  // pre-PR contract, and a contract whose work-contract row could not be
-  // read, both serialize as -- the frontend cannot and should not be able to
-  // tell those two apart, so the fixture below (no `verdict_class` key at
-  // all) is the real wire shape for either case, not a stand-in for it.
+  // (`Receipt.verdict_class`, `skip_serializing_if = "Option::is_none"`) and
+  // is skipped from the JSON entirely when `None`. That is what a contract
+  // whose work-contract row could not be read serializes as. It is *not*
+  // what a pre-PR contract serializes as: `TaskContract::verdict_class` has
+  // written the literal string `"authored"` since the root commit, so a
+  // pre-PR contract reads back as `Some(Authored)`, not `None` -- the
+  // fixture below (no `verdict_class` key at all) stands in only for "the
+  // work contract could not be read", not for "predates this field".
   it('renders no class badge or charged-credits line when the contract never declared a verdict class', () => {
     render(<ReceiptCard receipt={baseReceipt()} />);
     expect(screen.queryByText('Strong')).not.toBeInTheDocument();

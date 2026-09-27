@@ -4227,9 +4227,11 @@ pub struct Receipt {
     /// What kind of claim this verdict is, declared at plan time before this
     /// step ran -- so the customer sees the grade before they spend, not
     /// after. `None` for a receipt whose work contract could not be read, or
-    /// whose contract predates this field (`TaskContract::verdict_class` is
-    /// itself `Option`, `#[serde(default)]`) -- either way it is not a third
-    /// class, and grading treats it exactly like `Authored`.
+    /// whose contract explicitly declared no class. Note this is *not* what a
+    /// pre-PR contract reads back as: `verdict_class` has serialized as the
+    /// literal `"authored"` since the root commit, so an old contract reads
+    /// back as `Some(Authored)`, not `None`. Either way it is not a third
+    /// class, and grading treats `None` exactly like `Authored`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub verdict_class: Option<cortex_core::diff_surface::VerdictClass>,
     /// What the step was quoted at dispatch -- an `authored` verdict already

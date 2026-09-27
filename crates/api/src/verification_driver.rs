@@ -731,6 +731,21 @@ mod tests {
         assert_eq!(receipt.executions.len(), 2);
         assert_eq!(receipt.gate.required_total, 2);
         assert_eq!(receipt.gate.required_passed, 2);
+        // This test is what guards `get_receipt` against the deadlock its
+        // trailing self.read_step_work_contract / self.get_step_quote /
+        // self.ledger_net_charge_for_verification calls could reintroduce: a
+        // regression there hangs this test rather than failing it, so the
+        // fields those calls actually populate need to be asserted here.
+        assert_eq!(
+            receipt.verdict_class,
+            Some(VerdictClass::Strong),
+            "read back from the frozen work contract declared above"
+        );
+        assert_eq!(
+            receipt.charged_credits, None,
+            "facts_for this test carries no quoted_credits, so finish_and_bill \
+             never charges and no ledger row exists to read back"
+        );
     }
 
     #[tokio::test]
