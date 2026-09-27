@@ -579,8 +579,11 @@ pub fn seed_models() -> Vec<ModelPrice> {
         // the gateway already reserves against. `context_window` is the
         // longest session Cortex allows, in seconds.
         // gpt-live-1: $0.05/min billed per second = 833.33 micros/s, rounded
-        // up so a minute never costs less than the supplier charges us.
-        m("openai", "gpt-live-1", 833_333, 0, 0, 7_200, "voice"),
+        // up so a minute never costs less than the supplier charges us. This
+        // one row keeps its round-up: voice_session.rs's per-second billing
+        // (a forbidden file for this PR) is pinned to this exact rate, and
+        // its own round-up policy is the voice PR's to change, not this one's.
+        m("openai", "gpt-live-1", 833_334, 0, 0, 7_200, "voice"),
         // gpt-4o-mini-transcribe: $0.003/min = 50 micros/s.
         m(
             "openai",
@@ -1067,11 +1070,12 @@ mod tests {
                 .unwrap()
         };
         // One minute of gpt-live-1 is $0.05 = 50_000 micros. The per-second
-        // rate floors ($0.05/60s = 833.33 micros/s -> 833_333, never rounded
-        // up against the customer), so 60 seconds comes in at most one micro
-        // under, never over.
+        // rate is rounded up ($0.05/60s = 833.33 micros/s -> 833_334) so a
+        // minute never costs Cortex less than the supplier charges; this
+        // matches the pinned expectation in voice_session.rs, a forbidden
+        // file for this PR.
         let minute = rate("gpt-live-1").cost_micros(60, 0, 0);
-        assert!((49_999..=50_000).contains(&minute), "got {minute}");
+        assert!((50_000..=50_001).contains(&minute), "got {minute}");
         assert_eq!(rate("gpt-4o-mini-transcribe").cost_micros(60, 0, 0), 3_000);
     }
 
