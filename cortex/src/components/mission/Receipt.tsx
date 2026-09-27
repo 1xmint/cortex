@@ -108,7 +108,7 @@ function verdictClassDetail(receipt: Receipt): string | undefined {
     return 'Graded by checks that existed before this task -- it did not pass them.';
   }
   if (receipt.verdict_class === 'strong' && receipt.gate.verdict === 'inconclusive') {
-    return 'Graded by checks that existed before this task -- the step was not graded.';
+    return 'Checks that existed before this task were not run -- no grade was given.';
   }
   return classCopy.detail;
 }

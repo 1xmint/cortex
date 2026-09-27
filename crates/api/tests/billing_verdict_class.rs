@@ -72,12 +72,8 @@ fn authored_and_strong_are_charged_the_same_price() {
     let (_dir, db) = db();
     let (list, class) = billable_list(&db);
 
-    let strong_credits = pricing::quote(&list, &class).expect("priced").0;
+    // quote() takes no verdict_class, so the class price is the only price.
     let authored_credits = pricing::quote(&list, &class).expect("priced").0;
-    assert_eq!(
-        strong_credits, authored_credits,
-        "quote() takes no verdict_class and must not vary by declared class"
-    );
 
     let user = "user_authored_charge";
     db.init_credit_balance(user, 10_000).expect("init balance");

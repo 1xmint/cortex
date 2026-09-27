@@ -1048,9 +1048,9 @@ fn freeze_step_quote(
     };
 
     let class = cortex_core::task_class::TaskClass::new(work_kind, risk, verifiable);
-    // The declared verdict class is a stored label only -- billing is
-    // pass-through (exactly what the calls this step made cost), and does
-    // not vary by how the work was graded. See `TaskContract::verdict_class`.
+    // The declared verdict class does not change the quote: it is a label
+    // (and switches on the exam-integrity check), never a price input.
+    // See `TaskContract::verdict_class`.
     let Some((credits, billable)) = crate::pricing::quote(&list, &class) else {
         tracing::warn!(
             run_id, step_id, class = %class.key(), price_list_version = list.version,

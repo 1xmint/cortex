@@ -4235,8 +4235,7 @@ pub struct Receipt {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub verdict_class: Option<cortex_core::diff_surface::VerdictClass>,
     /// What the step was quoted at dispatch -- the class price, unaffected by
-    /// `verdict_class`; billing is pass-through and does not discount for a
-    /// looser grade. This is the plan, not the outcome: it does not move
+    /// `verdict_class`; the declared verdict class does not change the quote. This is the plan, not the outcome: it does not move
     /// when the charge is later refunded.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub quoted_credits: Option<i64>,

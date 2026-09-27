@@ -92,7 +92,7 @@ describe('ReceiptCard verdict class', () => {
     );
     expect(screen.getByText('Strong')).toBeInTheDocument();
     expect(
-      screen.getByText('Graded by checks that existed before this task -- the step was not graded.'),
+      screen.getByText('Checks that existed before this task were not run -- no grade was given.'),
     ).toBeInTheDocument();
     expect(screen.queryByText(/it did not pass them/)).not.toBeInTheDocument();
   });
