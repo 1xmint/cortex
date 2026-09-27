@@ -30,6 +30,10 @@ impl GitHubClient {
     }
 
     /// Create a pull request via the GitHub REST API.
+    ///
+    /// `draft` opens the PR in draft state — used when the run's latest
+    /// sealed verdict for a step is `Failed`: the work is still delivered,
+    /// just flagged for review before it can be merged.
     pub async fn create_pull_request(
         &self,
         owner: &str,
@@ -38,15 +42,11 @@ impl GitHubClient {
         body: &str,
         head: &str,
         base: &str,
+        draft: bool,
     ) -> Result<PrResponse, String> {
         let url = format!("https://api.github.com/repos/{owner}/{repo}/pulls");
 
-        let payload = serde_json::json!({
-            "title": title,
-            "body": body,
-            "head": head,
-            "base": base,
-        });
+        let payload = pr_payload(title, body, head, base, draft);
 
         let resp = self
             .client
@@ -68,6 +68,60 @@ impl GitHubClient {
         resp.json::<PrResponse>()
             .await
             .map_err(|e| format!("failed to parse GitHub PR response: {e}"))
+    }
+}
+
+/// Build the JSON body for the GitHub "create pull request" API call.
+/// Pulled out so the draft-flag wiring can be tested without a live HTTP
+/// call: `draft` must be `true` when the run's latest sealed verdict for a
+/// step is `Failed` and `false` otherwise.
+pub(crate) fn pr_payload(
+    title: &str,
+    body: &str,
+    head: &str,
+    base: &str,
+    draft: bool,
+) -> serde_json::Value {
+    serde_json::json!({
+        "title": title,
+        "body": body,
+        "head": head,
+        "base": base,
+        "draft": draft,
+    })
+}
+
+#[cfg(test)]
+mod pr_payload_tests {
+    use super::*;
+
+    #[test]
+    fn failed_run_payload_requests_a_draft_pr() {
+        let payload = pr_payload(
+            "[failed checks] cortex: do the thing",
+            "body",
+            "cortex/do-the-thing",
+            "main",
+            true,
+        );
+        assert_eq!(payload["draft"], serde_json::json!(true));
+        assert_eq!(
+            payload["title"],
+            serde_json::json!("[failed checks] cortex: do the thing")
+        );
+    }
+
+    #[test]
+    fn verified_run_payload_is_not_a_draft() {
+        let payload = pr_payload(
+            "cortex: do the thing",
+            "body",
+            "cortex/do-the-thing",
+            "main",
+            false,
+        );
+        assert_eq!(payload["draft"], serde_json::json!(false));
+        assert_eq!(payload["title"], serde_json::json!("cortex: do the thing"));
     }
 }
 
