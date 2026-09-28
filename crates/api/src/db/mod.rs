@@ -328,7 +328,7 @@ pub const SCHEMA_VERSION: u32 = 73;
 /// `SCHEMA_VERSION` alone cannot catch that: it only advances when someone
 /// remembers to bump it. See `schema_fingerprint_matches_pinned_value` in
 /// this module's tests, which is what computes and checks this value.
-pub const SCHEMA_FINGERPRINT: u64 = 0x65d388252c823520;
+pub const SCHEMA_FINGERPRINT: u64 = 0xc5a5cb1d843d8820;
 
 fn apply_migrations(conn: &Connection) {
     conn.execute_batch(
