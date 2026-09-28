@@ -34,7 +34,6 @@ pub struct StripeConfig {
     pub webhook_secret: String,
     pub price_monthly: String,
     pub price_annual: String,
-    pub price_credit_pack: String,
     pub success_url: String,
     pub cancel_url: String,
 }
@@ -47,7 +46,6 @@ impl StripeConfig {
             webhook_secret: std::env::var("STRIPE_WEBHOOK_SECRET").unwrap_or_default(),
             price_monthly: std::env::var("STRIPE_PRICE_MONTHLY").unwrap_or_default(),
             price_annual: std::env::var("STRIPE_PRICE_ANNUAL").unwrap_or_default(),
-            price_credit_pack: std::env::var("STRIPE_PRICE_CREDIT_PACK").unwrap_or_default(),
             success_url: std::env::var("STRIPE_SUCCESS_URL")
                 .unwrap_or_else(|_| "https://cortex.heyvera.org/billing?success=true".into()),
             cancel_url: std::env::var("STRIPE_CANCEL_URL")
@@ -61,7 +59,6 @@ pub struct StripeClient {
     http: reqwest::Client,
     pub price_monthly: String,
     pub price_annual: String,
-    pub price_credit_pack: String,
     pub success_url: String,
     pub cancel_url: String,
 }
@@ -103,7 +100,6 @@ impl StripeClient {
             http: reqwest::Client::new(),
             price_monthly: config.price_monthly,
             price_annual: config.price_annual,
-            price_credit_pack: config.price_credit_pack,
             success_url: config.success_url,
             cancel_url: config.cancel_url,
         };
@@ -183,17 +179,27 @@ impl StripeClient {
         self.post_form("/v1/checkout/sessions", &params).await
     }
 
-    pub async fn create_credit_pack_checkout(
+    /// A one-time-payment Checkout Session for a credit top-up, priced
+    /// inline with `price_data` (Cortex has no preset Stripe Price for this —
+    /// the amount is one of a small set of customer-chosen presets and the
+    /// rate is exact pass-through, so there's nothing a catalog Price would
+    /// buy us). Params are built by [`build_topup_checkout_params`], kept
+    /// separate so it's testable without a network call.
+    pub async fn create_topup_checkout_session(
         &self,
         customer_id: &str,
+        amount_usd: i64,
+        credits: i64,
+        clerk_user_id: &str,
     ) -> Result<CheckoutSessionResponse, StripeError> {
-        let mut params = HashMap::new();
-        params.insert("customer", customer_id.to_string());
-        params.insert("mode", "payment".to_string());
-        params.insert("line_items[0][price]", self.price_credit_pack.clone());
-        params.insert("line_items[0][quantity]", "1".to_string());
-        params.insert("success_url", self.success_url.clone());
-        params.insert("cancel_url", self.cancel_url.clone());
+        let params = build_topup_checkout_params(
+            customer_id,
+            amount_usd,
+            credits,
+            clerk_user_id,
+            &self.success_url,
+            &self.cancel_url,
+        );
         self.post_form("/v1/checkout/sessions", &params).await
     }
 
@@ -260,6 +266,133 @@ impl StripeClient {
             Ok(())
         } else {
             Err(StripeError::WebhookSignatureInvalid)
+        }
+    }
+}
+
+/// Pure builder for the `/v1/checkout/sessions` form params of a credit
+/// top-up: `mode=payment`, one inline `price_data` line item priced at
+/// exactly `amount_usd * 100` cents (no catalog Price, no markup), and the
+/// metadata the webhook needs to grant credits without re-deriving anything
+/// from the amount alone (`metadata[credits]` is the cross-check value; the
+/// webhook still grants based on what Stripe reports was actually paid).
+///
+/// Split out from [`StripeClient::create_topup_checkout_session`] so the
+/// request shape can be unit-tested without a network call or a Stripe test
+/// double, neither of which this crate has for HTTP-level Stripe calls.
+pub fn build_topup_checkout_params(
+    customer_id: &str,
+    amount_usd: i64,
+    credits: i64,
+    clerk_user_id: &str,
+    success_url: &str,
+    cancel_url: &str,
+) -> HashMap<&'static str, String> {
+    let mut params = HashMap::new();
+    params.insert("customer", customer_id.to_string());
+    params.insert("mode", "payment".to_string());
+    // Pin to card so the session settles immediately (payment_status "paid"
+    // on `checkout.session.completed`) instead of depending on whichever
+    // delayed payment methods the Stripe dashboard has enabled — those still
+    // work via `checkout.session.async_payment_succeeded`, but requiring
+    // card removes that dependency for the common case.
+    params.insert("payment_method_types[0]", "card".to_string());
+    params.insert("line_items[0][price_data][currency]", "usd".to_string());
+    params.insert(
+        "line_items[0][price_data][product_data][name]",
+        "Cortex credits".to_string(),
+    );
+    params.insert(
+        "line_items[0][price_data][unit_amount]",
+        (amount_usd * 100).to_string(),
+    );
+    params.insert("line_items[0][quantity]", "1".to_string());
+    params.insert("success_url", success_url.to_string());
+    params.insert("cancel_url", cancel_url.to_string());
+    params.insert("client_reference_id", clerk_user_id.to_string());
+    params.insert("metadata[clerk_user_id]", clerk_user_id.to_string());
+    params.insert("metadata[credits]", credits.to_string());
+    params.insert("metadata[kind]", "credit_topup".to_string());
+    params
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn topup_params_are_a_one_time_payment_priced_at_exactly_the_preset_amount() {
+        let params = build_topup_checkout_params(
+            "cus_123",
+            25,
+            250,
+            "user-1",
+            "https://cortex.heyvera.org/billing?success=true",
+            "https://cortex.heyvera.org/billing?cancelled=true",
+        );
+
+        assert_eq!(params.get("mode").map(String::as_str), Some("payment"));
+        assert_eq!(
+            params.get("payment_method_types[0]").map(String::as_str),
+            Some("card"),
+            "card must be pinned so the session doesn't depend on delayed payment methods"
+        );
+        assert_eq!(
+            params
+                .get("line_items[0][price_data][unit_amount]")
+                .map(String::as_str),
+            Some("2500"),
+            "$25 must be exactly 2500 cents — no markup"
+        );
+        assert_eq!(
+            params
+                .get("line_items[0][price_data][currency]")
+                .map(String::as_str),
+            Some("usd")
+        );
+        assert_eq!(
+            params
+                .get("line_items[0][price_data][product_data][name]")
+                .map(String::as_str),
+            Some("Cortex credits")
+        );
+        assert_eq!(params.get("customer").map(String::as_str), Some("cus_123"));
+        assert_eq!(
+            params.get("client_reference_id").map(String::as_str),
+            Some("user-1")
+        );
+        assert_eq!(
+            params.get("metadata[clerk_user_id]").map(String::as_str),
+            Some("user-1")
+        );
+        assert_eq!(
+            params.get("metadata[credits]").map(String::as_str),
+            Some("250")
+        );
+        assert_eq!(
+            params.get("metadata[kind]").map(String::as_str),
+            Some("credit_topup")
+        );
+    }
+
+    #[test]
+    fn topup_params_unit_amount_matches_every_preset() {
+        let presets = [(10, "1000"), (25, "2500"), (50, "5000"), (100, "10000")];
+        for (amount_usd, expected_cents) in presets {
+            let params = build_topup_checkout_params(
+                "cus_1",
+                amount_usd,
+                amount_usd * 10,
+                "user-1",
+                "https://example.com/ok",
+                "https://example.com/cancel",
+            );
+            assert_eq!(
+                params
+                    .get("line_items[0][price_data][unit_amount]")
+                    .map(String::as_str),
+                Some(expected_cents)
+            );
         }
     }
 }
