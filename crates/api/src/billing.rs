@@ -720,6 +720,92 @@ pub struct CheckoutResponse {
     pub session_id: String,
 }
 
+/// Pure decision: credits granted for a top-up preset, or `None` for an
+/// amount that isn't one of the offered presets. Rate is exact pass-through
+/// (1 credit = $0.10, see `pricing::SEED_MICROS_PER_CREDIT`) — never a
+/// discount or a markup off that rate.
+pub fn credits_for_topup_amount(amount_usd: i64) -> Option<i64> {
+    match amount_usd {
+        10 => Some(100),
+        25 => Some(250),
+        50 => Some(500),
+        100 => Some(1000),
+        _ => None,
+    }
+}
+
+#[derive(Deserialize)]
+pub struct TopupRequest {
+    pub amount_usd: i64,
+}
+
+/// POST /api/billing/topup — one-time credit purchase at exactly $0.10/credit.
+/// Requires an active or trialing subscription; refuses an amount that
+/// isn't one of the offered presets.
+pub async fn create_topup_checkout(
+    State(state): State<Arc<AppState>>,
+    user: ClerkUser,
+    Json(req): Json<TopupRequest>,
+) -> Result<Json<CheckoutResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let db = state.db.as_ref().ok_or((
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(ErrorResponse {
+            error: "database unavailable".into(),
+        }),
+    ))?;
+
+    // Validate the request and the account before touching Stripe at all --
+    // a bad amount or a missing subscription is a 400/409 regardless of
+    // whether Stripe is even configured on this deployment.
+    let credits = credits_for_topup_amount(req.amount_usd).ok_or((
+        StatusCode::BAD_REQUEST,
+        Json(ErrorResponse {
+            error: format!(
+                "unsupported top-up amount: ${}; choose $10, $25, $50, or $100",
+                req.amount_usd
+            ),
+        }),
+    ))?;
+
+    let sub = db.get_subscription(&user.user_id).ok_or((
+        StatusCode::CONFLICT,
+        Json(ErrorResponse {
+            error: "an active Cortex subscription is required to buy credits".into(),
+        }),
+    ))?;
+    if !matches!(sub.status.as_str(), "active" | "trialing") {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(ErrorResponse {
+                error: "an active Cortex subscription is required to buy credits".into(),
+            }),
+        ));
+    }
+
+    let stripe = require_stripe(&state)?;
+    let session = stripe
+        .create_topup_checkout_session(
+            &sub.stripe_customer_id,
+            req.amount_usd,
+            credits,
+            &user.user_id,
+        )
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(ErrorResponse {
+                    error: format!("failed to create checkout: {e}"),
+                }),
+            )
+        })?;
+
+    Ok(Json(CheckoutResponse {
+        checkout_url: session.url.unwrap_or_default(),
+        session_id: session.id,
+    }))
+}
+
 /// POST /api/billing/portal — Stripe Customer Portal.
 pub async fn create_portal(
     State(state): State<Arc<AppState>>,
@@ -1322,7 +1408,25 @@ pub async fn stripe_webhook(
                         "completed",
                     );
                     tracing::info!("subscription created + credits init for user {user_id}");
+                } else if mode.eq_ignore_ascii_case("payment")
+                    && obj["metadata"]["kind"].as_str() == Some("credit_topup")
+                    && obj["payment_status"].as_str() == Some("paid")
+                {
+                    grant_credit_topup(db, obj, event_id);
                 }
+                // A payment-mode session with a delayed payment method
+                // completes with payment_status "unpaid" — Stripe follows up
+                // with `checkout.session.async_payment_succeeded` (below)
+                // once the payment actually settles, and that's when credits
+                // are granted; nothing to do here for that case.
+            }
+        }
+        "checkout.session.async_payment_succeeded" => {
+            let mode = obj["mode"].as_str().unwrap_or("");
+            if mode.eq_ignore_ascii_case("payment")
+                && obj["metadata"]["kind"].as_str() == Some("credit_topup")
+            {
+                grant_credit_topup(db, obj, event_id);
             }
         }
         "customer.subscription.updated" => {
@@ -1414,6 +1518,310 @@ pub async fn stripe_webhook(
     }
 
     Ok(StatusCode::OK)
+}
+
+/// Grants credits for a completed credit-top-up Checkout Session.
+///
+/// Called from both `checkout.session.completed` (immediate payment methods)
+/// and `checkout.session.async_payment_succeeded` (delayed payment methods)
+/// for `mode=payment` sessions tagged `metadata.kind=credit_topup`. Granting
+/// is keyed on the Checkout Session id (see
+/// [`crate::db::Database::grant_topup_credits`]), so whichever event arrives
+/// first grants the credits and any later replay — the same event id, or the
+/// other event type for the same session — grants nothing further.
+///
+/// The amount granted is derived from what Stripe reports as actually paid
+/// (`amount_subtotal`, which excludes tax), not from the `metadata.credits`
+/// value recorded when the session was created, since that metadata cannot
+/// be trusted to still match what the customer paid. A mismatch is logged
+/// as an error for operator follow-up, but the paid-based amount is still
+/// granted so the customer is not shorted credits they already paid for.
+fn grant_credit_topup(db: &Database, obj: &serde_json::Value, event_id: &str) {
+    let session_id = obj["id"].as_str().unwrap_or("");
+    if session_id.is_empty() {
+        tracing::error!("credit topup session missing an id; cannot grant credits");
+        return;
+    }
+
+    let clerk_user_id = obj["metadata"]["clerk_user_id"]
+        .as_str()
+        .or_else(|| obj["client_reference_id"].as_str());
+    let Some(clerk_user_id) = clerk_user_id else {
+        tracing::error!(session_id, "credit topup session missing clerk_user_id");
+        return;
+    };
+
+    let currency = obj["currency"].as_str().unwrap_or("");
+    if !currency.eq_ignore_ascii_case("usd") {
+        tracing::error!(
+            session_id,
+            currency,
+            "credit topup settled in a non-usd currency; granting no credits"
+        );
+        return;
+    }
+
+    let amount_subtotal_cents = obj["amount_subtotal"].as_i64().unwrap_or(0);
+    if amount_subtotal_cents <= 0 {
+        tracing::error!(
+            session_id,
+            amount_subtotal_cents,
+            "credit topup has no positive amount_subtotal; granting no credits"
+        );
+        return;
+    }
+    let credits_from_amount = amount_subtotal_cents / 10;
+
+    if let Some(metadata_credits) =
+        obj["metadata"]["credits"].as_str().and_then(|s| s.parse::<i64>().ok())
+    {
+        if metadata_credits != credits_from_amount {
+            tracing::error!(
+                session_id,
+                metadata_credits,
+                credits_from_amount,
+                amount_subtotal_cents,
+                "credit topup metadata.credits disagrees with the amount paid; \
+                 granting based on the amount actually paid"
+            );
+        }
+    }
+
+    let description = format!("Top-up ${}", amount_subtotal_cents / 100);
+    match db.grant_topup_credits(clerk_user_id, session_id, credits_from_amount, &description) {
+        Ok(true) => {
+            db.record_billing_event(
+                clerk_user_id,
+                event_id,
+                amount_subtotal_cents,
+                &description,
+                "completed",
+            );
+            tracing::info!(
+                user_id = clerk_user_id,
+                session_id,
+                credits_from_amount,
+                "credit topup granted"
+            );
+        }
+        Ok(false) => {
+            tracing::debug!(session_id, "credit topup already granted; webhook replay ignored");
+        }
+        Err(e) => {
+            tracing::error!(session_id, "failed to grant credit topup: {e}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod topup_tests {
+    use super::*;
+    use crate::db::{Database, SubscriptionRecord};
+
+    /// A throwaway sqlite-backed `Database`. This module can't reach
+    /// `crate::db::tests::test_db` (it's `pub(super)`, scoped to `crate::db`
+    /// itself), so it builds its own the same way.
+    fn test_db() -> (tempfile::TempDir, Database) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = Database::open(&dir.path().join("cortex.sqlite"));
+        (dir, db)
+    }
+
+    fn active_subscription(user_id: &str) -> SubscriptionRecord {
+        SubscriptionRecord {
+            clerk_user_id: user_id.to_string(),
+            stripe_customer_id: "cus_test".to_string(),
+            stripe_subscription_id: Some("sub_test".to_string()),
+            plan_type: "monthly".to_string(),
+            status: "active".to_string(),
+            trial_end: None,
+            current_period_start: None,
+            current_period_end: None,
+        }
+    }
+
+    fn topup_session(
+        id: &str,
+        user_id: &str,
+        currency: &str,
+        amount_subtotal_cents: i64,
+        payment_status: &str,
+        metadata_credits: i64,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "id": id,
+            "mode": "payment",
+            "currency": currency,
+            "amount_subtotal": amount_subtotal_cents,
+            "payment_status": payment_status,
+            "client_reference_id": user_id,
+            "metadata": {
+                "clerk_user_id": user_id,
+                "credits": metadata_credits.to_string(),
+                "kind": "credit_topup",
+            },
+        })
+    }
+
+    #[test]
+    fn paid_topup_grants_the_pack_bucket_and_writes_one_ledger_and_history_row() {
+        let (_dir, db) = test_db();
+        let obj = topup_session("cs_1", "user-1", "usd", 2500, "paid", 250);
+
+        grant_credit_topup(&db, &obj, "evt_1");
+
+        let balance = db.get_credit_balance_row("user-1").expect("balance row");
+        assert_eq!(balance.subscription_remaining, 0);
+        assert_eq!(balance.pack_remaining, 250);
+        assert_eq!(db.get_billing_history("user-1", 10, 0).len(), 1);
+    }
+
+    #[test]
+    fn a_topup_with_no_prior_balance_row_never_invents_subscription_credits() {
+        let (_dir, db) = test_db();
+        assert!(db.get_credit_balance_row("user-1").is_none());
+        let obj = topup_session("cs_2", "user-1", "usd", 1000, "paid", 100);
+
+        grant_credit_topup(&db, &obj, "evt_1");
+
+        let balance = db.get_credit_balance_row("user-1").expect("balance row");
+        assert_eq!(balance.subscription_remaining, 0);
+        assert_eq!(balance.subscription_total, 0);
+        assert_eq!(balance.pack_remaining, 100);
+    }
+
+    #[test]
+    fn replaying_the_same_stripe_event_grants_nothing_further() {
+        let (_dir, db) = test_db();
+        let obj = topup_session("cs_3", "user-1", "usd", 2500, "paid", 250);
+
+        grant_credit_topup(&db, &obj, "evt_1");
+        grant_credit_topup(&db, &obj, "evt_1"); // Stripe's at-least-once redelivery
+
+        let balance = db.get_credit_balance_row("user-1").expect("balance row");
+        assert_eq!(balance.pack_remaining, 250);
+        assert_eq!(db.get_billing_history("user-1", 10, 0).len(), 1);
+    }
+
+    #[test]
+    fn a_different_event_id_for_the_same_checkout_session_still_grants_nothing_further() {
+        // `checkout.session.completed` and `checkout.session.async_payment_succeeded`
+        // are two different Stripe events (different `id`s) that can describe
+        // the same session; idempotency is keyed on the session id, not the
+        // event id.
+        let (_dir, db) = test_db();
+        let obj = topup_session("cs_4", "user-1", "usd", 2500, "paid", 250);
+
+        grant_credit_topup(&db, &obj, "evt_completed");
+        grant_credit_topup(&db, &obj, "evt_async_succeeded");
+
+        let balance = db.get_credit_balance_row("user-1").expect("balance row");
+        assert_eq!(balance.pack_remaining, 250);
+        assert_eq!(db.get_billing_history("user-1", 10, 0).len(), 1);
+    }
+
+    #[test]
+    fn an_unpaid_session_grants_nothing() {
+        let (_dir, db) = test_db();
+        let obj = topup_session("cs_5", "user-1", "usd", 2500, "unpaid", 250);
+
+        grant_credit_topup(&db, &obj, "evt_1");
+
+        assert!(db.get_credit_balance_row("user-1").is_none());
+    }
+
+    #[test]
+    fn async_payment_succeeded_grants_once_after_a_delayed_payment_method_settles() {
+        // The `checkout.session.completed` delivery for a delayed payment
+        // method (e.g. a bank debit) arrives with payment_status "unpaid" --
+        // `stripe_webhook`'s guard skips granting for that case, so this test
+        // drives `grant_credit_topup` the way the
+        // `checkout.session.async_payment_succeeded` arm does, once the
+        // payment has actually settled.
+        let (_dir, db) = test_db();
+        let unpaid = topup_session("cs_6", "user-1", "usd", 2500, "unpaid", 250);
+        grant_credit_topup(&db, &unpaid, "evt_completed");
+        assert!(db.get_credit_balance_row("user-1").is_none());
+
+        let paid = topup_session("cs_6", "user-1", "usd", 2500, "paid", 250);
+        grant_credit_topup(&db, &paid, "evt_async_succeeded");
+
+        let balance = db.get_credit_balance_row("user-1").expect("balance row");
+        assert_eq!(balance.pack_remaining, 250);
+        assert_eq!(db.get_billing_history("user-1", 10, 0).len(), 1);
+
+        // A duplicate async_payment_succeeded redelivery still grants nothing more.
+        grant_credit_topup(&db, &paid, "evt_async_succeeded_retry");
+        let balance = db.get_credit_balance_row("user-1").expect("balance row");
+        assert_eq!(balance.pack_remaining, 250);
+    }
+
+    #[test]
+    fn a_non_usd_settlement_grants_nothing() {
+        let (_dir, db) = test_db();
+        let obj = topup_session("cs_7", "user-1", "eur", 2500, "paid", 250);
+
+        grant_credit_topup(&db, &obj, "evt_1");
+
+        assert!(db.get_credit_balance_row("user-1").is_none());
+    }
+
+    async fn test_state() -> (tempfile::TempDir, std::sync::Arc<AppState>) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join(".cortex")).unwrap();
+        let state = AppState::new(
+            dir.path().join(".cortex/ledger.jsonl"),
+            dir.path().to_path_buf(),
+            None,
+        )
+        .await;
+        (dir, state)
+    }
+
+    #[tokio::test]
+    async fn topup_endpoint_rejects_an_amount_that_isnt_a_preset() {
+        let (_dir, state) = test_state().await;
+        let user = ClerkUser {
+            user_id: "user-1".into(),
+        };
+
+        let err = create_topup_checkout(State(state), user, Json(TopupRequest { amount_usd: 7 }))
+            .await
+            .expect_err("$7 is not one of the $10/$25/$50/$100 presets");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn topup_endpoint_requires_an_active_subscription() {
+        let (_dir, state) = test_state().await;
+        let user = ClerkUser {
+            user_id: "user-1".into(),
+        };
+
+        let err =
+            create_topup_checkout(State(state), user, Json(TopupRequest { amount_usd: 25 }))
+                .await
+                .expect_err("no subscription row exists for this user");
+        assert_eq!(err.0, StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn topup_endpoint_rejects_a_cancelled_subscription() {
+        let (_dir, state) = test_state().await;
+        let db = state.db.as_ref().expect("db configured");
+        let mut sub = active_subscription("user-1");
+        sub.status = "cancelled".to_string();
+        db.upsert_subscription(&sub);
+        let user = ClerkUser {
+            user_id: "user-1".into(),
+        };
+
+        let err =
+            create_topup_checkout(State(state), user, Json(TopupRequest { amount_usd: 25 }))
+                .await
+                .expect_err("a cancelled subscription may not buy credits");
+        assert_eq!(err.0, StatusCode::CONFLICT);
+    }
 }
 
 fn require_stripe(

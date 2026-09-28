@@ -1586,16 +1586,114 @@ impl Database {
         Ok(())
     }
 
+    /// Non-idempotent pack-credit top-up used by tests to fund a balance.
+    /// **Never for product billing** — it writes no ledger row and can be
+    /// called twice for the same money. Product code that grants purchased
+    /// credits must use [`Self::grant_topup_credits`], which is exactly-once
+    /// and durable.
+    ///
+    /// On a missing balance row this creates one with `subscription_remaining
+    /// = 0` / `subscription_total = 0` — never inventing a free monthly
+    /// allotment for a user who only bought a pack.
     pub fn add_pack_credits(&self, clerk_user_id: &str, amount: i64) -> Result<(), String> {
         let conn = self.conn();
         conn.execute(
             "INSERT INTO credit_balances (clerk_user_id, subscription_remaining, subscription_total, pack_remaining)
-             VALUES (?1, 200, 200, ?2)
+             VALUES (?1, 0, 0, ?2)
              ON CONFLICT(clerk_user_id) DO UPDATE SET pack_remaining = pack_remaining + ?2",
             params![clerk_user_id, amount],
         )
         .map_err(|e| format!("failed to add pack credits: {e}"))?;
         Ok(())
+    }
+
+    /// Grant purchased pack credits for one completed Stripe Checkout
+    /// Session, exactly once.
+    ///
+    /// **Idempotent on `checkout_session_id`**, not on the Stripe event id:
+    /// Stripe may replay `checkout.session.completed` (same event id, at-least-
+    /// once delivery) and, for delayed payment methods, follow it with a
+    /// separate `checkout.session.async_payment_succeeded` for the *same*
+    /// session — a different event id describing the same money. Keying on
+    /// the session id under `topup:{checkout_session_id}` and relying on
+    /// `credit_transactions.idempotency_key`'s UNIQUE constraint (the same
+    /// exactly-once mechanism `deduct_credits`/`charge_settled_cost` use)
+    /// makes every one of those deliveries after the first a no-op.
+    ///
+    /// One transaction: increments `pack_remaining` (creating the balance row
+    /// with `subscription_remaining = 0` / `subscription_total = 0` if it
+    /// doesn't exist yet — a top-up never invents subscription credits) and
+    /// inserts one positive `'pack'`-typed `credit_transactions` row with
+    /// reason `'purchase'`.
+    ///
+    /// Returns `Ok(true)` when this call granted the credits, `Ok(false)`
+    /// when the session had already been granted (replay).
+    pub fn grant_topup_credits(
+        &self,
+        clerk_user_id: &str,
+        checkout_session_id: &str,
+        credits: i64,
+        description: &str,
+    ) -> Result<bool, String> {
+        if credits <= 0 {
+            return Err("topup credits must be positive".into());
+        }
+        if checkout_session_id.trim().is_empty() {
+            return Err("checkout session id is required for a topup grant".into());
+        }
+
+        let idempotency_key = format!("topup:{checkout_session_id}");
+        let conn = self.conn();
+
+        conn.execute("BEGIN IMMEDIATE", [])
+            .map_err(|e| format!("failed to begin transaction: {e}"))?;
+
+        // Replay check inside the transaction, so it can't race a concurrent
+        // grant for the same session (e.g. `completed` and
+        // `async_payment_succeeded` arriving back to back).
+        let already: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM credit_transactions WHERE idempotency_key = ?1",
+                params![idempotency_key],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        if already > 0 {
+            conn.execute("ROLLBACK", []).ok();
+            tracing::debug!(
+                user_id = clerk_user_id,
+                checkout_session_id,
+                "credit topup replayed; no additional credits granted"
+            );
+            return Ok(false);
+        }
+
+        if let Err(e) = conn.execute(
+            "INSERT INTO credit_balances (clerk_user_id, subscription_remaining, subscription_total, pack_remaining)
+             VALUES (?1, 0, 0, ?2)
+             ON CONFLICT(clerk_user_id) DO UPDATE SET pack_remaining = pack_remaining + ?2",
+            params![clerk_user_id, credits],
+        ) {
+            conn.execute("ROLLBACK", []).ok();
+            return Err(format!("failed to credit pack balance: {e}"));
+        }
+
+        let tx_id = Uuid::new_v4().to_string();
+        if let Err(e) = conn.execute(
+            "INSERT INTO credit_transactions
+                (id, clerk_user_id, amount, balance_type, reason, description,
+                 idempotency_key, cost_micro_usd)
+             VALUES (?1, ?2, ?3, 'pack', 'purchase', ?4, ?5, NULL)",
+            params![tx_id, clerk_user_id, credits, description, idempotency_key],
+        ) {
+            conn.execute("ROLLBACK", []).ok();
+            return Err(format!("failed to record topup transaction: {e}"));
+        }
+
+        conn.execute("COMMIT", [])
+            .map_err(|e| format!("failed to commit transaction: {e}"))?;
+
+        Ok(true)
     }
 
     pub fn record_billing_event(
@@ -2345,5 +2443,144 @@ mod tests {
         seal_verification(&db, "run-sealed", "step-sealed", Verdict::Verified);
 
         assert!(!db.run_has_pending_verification("run-sealed"));
+    }
+
+    // --- grant_topup_credits ---
+
+    #[test]
+    fn a_topup_grant_credits_the_pack_bucket_and_writes_one_row() {
+        let db = test_db();
+        let user = subscriber(&db, 0);
+
+        let granted = db
+            .grant_topup_credits(user, "cs_test_1", 250, "Top-up $25")
+            .expect("grant");
+        assert!(granted, "a fresh session must grant credits");
+
+        let balance = db.get_credit_balance_row(user).expect("balance row");
+        assert_eq!(balance.pack_remaining, 250);
+        assert_eq!(
+            balance.subscription_remaining, 0,
+            "a top-up must never touch the subscription bucket"
+        );
+
+        let row_count: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM credit_transactions WHERE idempotency_key = ?1",
+                params!["topup:cs_test_1"],
+                |r| r.get(0),
+            )
+            .expect("count query");
+        assert_eq!(row_count, 1);
+    }
+
+    #[test]
+    fn a_topup_grant_never_invents_subscription_credits_for_a_new_user() {
+        // A pack purchase from a user with no balance row at all must not
+        // mint a free monthly allotment — only the pack bucket is credited.
+        let db = test_db();
+        let granted = db
+            .grant_topup_credits("brand-new-user", "cs_test_new", 250, "Top-up $25")
+            .expect("grant");
+        assert!(granted);
+
+        let balance = db
+            .get_credit_balance_row("brand-new-user")
+            .expect("a balance row must now exist");
+        assert_eq!(balance.subscription_remaining, 0);
+        assert_eq!(balance.subscription_total, 0);
+        assert_eq!(balance.pack_remaining, 250);
+    }
+
+    #[test]
+    fn a_replayed_topup_session_grants_nothing_further() {
+        // Stripe redelivers `checkout.session.completed` (same event id) and
+        // may separately fire `checkout.session.async_payment_succeeded` for
+        // the same session (a different event id, same money) -- both must
+        // be no-ops after the first grant.
+        let db = test_db();
+        let user = subscriber(&db, 0);
+
+        let first = db
+            .grant_topup_credits(user, "cs_test_2", 250, "Top-up $25")
+            .expect("first grant");
+        assert!(first);
+
+        let replay_same_event = db
+            .grant_topup_credits(user, "cs_test_2", 250, "Top-up $25")
+            .expect("replayed grant must not error");
+        assert!(!replay_same_event, "a replay must grant nothing further");
+
+        let balance = db.get_credit_balance_row(user).expect("balance row");
+        assert_eq!(balance.pack_remaining, 250, "credited only once");
+
+        let row_count: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM credit_transactions WHERE idempotency_key = ?1",
+                params!["topup:cs_test_2"],
+                |r| r.get(0),
+            )
+            .expect("count query");
+        assert_eq!(row_count, 1, "a replay must not write a second row");
+    }
+
+    #[test]
+    fn a_topped_up_pack_is_spent_only_after_the_subscription_runs_out() {
+        // Before `grant_topup_credits` existed, a pack purchase from a brand
+        // new user went through `add_pack_credits`, which minted a phantom
+        // 200-credit subscription allotment on the missing balance row --
+        // invisible to a spend test, since a charge would "succeed" against
+        // credits nobody paid for while the pack sat untouched. This proves
+        // the real path end to end: a subscriber tops up, and
+        // `charge_settled_cost` still drains the (real, small) subscription
+        // bucket before touching the pack credits they bought, and a
+        // zero-subscription top-up customer can still be charged at all out
+        // of the pack alone.
+        let db = test_db();
+        let user = subscriber(&db, 2);
+        db.grant_topup_credits(user, "cs_test_spend", 250, "Top-up $25")
+            .expect("grant");
+
+        let before = db.get_credit_balance_row(user).expect("balance row");
+        assert_eq!(before.subscription_remaining, 2);
+        assert_eq!(before.pack_remaining, 250);
+
+        let key = ChargeKey::for_chat_reply("reply-topup");
+        let settled = db
+            .charge_settled_cost(user, 300_000, 100_000, "Cortex-paid chat reply", &key)
+            .expect("settle");
+        assert_eq!(settled.credits_charged, 3);
+
+        let after = db.get_credit_balance_row(user).expect("balance row");
+        assert_eq!(
+            after.subscription_remaining, 0,
+            "the 2 subscription credits are drawn down first"
+        );
+        assert_eq!(
+            after.pack_remaining, 249,
+            "only the 1 remaining credit spills into the purchased pack"
+        );
+
+        // And a customer with no subscription at all -- purely a top-up --
+        // can still be charged: everything comes out of the pack.
+        db.grant_topup_credits("topup-only-user", "cs_test_spend_2", 250, "Top-up $25")
+            .expect("grant");
+        let zero_sub_settled = db
+            .charge_settled_cost(
+                "topup-only-user",
+                200_000,
+                100_000,
+                "Cortex-paid chat reply",
+                &ChargeKey::for_chat_reply("reply-topup-only"),
+            )
+            .expect("settle");
+        assert_eq!(zero_sub_settled.credits_charged, 2);
+        let zero_sub_after = db
+            .get_credit_balance_row("topup-only-user")
+            .expect("balance row");
+        assert_eq!(zero_sub_after.subscription_remaining, 0);
+        assert_eq!(zero_sub_after.pack_remaining, 248);
     }
 }
