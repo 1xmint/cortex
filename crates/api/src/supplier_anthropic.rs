@@ -17,6 +17,7 @@ use std::time::Duration;
 
 use serde_json::Value;
 
+use crate::pricing;
 use crate::provider_gateway::{
     GatewayRequest, ObservedUsage, ProviderTransport, TransportFailure, TransportFailureKind,
     TransportResponse,
@@ -166,38 +167,25 @@ fn error_message(text: &str) -> String {
 
 /// Anthropic's usage, in the gateway's terms.
 ///
-/// Anthropic reports three kinds of input separately; the gateway's
-/// `input_tokens` is all of them, with `cached_input_tokens` the part read
-/// from cache. Writing to the cache costs more than plain input, and the
-/// price list has no rate for it, so each written token is counted as
-/// several input tokens: 1.25 for the five-minute cache, 2 for the hour-long
-/// one, rounded up. When the split is not reported, all of it is counted at
-/// the dearer rate. The ledger may overstate a cache write; it never
-/// understates one.
+/// The parse itself lives in `pricing::parse_usage` — the one place a wire
+/// `usage` object becomes token counts — so this only carries its fields
+/// across into `ObservedUsage` unchanged: `input_tokens` stays Anthropic's
+/// own exclusive `input_tokens` (no cache read or write folded into it),
+/// `cached_input_tokens` is the cache-read count, and the two cache-write
+/// counts are carried in their own fields rather than pre-multiplied into
+/// an input-token-equivalent. The gateway's settlement
+/// (`provider_gateway.rs`'s `forward`) applies the 1.25x/2x cache-write
+/// multipliers itself, through `pricing::cost_micro_usd`, so the exact
+/// integer cost is computed in exactly one place.
 fn observed_usage(body: &Value) -> Option<ObservedUsage> {
     let usage = body.get("usage")?;
-    let count = |field: &str| usage.get(field).and_then(Value::as_i64).unwrap_or(0);
-    let plain = usage.get("input_tokens")?.as_i64()?;
-    let output = usage.get("output_tokens")?.as_i64()?;
-    let cache_read = count("cache_read_input_tokens");
-    let cache_write = count("cache_creation_input_tokens");
-
-    let split = usage.get("cache_creation");
-    let short = split
-        .and_then(|s| s.get("ephemeral_5m_input_tokens"))
-        .and_then(Value::as_i64);
-    let long = split
-        .and_then(|s| s.get("ephemeral_1h_input_tokens"))
-        .and_then(Value::as_i64);
-    let write_as_input = match (short, long) {
-        (Some(short), Some(long)) => (short * 5 + 3) / 4 + long * 2,
-        _ => cache_write * 2,
-    };
-
+    let tokens = pricing::parse_usage(usage);
     Some(ObservedUsage {
-        input_tokens: plain + write_as_input + cache_read,
-        cached_input_tokens: cache_read,
-        output_tokens: output,
+        input_tokens: tokens.input_tokens,
+        cached_input_tokens: tokens.cache_read_tokens,
+        output_tokens: tokens.output_tokens,
+        cache_write_5m_tokens: tokens.cache_write_5m_tokens,
+        cache_write_1h_tokens: tokens.cache_write_1h_tokens,
     })
 }
 
@@ -281,6 +269,7 @@ mod tests {
                 input_tokens: 10,
                 cached_input_tokens: 0,
                 output_tokens: 4,
+                ..Default::default()
             })
         );
     }
@@ -330,7 +319,10 @@ mod tests {
     }
 
     #[test]
-    fn cache_writes_are_never_understated() {
+    fn cache_writes_are_carried_through_by_kind_and_never_multiplied_here() {
+        // The multiplier lives in `pricing::cost_micro_usd`, settled by the
+        // gateway; this function only carries Anthropic's own counts
+        // through unchanged, split by kind.
         let split = observed_usage(&serde_json::json!({"usage": {
             "input_tokens": 10,
             "output_tokens": 5,
@@ -339,17 +331,36 @@ mod tests {
             "cache_creation": {"ephemeral_5m_input_tokens": 8, "ephemeral_1h_input_tokens": 4}
         }}))
         .unwrap();
-        // 10 plain + ceil(8 * 1.25) = 10 + 4 * 2 = 8 + 100 read
-        assert_eq!(split.input_tokens, 10 + 10 + 8 + 100);
-        assert_eq!(split.cached_input_tokens, 100);
+        assert_eq!(
+            split,
+            ObservedUsage {
+                input_tokens: 10,
+                cached_input_tokens: 100,
+                output_tokens: 5,
+                cache_write_5m_tokens: 8,
+                cache_write_1h_tokens: 4,
+            }
+        );
 
+        // No split reported: the whole write is billed as a 5-minute write
+        // (the cheaper of the two multipliers) rather than guessing the
+        // dearer one — M-D-0023, mirrored from `pricing::parse_usage`.
         let unsplit = observed_usage(&serde_json::json!({"usage": {
             "input_tokens": 10,
             "output_tokens": 5,
             "cache_creation_input_tokens": 12
         }}))
         .unwrap();
-        assert_eq!(unsplit.input_tokens, 10 + 24);
+        assert_eq!(
+            unsplit,
+            ObservedUsage {
+                input_tokens: 10,
+                cached_input_tokens: 0,
+                output_tokens: 5,
+                cache_write_5m_tokens: 12,
+                cache_write_1h_tokens: 0,
+            }
+        );
     }
 
     #[test]

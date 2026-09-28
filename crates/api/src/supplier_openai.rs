@@ -179,6 +179,10 @@ fn observed_usage(body: &Value) -> Option<ObservedUsage> {
         input_tokens: input,
         cached_input_tokens: cached,
         output_tokens: output,
+        // OpenAI never reports a separate cache-write charge (see the doc
+        // comment above): there is nothing to put in these two fields.
+        cache_write_5m_tokens: 0,
+        cache_write_1h_tokens: 0,
     })
 }
 
@@ -261,6 +265,7 @@ mod tests {
                 input_tokens: 10,
                 cached_input_tokens: 2,
                 output_tokens: 4,
+                ..Default::default()
             })
         );
     }

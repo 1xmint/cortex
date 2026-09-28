@@ -260,6 +260,7 @@ impl ProviderTransport for StubTransport {
                 input_tokens: 1,
                 cached_input_tokens: 0,
                 output_tokens: 1,
+                ..Default::default()
             }),
         }))
     }

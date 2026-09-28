@@ -15,6 +15,7 @@ use sha2::Sha256;
 use thiserror::Error;
 
 use crate::db::{Database, ProviderReservation};
+use crate::pricing;
 
 const CAPABILITY_VERSION: u32 = 1;
 
@@ -94,11 +95,17 @@ pub struct GatewayRequest {
     pub capability: SignedCapability,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ObservedUsage {
     pub input_tokens: i64,
     pub cached_input_tokens: i64,
     pub output_tokens: i64,
+    /// Tokens newly written to a 5-minute cache entry this call. See
+    /// `pricing::UsageTokens::cache_write_5m_tokens`.
+    pub cache_write_5m_tokens: i64,
+    /// Tokens newly written to a 1-hour cache entry this call. See
+    /// `pricing::UsageTokens::cache_write_1h_tokens`.
+    pub cache_write_1h_tokens: i64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -166,6 +173,8 @@ pub enum GatewayError {
     CredentialExposure,
     #[error("usage reconciliation failed: {0}")]
     Reconciliation(String),
+    #[error("request uses a feature Cortex cannot price, refused before any spend: {0}")]
+    UnpriceableFeature(String),
 }
 
 pub struct ProviderGateway<'a, T> {
@@ -304,7 +313,8 @@ impl<'a, T: ProviderTransport> ProviderGateway<'a, T> {
                 if usage.input_tokens < 0
                     || usage.cached_input_tokens < 0
                     || usage.output_tokens < 0
-                    || usage.cached_input_tokens > usage.input_tokens
+                    || usage.cache_write_5m_tokens < 0
+                    || usage.cache_write_1h_tokens < 0
                 {
                     self.db
                         .mark_provider_request_unresolved(
@@ -319,11 +329,19 @@ impl<'a, T: ProviderTransport> ProviderGateway<'a, T> {
                     ));
                 }
 
-                let observed_micros = rate.cost_micros(
-                    usage.input_tokens,
-                    usage.cached_input_tokens,
-                    usage.output_tokens,
-                );
+                // The upper-bound reservation above may stay conservative
+                // (rounded up); the settled charge must be exact, so it goes
+                // through the same integer, floor-only pricing math as every
+                // other settlement path (`pricing::cost_micro_usd`), not the
+                // older `ModelPrice::cost_micros` used only for that bound.
+                let observed_tokens = pricing::UsageTokens {
+                    input_tokens: usage.input_tokens,
+                    output_tokens: usage.output_tokens,
+                    cache_read_tokens: usage.cached_input_tokens,
+                    cache_write_5m_tokens: usage.cache_write_5m_tokens,
+                    cache_write_1h_tokens: usage.cache_write_1h_tokens,
+                };
+                let observed_micros = pricing::cost_micro_usd(&rate, &observed_tokens) as i64;
                 let reservation = self
                     .db
                     .settle_provider_request(
@@ -444,6 +462,7 @@ fn validate_bounded_form(request: &GatewayRequest) -> Result<(), GatewayError> {
             "body max_tokens must exactly match the reserved maximum".into(),
         ));
     }
+    refuse_unpriceable_request(&request.body)?;
     validate_tools(request.body.get("tools"))?;
     if request
         .body
@@ -453,6 +472,35 @@ fn validate_bounded_form(request: &GatewayRequest) -> Result<(), GatewayError> {
         return Err(GatewayError::UnboundedRequest(
             "stream must be a boolean".into(),
         ));
+    }
+    Ok(())
+}
+
+/// Refuse, before any reservation or transport call, a request whose flat
+/// per-token rate cannot price it: fast mode (billed on its own schedule,
+/// not the model's per-token rate) and a non-default inference region
+/// (`inference_geo`, billed on its own per-region schedule). Neither has a
+/// published rate on `ModelPrice`, so pricing it would mean guessing.
+///
+/// The gateway today never forwards an `anthropic-beta` header at all (see
+/// `supplier_anthropic.rs`), so there is no separate "fast-mode beta header"
+/// to check yet; once the gateway forwards betas, whichever beta value
+/// switches on fast mode must be refused here too.
+fn refuse_unpriceable_request(body: &Value) -> Result<(), GatewayError> {
+    if body.get("speed").and_then(Value::as_str) == Some("fast") {
+        return Err(GatewayError::UnpriceableFeature(
+            "fast mode (\"speed\": \"fast\") is billed on its own schedule and has no \
+             published per-token rate"
+                .into(),
+        ));
+    }
+    if let Some(geo) = body.get("inference_geo") {
+        if geo.as_str() != Some("global") {
+            return Err(GatewayError::UnpriceableFeature(format!(
+                "inference_geo {geo} is not the default region (\"global\") and has no \
+                 published per-region rate"
+            )));
+        }
     }
     Ok(())
 }
@@ -478,6 +526,23 @@ fn validate_tools(tools: Option<&Value>) -> Result<(), GatewayError> {
                 "each tool definition must be an object".into(),
             ));
         };
+        // A server tool (`type` starting with one of these prefixes) is
+        // billed per-use by the supplier on top of its token cost. The flat
+        // per-token `ModelPrice` this gateway bills from has no field for
+        // that, so admitting one would mean under-billing every call that
+        // uses it. Refuse before any reservation rather than guess a price.
+        if let Some(tool_type) = tool.get("type").and_then(Value::as_str) {
+            const PAID_SERVER_TOOL_PREFIXES: &[&str] =
+                &["web_search", "web_fetch", "code_execution"];
+            if PAID_SERVER_TOOL_PREFIXES
+                .iter()
+                .any(|prefix| tool_type.starts_with(prefix))
+            {
+                return Err(GatewayError::UnpriceableFeature(format!(
+                    "server tool type {tool_type:?} is billed per-use and has no published rate"
+                )));
+            }
+        }
         let Some(name) = tool.get("name").and_then(Value::as_str) else {
             return Err(GatewayError::UnboundedRequest(
                 "each tool definition requires a name".into(),
@@ -688,6 +753,7 @@ mod tests {
             input_tokens: 100,
             cached_input_tokens: 0,
             output_tokens: 10,
+            ..Default::default()
         })));
         let request = fixture.request(&gateway, "request-1");
 
@@ -871,6 +937,7 @@ mod tests {
             input_tokens: 100,
             cached_input_tokens: 0,
             output_tokens: 10,
+            ..Default::default()
         })));
         let mut request = fixture.request(&gateway, "bounded-tools");
         request.body["tools"] = serde_json::json!([
@@ -921,6 +988,7 @@ mod tests {
             input_tokens: 100,
             cached_input_tokens: 0,
             output_tokens: 10,
+            ..Default::default()
         })));
         let mut request = fixture.request(&gateway, "measured-cli-stream");
         request.body["stream"] = serde_json::json!(true);
@@ -1093,5 +1161,90 @@ mod tests {
             format!("{:?}", fixture.request(&gateway, "debug").capability),
             "SignedCapability([REDACTED])"
         );
+    }
+
+    #[tokio::test]
+    async fn settlement_bills_the_exact_pass_through_cost_including_cache_writes() {
+        let fixture = Fixture::new(100_000, 100_000);
+        let gateway = fixture.gateway(success(Some(ObservedUsage {
+            input_tokens: 1_000,
+            cached_input_tokens: 2_000,
+            output_tokens: 500,
+            cache_write_5m_tokens: 300,
+            cache_write_1h_tokens: 100,
+        })));
+        // Pad the body so its conservative (byte-length) reservation
+        // comfortably covers the settled cost computed below — this test
+        // pins the settlement math, not the reservation bound.
+        let mut request = fixture.request(&gateway, "cache-write-settlement");
+        request.body["messages"][0]["content"] = serde_json::json!("x".repeat(4_200));
+
+        let outcome = gateway.forward(request, NOW).await.unwrap();
+        assert_eq!(outcome.reservation.status, "settled");
+        // claude-sonnet-5 seed rates (`pricing::seed_models`): input 2_000
+        // micros/1k, output 10_000 micros/1k, cache_read_bp 1_000 (10% of
+        // input). Cache-write multipliers are fixed at 1.25x (5-minute) and
+        // 2x (1-hour) of the input rate for every model
+        // (`pricing::CACHE_WRITE_5M_BP` / `CACHE_WRITE_1H_BP`):
+        //   regular input:  1_000 * 2_000 / 1_000                  =  2_000
+        //   cache read:     2_000 * 2_000 * 1_000 / (1_000*10_000) =    400
+        //   cache write 5m:   300 * 2_000 * 12_500 / (1_000*10_000) =   750
+        //   cache write 1h:   100 * 2_000 * 20_000 / (1_000*10_000) =   400
+        //   output:           500 * 10_000 / 1_000                =  5_000
+        //   total                                                 =  8_550
+        assert_eq!(outcome.reservation.observed_micro_usd, Some(8_550));
+    }
+
+    #[tokio::test]
+    async fn requests_cortex_cannot_price_are_refused_before_any_call_or_reservation() {
+        let fixture = Fixture::new(100_000, 100_000);
+        let gateway = fixture.gateway(success(Some(ObservedUsage {
+            input_tokens: 100,
+            cached_input_tokens: 0,
+            output_tokens: 10,
+            ..Default::default()
+        })));
+
+        let mut fast_mode = fixture.request(&gateway, "fast-mode");
+        fast_mode.body["speed"] = serde_json::json!("fast");
+        assert!(matches!(
+            gateway.forward(fast_mode, NOW).await.unwrap_err(),
+            GatewayError::UnpriceableFeature(_)
+        ));
+
+        let mut non_global_geo = fixture.request(&gateway, "non-global-geo");
+        non_global_geo.body["inference_geo"] = serde_json::json!("eu-west-1");
+        assert!(matches!(
+            gateway.forward(non_global_geo, NOW).await.unwrap_err(),
+            GatewayError::UnpriceableFeature(_)
+        ));
+
+        let mut paid_server_tool = fixture.request(&gateway, "paid-server-tool");
+        paid_server_tool.body["tools"] = serde_json::json!([
+            {"type": "web_search_20250305", "name": "web_search"}
+        ]);
+        assert!(matches!(
+            gateway.forward(paid_server_tool, NOW).await.unwrap_err(),
+            GatewayError::UnpriceableFeature(_)
+        ));
+
+        assert_eq!(
+            fixture.calls.load(Ordering::SeqCst),
+            0,
+            "a request Cortex cannot price must never reach transport"
+        );
+        for key in ["fast-mode", "non-global-geo", "paid-server-tool"] {
+            assert!(
+                fixture.db.get_provider_reservation(key).is_none(),
+                "a request Cortex cannot price must never create a reservation"
+            );
+        }
+
+        // The same shape with none of those three fields still forwards and
+        // settles normally: the refusal is specific to what it names.
+        let normal = fixture.request(&gateway, "normal");
+        let outcome = gateway.forward(normal, NOW).await.unwrap();
+        assert_eq!(outcome.reservation.status, "settled");
+        assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
     }
 }
