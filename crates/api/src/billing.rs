@@ -1551,6 +1551,16 @@ fn grant_credit_topup(db: &Database, obj: &serde_json::Value, event_id: &str) {
         return;
     };
 
+    let payment_status = obj["payment_status"].as_str().unwrap_or("");
+    if payment_status != "paid" {
+        tracing::debug!(
+            session_id,
+            payment_status,
+            "credit topup session is not paid yet; granting no credits"
+        );
+        return;
+    }
+
     let currency = obj["currency"].as_str().unwrap_or("");
     if !currency.eq_ignore_ascii_case("usd") {
         tracing::error!(
