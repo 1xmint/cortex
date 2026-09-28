@@ -9526,6 +9526,30 @@ impl Database {
         tx.commit()
             .map_err(|err| CancelError::Internal(err.to_string()))?;
 
+        // Release the connection lock before settling attempts below: each
+        // settlement call re-acquires it via `self.conn()`, and this mutex
+        // (a single shared `Connection` behind a `MutexGuard`) is not
+        // reentrant — holding `conn` here while calling back into `self`
+        // would deadlock.
+        drop(conn);
+
+        // A step that was leased or running when the run was cancelled may
+        // already have made priced provider calls; settle its attempt now as
+        // a customer-initiated cancellation (charge or absorb, never a
+        // refund — see `billing_binding::settle_attempt`). `execution_jobs`
+        // is the only place `(step_id, lease_gen)` maps to the attempt's UUID
+        // id: no row there means the worker never got far enough to spend
+        // anything, so there is nothing to settle.
+        for (step_id, _worker, lease_gen) in &in_flight {
+            if let Some(attempt_id) = self.attempt_id_for_step_lease(step_id, *lease_gen) {
+                self.settle_ended_attempt(
+                    user_id,
+                    &attempt_id,
+                    cortex_core::billing_binding::AttemptEndCause::CustomerCancel,
+                );
+            }
+        }
+
         Ok(CancelOutcome {
             already_terminal: false,
             cancelled_steps: cancellable_ids,
@@ -10539,19 +10563,53 @@ impl Database {
     }
 
     pub fn expire_stale_leases(&self) -> Vec<String> {
-        let conn = self.conn();
-        let now = Utc::now().timestamp_millis();
-        let mut stmt = conn.prepare(
-            "UPDATE steps SET status = 'orphaned', assigned_worker = NULL, lease_deadline = NULL,
-                 updated_at = ?1, version = version + 1
-             WHERE status IN ('leased', 'running') AND lease_deadline < ?1
-             RETURNING id"
-        ).unwrap();
+        let expired: Vec<(String, String, i64)> = {
+            let conn = self.conn();
+            let now = Utc::now().timestamp_millis();
+            let mut stmt = conn.prepare(
+                "UPDATE steps SET status = 'orphaned', assigned_worker = NULL, lease_deadline = NULL,
+                     updated_at = ?1, version = version + 1
+                 WHERE status IN ('leased', 'running') AND lease_deadline < ?1
+                 RETURNING id, run_id, lease_gen"
+            ).unwrap();
 
-        stmt.query_map(params![now], |row| row.get::<_, String>(0))
+            stmt.query_map(params![now], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })
             .unwrap()
             .filter_map(|r| r.ok())
             .collect()
+            // `conn` (and the `stmt` borrowing it) are dropped at the end of
+            // this block, before the settlement calls below re-acquire the
+            // same mutex-guarded connection via `self.conn()`.
+        };
+
+        // A worker that never renewed its lease is gone — this is this
+        // codebase's only mechanism for noticing that (see
+        // `billing_binding`'s doc comment on why `WorkerLost` is not a
+        // separate `AttemptEndCause` from `LeaseExpired`). Any priced calls
+        // the vanished worker's attempt already made still get settled:
+        // charged or absorbed, never refunded.
+        for (step_id, run_id, lease_gen) in &expired {
+            let Some(attempt_id) = self.attempt_id_for_step_lease(step_id, *lease_gen) else {
+                continue;
+            };
+            let Some(user_id) = self.get_run_user_id(run_id) else {
+                tracing::warn!(run_id = %run_id, "no owner for run; skipping ledger write for expired lease");
+                continue;
+            };
+            self.settle_ended_attempt(
+                &user_id,
+                &attempt_id,
+                cortex_core::billing_binding::AttemptEndCause::LeaseExpired,
+            );
+        }
+
+        expired.into_iter().map(|(step_id, _, _)| step_id).collect()
     }
 
     pub fn expire_stale_resource_leases(&self) -> Vec<String> {

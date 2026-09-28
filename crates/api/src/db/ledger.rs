@@ -694,6 +694,118 @@ impl Database {
         Ok(())
     }
 
+    /// Recover the attempt id a step's current (or most recently expired)
+    /// lease was executing under, from `execution_jobs`.
+    ///
+    /// `verification_driver.rs`'s `DeliveryFacts` carries `attempt_id`
+    /// because it comes from the worker's own delivery report — but an
+    /// attempt that never delivers (the customer cancelled it, or its lease
+    /// expired with the worker never reporting back) has no delivery report
+    /// to read it from. `execution_jobs` is written when the worker submits
+    /// the job to its sandbox, keyed by `(attempt_id, lease_gen)` and indexed
+    /// by `(run_id, step_id)` — before any provider call, but after dispatch
+    /// minted the attempt id — so it is the one place server-side that still
+    /// has it for a still-in-flight attempt.
+    ///
+    /// Returns `None` when the step never got far enough to submit a job (no
+    /// row was ever written). That is not a bug to work around: nothing was
+    /// spent either, so the caller's settlement short-circuits on zero cost
+    /// regardless of whether an attempt id was found.
+    pub fn attempt_id_for_step_lease(&self, step_id: &str, lease_gen: i64) -> Option<String> {
+        self.conn()
+            .query_row(
+                "SELECT attempt_id FROM execution_jobs WHERE step_id = ?1 AND lease_gen = ?2",
+                params![step_id, lease_gen],
+                |row| row.get(0),
+            )
+            .ok()
+    }
+
+    /// Settle one attempt's ledger effect for an `AttemptEndCause`, charging
+    /// or absorbing its settled observed cost exactly as `finish_and_bill`
+    /// (`verification_driver.rs`) does after sealing a verdict.
+    ///
+    /// This is that same decision and those same two ledger writes, factored
+    /// out so a verdict is not the only door into the ledger: `cancel_run`
+    /// (`CustomerCancel`) and lease expiry (`LeaseExpired`) end an attempt
+    /// without ever producing one, and must settle whatever it already spent
+    /// through the identical path — not a hand-rolled copy that could drift
+    /// from it on which causes charge and which absorb.
+    ///
+    /// An attempt with no settled provider calls writes no ledger row either
+    /// way, and `charge`/`absorb` are each idempotent on
+    /// `ChargeKey::for_attempt`, so calling this twice for the same attempt
+    /// (a cancel racing a verdict, say) is a no-op the second time, not a
+    /// double charge.
+    pub fn settle_ended_attempt(
+        &self,
+        clerk_user_id: &str,
+        attempt_id: &str,
+        end_cause: cortex_core::billing_binding::AttemptEndCause,
+    ) {
+        use cortex_core::billing_binding::{self, AttemptSettlement};
+
+        let cost_micro_usd = self.attempt_settled_cost_micro_usd(attempt_id);
+        if cost_micro_usd == 0 {
+            tracing::debug!(
+                attempt_id,
+                ?end_cause,
+                "ended attempt made no settled provider calls; no ledger row"
+            );
+            return;
+        }
+
+        let key = billing_binding::ChargeKey::for_attempt(attempt_id);
+        match billing_binding::settle_attempt(end_cause) {
+            AttemptSettlement::Charge => {
+                let Some(price_list) = self.active_price_list() else {
+                    tracing::error!(
+                        attempt_id,
+                        "no active price list; cannot convert the ended attempt's observed cost to credits"
+                    );
+                    return;
+                };
+                match self.charge_settled_cost(
+                    clerk_user_id,
+                    cost_micro_usd,
+                    price_list.micros_per_credit,
+                    billing_binding::reason::TASK_ATTEMPT_CHARGED,
+                    &key,
+                ) {
+                    Ok(settled) => tracing::info!(
+                        attempt_id,
+                        cost_micro_usd,
+                        credits_charged = settled.credits_charged,
+                        ?end_cause,
+                        "charged the ended attempt's settled observed cost"
+                    ),
+                    Err(e) => tracing::error!(
+                        attempt_id,
+                        error = %e,
+                        "settled-cost charge failed for ended attempt"
+                    ),
+                }
+            }
+            AttemptSettlement::Absorb(cause) => {
+                let description =
+                    format!("{}: {cause:?}", billing_binding::reason::TASK_ATTEMPT_ABSORBED);
+                match self.absorb_attempt_cost(clerk_user_id, cost_micro_usd, &description, &key) {
+                    Ok(()) => tracing::info!(
+                        attempt_id,
+                        cost_micro_usd,
+                        ?cause,
+                        "absorbed the ended attempt's settled observed cost"
+                    ),
+                    Err(e) => tracing::error!(
+                        attempt_id,
+                        error = %e,
+                        "failed to record the absorbed cost for ended attempt"
+                    ),
+                }
+            }
+        }
+    }
+
     /// The carry alone: the fractional micro-USD remainder from previous
     /// exact charges that hasn't yet added up to one whole credit. `0` for a
     /// user with no balance row.
