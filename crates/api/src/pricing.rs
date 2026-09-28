@@ -796,20 +796,30 @@ pub fn cost_micro_usd(rate: &ModelPrice, usage: &UsageTokens) -> u64 {
 /// definition of what each field means and one thing a unit test has to
 /// pin.
 ///
-/// `input_tokens` and `output_tokens` are read as-is. `cache_read_tokens`
-/// comes from `cache_read_input_tokens`. The cache-write split comes from
-/// `cache_creation.ephemeral_5m_input_tokens` /
-/// `.ephemeral_1h_input_tokens` when Anthropic reports it; when it does not,
-/// the whole of `cache_creation_input_tokens` is billed as a 5-minute write
-/// — the cheaper of the two multipliers — because a missing split must never
-/// cause an overcharge (M-D-0023: never round up, never guess dear). Every
-/// missing or non-numeric field reads as `0` rather than failing the parse:
-/// a usage object that omits cache fields entirely (no caching used) is
-/// common and must not become a refusal.
-pub fn parse_usage(usage: &Value) -> UsageTokens {
+/// Returns `None` — never a silent all-zero [`UsageTokens`] — unless both
+/// `input_tokens` and `output_tokens` are present and are actual JSON
+/// integers. Those two fields are what `pricing::cost_micro_usd` bills the
+/// bulk of a call on; a `usage` object that omits either one (`{}`, `null`,
+/// or a caller/proxy that mangled the field into a string) is not "no usage
+/// to report", it is unpriceable, and settling it at 0 would let that call
+/// through for free rather than staying unresolved for reconciliation like
+/// every other can't-price-it case (M-D-0023: a response Cortex cannot
+/// price must not settle at zero).
+///
+/// Only the cache fields default to `0` when absent: `cache_read_tokens`
+/// from `cache_read_input_tokens`, and the cache-write split from
+/// `cache_creation.ephemeral_5m_input_tokens` / `.ephemeral_1h_input_tokens`
+/// when Anthropic reports it, else the whole of `cache_creation_input_tokens`
+/// billed as a 5-minute write — the cheaper of the two multipliers — because
+/// a missing split must never cause an overcharge (M-D-0023: never round up,
+/// never guess dear). A `usage` object that omits cache fields entirely (no
+/// caching used) is common and correctly priced as zero cache activity, in
+/// contrast to `input_tokens`/`output_tokens` above.
+pub fn parse_usage(usage: &Value) -> Option<UsageTokens> {
+    let input_tokens = usage.get("input_tokens")?.as_i64()?;
+    let output_tokens = usage.get("output_tokens")?.as_i64()?;
+
     let field = |name: &str| usage.get(name).and_then(Value::as_i64).unwrap_or(0);
-    let input_tokens = field("input_tokens");
-    let output_tokens = field("output_tokens");
     let cache_read_tokens = field("cache_read_input_tokens");
     let cache_creation_total = field("cache_creation_input_tokens");
 
@@ -829,13 +839,13 @@ pub fn parse_usage(usage: &Value) -> UsageTokens {
         _ => (cache_creation_total, 0),
     };
 
-    UsageTokens {
+    Some(UsageTokens {
         input_tokens,
         output_tokens,
         cache_read_tokens,
         cache_write_5m_tokens,
         cache_write_1h_tokens,
-    }
+    })
 }
 
 /// Pass-through charge arithmetic (M-D-0023): deduct exactly the whole
@@ -1267,7 +1277,7 @@ mod tests {
                 "ephemeral_1h_input_tokens": 300,
             }
         });
-        let tokens = parse_usage(&usage);
+        let tokens = parse_usage(&usage).unwrap();
         assert_eq!(
             tokens,
             UsageTokens {
@@ -1303,7 +1313,7 @@ mod tests {
             "cache_read_input_tokens": 0,
             "cache_creation_input_tokens": 400,
         });
-        let tokens = parse_usage(&usage);
+        let tokens = parse_usage(&usage).unwrap();
         assert_eq!(
             tokens,
             UsageTokens {
@@ -1327,9 +1337,56 @@ mod tests {
     }
 
     #[test]
-    fn parse_usage_defaults_missing_fields_to_zero() {
-        let tokens = parse_usage(&serde_json::json!({}));
-        assert_eq!(tokens, UsageTokens::default());
+    fn parse_usage_refuses_rather_than_zero_a_body_missing_input_or_output_tokens() {
+        // `{}` and `null` must never become `Some(UsageTokens::default())` —
+        // that would settle an unpriceable call at 0 instead of leaving it
+        // unresolved for reconciliation (M-D-0023).
+        assert_eq!(parse_usage(&serde_json::json!({})), None);
+        assert_eq!(parse_usage(&serde_json::json!(null)), None);
+
+        // Missing just one of the two required fields is just as unpriceable
+        // as missing both.
+        assert_eq!(
+            parse_usage(&serde_json::json!({"input_tokens": 10})),
+            None
+        );
+        assert_eq!(
+            parse_usage(&serde_json::json!({"output_tokens": 10})),
+            None
+        );
+
+        // A string-valued token count is not the integer this must be priced
+        // from — refuse it rather than coerce or truncate it.
+        assert_eq!(
+            parse_usage(&serde_json::json!({"input_tokens": "12", "output_tokens": 5})),
+            None
+        );
+        assert_eq!(
+            parse_usage(&serde_json::json!({"input_tokens": 12, "output_tokens": "5"})),
+            None
+        );
+    }
+
+    #[test]
+    fn parse_usage_defaults_only_the_cache_fields_to_zero_when_absent() {
+        // `input_tokens`/`output_tokens` present, every cache field absent
+        // (no caching used) is a common, legitimately-zero-cache-activity
+        // body, and must still parse — only the cache fields default here.
+        let tokens = parse_usage(&serde_json::json!({
+            "input_tokens": 500,
+            "output_tokens": 100
+        }))
+        .unwrap();
+        assert_eq!(
+            tokens,
+            UsageTokens {
+                input_tokens: 500,
+                output_tokens: 100,
+                cache_read_tokens: 0,
+                cache_write_5m_tokens: 0,
+                cache_write_1h_tokens: 0,
+            }
+        );
     }
 
     #[test]

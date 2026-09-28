@@ -177,9 +177,15 @@ fn error_message(text: &str) -> String {
 /// (`provider_gateway.rs`'s `forward`) applies the 1.25x/2x cache-write
 /// multipliers itself, through `pricing::cost_micro_usd`, so the exact
 /// integer cost is computed in exactly one place.
+///
+/// `parse_usage` itself returns `None` for a `usage` object missing (or
+/// non-integer on) `input_tokens`/`output_tokens` — `{}`, `null`, or a
+/// mangled body — rather than a silent all-zero `UsageTokens`, so that
+/// propagates here with `?` too: a call this cannot price stays unresolved,
+/// it never settles at zero.
 fn observed_usage(body: &Value) -> Option<ObservedUsage> {
     let usage = body.get("usage")?;
-    let tokens = pricing::parse_usage(usage);
+    let tokens = pricing::parse_usage(usage)?;
     Some(ObservedUsage {
         input_tokens: tokens.input_tokens,
         cached_input_tokens: tokens.cache_read_tokens,
@@ -367,6 +373,19 @@ mod tests {
     fn a_message_without_usage_reports_none() {
         assert_eq!(
             observed_usage(&serde_json::json!({"type": "message"})),
+            None
+        );
+    }
+
+    #[test]
+    fn an_empty_usage_object_reports_none_rather_than_settling_at_zero() {
+        // `parse_usage` refuses a `usage` object missing `input_tokens`/
+        // `output_tokens`; that refusal must reach `observed_usage`'s caller
+        // (the gateway marks it unresolved) rather than being swallowed into
+        // `Some(ObservedUsage::default())`, which would settle a call this
+        // cannot price at zero instead.
+        assert_eq!(
+            observed_usage(&serde_json::json!({"type": "message", "usage": {}})),
             None
         );
     }
