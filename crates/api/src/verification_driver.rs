@@ -3,8 +3,16 @@
 //!
 //! This is the money path. Everything here exists to make two guarantees hold
 //! at once: a verdict is produced by *us* executing checks rather than by a
-//! worker reporting on itself, and the charge or refund that follows fires
-//! exactly once no matter how many times this runs.
+//! worker reporting on itself, and the settlement that follows — a charge or
+//! an absorption of the attempt's own observed cost — fires exactly once no
+//! matter how many times this runs.
+//!
+//! **No verdict here ever produces a refund.** The owner's settled billing
+//! rule (`cortex_core::billing_binding`) is pass-through: a customer pays
+//! exactly what the model calls an attempt made, nothing more, and a failed
+//! attempt is still charged for calls it made. The only question this module
+//! answers per attempt-end is *charge the customer, or have Cortex absorb it*
+//! — see [`billing_binding::AttemptEndCause`] and [`billing_binding::settle_attempt`].
 //!
 //! The sequence, and why it is in this order:
 //!
@@ -17,14 +25,15 @@
 //!    working directory: the moment a worker can influence its own verdict the
 //!    product claim is void.
 //! 4. Execute, record, compute the verdict, seal it.
-//! 5. Bind to the ledger, with the billing state derived from the ledger
-//!    itself rather than from a column that could drift from the money.
+//! 5. Settle the attempt: sum its settled observed provider cost and either
+//!    charge it (via `ChargeKey::for_attempt`, so a replay of the same
+//!    attempt writes no second row) or absorb it against Cortex.
 //!
 //! See `cortex/plan/VERIFIER.md` and `cortex/plan/V3-LAUNCH-SPEC.md`.
 
 use std::path::{Path, PathBuf};
 
-use cortex_core::billing_binding::{self, BillingEffect, BillingState};
+use cortex_core::billing_binding::{self, AttemptEndCause, AttemptSettlement};
 use cortex_core::check_derivation::EcosystemFacts;
 use cortex_core::diff_surface::{self, ClassOutcome, VerdictClass};
 use cortex_core::verification::{

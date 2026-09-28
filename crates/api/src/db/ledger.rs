@@ -585,6 +585,115 @@ impl Database {
         })
     }
 
+    /// Sum of one task attempt's confirmed observed cost, across every
+    /// `provider_request_reservations` row `record_gateway_request`/
+    /// `settle_provider_request` wrote for it.
+    ///
+    /// Only `status = 'settled'` rows count. `reserved` means the call may
+    /// still be in flight; `released` means it never happened; `unresolved`
+    /// means the gateway never heard back from the supplier to confirm a
+    /// price; `mismatch` means the reconciliation contradicted itself or blew
+    /// past the reservation and is sitting in `admin.rs`'s stuck-reservation
+    /// queue for an operator to resolve. None of those four are a number
+    /// Cortex has actually confirmed — charging from one of them risks
+    /// billing for a call that didn't happen, or missing a call that did and
+    /// silently absorbing it forever. `unresolved` and `mismatch` rows are
+    /// logged so the gap is visible instead of silent; the settlement itself
+    /// waits for reconciliation rather than guessing.
+    ///
+    /// An attempt with zero reservations at all (no provider call was ever
+    /// made — e.g. it never got past a lease before the customer cancelled)
+    /// returns `0`, which the caller turns into "no ledger row" rather than a
+    /// zero-amount charge.
+    pub fn attempt_settled_cost_micro_usd(&self, attempt_id: &str) -> u64 {
+        let conn = self.conn();
+
+        let stuck: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM provider_request_reservations
+                 WHERE attempt_id = ?1 AND status IN ('unresolved', 'mismatch')",
+                params![attempt_id],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+        if stuck > 0 {
+            tracing::warn!(
+                attempt_id,
+                stuck_reservations = stuck,
+                "attempt has unresolved/mismatched provider reservations; \
+                 excluded from its settled cost pending reconciliation"
+            );
+        }
+
+        let settled: i64 = conn
+            .query_row(
+                "SELECT COALESCE(SUM(observed_micro_usd), 0)
+                 FROM provider_request_reservations
+                 WHERE attempt_id = ?1 AND status = 'settled'",
+                params![attempt_id],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+        settled.max(0) as u64
+    }
+
+    /// Record that Cortex, not the customer, absorbed a task attempt's
+    /// settled observed cost — an infrastructure failure ended the attempt
+    /// before a verdict could be reached, so there is nothing to charge for
+    /// and nothing to refund.
+    ///
+    /// Writes one `credit_transactions` row with `amount = 0`: the balance
+    /// and carry are untouched, but the cost is on the record, against
+    /// Cortex, exactly the way a settled charge would record it against the
+    /// customer. Idempotent on `key` (the same `ChargeKey::for_attempt` used
+    /// for a charge, since exactly one of charge-or-absorb ever happens for a
+    /// given attempt) — a replay is a silent no-op, not a second zero row.
+    ///
+    /// Takes `clerk_user_id` purely for the record — `credit_transactions`
+    /// requires one on every row, and every call site of this function
+    /// already has it (it's the same run/user lookup `charge_settled_cost`
+    /// needs for the charge path, resolved before either branch is chosen).
+    /// The row's `amount` is always `0`: this never touches a balance.
+    pub fn absorb_attempt_cost(
+        &self,
+        clerk_user_id: &str,
+        cost_micro_usd: u64,
+        description: &str,
+        key: &cortex_core::billing_binding::ChargeKey,
+    ) -> Result<(), String> {
+        let idempotency_key = key.as_str();
+        if idempotency_key.trim().is_empty() {
+            return Err("idempotency key is required to record an absorbed cost".into());
+        }
+
+        let conn = self.conn();
+
+        let already: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM credit_transactions WHERE idempotency_key = ?1",
+                params![idempotency_key],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        if already > 0 {
+            tracing::debug!(idempotency_key, "absorbed-cost record replayed; nothing written again");
+            return Ok(());
+        }
+
+        let cost_i64 = i64::try_from(cost_micro_usd).unwrap_or(i64::MAX);
+        let tx_id = Uuid::new_v4().to_string();
+        conn.execute(
+            "INSERT INTO credit_transactions
+                (id, clerk_user_id, amount, balance_type, reason, description,
+                 idempotency_key, cost_micro_usd)
+             VALUES (?1, ?2, 0, 'subscription', 'absorbed', ?3, ?4, ?5)",
+            params![tx_id, clerk_user_id, description, idempotency_key, cost_i64],
+        )
+        .map_err(|e| format!("failed to record absorbed cost: {e}"))?;
+
+        Ok(())
+    }
+
     /// The carry alone: the fractional micro-USD remainder from previous
     /// exact charges that hasn't yet added up to one whole credit. `0` for a
     /// user with no balance row.
@@ -866,6 +975,47 @@ impl Database {
                     verification_id,
                     error = %err,
                     "ledger_net_charge_for_verification: query failed"
+                );
+                return None;
+            }
+        };
+        if count == 0 {
+            return None;
+        }
+        Some(-sum)
+    }
+
+    /// What the ledger actually moved for one task attempt's settled-cost
+    /// charge, net.
+    ///
+    /// The attempt-billing counterpart to [`Self::ledger_net_charge_for_verification`],
+    /// for the observed-cost charge `finish_and_bill` writes under
+    /// `ChargeKey::for_attempt`. There is no refund key to sum here: nothing
+    /// in `settle_attempt` ever refunds an attempt charge, so the sum of the
+    /// charge rows alone is the amount still standing.
+    ///
+    /// `None` means no charge was ever written for this attempt (including:
+    /// it was absorbed, not charged).
+    pub fn ledger_net_charge_for_attempt(&self, attempt_id: &str) -> Option<i64> {
+        let charge_key = cortex_core::billing_binding::ChargeKey::for_attempt(attempt_id);
+        let conn = self.conn();
+        let keys = [
+            format!("{}:subscription", charge_key.as_str()),
+            format!("{}:pack", charge_key.as_str()),
+        ];
+        let row = conn.query_row(
+            "SELECT COUNT(*), COALESCE(SUM(amount), 0) FROM credit_transactions
+             WHERE idempotency_key IN (?1, ?2)",
+            params![keys[0], keys[1]],
+            |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
+        );
+        let (count, sum) = match row {
+            Ok(v) => v,
+            Err(err) => {
+                tracing::error!(
+                    attempt_id,
+                    error = %err,
+                    "ledger_net_charge_for_attempt: query failed"
                 );
                 return None;
             }
@@ -1272,7 +1422,7 @@ impl Database {
         // Scoped so `conn` (a std MutexGuard, non-reentrant) drops before the
         // later self.* calls below, each of which locks it again. Holding it
         // across those calls deadlocked on this thread.
-        let (verification_id, attempt, tree_hash, executions, egress) = {
+        let (verification_id, attempt, tree_hash, executions, egress, attempt_id) = {
             let conn = self.conn();
 
             let (verification_id, attempt, tree_hash) = conn
@@ -1381,7 +1531,21 @@ impl Database {
                     })
                 });
 
-            (verification_id, attempt, tree_hash, executions, egress)
+            // The attempt id this delivery ran under, read from the same
+            // `execution_jobs` row the egress read above came from. Best
+            // effort: a step executed before `execution_jobs` existed, or one
+            // whose worker never reported `StepStarted`, has no row, and the
+            // charge lookup below falls back to the pre-attempt-billing key.
+            let attempt_id: Option<String> = conn
+                .query_row(
+                    "SELECT attempt_id FROM execution_jobs WHERE run_id = ?1 AND step_id = ?2
+                     ORDER BY lease_gen DESC, submitted_at DESC LIMIT 1",
+                    params![run_id, step_id],
+                    |r| r.get(0),
+                )
+                .ok();
+
+            (verification_id, attempt, tree_hash, executions, egress, attempt_id)
         };
 
         // Declared at plan time, before this step ran -- read back from the
@@ -1397,11 +1561,17 @@ impl Database {
         let quoted_credits = self
             .get_step_quote(run_id, step_id)
             .map(|q| q.quoted_credits);
-        // What the ledger actually moved for this verification -- not the
-        // quote. A quote is a plan; `credit_transactions` is what happened.
-        // Reading the quote here would show a charge that was already
-        // refunded as still standing.
-        let charged_credits = self.ledger_net_charge_for_verification(&verification_id);
+        // What the ledger actually moved -- not the quote. A quote is a plan;
+        // `credit_transactions` is what happened. Task attempts are charged
+        // under an attempt-derived key now (`ChargeKey::for_attempt`), not a
+        // verification-derived one, so that key is tried first; the
+        // verification-derived lookup remains as a fallback for rows written
+        // before this change (and for the refund it could carry, which an
+        // attempt charge never can).
+        let charged_credits = attempt_id
+            .as_deref()
+            .and_then(|aid| self.ledger_net_charge_for_attempt(aid))
+            .or_else(|| self.ledger_net_charge_for_verification(&verification_id));
 
         Some(Receipt {
             verification_id,
