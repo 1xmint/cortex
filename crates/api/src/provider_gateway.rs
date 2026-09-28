@@ -15,6 +15,7 @@ use sha2::Sha256;
 use thiserror::Error;
 
 use crate::db::{Database, ProviderReservation};
+use crate::pricing;
 
 const CAPABILITY_VERSION: u32 = 1;
 
@@ -94,11 +95,29 @@ pub struct GatewayRequest {
     pub capability: SignedCapability,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ObservedUsage {
+    /// Uncached, non-cache-write input tokens **only** — this EXCLUDES both
+    /// cache reads (`cached_input_tokens`) and cache writes
+    /// (`cache_write_5m_tokens` / `cache_write_1h_tokens`). This is
+    /// Anthropic's own `usage.input_tokens` shape, which already reports
+    /// those separately. A supplier whose wire format instead reports a
+    /// total that *includes* cached tokens (OpenAI's Responses API does:
+    /// `usage.input_tokens` includes `input_tokens_details.cached_tokens`)
+    /// must normalise to this shape itself — subtracting the cached/written
+    /// counts out of its own total — before returning `ObservedUsage`, or
+    /// settlement (`pricing::cost_micro_usd`, driven by this struct) double
+    /// bills the cached portion at both the regular and cached rate. See
+    /// `supplier_openai.rs::observed_usage` for the OpenAI-side normalisation.
     pub input_tokens: i64,
     pub cached_input_tokens: i64,
     pub output_tokens: i64,
+    /// Tokens newly written to a 5-minute cache entry this call. See
+    /// `pricing::UsageTokens::cache_write_5m_tokens`.
+    pub cache_write_5m_tokens: i64,
+    /// Tokens newly written to a 1-hour cache entry this call. See
+    /// `pricing::UsageTokens::cache_write_1h_tokens`.
+    pub cache_write_1h_tokens: i64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -166,6 +185,8 @@ pub enum GatewayError {
     CredentialExposure,
     #[error("usage reconciliation failed: {0}")]
     Reconciliation(String),
+    #[error("request uses a feature Cortex cannot price, refused before any spend: {0}")]
+    UnpriceableFeature(String),
 }
 
 pub struct ProviderGateway<'a, T> {
@@ -304,7 +325,8 @@ impl<'a, T: ProviderTransport> ProviderGateway<'a, T> {
                 if usage.input_tokens < 0
                     || usage.cached_input_tokens < 0
                     || usage.output_tokens < 0
-                    || usage.cached_input_tokens > usage.input_tokens
+                    || usage.cache_write_5m_tokens < 0
+                    || usage.cache_write_1h_tokens < 0
                 {
                     self.db
                         .mark_provider_request_unresolved(
@@ -319,11 +341,19 @@ impl<'a, T: ProviderTransport> ProviderGateway<'a, T> {
                     ));
                 }
 
-                let observed_micros = rate.cost_micros(
-                    usage.input_tokens,
-                    usage.cached_input_tokens,
-                    usage.output_tokens,
-                );
+                // The upper-bound reservation above may stay conservative
+                // (rounded up); the settled charge must be exact, so it goes
+                // through the same integer, floor-only pricing math as every
+                // other settlement path (`pricing::cost_micro_usd`), not the
+                // older `ModelPrice::cost_micros` used only for that bound.
+                let observed_tokens = pricing::UsageTokens {
+                    input_tokens: usage.input_tokens,
+                    output_tokens: usage.output_tokens,
+                    cache_read_tokens: usage.cached_input_tokens,
+                    cache_write_5m_tokens: usage.cache_write_5m_tokens,
+                    cache_write_1h_tokens: usage.cache_write_1h_tokens,
+                };
+                let observed_micros = pricing::cost_micro_usd(&rate, &observed_tokens) as i64;
                 let reservation = self
                     .db
                     .settle_provider_request(
@@ -444,6 +474,7 @@ fn validate_bounded_form(request: &GatewayRequest) -> Result<(), GatewayError> {
             "body max_tokens must exactly match the reserved maximum".into(),
         ));
     }
+    refuse_unpriceable_request(&request.body)?;
     validate_tools(request.body.get("tools"))?;
     if request
         .body
@@ -453,6 +484,53 @@ fn validate_bounded_form(request: &GatewayRequest) -> Result<(), GatewayError> {
         return Err(GatewayError::UnboundedRequest(
             "stream must be a boolean".into(),
         ));
+    }
+    Ok(())
+}
+
+/// Refuse, before any reservation or transport call, a request whose flat
+/// per-token rate cannot price it: fast mode (billed on its own schedule,
+/// not the model's per-token rate), a non-default inference region
+/// (`inference_geo`, billed on its own per-region schedule), and a
+/// non-standard OpenAI `service_tier`. None of these has a published rate on
+/// `ModelPrice`, so pricing them would mean guessing.
+///
+/// The gateway today never forwards an `anthropic-beta` header at all (see
+/// `supplier_anthropic.rs`), so there is no separate "fast-mode beta header"
+/// to check yet; once the gateway forwards betas, whichever beta value
+/// switches on fast mode must be refused here too.
+fn refuse_unpriceable_request(body: &Value) -> Result<(), GatewayError> {
+    if body.get("speed").and_then(Value::as_str) == Some("fast") {
+        return Err(GatewayError::UnpriceableFeature(
+            "fast mode (\"speed\": \"fast\") is billed on its own schedule and has no \
+             published per-token rate"
+                .into(),
+        ));
+    }
+    if let Some(geo) = body.get("inference_geo") {
+        if geo.as_str() != Some("global") {
+            return Err(GatewayError::UnpriceableFeature(format!(
+                "inference_geo {geo} is not the default region (\"global\") and has no \
+                 published per-region rate"
+            )));
+        }
+    }
+    // OpenAI's `service_tier` selects a different price for the same model:
+    // "priority" and "flex" are billed at their own multipliers of the
+    // standard rate, "scale" is a batch-style tier with its own schedule,
+    // and "auto" leaves the tier for OpenAI to pick at request time, so
+    // which rate applies is not knowable up front either. `ModelPrice` has
+    // one rate per model — the standard tier's — so only that tier (or the
+    // field being left out entirely) can be priced. Reject `null` too: an
+    // explicit null is not the same as omitting the field, and must not be
+    // read as "use the default" without checking.
+    if let Some(tier) = body.get("service_tier") {
+        if !matches!(tier.as_str(), Some("default") | Some("standard_only")) {
+            return Err(GatewayError::UnpriceableFeature(format!(
+                "service_tier {tier} is not the standard tier Cortex prices \
+                 (omit the field, or use \"default\"/\"standard_only\")"
+            )));
+        }
     }
     Ok(())
 }
@@ -478,6 +556,37 @@ fn validate_tools(tools: Option<&Value>) -> Result<(), GatewayError> {
                 "each tool definition must be an object".into(),
             ));
         };
+        // A server tool item, by `type` prefix, is refused before any
+        // reservation, for two different reasons. Most of these
+        // (web_search, code_execution, code_interpreter, file_search,
+        // image_generation) are billed per-use by the supplier on top of
+        // token cost, and the flat per-token `ModelPrice` this gateway
+        // bills from has no field for that, so admitting one would mean
+        // under-billing every call that uses it. `web_fetch` is different:
+        // Anthropic charges no separate per-use fee for it, but the
+        // fetched page becomes part of the model's input in a size that is
+        // not known before the call runs, so no reservation bound could be
+        // trusted not to be exceeded. Either way, refuse before any
+        // reservation rather than guess a price.
+        if let Some(tool_type) = tool.get("type").and_then(Value::as_str) {
+            const PAID_SERVER_TOOL_PREFIXES: &[&str] = &[
+                "web_search",
+                "web_fetch",
+                "code_execution",
+                "code_interpreter",
+                "file_search",
+                "image_generation",
+            ];
+            if PAID_SERVER_TOOL_PREFIXES
+                .iter()
+                .any(|prefix| tool_type.starts_with(prefix))
+            {
+                return Err(GatewayError::UnpriceableFeature(format!(
+                    "server tool type {tool_type:?} has no published per-token rate and its \
+                     cost cannot be bounded before the call runs"
+                )));
+            }
+        }
         let Some(name) = tool.get("name").and_then(Value::as_str) else {
             return Err(GatewayError::UnboundedRequest(
                 "each tool definition requires a name".into(),
@@ -601,18 +710,31 @@ mod tests {
 
     impl Fixture {
         fn new(max_micro_usd: i64, capacity_micro_usd: i64) -> Self {
+            Self::with_model(max_micro_usd, capacity_micro_usd, PROVIDER, MODEL)
+        }
+
+        /// Same as `new`, but against a rate row other than the default
+        /// `claude`/`claude-sonnet-5` one — for a settlement test that needs
+        /// to pin the numbers for a specific seeded row (e.g. an `openai`
+        /// one) rather than whichever row `new` happens to use.
+        fn with_model(
+            max_micro_usd: i64,
+            capacity_micro_usd: i64,
+            provider: &str,
+            model: &str,
+        ) -> Self {
             let dir = tempfile::tempdir().unwrap();
             let db = Database::open(&dir.path().join("gateway.sqlite"));
             let price_list_id = db.active_price_list().unwrap().id;
-            db.set_supplier_capacity(PROVIDER, capacity_micro_usd, NOW)
+            db.set_supplier_capacity(provider, capacity_micro_usd, NOW)
                 .unwrap();
             let authorization = SpendAuthorization {
                 id: "auth-1".into(),
                 user_id: "tenant-1".into(),
                 run_id: "run-1".into(),
                 attempt_id: "attempt-1".into(),
-                provider: PROVIDER.into(),
-                model: MODEL.into(),
+                provider: provider.into(),
+                model: model.into(),
                 price_list_id,
                 max_micro_usd,
                 expires_at_ms: NOW + 60_000,
@@ -648,7 +770,7 @@ mod tests {
                 model: self.claims.model.clone(),
                 max_output_tokens: 100,
                 body: serde_json::json!({
-                    "model": MODEL,
+                    "model": self.claims.model,
                     "max_tokens": 100,
                     "messages": [{"role": "user", "content": "bounded stub request"}]
                 }),
@@ -688,6 +810,7 @@ mod tests {
             input_tokens: 100,
             cached_input_tokens: 0,
             output_tokens: 10,
+            ..Default::default()
         })));
         let request = fixture.request(&gateway, "request-1");
 
@@ -871,6 +994,7 @@ mod tests {
             input_tokens: 100,
             cached_input_tokens: 0,
             output_tokens: 10,
+            ..Default::default()
         })));
         let mut request = fixture.request(&gateway, "bounded-tools");
         request.body["tools"] = serde_json::json!([
@@ -921,6 +1045,7 @@ mod tests {
             input_tokens: 100,
             cached_input_tokens: 0,
             output_tokens: 10,
+            ..Default::default()
         })));
         let mut request = fixture.request(&gateway, "measured-cli-stream");
         request.body["stream"] = serde_json::json!(true);
@@ -1093,5 +1218,225 @@ mod tests {
             format!("{:?}", fixture.request(&gateway, "debug").capability),
             "SignedCapability([REDACTED])"
         );
+    }
+
+    #[tokio::test]
+    async fn settlement_bills_the_exact_pass_through_cost_including_cache_writes() {
+        let fixture = Fixture::new(100_000, 100_000);
+        let gateway = fixture.gateway(success(Some(ObservedUsage {
+            input_tokens: 1_000,
+            cached_input_tokens: 2_000,
+            output_tokens: 500,
+            cache_write_5m_tokens: 300,
+            cache_write_1h_tokens: 100,
+        })));
+        // Pad the body so its conservative (byte-length) reservation
+        // comfortably covers the settled cost computed below — this test
+        // pins the settlement math, not the reservation bound.
+        let mut request = fixture.request(&gateway, "cache-write-settlement");
+        request.body["messages"][0]["content"] = serde_json::json!("x".repeat(4_200));
+
+        let outcome = gateway.forward(request, NOW).await.unwrap();
+        assert_eq!(outcome.reservation.status, "settled");
+        // claude-sonnet-5 seed rates (`pricing::seed_models`): input 2_000
+        // micros/1k, output 10_000 micros/1k, cache_read_bp 1_000 (10% of
+        // input). Cache-write multipliers are fixed at 1.25x (5-minute) and
+        // 2x (1-hour) of the input rate for every model
+        // (`pricing::CACHE_WRITE_5M_BP` / `CACHE_WRITE_1H_BP`):
+        //   regular input:  1_000 * 2_000 / 1_000                  =  2_000
+        //   cache read:     2_000 * 2_000 * 1_000 / (1_000*10_000) =    400
+        //   cache write 5m:   300 * 2_000 * 12_500 / (1_000*10_000) =   750
+        //   cache write 1h:   100 * 2_000 * 20_000 / (1_000*10_000) =   400
+        //   output:           500 * 10_000 / 1_000                =  5_000
+        //   total                                                 =  8_550
+        assert_eq!(outcome.reservation.observed_micro_usd, Some(8_550));
+    }
+
+    #[tokio::test]
+    async fn settlement_bills_openai_cached_tokens_at_the_cached_rate_only_once() {
+        // Regression test for the OpenAI cached-token double-count bug:
+        // OpenAI's `usage.input_tokens` is a TOTAL that already includes
+        // cached tokens, unlike Anthropic's. `supplier_openai::observed_usage`
+        // normalises that into the gateway's exclusive `ObservedUsage.
+        // input_tokens` shape by subtracting the cached count out first, so
+        // this test settles the request the way that adapter actually
+        // reports it (uncached remainder + cached count), not OpenAI's raw
+        // total — see `ObservedUsage::input_tokens`'s doc comment and
+        // `supplier_openai::observed_usage`.
+        let fixture = Fixture::with_model(200_000, 200_000, "openai", "gpt-5.5");
+        let gateway = fixture.gateway(success(Some(ObservedUsage {
+            input_tokens: 2_000,
+            cached_input_tokens: 8_000,
+            output_tokens: 500,
+            cache_write_5m_tokens: 0,
+            cache_write_1h_tokens: 0,
+        })));
+        // Pad the body so its conservative (byte-length) reservation
+        // comfortably covers the settled cost computed below — this test
+        // pins the settlement math, not the reservation bound.
+        let mut request = fixture.request(&gateway, "openai-cache-read-settlement");
+        request.body["messages"][0]["content"] = serde_json::json!("x".repeat(10_000));
+
+        let outcome = gateway.forward(request, NOW).await.unwrap();
+        assert_eq!(outcome.reservation.status, "settled");
+        // gpt-5.5 seed rates (`pricing::seed_models`): input 5_000 micros/1k,
+        // output 30_000 micros/1k, cache_read_bp 5_000 (50% of the input
+        // rate). Reviewer's worked example: OpenAI reports 10_000 input
+        // tokens of which 8_000 were cached (so `ObservedUsage.input_tokens`
+        // is 2_000, the uncached remainder) and 500 output tokens.
+        //   regular input: 2_000 * 5_000 / 1_000                    = 10_000
+        //   cache read:    8_000 * 5_000 * 5_000 / (1_000 * 10_000) = 20_000
+        //   output:          500 * 30_000 / 1_000                   = 15_000
+        //   total                                                   = 45_000
+        assert_eq!(outcome.reservation.observed_micro_usd, Some(45_000));
+    }
+
+    #[tokio::test]
+    async fn requests_cortex_cannot_price_are_refused_before_any_call_or_reservation() {
+        let fixture = Fixture::new(100_000, 100_000);
+        let gateway = fixture.gateway(success(Some(ObservedUsage {
+            input_tokens: 100,
+            cached_input_tokens: 0,
+            output_tokens: 10,
+            ..Default::default()
+        })));
+
+        let mut fast_mode = fixture.request(&gateway, "fast-mode");
+        fast_mode.body["speed"] = serde_json::json!("fast");
+        assert!(matches!(
+            gateway.forward(fast_mode, NOW).await.unwrap_err(),
+            GatewayError::UnpriceableFeature(_)
+        ));
+
+        let mut non_global_geo = fixture.request(&gateway, "non-global-geo");
+        non_global_geo.body["inference_geo"] = serde_json::json!("eu-west-1");
+        assert!(matches!(
+            gateway.forward(non_global_geo, NOW).await.unwrap_err(),
+            GatewayError::UnpriceableFeature(_)
+        ));
+
+        let mut paid_server_tool = fixture.request(&gateway, "paid-server-tool");
+        paid_server_tool.body["tools"] = serde_json::json!([
+            {"type": "web_search_20250305", "name": "web_search"}
+        ]);
+        assert!(matches!(
+            gateway.forward(paid_server_tool, NOW).await.unwrap_err(),
+            GatewayError::UnpriceableFeature(_)
+        ));
+
+        assert_eq!(
+            fixture.calls.load(Ordering::SeqCst),
+            0,
+            "a request Cortex cannot price must never reach transport"
+        );
+        for key in ["fast-mode", "non-global-geo", "paid-server-tool"] {
+            assert!(
+                fixture.db.get_provider_reservation(key).is_none(),
+                "a request Cortex cannot price must never create a reservation"
+            );
+        }
+
+        // The same shape with none of those three fields still forwards and
+        // settles normally: the refusal is specific to what it names.
+        let normal = fixture.request(&gateway, "normal");
+        let outcome = gateway.forward(normal, NOW).await.unwrap();
+        assert_eq!(outcome.reservation.status, "settled");
+        assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn non_standard_service_tiers_are_refused_before_any_call_or_reservation() {
+        let fixture = Fixture::new(100_000, 100_000);
+        let gateway = fixture.gateway(success(Some(ObservedUsage {
+            input_tokens: 100,
+            cached_input_tokens: 0,
+            output_tokens: 10,
+            ..Default::default()
+        })));
+
+        // Cortex has one published rate per model: the standard tier's.
+        // "auto", "priority", "flex", "scale" and an explicit null all
+        // pick, or leave open, some other billing schedule and must be
+        // refused rather than silently priced as standard.
+        let refused_keys = ["auto", "priority", "flex", "scale", "explicit-null"];
+        for key in refused_keys {
+            let mut request = fixture.request(&gateway, key);
+            request.body["service_tier"] = if key == "explicit-null" {
+                serde_json::Value::Null
+            } else {
+                serde_json::json!(key)
+            };
+            assert!(
+                matches!(
+                    gateway.forward(request, NOW).await.unwrap_err(),
+                    GatewayError::UnpriceableFeature(_)
+                ),
+                "service_tier {key:?} should be refused"
+            );
+        }
+        assert_eq!(
+            fixture.calls.load(Ordering::SeqCst),
+            0,
+            "a service_tier Cortex cannot price must never reach transport"
+        );
+        for key in refused_keys {
+            assert!(
+                fixture.db.get_provider_reservation(key).is_none(),
+                "a service_tier Cortex cannot price must never create a reservation"
+            );
+        }
+
+        // "default", "standard_only", and omitting the field entirely are
+        // all the standard tier and forward normally.
+        for (key, tier) in [
+            ("tier-default", Some("default")),
+            ("tier-standard-only", Some("standard_only")),
+            ("tier-omitted", None),
+        ] {
+            let mut request = fixture.request(&gateway, key);
+            if let Some(tier) = tier {
+                request.body["service_tier"] = serde_json::json!(tier);
+            }
+            let outcome = gateway.forward(request, NOW).await.unwrap();
+            assert_eq!(outcome.reservation.status, "settled");
+        }
+    }
+
+    #[tokio::test]
+    async fn newly_refused_server_tool_types_are_refused_before_any_call_or_reservation() {
+        let fixture = Fixture::new(100_000, 100_000);
+        let gateway = fixture.gateway(success(Some(ObservedUsage {
+            input_tokens: 100,
+            cached_input_tokens: 0,
+            output_tokens: 10,
+            ..Default::default()
+        })));
+
+        // code_interpreter, file_search, and image_generation are each
+        // billed per-use by the supplier on top of token cost, the same
+        // reason web_search and code_execution were already refused.
+        let tool_types = ["code_interpreter", "file_search", "image_generation"];
+        for tool_type in tool_types {
+            let mut request = fixture.request(&gateway, tool_type);
+            request.body["tools"] = serde_json::json!([{"type": tool_type, "name": tool_type}]);
+            assert!(
+                matches!(
+                    gateway.forward(request, NOW).await.unwrap_err(),
+                    GatewayError::UnpriceableFeature(_)
+                ),
+                "tool type {tool_type:?} should be refused"
+            );
+        }
+        assert_eq!(
+            fixture.calls.load(Ordering::SeqCst),
+            0,
+            "a tool type Cortex cannot price must never reach transport"
+        );
+        for tool_type in tool_types {
+            assert!(
+                fixture.db.get_provider_reservation(tool_type).is_none(),
+                "a tool type Cortex cannot price must never create a reservation"
+            );
+        }
     }
 }
