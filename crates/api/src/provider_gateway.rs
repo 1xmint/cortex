@@ -97,6 +97,18 @@ pub struct GatewayRequest {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ObservedUsage {
+    /// Uncached, non-cache-write input tokens **only** — this EXCLUDES both
+    /// cache reads (`cached_input_tokens`) and cache writes
+    /// (`cache_write_5m_tokens` / `cache_write_1h_tokens`). This is
+    /// Anthropic's own `usage.input_tokens` shape, which already reports
+    /// those separately. A supplier whose wire format instead reports a
+    /// total that *includes* cached tokens (OpenAI's Responses API does:
+    /// `usage.input_tokens` includes `input_tokens_details.cached_tokens`)
+    /// must normalise to this shape itself — subtracting the cached/written
+    /// counts out of its own total — before returning `ObservedUsage`, or
+    /// settlement (`pricing::cost_micro_usd`, driven by this struct) double
+    /// bills the cached portion at both the regular and cached rate. See
+    /// `supplier_openai.rs::observed_usage` for the OpenAI-side normalisation.
     pub input_tokens: i64,
     pub cached_input_tokens: i64,
     pub output_tokens: i64,
@@ -666,18 +678,31 @@ mod tests {
 
     impl Fixture {
         fn new(max_micro_usd: i64, capacity_micro_usd: i64) -> Self {
+            Self::with_model(max_micro_usd, capacity_micro_usd, PROVIDER, MODEL)
+        }
+
+        /// Same as `new`, but against a rate row other than the default
+        /// `claude`/`claude-sonnet-5` one — for a settlement test that needs
+        /// to pin the numbers for a specific seeded row (e.g. an `openai`
+        /// one) rather than whichever row `new` happens to use.
+        fn with_model(
+            max_micro_usd: i64,
+            capacity_micro_usd: i64,
+            provider: &str,
+            model: &str,
+        ) -> Self {
             let dir = tempfile::tempdir().unwrap();
             let db = Database::open(&dir.path().join("gateway.sqlite"));
             let price_list_id = db.active_price_list().unwrap().id;
-            db.set_supplier_capacity(PROVIDER, capacity_micro_usd, NOW)
+            db.set_supplier_capacity(provider, capacity_micro_usd, NOW)
                 .unwrap();
             let authorization = SpendAuthorization {
                 id: "auth-1".into(),
                 user_id: "tenant-1".into(),
                 run_id: "run-1".into(),
                 attempt_id: "attempt-1".into(),
-                provider: PROVIDER.into(),
-                model: MODEL.into(),
+                provider: provider.into(),
+                model: model.into(),
                 price_list_id,
                 max_micro_usd,
                 expires_at_ms: NOW + 60_000,
@@ -713,7 +738,7 @@ mod tests {
                 model: self.claims.model.clone(),
                 max_output_tokens: 100,
                 body: serde_json::json!({
-                    "model": MODEL,
+                    "model": self.claims.model,
                     "max_tokens": 100,
                     "messages": [{"role": "user", "content": "bounded stub request"}]
                 }),
@@ -1193,6 +1218,45 @@ mod tests {
         //   output:           500 * 10_000 / 1_000                =  5_000
         //   total                                                 =  8_550
         assert_eq!(outcome.reservation.observed_micro_usd, Some(8_550));
+    }
+
+    #[tokio::test]
+    async fn settlement_bills_openai_cached_tokens_at_the_cached_rate_only_once() {
+        // Regression test for the OpenAI cached-token double-count bug:
+        // OpenAI's `usage.input_tokens` is a TOTAL that already includes
+        // cached tokens, unlike Anthropic's. `supplier_openai::observed_usage`
+        // normalises that into the gateway's exclusive `ObservedUsage.
+        // input_tokens` shape by subtracting the cached count out first, so
+        // this test settles the request the way that adapter actually
+        // reports it (uncached remainder + cached count), not OpenAI's raw
+        // total — see `ObservedUsage::input_tokens`'s doc comment and
+        // `supplier_openai::observed_usage`.
+        let fixture = Fixture::with_model(200_000, 200_000, "openai", "gpt-5.5");
+        let gateway = fixture.gateway(success(Some(ObservedUsage {
+            input_tokens: 2_000,
+            cached_input_tokens: 8_000,
+            output_tokens: 500,
+            cache_write_5m_tokens: 0,
+            cache_write_1h_tokens: 0,
+        })));
+        // Pad the body so its conservative (byte-length) reservation
+        // comfortably covers the settled cost computed below — this test
+        // pins the settlement math, not the reservation bound.
+        let mut request = fixture.request(&gateway, "openai-cache-read-settlement");
+        request.body["messages"][0]["content"] = serde_json::json!("x".repeat(10_000));
+
+        let outcome = gateway.forward(request, NOW).await.unwrap();
+        assert_eq!(outcome.reservation.status, "settled");
+        // gpt-5.5 seed rates (`pricing::seed_models`): input 5_000 micros/1k,
+        // output 30_000 micros/1k, cache_read_bp 5_000 (50% of the input
+        // rate). Reviewer's worked example: OpenAI reports 10_000 input
+        // tokens of which 8_000 were cached (so `ObservedUsage.input_tokens`
+        // is 2_000, the uncached remainder) and 500 output tokens.
+        //   regular input: 2_000 * 5_000 / 1_000                    = 10_000
+        //   cache read:    8_000 * 5_000 * 5_000 / (1_000 * 10_000) = 20_000
+        //   output:          500 * 30_000 / 1_000                   = 15_000
+        //   total                                                   = 45_000
+        assert_eq!(outcome.reservation.observed_micro_usd, Some(45_000));
     }
 
     #[tokio::test]

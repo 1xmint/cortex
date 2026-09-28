@@ -160,11 +160,31 @@ fn error_message(text: &str) -> String {
         .unwrap_or_else(|| text.chars().take(300).collect())
 }
 
-/// OpenAI's usage, in the gateway's terms. The Responses API reports total
-/// input tokens plus, separately, how many of those were served from cache;
-/// unlike Anthropic there is no separate cache-write charge to account for.
-/// When `cached_tokens` is absent, none of the input is counted as cached
-/// rather than guessed at.
+/// OpenAI's usage, in the gateway's terms.
+///
+/// The Responses API's `usage.input_tokens` is a TOTAL that already includes
+/// `input_tokens_details.cached_tokens` — unlike Anthropic, whose
+/// `usage.input_tokens` is exclusive of its cache-read count. `ObservedUsage`
+/// (see its doc comment in `provider_gateway.rs`) is defined in the
+/// exclusive, Anthropic shape, so it is normalised here: the cached count is
+/// subtracted out of the reported total before it is carried across, rather
+/// than passed through as-is, which would otherwise bill the cached tokens
+/// twice (once at the regular rate inside `input_tokens`, once again at the
+/// cached rate). If `cached_tokens` were ever to exceed the reported total —
+/// a malformed or self-contradictory usage object — the subtraction is not
+/// guessed at; the call is reported as unpriceable (`None`) so it stays
+/// unresolved rather than settling on a nonsensical negative count.
+///
+/// GPT-5.5 and GPT-5.4 (today's only priced OpenAI rows) never report a
+/// cache-write charge, so there is nothing to put in the two cache-write
+/// fields below. OpenAI's published pricing bills a cache write starting
+/// with GPT-5.6: 1.25x the input rate, mirroring Anthropic's 5-minute write
+/// multiplier (`pricing::CACHE_WRITE_5M_BP`). No GPT-5.6+ model is priced in
+/// `pricing::seed_models` yet; when one is added, this function must also
+/// read `input_tokens_details.cache_write_tokens` into
+/// `cache_write_5m_tokens` (there is no 1-hour tier for OpenAI) and subtract
+/// it out of `input` above the same way `cached` is, so it is not
+/// double-billed as regular input too.
 fn observed_usage(body: &Value) -> Option<ObservedUsage> {
     let usage = body.get("usage")?;
     let input = usage.get("input_tokens")?.as_i64()?;
@@ -174,13 +194,18 @@ fn observed_usage(body: &Value) -> Option<ObservedUsage> {
         .and_then(|details| details.get("cached_tokens"))
         .and_then(Value::as_i64)
         .unwrap_or(0);
+    if cached > input {
+        // Self-contradictory usage object: never guess which figure is
+        // right, stay unresolved instead of settling at a made-up cost.
+        return None;
+    }
 
     Some(ObservedUsage {
-        input_tokens: input,
+        input_tokens: input - cached,
         cached_input_tokens: cached,
         output_tokens: output,
-        // OpenAI never reports a separate cache-write charge (see the doc
-        // comment above): there is nothing to put in these two fields.
+        // See the doc comment above: nothing priced today bills this, and a
+        // future GPT-5.6+ row must fill it in rather than leave it at 0.
         cache_write_5m_tokens: 0,
         cache_write_1h_tokens: 0,
     })
@@ -262,7 +287,10 @@ mod tests {
         assert_eq!(
             response.usage,
             Some(ObservedUsage {
-                input_tokens: 10,
+                // OpenAI's reported `input_tokens: 10` includes the 2 cached
+                // tokens; `ObservedUsage.input_tokens` excludes them, so it
+                // is 10 - 2 = 8 here, not the raw 10 OpenAI reported.
+                input_tokens: 8,
                 cached_input_tokens: 2,
                 output_tokens: 4,
                 ..Default::default()
@@ -318,6 +346,44 @@ mod tests {
     fn a_message_without_usage_reports_none() {
         assert_eq!(
             observed_usage(&serde_json::json!({"type": "response"})),
+            None
+        );
+    }
+
+    #[test]
+    fn cached_tokens_are_subtracted_out_of_the_reported_input_total() {
+        // OpenAI's `input_tokens` is a total that includes `cached_tokens`;
+        // `ObservedUsage.input_tokens` must exclude them, so 10 - 2 = 8.
+        assert_eq!(
+            observed_usage(&serde_json::json!({
+                "usage": {
+                    "input_tokens": 10,
+                    "output_tokens": 4,
+                    "input_tokens_details": {"cached_tokens": 2}
+                }
+            })),
+            Some(ObservedUsage {
+                input_tokens: 8,
+                cached_input_tokens: 2,
+                output_tokens: 4,
+                ..Default::default()
+            })
+        );
+    }
+
+    #[test]
+    fn cached_tokens_exceeding_the_reported_total_stays_unresolved() {
+        // A self-contradictory usage object (cached > input) must never be
+        // guessed at: it stays unresolved (`None`), same as no usage at all,
+        // rather than settling on a made-up or negative input count.
+        assert_eq!(
+            observed_usage(&serde_json::json!({
+                "usage": {
+                    "input_tokens": 10,
+                    "output_tokens": 4,
+                    "input_tokens_details": {"cached_tokens": 11}
+                }
+            })),
             None
         );
     }
