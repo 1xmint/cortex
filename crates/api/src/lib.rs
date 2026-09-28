@@ -576,6 +576,7 @@ pub fn build_cortex_router(state: Arc<AppState>) -> Router {
         .route("/api/groups/{group_id}/approvals/{request_id}", patch(cortex_groups::resolve_group_approval_request))
         .route("/api/billing/status", get(billing::get_billing_status))
         .route("/api/billing/checkout", post(billing::create_checkout))
+        .route("/api/billing/topup", post(billing::create_topup_checkout))
         .route("/api/billing/portal", post(billing::create_portal))
         .route("/api/billing/referral/validate", post(billing::validate_referral))
         .route("/api/billing/history", get(billing::get_billing_history))

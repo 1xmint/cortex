@@ -100,6 +100,7 @@ duplicate,POST,/api/billing/checkout
 duplicate,GET,/api/billing/history
 duplicate,POST,/api/billing/portal
 duplicate,GET,/api/billing/status
+duplicate,POST,/api/billing/topup
 duplicate,GET,/api/billing/usage
 duplicate,GET,/api/health
 duplicate,POST,/api/stripe/webhook
