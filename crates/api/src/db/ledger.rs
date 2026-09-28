@@ -542,7 +542,14 @@ impl Database {
                 (id, clerk_user_id, amount, balance_type, reason, description,
                  idempotency_key, cost_micro_usd)
              VALUES (?1, ?2, ?3, 'subscription', 'spend', ?4, ?5, ?6)",
-            params![tx_id, clerk_user_id, -from_sub, row_description, idempotency_key, cost_i64],
+            params![
+                tx_id,
+                clerk_user_id,
+                -from_sub,
+                row_description,
+                idempotency_key,
+                cost_i64
+            ],
         ) {
             conn.execute("ROLLBACK", []).ok();
             return Err(format!("failed to record settled charge: {e}"));
@@ -556,7 +563,13 @@ impl Database {
                     (id, clerk_user_id, amount, balance_type, reason, description,
                      idempotency_key, cost_micro_usd)
                  VALUES (?1, ?2, ?3, 'pack', 'spend', ?4, ?5, NULL)",
-                params![pack_tx_id, clerk_user_id, -from_pack, row_description, pack_key],
+                params![
+                    pack_tx_id,
+                    clerk_user_id,
+                    -from_pack,
+                    row_description,
+                    pack_key
+                ],
             ) {
                 conn.execute("ROLLBACK", []).ok();
                 return Err(format!("failed to record settled pack charge: {e}"));
@@ -1898,8 +1911,15 @@ mod tests {
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .expect("bare row");
-        assert_eq!(bare_type, "subscription", "the replay-checked key is never 'mixed'");
-        assert_eq!(bare_cost, Some(150_000), "the bare row carries the full nominal cost");
+        assert_eq!(
+            bare_type, "subscription",
+            "the replay-checked key is never 'mixed'"
+        );
+        assert_eq!(
+            bare_cost,
+            Some(150_000),
+            "the bare row carries the full nominal cost"
+        );
 
         // Replaying the same key charges nothing and inserts no further rows.
         let replay = db
@@ -1907,7 +1927,11 @@ mod tests {
             .expect("replay is a no-op, not an error");
         assert_eq!(replay.credits_charged, 0);
         assert_eq!(replay.new_carry_micro_usd, 40_000);
-        assert_eq!(db.credit_ledger_totals(user), (-1, -1), "a replay must not add more rows");
+        assert_eq!(
+            db.credit_ledger_totals(user),
+            (-1, -1),
+            "a replay must not add more rows"
+        );
 
         let total_rows: i64 = db
             .conn()

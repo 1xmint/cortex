@@ -2909,20 +2909,26 @@ mod tests {
         db.init_credit_balance("user-1", 100).unwrap();
 
         // Usage must stay inside the per-turn reservation (MAX_OUTPUT_TOKENS
-        // of output) or the gateway refuses it before the loop sees it. A
+        // of output) or the gateway refuses it before the loop sees it. The
+        // reservation's own upper bound is computed from the *request*
+        // body's serialized size, not from the usage a supplier reports
+        // back, so inflating `input_tokens` here (fabricated usage on the
+        // response, not on the request) does not risk tripping that cap. A
         // haiku turn that size costs under one credit, so this test uses a
-        // pricier model to make one in-bounds turn cost more than the 1
-        // credit left after the concurrent drain.
+        // pricier model, and enough input tokens, to make one in-bounds turn
+        // cost more than *two* credits — not just more than the 1 credit
+        // left after the concurrent drain — so the shortfall this test
+        // exists to exercise (owed 2, charged 1) is actually nonzero.
         const PRICEY_MODEL: &str = "claude-opus-5";
-        let input_tokens = 10;
+        let input_tokens = 20_001;
         let output_tokens = MAX_OUTPUT_TOKENS - 96;
         let price_list = db.active_price_list().unwrap();
         let rate = price_list.model("claude", PRICEY_MODEL).unwrap();
         let observed_micros = rate.cost_micros(input_tokens, 0, output_tokens);
         assert!(
-            observed_micros > price_list.micros_per_credit,
-            "fixture must cost more than the 1 credit (100_000 micro-USD) left after the \
-             concurrent drain, for the clamp below to be exercised"
+            observed_micros > 2 * price_list.micros_per_credit,
+            "fixture must cost more than 2 credits (200_000 micro-USD) so that, clamped to \
+             the 1 credit left after the concurrent drain, a nonzero shortfall remains"
         );
 
         let transport = ShrinkingBalanceTransport {
@@ -2994,8 +3000,7 @@ mod tests {
         // (starting carry, here 0, plus the observed cost), mod
         // micros_per_credit -- not clamped down to what was actually
         // collected. This is a fresh balance, so starting carry is 0.
-        let expected_carry =
-            (observed_micros as u64) % (price_list.micros_per_credit as u64);
+        let expected_carry = (observed_micros as u64) % (price_list.micros_per_credit as u64);
         assert_eq!(
             db.get_credit_carry_micro_usd("user-1"),
             expected_carry,
