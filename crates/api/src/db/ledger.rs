@@ -2628,4 +2628,188 @@ mod tests {
 
         assert!(!db.run_has_pending_verification("run-sealed"));
     }
+
+    // --- settle_ended_attempt / attempt_settled_cost_micro_usd ---
+    //
+    // These settle real `provider_request_reservations` rows through the same
+    // two calls a gateway `forward()` makes (`reserve_provider_request` then
+    // `settle_provider_request`/`mark_provider_request_unresolved`), not a
+    // hand-rolled substitute, so they exercise the actual state machine the
+    // production end paths (a sealed verdict, `cancel_run`,
+    // `expire_stale_leases`) all read from.
+
+    use crate::db::SpendAuthorization;
+    use crate::provider_gateway::GatewayCapability;
+    use cortex_core::billing_binding::AttemptEndCause;
+
+    const ATTEMPT_NOW: i64 = 1_800_000_000_000;
+
+    /// A funded spend authorization scoped to one attempt, ready for
+    /// `reserve_provider_request`.
+    fn attempt_capability(db: &Database, attempt_id: &str) -> GatewayCapability {
+        let price_list_id = db.active_price_list().unwrap().id;
+        db.set_supplier_capacity("claude", 10_000_000, ATTEMPT_NOW)
+            .unwrap();
+        let authorization = SpendAuthorization {
+            id: format!("auth-{attempt_id}"),
+            user_id: "user-1".into(),
+            run_id: "run-1".into(),
+            attempt_id: attempt_id.into(),
+            provider: "claude".into(),
+            model: "claude-sonnet-5".into(),
+            price_list_id,
+            max_micro_usd: 10_000_000,
+            expires_at_ms: ATTEMPT_NOW + 60_000,
+        };
+        db.create_spend_authorization(&authorization, ATTEMPT_NOW)
+            .unwrap();
+        GatewayCapability::new(
+            authorization.id,
+            authorization.user_id,
+            authorization.run_id,
+            authorization.attempt_id,
+            authorization.provider,
+            authorization.model,
+            authorization.expires_at_ms,
+        )
+    }
+
+    /// Reserve and settle one provider call for `claims.attempt_id`, exactly
+    /// as a real gateway `forward()` would once the supplier confirms a cost.
+    fn settle_call(db: &Database, claims: &GatewayCapability, request_key: &str, observed: i64) {
+        db.reserve_provider_request(claims, request_key, "digest", observed, ATTEMPT_NOW)
+            .expect("reserve");
+        let settled = db
+            .settle_provider_request(request_key, observed, Some("upstream-1"), ATTEMPT_NOW)
+            .expect("settle");
+        assert_eq!(settled.status, "settled");
+    }
+
+    /// Reserve one provider call and leave it unresolved -- the supplier
+    /// never confirmed a cost, so it must never contribute to what an
+    /// attempt owes.
+    fn leave_unresolved(db: &Database, claims: &GatewayCapability, request_key: &str) {
+        db.reserve_provider_request(claims, request_key, "digest", 999_999, ATTEMPT_NOW)
+            .expect("reserve");
+        db.mark_provider_request_unresolved(request_key, None, "stub timeout", ATTEMPT_NOW)
+            .expect("mark unresolved");
+    }
+
+    #[test]
+    fn attempt_settled_cost_sums_every_settled_call_and_excludes_unresolved_ones() {
+        let db = test_db();
+        let claims = attempt_capability(&db, "attempt-sum");
+        settle_call(&db, &claims, "call-1", 300_000);
+        settle_call(&db, &claims, "call-2", 150_000);
+        leave_unresolved(&db, &claims, "call-3");
+
+        assert_eq!(db.attempt_settled_cost_micro_usd("attempt-sum"), 450_000);
+    }
+
+    #[test]
+    fn an_attempt_with_no_provider_calls_owes_nothing() {
+        let db = test_db();
+        assert_eq!(db.attempt_settled_cost_micro_usd("attempt-never-dispatched"), 0);
+    }
+
+    #[test]
+    fn settle_ended_attempt_charges_the_exact_settled_sum_for_a_chargeable_cause() {
+        // 300_000 + 150_000 micro-USD at the seeded 100_000-micro-USD credit
+        // (`SEED_MICROS_PER_CREDIT`) is exactly 4 whole credits with a
+        // 50_000 remainder -- pass-through billing, no rounding up.
+        let db = test_db();
+        let user = subscriber(&db, 1_000);
+        let claims = attempt_capability(&db, "attempt-charge");
+        settle_call(&db, &claims, "charge-1", 300_000);
+        settle_call(&db, &claims, "charge-2", 150_000);
+
+        db.settle_ended_attempt(user, "attempt-charge", AttemptEndCause::CustomerCancel);
+
+        assert_eq!(db.get_credit_balance(user).subscription_remaining, 996);
+        assert_eq!(db.get_credit_carry_micro_usd(user), 50_000);
+    }
+
+    #[test]
+    fn settle_ended_attempt_replay_is_a_noop_not_a_double_charge() {
+        let db = test_db();
+        let user = subscriber(&db, 1_000);
+        let claims = attempt_capability(&db, "attempt-replay");
+        settle_call(&db, &claims, "replay-1", 300_000);
+
+        db.settle_ended_attempt(user, "attempt-replay", AttemptEndCause::Verified);
+        assert_eq!(db.get_credit_balance(user).subscription_remaining, 997);
+        assert_eq!(db.get_credit_carry_micro_usd(user), 0);
+
+        // Same attempt, same cause, called again (e.g. a cancel racing a
+        // verdict that already settled): `ChargeKey::for_attempt` makes the
+        // second call see its own idempotency key already spent and write
+        // nothing further.
+        db.settle_ended_attempt(user, "attempt-replay", AttemptEndCause::Verified);
+        assert_eq!(db.get_credit_balance(user).subscription_remaining, 997);
+        assert_eq!(db.get_credit_carry_micro_usd(user), 0);
+    }
+
+    #[test]
+    fn settle_ended_attempt_with_no_settled_calls_writes_no_ledger_row_at_all() {
+        let db = test_db();
+        let user = subscriber(&db, 1_000);
+
+        // Never dispatched far enough to make a priced call -- there is
+        // nothing to charge and nothing to absorb, so this must be silent:
+        // no ledger row, whether the cause would have charged or absorbed.
+        db.settle_ended_attempt(user, "attempt-nothing-spent", AttemptEndCause::CustomerCancel);
+        db.settle_ended_attempt(user, "attempt-nothing-spent-2", AttemptEndCause::RunnerDown);
+
+        assert_eq!(db.get_credit_balance(user).subscription_remaining, 1_000);
+        assert_eq!(db.get_credit_carry_micro_usd(user), 0);
+        assert_eq!(db.credit_ledger_totals(user), (0, 0));
+
+        // `credit_ledger_totals` alone would read the same 0 whether no row
+        // was written or a zero-amount absorb row was: count rows directly
+        // to prove this case is silent, not merely balance-neutral.
+        let rows: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM credit_transactions WHERE clerk_user_id = ?1",
+                params![user],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 0, "an attempt with no settled calls must write no ledger row");
+    }
+
+    #[test]
+    fn settle_ended_attempt_absorbs_as_a_zero_amount_row_never_a_refund() {
+        // An infrastructure-caused end (the worker vanished, or Cortex itself
+        // crashed) must never touch the customer's balance -- Cortex eats the
+        // cost. This is recorded as a `credit_transactions` row with
+        // `amount = 0`, on the record against Cortex, not as a refund of any
+        // kind (there is nothing to refund: nothing was ever charged).
+        let db = test_db();
+        let user = subscriber(&db, 1_000);
+        let claims = attempt_capability(&db, "attempt-absorb");
+        settle_call(&db, &claims, "absorb-1", 300_000);
+
+        db.settle_ended_attempt(user, "attempt-absorb", AttemptEndCause::RunnerDown);
+
+        assert_eq!(
+            db.get_credit_balance(user).subscription_remaining,
+            1_000,
+            "an absorbed attempt must not touch the customer's balance"
+        );
+        assert_eq!(db.get_credit_carry_micro_usd(user), 0);
+        assert_eq!(db.credit_ledger_totals(user), (0, 0));
+
+        let key = cortex_core::billing_binding::ChargeKey::for_attempt("attempt-absorb");
+        let (amount, reason): (i64, String) = db
+            .conn()
+            .query_row(
+                "SELECT amount, reason FROM credit_transactions WHERE idempotency_key = ?1",
+                params![key.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("absorbed-cost row");
+        assert_eq!(amount, 0, "an absorbed cost is never a nonzero refund row");
+        assert_eq!(reason, "absorbed");
+    }
 }
