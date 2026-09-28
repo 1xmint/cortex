@@ -4551,12 +4551,17 @@ mod tests {
 
             let price_list = db.active_price_list().unwrap();
             let rate = price_list.model("claude", DELEGATION_MODEL).unwrap();
-            let expected_credits =
-                ceil_div(rate.cost_micros(10, 0, 10), price_list.micros_per_credit);
+            let observed_micros = rate.cost_micros(10, 0, 10);
+            assert!(observed_micros > 0);
+            assert!(observed_micros < price_list.micros_per_credit);
             let after = db.get_credit_balance_row(USER).unwrap();
             assert_eq!(
-                before.subscription_remaining - after.subscription_remaining,
-                expected_credits,
+                before.subscription_remaining, after.subscription_remaining,
+                "a 10-in/10-out delegation costs under one credit, so no whole credit is taken"
+            );
+            assert_eq!(
+                db.get_credit_carry_micro_usd(USER),
+                observed_micros as u64,
                 "the delegation must charge exactly the observed 10-in/10-out token cost"
             );
         }

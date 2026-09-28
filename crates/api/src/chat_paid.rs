@@ -1222,7 +1222,10 @@ mod tests {
         assert_eq!(reply.charged_credits, 0);
         let balance = db.get_credit_balance_row("user-1").unwrap();
         assert_eq!(balance.subscription_remaining, 100);
-        assert_eq!(db.get_credit_carry_micro_usd("user-1"), observed_micros as u64);
+        assert_eq!(
+            db.get_credit_carry_micro_usd("user-1"),
+            observed_micros as u64
+        );
     }
 
     #[tokio::test]
@@ -1552,7 +1555,10 @@ mod tests {
 
         assert_eq!(transport.call_count(), 2, "one turn per gateway call");
         assert_eq!(reply.text, "here is your answer");
-        assert_eq!(reply.charged_credits, 0, "120 micro-USD is under one credit");
+        assert_eq!(
+            reply.charged_credits, 0,
+            "120 micro-USD is under one credit"
+        );
         let balance = db.get_credit_balance_row("user-1").unwrap();
         assert_eq!(
             balance.subscription_remaining, 1000,
