@@ -2909,18 +2909,19 @@ mod tests {
         db.init_credit_balance("user-1", 100).unwrap();
 
         // Usage must stay inside the per-turn reservation (MAX_OUTPUT_TOKENS
-        // of output) or the gateway refuses it before the loop sees it. The
-        // reservation's own upper bound is computed from the *request*
-        // body's serialized size, not from the usage a supplier reports
-        // back, so inflating `input_tokens` here (fabricated usage on the
-        // response, not on the request) does not risk tripping that cap. A
-        // haiku turn that size costs under one credit, so this test uses a
-        // pricier model, and enough input tokens, to make one in-bounds turn
-        // cost more than *two* credits — not just more than the 1 credit
-        // left after the concurrent drain — so the shortfall this test
-        // exists to exercise (owed 2, charged 1) is actually nonzero.
-        const PRICEY_MODEL: &str = "claude-opus-5";
-        let input_tokens = 20_001;
+        // of output) or the gateway refuses it before the loop sees it; the
+        // *observed* cost settled here also can't exceed that reservation's
+        // own upper bound (computed off the real, tiny request body plus
+        // MAX_OUTPUT_TOKENS), so inflating input_tokens in the fabricated
+        // response usage is not an option -- it would make the observed
+        // cost exceed the reservation and the call would be rejected before
+        // the clamp this test targets is ever reached. Instead this uses
+        // Cortex's priciest model (claude-fable-5, $10/$50 per million
+        // tokens) so that one near-max-output turn alone costs just over 2
+        // credits, leaving a nonzero shortfall (owed 2, charged 1) after the
+        // clamp to the 1 credit left post-drain.
+        const PRICEY_MODEL: &str = "claude-fable-5";
+        let input_tokens = 10;
         let output_tokens = MAX_OUTPUT_TOKENS - 96;
         let price_list = db.active_price_list().unwrap();
         let rate = price_list.model("claude", PRICEY_MODEL).unwrap();
