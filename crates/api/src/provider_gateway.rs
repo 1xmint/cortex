@@ -490,9 +490,10 @@ fn validate_bounded_form(request: &GatewayRequest) -> Result<(), GatewayError> {
 
 /// Refuse, before any reservation or transport call, a request whose flat
 /// per-token rate cannot price it: fast mode (billed on its own schedule,
-/// not the model's per-token rate) and a non-default inference region
-/// (`inference_geo`, billed on its own per-region schedule). Neither has a
-/// published rate on `ModelPrice`, so pricing it would mean guessing.
+/// not the model's per-token rate), a non-default inference region
+/// (`inference_geo`, billed on its own per-region schedule), and a
+/// non-standard OpenAI `service_tier`. None of these has a published rate on
+/// `ModelPrice`, so pricing them would mean guessing.
 ///
 /// The gateway today never forwards an `anthropic-beta` header at all (see
 /// `supplier_anthropic.rs`), so there is no separate "fast-mode beta header"
@@ -511,6 +512,23 @@ fn refuse_unpriceable_request(body: &Value) -> Result<(), GatewayError> {
             return Err(GatewayError::UnpriceableFeature(format!(
                 "inference_geo {geo} is not the default region (\"global\") and has no \
                  published per-region rate"
+            )));
+        }
+    }
+    // OpenAI's `service_tier` selects a different price for the same model:
+    // "priority" and "flex" are billed at their own multipliers of the
+    // standard rate, "scale" is a batch-style tier with its own schedule,
+    // and "auto" leaves the tier for OpenAI to pick at request time, so
+    // which rate applies is not knowable up front either. `ModelPrice` has
+    // one rate per model — the standard tier's — so only that tier (or the
+    // field being left out entirely) can be priced. Reject `null` too: an
+    // explicit null is not the same as omitting the field, and must not be
+    // read as "use the default" without checking.
+    if let Some(tier) = body.get("service_tier") {
+        if !matches!(tier.as_str(), Some("default") | Some("standard_only")) {
+            return Err(GatewayError::UnpriceableFeature(format!(
+                "service_tier {tier} is not the standard tier Cortex prices \
+                 (omit the field, or use \"default\"/\"standard_only\")"
             )));
         }
     }
@@ -538,20 +556,34 @@ fn validate_tools(tools: Option<&Value>) -> Result<(), GatewayError> {
                 "each tool definition must be an object".into(),
             ));
         };
-        // A server tool (`type` starting with one of these prefixes) is
-        // billed per-use by the supplier on top of its token cost. The flat
-        // per-token `ModelPrice` this gateway bills from has no field for
-        // that, so admitting one would mean under-billing every call that
-        // uses it. Refuse before any reservation rather than guess a price.
+        // A server tool item, by `type` prefix, is refused before any
+        // reservation, for two different reasons. Most of these
+        // (web_search, code_execution, code_interpreter, file_search,
+        // image_generation) are billed per-use by the supplier on top of
+        // token cost, and the flat per-token `ModelPrice` this gateway
+        // bills from has no field for that, so admitting one would mean
+        // under-billing every call that uses it. `web_fetch` is different:
+        // Anthropic charges no separate per-use fee for it, but the
+        // fetched page becomes part of the model's input in a size that is
+        // not known before the call runs, so no reservation bound could be
+        // trusted not to be exceeded. Either way, refuse before any
+        // reservation rather than guess a price.
         if let Some(tool_type) = tool.get("type").and_then(Value::as_str) {
-            const PAID_SERVER_TOOL_PREFIXES: &[&str] =
-                &["web_search", "web_fetch", "code_execution"];
+            const PAID_SERVER_TOOL_PREFIXES: &[&str] = &[
+                "web_search",
+                "web_fetch",
+                "code_execution",
+                "code_interpreter",
+                "file_search",
+                "image_generation",
+            ];
             if PAID_SERVER_TOOL_PREFIXES
                 .iter()
                 .any(|prefix| tool_type.starts_with(prefix))
             {
                 return Err(GatewayError::UnpriceableFeature(format!(
-                    "server tool type {tool_type:?} is billed per-use and has no published rate"
+                    "server tool type {tool_type:?} has no published per-token rate and its \
+                     cost cannot be bounded before the call runs"
                 )));
             }
         }
@@ -1310,5 +1342,101 @@ mod tests {
         let outcome = gateway.forward(normal, NOW).await.unwrap();
         assert_eq!(outcome.reservation.status, "settled");
         assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn non_standard_service_tiers_are_refused_before_any_call_or_reservation() {
+        let fixture = Fixture::new(100_000, 100_000);
+        let gateway = fixture.gateway(success(Some(ObservedUsage {
+            input_tokens: 100,
+            cached_input_tokens: 0,
+            output_tokens: 10,
+            ..Default::default()
+        })));
+
+        // Cortex has one published rate per model: the standard tier's.
+        // "auto", "priority", "flex", "scale" and an explicit null all
+        // pick, or leave open, some other billing schedule and must be
+        // refused rather than silently priced as standard.
+        let refused_keys = ["auto", "priority", "flex", "scale", "explicit-null"];
+        for key in refused_keys {
+            let mut request = fixture.request(&gateway, key);
+            request.body["service_tier"] = if key == "explicit-null" {
+                serde_json::Value::Null
+            } else {
+                serde_json::json!(key)
+            };
+            assert!(
+                matches!(
+                    gateway.forward(request, NOW).await.unwrap_err(),
+                    GatewayError::UnpriceableFeature(_)
+                ),
+                "service_tier {key:?} should be refused"
+            );
+        }
+        assert_eq!(
+            fixture.calls.load(Ordering::SeqCst),
+            0,
+            "a service_tier Cortex cannot price must never reach transport"
+        );
+        for key in refused_keys {
+            assert!(
+                fixture.db.get_provider_reservation(key).is_none(),
+                "a service_tier Cortex cannot price must never create a reservation"
+            );
+        }
+
+        // "default", "standard_only", and omitting the field entirely are
+        // all the standard tier and forward normally.
+        for (key, tier) in [
+            ("tier-default", Some("default")),
+            ("tier-standard-only", Some("standard_only")),
+            ("tier-omitted", None),
+        ] {
+            let mut request = fixture.request(&gateway, key);
+            if let Some(tier) = tier {
+                request.body["service_tier"] = serde_json::json!(tier);
+            }
+            let outcome = gateway.forward(request, NOW).await.unwrap();
+            assert_eq!(outcome.reservation.status, "settled");
+        }
+    }
+
+    #[tokio::test]
+    async fn newly_refused_server_tool_types_are_refused_before_any_call_or_reservation() {
+        let fixture = Fixture::new(100_000, 100_000);
+        let gateway = fixture.gateway(success(Some(ObservedUsage {
+            input_tokens: 100,
+            cached_input_tokens: 0,
+            output_tokens: 10,
+            ..Default::default()
+        })));
+
+        // code_interpreter, file_search, and image_generation are each
+        // billed per-use by the supplier on top of token cost, the same
+        // reason web_search and code_execution were already refused.
+        let tool_types = ["code_interpreter", "file_search", "image_generation"];
+        for tool_type in tool_types {
+            let mut request = fixture.request(&gateway, tool_type);
+            request.body["tools"] = serde_json::json!([{"type": tool_type, "name": tool_type}]);
+            assert!(
+                matches!(
+                    gateway.forward(request, NOW).await.unwrap_err(),
+                    GatewayError::UnpriceableFeature(_)
+                ),
+                "tool type {tool_type:?} should be refused"
+            );
+        }
+        assert_eq!(
+            fixture.calls.load(Ordering::SeqCst),
+            0,
+            "a tool type Cortex cannot price must never reach transport"
+        );
+        for tool_type in tool_types {
+            assert!(
+                fixture.db.get_provider_reservation(tool_type).is_none(),
+                "a tool type Cortex cannot price must never create a reservation"
+            );
+        }
     }
 }
