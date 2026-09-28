@@ -84,6 +84,17 @@ pub enum AttemptEndCause {
     /// example: the delivered tree could not be checked out for grading, or
     /// the frozen exam's integrity could not be established at all).
     CortexCrash,
+    /// A Cortex-owned worker's own tooling or network failed while the
+    /// attempt was running — a missing or uninstalled CLI, an expired or
+    /// missing provider session, a rate limit or unavailable model on the
+    /// account Cortex configured for it, a crashed process, or a network
+    /// error reaching the provider. Cortex's problem *because* it was
+    /// Cortex's own worker: the identical failure on a customer's own
+    /// `cwk_`-keyed worker is that customer's own machinery breaking, and
+    /// bills as [`Failed`](Self::Failed) instead — see
+    /// `classify_worker_failure`, which is the only place this variant is
+    /// produced.
+    WorkerInfraDown,
 }
 
 /// What settling an attempt does to the ledger.
@@ -105,7 +116,112 @@ pub fn settle_attempt(end_cause: AttemptEndCause) -> AttemptSettlement {
     use AttemptEndCause::*;
     match end_cause {
         Verified | Unverified | Failed | ExamTampered | CustomerCancel => AttemptSettlement::Charge,
-        RunnerDown | LeaseExpired | CortexCrash => AttemptSettlement::Absorb(end_cause),
+        RunnerDown | LeaseExpired | CortexCrash | WorkerInfraDown => {
+            AttemptSettlement::Absorb(end_cause)
+        }
+    }
+}
+
+/// Classify a lease expiry into the [`AttemptEndCause`] it bills as.
+///
+/// `expire_stale_leases` notices exactly one fact: the lease deadline passed
+/// with no delivery. Whether that is Cortex's outage or the customer's own
+/// problem depends on whose worker held the lease — the same worker key a
+/// customer brings with `cwk_` is their own compute, and its disappearing is
+/// no different, billing-wise, from their laptop losing power mid-task. Only
+/// a lease held by a worker Cortex itself owns and operates is Cortex's own
+/// machinery breaking.
+///
+/// `worker_owned_by_cortex` is the snapshot taken at end-time from
+/// `workers.owned_by_cortex` (see `attempt_endings.worker_owned_by_cortex`),
+/// not re-read live — the worker record can change ownership after the
+/// attempt ended, and this must bill against what was true while the lease
+/// was held.
+pub fn classify_lease_expiry(worker_owned_by_cortex: bool) -> AttemptEndCause {
+    if worker_owned_by_cortex {
+        AttemptEndCause::LeaseExpired
+    } else {
+        AttemptEndCause::Failed
+    }
+}
+
+/// Classify a worker's reported failure ([`crate::failure::WorkerFailureKind`])
+/// into the [`AttemptEndCause`] it bills as.
+///
+/// Three buckets, exhaustively:
+///
+/// - [`crate::failure::WorkerFailureKind::Cancelled`] is the customer's own
+///   act, never a fault to attribute to either side's machinery. It is
+///   always [`AttemptEndCause::CustomerCancel`], regardless of whose worker
+///   ran it.
+/// - Agent/task failures are about the work itself, not about whose compute
+///   produced it: a step that timed out, got killed, was denied a
+///   permission, or delivered nothing usable failed on its own terms and
+///   would have failed identically on anyone's worker. These are always
+///   [`AttemptEndCause::Failed`], independent of `worker_owned_by_cortex`.
+///   `Unknown` is deliberately in this bucket too — absorption is the
+///   exception the owner's rule carves out for a *confirmed* Cortex fault,
+///   and an unclassified failure has not confirmed anything.
+/// - Infrastructure failures are about the environment the CLI ran in: a
+///   missing binary, an unauthenticated or expired provider session, a rate
+///   limit or unavailable model on whatever account was configured, a
+///   crashed process, or a network error reaching the provider. Whichever
+///   side's worker (and therefore whichever side's credentials, install and
+///   egress path) hit this owns the fault, so these absorb only when
+///   `worker_owned_by_cortex` is true and charge as
+///   [`AttemptEndCause::Failed`] otherwise — the same worker-key-aware rule
+///   as [`classify_lease_expiry`].
+///
+/// `worker_owned_by_cortex` is the same end-time snapshot described on
+/// [`classify_lease_expiry`], not a live lookup.
+pub fn classify_worker_failure(
+    kind: crate::failure::WorkerFailureKind,
+    worker_owned_by_cortex: bool,
+) -> AttemptEndCause {
+    use crate::failure::WorkerFailureKind::*;
+
+    match kind {
+        Cancelled => AttemptEndCause::CustomerCancel,
+
+        ProcessTimeout | ProcessKilled | PermissionDenied | OutputEmpty | NothingDelivered
+        | Unknown => AttemptEndCause::Failed,
+
+        CliNotFound | CliNotAuthenticated | CliAuthExpired | CliRateLimited
+        | CliModelUnavailable | CliCrashed | NetworkError => {
+            if worker_owned_by_cortex {
+                AttemptEndCause::WorkerInfraDown
+            } else {
+                AttemptEndCause::Failed
+            }
+        }
+    }
+}
+
+/// Classify a verifier-side failure to reach a verdict — the delivered tree
+/// could not be checked out, or the frozen exam's own integrity could not be
+/// established — into the [`AttemptEndCause`] it bills as.
+///
+/// Both of `verification_driver.rs`'s exam-integrity refusals
+/// (`Verdict::Inconclusive` for a tamper detection, and for an
+/// integrity-unknown result) and its failed-checkout path reach here. The
+/// question this answers is narrow and specific: is the reason the delivered
+/// tree itself (the agent broke its own exam, or delivered something that
+/// will not check out at all — its problem, charged), or is it Cortex's own
+/// grading machinery failing on a tree that was otherwise fine to check out
+/// (Cortex's problem, absorbed)?
+///
+/// `cause_is_delivered_tree` is `true` exactly when the tree the agent
+/// delivered is itself why grading could not happen — a tamper detection, or
+/// a checkout failure caused by what was actually pushed. It is `false` when
+/// grading failed for a reason unrelated to what was delivered — the runner
+/// image missing, the checkout host itself unavailable, or any other failure
+/// in Cortex's own verification path that a well-formed delivery would not
+/// have triggered.
+pub fn classify_exam_integrity_failure(cause_is_delivered_tree: bool) -> AttemptEndCause {
+    if cause_is_delivered_tree {
+        AttemptEndCause::ExamTampered
+    } else {
+        AttemptEndCause::CortexCrash
     }
 }
 
@@ -285,6 +401,7 @@ mod tests {
             AttemptEndCause::RunnerDown,
             AttemptEndCause::LeaseExpired,
             AttemptEndCause::CortexCrash,
+            AttemptEndCause::WorkerInfraDown,
         ] {
             assert_eq!(
                 settle_attempt(cause),
@@ -310,12 +427,151 @@ mod tests {
             AttemptEndCause::RunnerDown,
             AttemptEndCause::LeaseExpired,
             AttemptEndCause::CortexCrash,
+            AttemptEndCause::WorkerInfraDown,
         ] {
             assert!(matches!(
                 settle_attempt(cause),
                 AttemptSettlement::Charge | AttemptSettlement::Absorb(_)
             ));
         }
+    }
+
+    #[test]
+    fn lease_expiry_absorbs_only_on_cortex_owned_worker() {
+        assert_eq!(
+            classify_lease_expiry(true),
+            AttemptEndCause::LeaseExpired,
+            "Cortex's own worker disappearing is Cortex's outage"
+        );
+        assert_eq!(
+            classify_lease_expiry(false),
+            AttemptEndCause::Failed,
+            "a customer's own worker disappearing is charged, not absorbed \
+             — only Cortex's own machinery faults are free"
+        );
+        assert_eq!(
+            settle_attempt(classify_lease_expiry(true)),
+            AttemptSettlement::Absorb(AttemptEndCause::LeaseExpired)
+        );
+        assert_eq!(
+            settle_attempt(classify_lease_expiry(false)),
+            AttemptSettlement::Charge
+        );
+    }
+
+    #[test]
+    fn worker_failure_cancelled_is_always_customer_cancel() {
+        for worker_owned_by_cortex in [true, false] {
+            assert_eq!(
+                classify_worker_failure(
+                    crate::failure::WorkerFailureKind::Cancelled,
+                    worker_owned_by_cortex
+                ),
+                AttemptEndCause::CustomerCancel
+            );
+        }
+    }
+
+    #[test]
+    fn worker_failure_agent_task_causes_always_charge() {
+        use crate::failure::WorkerFailureKind::*;
+        for kind in [
+            ProcessTimeout,
+            ProcessKilled,
+            PermissionDenied,
+            OutputEmpty,
+            NothingDelivered,
+            Unknown,
+        ] {
+            for worker_owned_by_cortex in [true, false] {
+                assert_eq!(
+                    classify_worker_failure(kind, worker_owned_by_cortex),
+                    AttemptEndCause::Failed,
+                    "{kind:?} (owned_by_cortex={worker_owned_by_cortex}) is the \
+                     task's own failure, independent of whose worker ran it"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn worker_failure_infra_causes_absorb_only_on_cortex_owned_worker() {
+        use crate::failure::WorkerFailureKind::*;
+        for kind in [
+            CliNotFound,
+            CliNotAuthenticated,
+            CliAuthExpired,
+            CliRateLimited,
+            CliModelUnavailable,
+            CliCrashed,
+            NetworkError,
+        ] {
+            assert_eq!(
+                classify_worker_failure(kind, true),
+                AttemptEndCause::WorkerInfraDown,
+                "{kind:?} on Cortex's own worker must absorb"
+            );
+            assert_eq!(
+                classify_worker_failure(kind, false),
+                AttemptEndCause::Failed,
+                "{kind:?} on a customer's own worker must charge"
+            );
+            assert_eq!(
+                settle_attempt(classify_worker_failure(kind, true)),
+                AttemptSettlement::Absorb(AttemptEndCause::WorkerInfraDown)
+            );
+        }
+    }
+
+    #[test]
+    fn worker_failure_classification_is_exhaustive_and_never_refunds() {
+        // Every `WorkerFailureKind` must resolve to a real settlement — no
+        // panic, no cause that `settle_attempt` doesn't know how to bill.
+        use crate::failure::WorkerFailureKind::*;
+        for kind in [
+            CliNotFound,
+            CliNotAuthenticated,
+            CliAuthExpired,
+            CliRateLimited,
+            CliModelUnavailable,
+            CliCrashed,
+            ProcessTimeout,
+            ProcessKilled,
+            Cancelled,
+            NetworkError,
+            PermissionDenied,
+            OutputEmpty,
+            NothingDelivered,
+            Unknown,
+        ] {
+            for worker_owned_by_cortex in [true, false] {
+                let cause = classify_worker_failure(kind, worker_owned_by_cortex);
+                assert!(matches!(
+                    settle_attempt(cause),
+                    AttemptSettlement::Charge | AttemptSettlement::Absorb(_)
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn exam_integrity_failure_charges_iff_the_delivered_tree_is_the_cause() {
+        assert_eq!(
+            classify_exam_integrity_failure(true),
+            AttemptEndCause::ExamTampered
+        );
+        assert_eq!(
+            settle_attempt(classify_exam_integrity_failure(true)),
+            AttemptSettlement::Charge
+        );
+        assert_eq!(
+            classify_exam_integrity_failure(false),
+            AttemptEndCause::CortexCrash
+        );
+        assert_eq!(
+            settle_attempt(classify_exam_integrity_failure(false)),
+            AttemptSettlement::Absorb(AttemptEndCause::CortexCrash)
+        );
     }
 
     #[test]

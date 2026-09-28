@@ -1116,13 +1116,22 @@ impl Database {
     pub fn ledger_net_charge_for_attempt(&self, attempt_id: &str) -> Option<i64> {
         let charge_key = cortex_core::billing_binding::ChargeKey::for_attempt(attempt_id);
         let conn = self.conn();
+        // `charge_settled_cost` writes the subscription-bucket row under the
+        // BARE idempotency key (never a `:subscription` suffix) and, only
+        // when `from_pack > 0`, a second pack-bucket row under `{key}:pack`.
+        // A previous version of this query looked for `{key}:subscription`,
+        // which `charge_settled_cost` never writes, so it silently missed
+        // every attempt's subscription-bucket charge. `reason = 'spend'`
+        // excludes an `absorbed` (zero-amount) row from the sum, which
+        // matters once `absorb_attempt_cost` and this share the same
+        // `attempt:{id}` key prefix.
         let keys = [
-            format!("{}:subscription", charge_key.as_str()),
+            charge_key.as_str().to_string(),
             format!("{}:pack", charge_key.as_str()),
         ];
         let row = conn.query_row(
             "SELECT COUNT(*), COALESCE(SUM(amount), 0) FROM credit_transactions
-             WHERE idempotency_key IN (?1, ?2)",
+             WHERE idempotency_key IN (?1, ?2) AND reason = 'spend'",
             params![keys[0], keys[1]],
             |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
         );
@@ -1648,16 +1657,28 @@ impl Database {
                     })
                 });
 
-            // The attempt id this delivery ran under, read from the same
-            // `execution_jobs` row the egress read above came from. Best
-            // effort: a step executed before `execution_jobs` existed, or one
-            // whose worker never reported `StepStarted`, has no row, and the
-            // charge lookup below falls back to the pre-attempt-billing key.
+            // The attempt id this *sealed verification* ran under -- not
+            // whatever `execution_jobs` row happens to be the latest lease
+            // right now, which can already belong to a later re-lease than
+            // the one this verdict is about.
+            //
+            // `verification_runs.attempt` is the lease generation the
+            // verifier claimed under (`verify_delivery` passes
+            // `facts.attempt == job.lease_gen` into `claim_verification`), so
+            // the `verification_jobs` row for this exact `(run_id, step_id,
+            // lease_gen)` is the one that opened this verdict, and its
+            // `attempt_id` is the scheduler-minted id the settler and receipts
+            // key off of.
+            //
+            // Best effort: a step verified before `verification_jobs`
+            // existed has no row, and the charge lookup below falls back to
+            // the pre-attempt-billing key.
             let attempt_id: Option<String> = conn
                 .query_row(
-                    "SELECT attempt_id FROM execution_jobs WHERE run_id = ?1 AND step_id = ?2
-                     ORDER BY lease_gen DESC, submitted_at DESC LIMIT 1",
-                    params![run_id, step_id],
+                    "SELECT attempt_id FROM verification_jobs
+                     WHERE run_id = ?1 AND step_id = ?2 AND lease_gen = ?3
+                     LIMIT 1",
+                    params![run_id, step_id, attempt],
                     |r| r.get(0),
                 )
                 .ok();

@@ -364,9 +364,9 @@ mod verifier {
             &[],
         );
         db.update_run_status(&run_id, "running", None);
-        db.register_worker("worker-1", "user-1");
+        db.register_worker("worker-1", "user-1", false);
         let lease_gen = db
-            .lease_step(step_id, "worker-1", now + 600_000)
+            .lease_step(step_id, "worker-1", now + 600_000, "attempt-1")
             .expect("step leases");
         assert!(db.start_step(step_id, lease_gen));
         assert!(db.deliver_step(step_id, "a1", lease_gen, None, None, None, Some("c0ffee")));

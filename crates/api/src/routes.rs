@@ -513,6 +513,23 @@ pub async fn create_run(
         )
     })?;
 
+    // Item F of the M-D-0024 settlement redesign: production dispatch
+    // requires a usable provider gateway. Refusing here, before a run row
+    // even exists, is cheaper for the customer than accepting the run and
+    // letting every one of its steps discover the same thing one at a time
+    // in the scheduler's own `dispatch_money_gate` check (which still runs,
+    // for runs created before an outage started or outside this endpoint).
+    // No run means nothing downstream can be dispatched, leased or charged
+    // for a call that was never going to be possible.
+    if crate::is_production_env() && !crate::provider_gateway_http::is_gateway_on() {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse {
+                error: cortex_core::billing_binding::GATEWAY_DOWN_MESSAGE.into(),
+            }),
+        ));
+    }
+
     if req.task_id.is_some() || req.conversation_id.is_some() {
         if let (Some(task_id), Some(group_id)) = (req.task_id.as_deref(), req.group_id.as_deref()) {
             if !db.cortex_task_exists(&user.user_id, group_id, task_id) {

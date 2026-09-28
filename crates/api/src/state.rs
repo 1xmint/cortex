@@ -552,7 +552,7 @@ impl AppState {
                 &format!("{:?}", task.risk),
                 &task.objective,
             );
-            db.lease_step(&sid, &worker_id, lease_deadline_ms);
+            db.lease_step(&sid, &worker_id, lease_deadline_ms, &attempt_id);
             (rid, sid)
         } else {
             (Uuid::new_v4().to_string(), Uuid::new_v4().to_string())

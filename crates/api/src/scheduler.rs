@@ -378,7 +378,11 @@ async fn dispatch_step(state: &AppState, step: &StepRef) -> DispatchOutcome {
     let gateway_on = crate::provider_gateway_http::is_gateway_on();
     match cortex_core::billing_binding::dispatch_money_gate(crate::is_production_env(), gateway_on)
     {
-        cortex_core::billing_binding::DispatchGate::Allow => {}
+        cortex_core::billing_binding::DispatchGate::Allow => {
+            // Close out a prior outage's event, if this run had one open. A
+            // no-op unless the run's last gateway event was `gateway_down`.
+            db.record_gateway_recovered_event(&step.run_id);
+        }
         cortex_core::billing_binding::DispatchGate::AllowWithWarning => {
             if !gateway_on {
                 tracing::warn!(
@@ -394,6 +398,10 @@ async fn dispatch_step(state: &AppState, step: &StepRef) -> DispatchOutcome {
                 "{} (step stays pending, will retry next tick)",
                 cortex_core::billing_binding::GATEWAY_DOWN_MESSAGE
             );
+            // Run-visible, deduped once per run per outage — see
+            // `record_gateway_down_event`'s doc for why repeated ticks don't
+            // each write their own row.
+            db.record_gateway_down_event(&step.run_id);
             return DispatchOutcome::RetryLater;
         }
     }
@@ -652,7 +660,7 @@ async fn dispatch_step(state: &AppState, step: &StepRef) -> DispatchOutcome {
     // This sits upstream of F7: the step never reached a worker, let alone a
     // sandbox. It was found by wave 4 / Task 4, which is the first thing that
     // ever asked a step to actually run.
-    let lease_gen = match db.lease_step(&step.step_id, &worker_id, deadline) {
+    let lease_gen = match db.lease_step(&step.step_id, &worker_id, deadline, &attempt_id) {
         Some(g) => g,
         None => {
             // `lease_step`'s CAS only succeeds from 'pending' | 'ready' |
@@ -2867,7 +2875,7 @@ mod tests {
         // run candidate.
         let dir = tempfile::tempdir().unwrap();
         let db = Database::open(&dir.path().join("scheduler-zen.sqlite"));
-        db.register_worker("worker-zen", "user-zen");
+        db.register_worker("worker-zen", "user-zen", false);
         db.upsert_provider_capability("worker-zen", "user-zen", "zen", None);
 
         let step = StepRef {
@@ -2899,7 +2907,7 @@ mod tests {
         // so the step could not reach a model at all.
         let dir = tempfile::tempdir().unwrap();
         let db = Database::open(&dir.path().join("scheduler-claims.sqlite"));
-        db.register_worker("worker-both", "user-both");
+        db.register_worker("worker-both", "user-both", false);
         for provider in ["claude", "openai", "gemini"] {
             db.upsert_provider_capability("worker-both", "user-both", provider, None);
         }

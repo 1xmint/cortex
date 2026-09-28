@@ -249,7 +249,21 @@ async fn handle_worker_msg(
 
             // Persist to DB
             if let Some(db) = &state.db {
-                db.register_worker(worker_id, &user_id);
+                // `authenticate_worker` above already validated `token`; this
+                // second, idempotent lookup only recovers whether it was a
+                // Cortex-operated worker key, which does not escape that
+                // function's `Result<String, String>` (see M-D-0024 item D).
+                // A non-`cwk_` token (anonymous or Soma/Clerk) is never
+                // Cortex-operated.
+                let owned_by_cortex = crate::worker_key::is_worker_key(&token)
+                    && db
+                        .authenticate_worker_key(
+                            &crate::worker_key::hash_worker_key(&token),
+                            chrono::Utc::now().timestamp_millis(),
+                        )
+                        .map(|(_, owned)| owned)
+                        .unwrap_or(false);
+                db.register_worker(worker_id, &user_id, owned_by_cortex);
                 db.create_worker_session(session_id, worker_id);
 
                 for claim in &providers {
@@ -1477,6 +1491,7 @@ async fn authenticate_worker(state: &AppState, token: &str) -> Result<String, St
         // The revoked/expired filtering is in the SQL, not here.
         return db
             .authenticate_worker_key(&crate::worker_key::hash_worker_key(token), now)
+            .map(|(owner_user_id, _owned_by_cortex)| owner_user_id)
             .ok_or_else(|| "invalid worker key".to_string());
     }
 

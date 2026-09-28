@@ -318,7 +318,7 @@ const RUN_RESOURCE_LEASE_TTL_MS: i64 = 24 * 60 * 60 * 1000;
 ///
 /// Next migration author: bump this to match the new highest `migrate_vN`
 /// when you add one (see CONTRIBUTING.md's migration-counter section).
-pub const SCHEMA_VERSION: u32 = 72;
+pub const SCHEMA_VERSION: u32 = 73;
 
 /// A hash of the whole schema `open()` actually produces (every table, index,
 /// trigger and view in `sqlite_master`), pinned so a schema change that does
@@ -573,6 +573,66 @@ fn apply_migrations(conn: &Connection) {
     if current < 72 {
         migrate_v72(conn);
     }
+    if current < 73 {
+        migrate_v73(conn);
+    }
+}
+
+/// M-D-0024: the settlement redesign. Three independent additions, one
+/// migration because they all land together:
+///
+/// 1. `steps.server_attempt_id` — the scheduler-minted attempt id, stamped by
+///    `lease_step` in the SAME statement that grants the lease (see item A).
+///    Settlement, receipts and worker-message validation trust only this
+///    column, never a worker-reported attempt id. NULL for a step that has
+///    never been leased since this migration.
+/// 2. `worker_keys.owned_by_cortex` / `workers.owned_by_cortex` — both
+///    default 0 (false). A key is marked Cortex-operated only by an operator
+///    calling `mark_worker_key_cortex_owned` after `cortex-worker-key issue`
+///    mints it; there is deliberately no self-serve or CLI-flag path, so a
+///    customer's own worker can never end up flagged this way by mistake.
+///    `workers.owned_by_cortex` is a snapshot taken at `register_worker`
+///    time so a later key change cannot rewrite history for an
+///    already-dispatched attempt.
+/// 3. `attempt_endings` — the one durable "this attempt is over" record
+///    (item B). Every end path (`finish_and_bill`, `cancel_run`,
+///    `expire_stale_leases`, every `ws.rs` failure/rejection/block path)
+///    inserts here with `INSERT OR IGNORE` inside the same transaction as
+///    its own state change. `settle_pending_attempts` (item C) is the only
+///    thing that ever reads unsettled rows and charges or absorbs; nothing
+///    else charges directly any more. `worker_owned_by_cortex` snapshots
+///    `workers.owned_by_cortex` at end-time, so item D's classification
+///    functions never need to look anything else up. The partial index
+///    keeps the settler's per-tick scan cheap as the table grows.
+fn migrate_v73(conn: &Connection) {
+    conn.execute_batch(
+        "ALTER TABLE steps ADD COLUMN server_attempt_id TEXT;
+        ALTER TABLE worker_keys ADD COLUMN owned_by_cortex INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE workers ADD COLUMN owned_by_cortex INTEGER NOT NULL DEFAULT 0;
+
+        CREATE TABLE IF NOT EXISTS attempt_endings (
+            attempt_id             TEXT PRIMARY KEY,
+            user_id                TEXT NOT NULL,
+            step_id                TEXT NOT NULL,
+            cause                  TEXT NOT NULL,
+            worker_owned_by_cortex INTEGER NOT NULL DEFAULT 0,
+            ended_at               INTEGER NOT NULL,
+            settled_at             INTEGER,
+            last_error             TEXT
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_attempt_endings_unsettled
+            ON attempt_endings(settled_at)
+            WHERE settled_at IS NULL;
+
+        UPDATE schema_version SET version = 73;",
+    )
+    .expect("migration v73 failed adding settlement redesign tables/columns");
+
+    tracing::info!(
+        "applied migration v73: steps.server_attempt_id, worker_keys/workers.owned_by_cortex, \
+         attempt_endings"
+    );
 }
 
 fn migrate_v68(conn: &Connection) {
@@ -8891,12 +8951,26 @@ impl Database {
 
     // --- Workers ---
 
-    pub fn register_worker(&self, worker_id: &str, user_id: &str) {
+    /// `owned_by_cortex` records, at connection time, whether this worker
+    /// authenticated with a Cortex-operated worker key (see
+    /// `mark_worker_key_cortex_owned`) rather than a customer's own `cwk_`
+    /// key. Settlement's absorption classification (item D of the M-D-0024
+    /// settlement redesign) reads this column, snapshotted onto each
+    /// `attempt_endings` row at end-time, to decide whether a lease expiry
+    /// or infrastructure failure is Cortex's own machinery faulting (free)
+    /// or a customer's own worker failing (charged).
+    pub fn register_worker(&self, worker_id: &str, user_id: &str, owned_by_cortex: bool) {
         let conn = self.conn();
         let now = Utc::now().timestamp_millis();
         conn.execute(
-            "INSERT OR REPLACE INTO workers (id, user_id, status, created_at, last_seen) VALUES (?1, ?2, 'connected', ?3, ?3)",
-            params![worker_id, user_id, now],
+            "INSERT INTO workers (id, user_id, status, created_at, last_seen, owned_by_cortex)
+             VALUES (?1, ?2, 'connected', ?3, ?3, ?4)
+             ON CONFLICT(id) DO UPDATE SET
+                user_id = excluded.user_id,
+                status = 'connected',
+                last_seen = excluded.last_seen,
+                owned_by_cortex = excluded.owned_by_cortex",
+            params![worker_id, user_id, now, owned_by_cortex],
         )
         .map_err(|e| {
             // Same reasoning as `lease_step`: a worker that fails to persist
@@ -9257,6 +9331,76 @@ impl Database {
                 }),
             );
         }
+    }
+
+    /// Tell a run's own event stream that dispatch is blocked because the
+    /// provider gateway is off in production (item F of the M-D-0024
+    /// settlement redesign, `dispatch_money_gate`'s `Block` arm).
+    ///
+    /// Deduped once per run per outage: if the most recent gateway-related
+    /// event already on this run is itself `run.gateway_down`, every tick
+    /// that finds the same step still blocked would otherwise write a fresh
+    /// row, and a run stuck through a long outage would drown its own event
+    /// list in copies of the same fact. Only the transition into the outage
+    /// is worth a row; `record_gateway_recovered_event` writes the matching
+    /// transition out of it, which is what lets the next outage be noticed
+    /// again.
+    ///
+    /// Returns whether a new event was written, so a caller (and a test) can
+    /// tell "already noted" from "just noted" without a second query.
+    pub fn record_gateway_down_event(&self, run_id: &str) -> bool {
+        let conn = self.conn();
+        let last_state: Option<String> = conn
+            .query_row(
+                "SELECT event_type FROM operations_events
+                 WHERE run_id = ?1 AND event_type IN ('run.gateway_down', 'run.gateway_recovered')
+                 ORDER BY created_at DESC LIMIT 1",
+                params![run_id],
+                |row| row.get(0),
+            )
+            .ok();
+        if last_state.as_deref() == Some("run.gateway_down") {
+            return false;
+        }
+        insert_run_operations_event(
+            &conn,
+            run_id,
+            "run.gateway_down",
+            &serde_json::json!({
+                "message": cortex_core::billing_binding::GATEWAY_DOWN_MESSAGE,
+            }),
+        );
+        true
+    }
+
+    /// The matching close to [`Self::record_gateway_down_event`]: written
+    /// once dispatch for this run succeeds again, so a later outage is
+    /// noticed rather than swallowed by the earlier one's dedup.
+    ///
+    /// A no-op (no row written) unless the run's most recent gateway event is
+    /// actually `run.gateway_down` — a run that was never blocked, or whose
+    /// outage was already closed, has nothing to recover from.
+    pub fn record_gateway_recovered_event(&self, run_id: &str) -> bool {
+        let conn = self.conn();
+        let last_state: Option<String> = conn
+            .query_row(
+                "SELECT event_type FROM operations_events
+                 WHERE run_id = ?1 AND event_type IN ('run.gateway_down', 'run.gateway_recovered')
+                 ORDER BY created_at DESC LIMIT 1",
+                params![run_id],
+                |row| row.get(0),
+            )
+            .ok();
+        if last_state.as_deref() != Some("run.gateway_down") {
+            return false;
+        }
+        insert_run_operations_event(
+            &conn,
+            run_id,
+            "run.gateway_recovered",
+            &serde_json::json!({}),
+        );
+        true
     }
 
     /// Retrieve the branch name recorded for a run, if any.
@@ -9710,16 +9854,29 @@ impl Database {
         .collect()
     }
 
-    pub fn lease_step(&self, step_id: &str, worker_id: &str, deadline_ms: i64) -> Option<i64> {
+    /// Lease `step_id` to `worker_id`, stamping the scheduler-minted
+    /// `attempt_id` onto the step in the SAME statement that grants the
+    /// lease. This is the one moment the server records which attempt id is
+    /// authoritative for the new `(step_id, lease_gen)`: `steps.server_attempt_id`
+    /// is what settlement, receipts, and worker-message validation trust —
+    /// never a worker-reported id. See item A of the M-D-0024 settlement
+    /// redesign.
+    pub fn lease_step(
+        &self,
+        step_id: &str,
+        worker_id: &str,
+        deadline_ms: i64,
+        attempt_id: &str,
+    ) -> Option<i64> {
         let conn = self.conn();
         let now = Utc::now().timestamp_millis();
         let rows = conn
             .execute(
                 "UPDATE steps SET status = 'leased', assigned_worker = ?1, lease_deadline = ?2,
                  lease_gen = lease_gen + 1, attempt_count = attempt_count + 1,
-                 updated_at = ?3, version = version + 1
+                 updated_at = ?3, version = version + 1, server_attempt_id = ?5
              WHERE id = ?4 AND status IN ('pending', 'ready', 'orphaned')",
-                params![worker_id, deadline_ms, now, step_id],
+                params![worker_id, deadline_ms, now, step_id, attempt_id],
             )
             // A failed statement is **not** a lost race, and conflating them is
             // how this stayed hidden. `assigned_worker` is a foreign key onto
@@ -14483,7 +14640,8 @@ mod tests {
             .lease_step(
                 "step-running",
                 "worker-2",
-                Utc::now().timestamp_millis() + 60_000
+                Utc::now().timestamp_millis() + 60_000,
+                "attempt-cancelled-release"
             )
             .is_none());
     }
@@ -14597,7 +14755,7 @@ mod tests {
         let db = test_db();
         let run_id = db.create_run("user-1", "Exercise scheduler event coverage", "auto", &[]);
         for worker_id in ["worker-1", "worker-2", "worker-3", "worker-4"] {
-            db.register_worker(worker_id, "user-1");
+            db.register_worker(worker_id, "user-1", false);
         }
 
         let planned_step_id = "planned-by-scheduler";
@@ -14619,6 +14777,7 @@ mod tests {
                 &unleased_step,
                 "worker-1",
                 Utc::now().timestamp_millis() + 60_000,
+                "attempt-unleased",
             )
             .expect("lease step");
         assert!(db.unlease_step(&unleased_step, lease_gen));
@@ -14629,6 +14788,7 @@ mod tests {
                 &cancelled_step,
                 "worker-2",
                 Utc::now().timestamp_millis() + 60_000,
+                "attempt-cancelled",
             )
             .expect("lease step");
         assert!(db.start_step(&cancelled_step, cancelled_lease_gen));
@@ -14640,6 +14800,7 @@ mod tests {
                 &orphaned_step,
                 "worker-3",
                 Utc::now().timestamp_millis() + 60_000,
+                "attempt-orphaned",
             )
             .expect("lease step");
         assert!(db.start_step(&orphaned_step, orphaned_lease_gen));
@@ -14651,6 +14812,7 @@ mod tests {
                 &recovered_step,
                 "worker-4",
                 Utc::now().timestamp_millis() + 60_000,
+                "attempt-recovered",
             )
             .expect("lease step");
         assert!(db.fail_step(&recovered_step, recovered_lease_gen, "boom", None));
@@ -17058,15 +17220,15 @@ mod truth {
         assert!(!run_id.is_empty());
 
         assert_eq!(
-            db.lease_step("step-lease", "w-does-not-exist", now + 600_000),
+            db.lease_step("step-lease", "w-does-not-exist", now + 600_000, "attempt-1"),
             None,
             "leasing to a worker with no row must fail rather than corrupting the \
              foreign key"
         );
 
-        db.register_worker("w-real", "user-1");
+        db.register_worker("w-real", "user-1", false);
         let lease_gen = db
-            .lease_step("step-lease", "w-real", now + 600_000)
+            .lease_step("step-lease", "w-real", now + 600_000, "attempt-1")
             .expect("leasing to a registered worker must succeed");
         assert!(lease_gen > 0);
     }
@@ -17095,9 +17257,9 @@ mod truth {
             &[],
         );
         db.update_run_status(&run_id, "running", None);
-        db.register_worker("worker-1", "user-1");
+        db.register_worker("worker-1", "user-1", false);
         let lease_gen = db
-            .lease_step(step_id, "worker-1", now + 600_000)
+            .lease_step(step_id, "worker-1", now + 600_000, "attempt-1")
             .expect("step leases");
         assert!(db.start_step(step_id, lease_gen));
         (run_id, lease_gen)
@@ -17226,8 +17388,10 @@ mod truth {
             )],
         );
         db.update_run_status(&run_id, "running", None);
-        db.register_worker("worker-1", "user-1");
-        let gen = db.lease_step("step-a", "worker-1", now + 600_000).unwrap();
+        db.register_worker("worker-1", "user-1", false);
+        let gen = db
+            .lease_step("step-a", "worker-1", now + 600_000, "attempt-a")
+            .unwrap();
         assert!(db.start_step("step-a", gen));
         assert!(db.deliver_step("step-a", "a1", gen, None, None, None, Some("abc")));
 
@@ -17746,21 +17910,24 @@ impl Database {
     /// the check. `now_ms` is passed in rather than read here so a test can
     /// place a key in the past or the future without sleeping.
     ///
-    /// `last_used_at` is stamped only on a successful resolution, and its
-    /// failure is not fatal: an audit timestamp is not worth refusing a
-    /// worker that legitimately authenticated.
-    pub fn authenticate_worker_key(&self, key_hash: &str, now_ms: i64) -> Option<String> {
+    /// Returns `(owner_user_id, owned_by_cortex)`. `owned_by_cortex` is
+    /// `true` only for a key an operator has marked via
+    /// `mark_worker_key_cortex_owned` — every key starts `false`, including
+    /// one issued to a customer, so a Cortex-operated worker must be
+    /// explicitly marked after issuance. Callers pass this straight to
+    /// `register_worker`.
+    pub fn authenticate_worker_key(&self, key_hash: &str, now_ms: i64) -> Option<(String, bool)> {
         let conn = self.conn();
-        let owner: String = conn
+        let (owner, owned_by_cortex): (String, bool) = conn
             .query_row(
-                "SELECT owner_user_id
+                "SELECT owner_user_id, owned_by_cortex
                  FROM worker_keys
                  WHERE key_hash = ?1
                    AND revoked_at IS NULL
                    AND (expires_at IS NULL OR expires_at > ?2)
                  LIMIT 1",
                 params![key_hash, now_ms],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .ok()?;
 
@@ -17771,7 +17938,21 @@ impl Database {
             tracing::warn!("could not stamp worker key last_used_at: {e}");
         }
 
-        Some(owner)
+        Some((owner, owned_by_cortex))
+    }
+
+    /// Mark an already-issued worker key as Cortex-operated (as opposed to a
+    /// customer's own `cwk_` key). There is no self-serve or CLI flag for
+    /// this deliberately: it is an operator action taken once, out of band,
+    /// after `cortex-worker-key issue` mints the key for Cortex's own
+    /// infrastructure. Matches `revoke_worker_key`'s id-or-prefix lookup.
+    pub fn mark_worker_key_cortex_owned(&self, id_or_prefix: &str) -> usize {
+        let conn = self.conn();
+        conn.execute(
+            "UPDATE worker_keys SET owned_by_cortex = 1 WHERE id = ?1 OR key_prefix = ?1",
+            params![id_or_prefix],
+        )
+        .unwrap_or(0)
     }
 
     /// Revoke a worker key by its display prefix or id. Returns rows affected.

@@ -996,9 +996,9 @@ mod tests {
     fn seed_verifying_step(db: &Database, step_id: &str, head: &str) -> (String, i64) {
         let run_id = seed_run_and_step(db, step_id);
         db.update_run_status(&run_id, "running", None);
-        db.register_worker("worker-1", "user-1");
+        db.register_worker("worker-1", "user-1", false);
         let lease_gen = db
-            .lease_step(step_id, "worker-1", i64::MAX)
+            .lease_step(step_id, "worker-1", i64::MAX, "attempt-1")
             .expect("step leases");
         assert!(db.start_step(step_id, lease_gen));
         assert!(db.deliver_step(
