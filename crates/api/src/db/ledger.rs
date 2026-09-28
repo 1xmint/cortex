@@ -1760,7 +1760,10 @@ mod tests {
                 )
                 .expect("repeated charge");
             if charge.credits_charged > 0 {
-                assert_eq!(charge.credits_charged, 1, "one carry-crossing is one credit");
+                assert_eq!(
+                    charge.credits_charged, 1,
+                    "one carry-crossing is one credit"
+                );
                 assert_eq!(charge.new_carry_micro_usd, 11_105);
                 break;
             }
