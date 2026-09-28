@@ -1346,14 +1346,8 @@ mod tests {
 
         // Missing just one of the two required fields is just as unpriceable
         // as missing both.
-        assert_eq!(
-            parse_usage(&serde_json::json!({"input_tokens": 10})),
-            None
-        );
-        assert_eq!(
-            parse_usage(&serde_json::json!({"output_tokens": 10})),
-            None
-        );
+        assert_eq!(parse_usage(&serde_json::json!({"input_tokens": 10})), None);
+        assert_eq!(parse_usage(&serde_json::json!({"output_tokens": 10})), None);
 
         // A string-valued token count is not the integer this must be priced
         // from — refuse it rather than coerce or truncate it.
