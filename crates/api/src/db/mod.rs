@@ -605,12 +605,41 @@ fn apply_migrations(conn: &Connection) {
 ///    functions never need to look anything else up. The partial index
 ///    keeps the settler's per-tick scan cheap as the table grows.
 fn migrate_v73(conn: &Connection) {
-    conn.execute_batch(
-        "ALTER TABLE steps ADD COLUMN server_attempt_id TEXT;
-        ALTER TABLE worker_keys ADD COLUMN owned_by_cortex INTEGER NOT NULL DEFAULT 0;
-        ALTER TABLE workers ADD COLUMN owned_by_cortex INTEGER NOT NULL DEFAULT 0;
+    let has_column = |table: &str, column: &str| -> bool {
+        conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info(?1) WHERE name = ?2",
+            rusqlite::params![table, column],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap_or(0)
+            > 0
+    };
 
-        CREATE TABLE IF NOT EXISTS attempt_endings (
+    // Rewinding `schema_version` (as the billing_schema.rs regression test
+    // does, to re-exercise an earlier migration) re-runs every migration
+    // after the rewound-to version, not just the one whose columns were
+    // rolled back. These three `ADD COLUMN`s must therefore tolerate running
+    // again against a database that already has them — unlike
+    // `attempt_endings` and its index, which are already `IF NOT EXISTS`.
+    if !has_column("steps", "server_attempt_id") {
+        conn.execute_batch("ALTER TABLE steps ADD COLUMN server_attempt_id TEXT;")
+            .expect("migration v73 failed adding steps.server_attempt_id");
+    }
+    if !has_column("worker_keys", "owned_by_cortex") {
+        conn.execute_batch(
+            "ALTER TABLE worker_keys ADD COLUMN owned_by_cortex INTEGER NOT NULL DEFAULT 0;",
+        )
+        .expect("migration v73 failed adding worker_keys.owned_by_cortex");
+    }
+    if !has_column("workers", "owned_by_cortex") {
+        conn.execute_batch(
+            "ALTER TABLE workers ADD COLUMN owned_by_cortex INTEGER NOT NULL DEFAULT 0;",
+        )
+        .expect("migration v73 failed adding workers.owned_by_cortex");
+    }
+
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS attempt_endings (
             attempt_id             TEXT PRIMARY KEY,
             user_id                TEXT NOT NULL,
             step_id                TEXT NOT NULL,
