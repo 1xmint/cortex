@@ -260,6 +260,7 @@ impl ProviderTransport for StubTransport {
                 input_tokens: 1,
                 cached_input_tokens: 0,
                 output_tokens: 1,
+                ..Default::default()
             }),
         }))
     }
@@ -744,6 +745,7 @@ fn gateway_error_response(error: GatewayError) -> Response {
         GatewayError::UnsupportedProvider
         | GatewayError::ScopeMismatch
         | GatewayError::UnboundedRequest(_)
+        | GatewayError::UnpriceableFeature(_)
         | GatewayError::MissingRate => StatusCode::BAD_REQUEST,
         GatewayError::Reservation(_) => StatusCode::CONFLICT,
         GatewayError::CostOverflow

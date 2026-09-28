@@ -54,6 +54,7 @@ use cortex_core::routing::RiskLevel;
 use cortex_core::task::WorkKind;
 use cortex_core::task_class::TaskClass;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 /// Micros per US dollar. Prices are integers throughout: money that
 /// round-trips through an `f64` disagrees with itself at the third decimal, and
@@ -732,14 +733,19 @@ pub const CACHE_WRITE_1H_BP: i64 = 20_000;
 /// included, for [`cost_micro_usd`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct UsageTokens {
-    /// Total input tokens, including any that were served from cache. A
-    /// cache *read* is still an input token for billing purposes — it is
-    /// discounted, not free — so this is the full input count, not just the
-    /// uncached remainder.
+    /// Anthropic's `usage.input_tokens` **exactly**: the uncached, not
+    /// newly-cache-written remainder. Anthropic already reports
+    /// `cache_read_input_tokens` and `cache_creation_input_tokens`
+    /// separately from `input_tokens` — it is not a total that this field
+    /// needs to have anything subtracted from, and doing so would double
+    /// count the cache read/write tokens as *both* discounted and regular
+    /// input. See [`parse_usage`], the one place a wire `usage` object
+    /// becomes this type.
     pub input_tokens: i64,
     pub output_tokens: i64,
-    /// Of `input_tokens`, how many were served from a previously written
-    /// cache entry (Anthropic's `cache_read_input_tokens`).
+    /// How many tokens were served from a previously written cache entry
+    /// (Anthropic's `cache_read_input_tokens`). Separate from
+    /// `input_tokens`, not a subset of it.
     pub cache_read_tokens: i64,
     /// Tokens newly written to a 5-minute cache entry this call
     /// (`cache_creation.ephemeral_5m_input_tokens`, or the whole of
@@ -763,12 +769,14 @@ pub struct UsageTokens {
 /// `input_micros_per_1k` (1.25x for a 5-minute write, 2x for a 1-hour write —
 /// the same multiplier for every model on the published list, so there is no
 /// per-model field for it). A cache read is priced at `cache_read_bp` of the
-/// input rate, same as [`ModelPrice::cost_micros`]. Regular (uncached, not a
-/// write) input is `input_tokens - cache_read_tokens`, floored at zero so a
-/// caller's mismatched counts cannot underflow.
+/// input rate, same as [`ModelPrice::cost_micros`]. `usage.input_tokens` is
+/// Anthropic's own `usage.input_tokens` — already exclusive of both
+/// `cache_read_tokens` and any cache-write tokens — so it is billed at the
+/// regular rate as-is, with no subtraction: subtracting the cache counts
+/// from it would double-discount tokens Anthropic never counted as input in
+/// the first place.
 pub fn cost_micro_usd(rate: &ModelPrice, usage: &UsageTokens) -> u64 {
-    let regular_in = (usage.input_tokens - usage.cache_read_tokens).max(0);
-    let regular = regular_in * rate.input_micros_per_1k / 1_000;
+    let regular = usage.input_tokens.max(0) * rate.input_micros_per_1k / 1_000;
     let cached = usage.cache_read_tokens * rate.input_micros_per_1k * rate.cache_read_bp
         / (1_000 * BP_PER_WHOLE);
     let write_5m = usage.cache_write_5m_tokens * rate.input_micros_per_1k * CACHE_WRITE_5M_BP
@@ -778,6 +786,66 @@ pub fn cost_micro_usd(rate: &ModelPrice, usage: &UsageTokens) -> u64 {
     let out = usage.output_tokens * rate.output_micros_per_1k / 1_000;
     let total = regular + cached + write_5m + write_1h + out;
     total.max(0) as u64
+}
+
+/// Parse one Anthropic Messages `usage` JSON object into [`UsageTokens`].
+///
+/// Pure, and the one place a wire `usage` object is allowed to become this
+/// type — every supplier call site (`supplier_anthropic.rs` today) should go
+/// through this rather than reading the JSON fields itself, so there is one
+/// definition of what each field means and one thing a unit test has to
+/// pin.
+///
+/// Returns `None` — never a silent all-zero [`UsageTokens`] — unless both
+/// `input_tokens` and `output_tokens` are present and are actual JSON
+/// integers. Those two fields are what `pricing::cost_micro_usd` bills the
+/// bulk of a call on; a `usage` object that omits either one (`{}`, `null`,
+/// or a caller/proxy that mangled the field into a string) is not "no usage
+/// to report", it is unpriceable, and settling it at 0 would let that call
+/// through for free rather than staying unresolved for reconciliation like
+/// every other can't-price-it case (M-D-0023: a response Cortex cannot
+/// price must not settle at zero).
+///
+/// Only the cache fields default to `0` when absent: `cache_read_tokens`
+/// from `cache_read_input_tokens`, and the cache-write split from
+/// `cache_creation.ephemeral_5m_input_tokens` / `.ephemeral_1h_input_tokens`
+/// when Anthropic reports it, else the whole of `cache_creation_input_tokens`
+/// billed as a 5-minute write — the cheaper of the two multipliers — because
+/// a missing split must never cause an overcharge (M-D-0023: never round up,
+/// never guess dear). A `usage` object that omits cache fields entirely (no
+/// caching used) is common and correctly priced as zero cache activity, in
+/// contrast to `input_tokens`/`output_tokens` above.
+pub fn parse_usage(usage: &Value) -> Option<UsageTokens> {
+    let input_tokens = usage.get("input_tokens")?.as_i64()?;
+    let output_tokens = usage.get("output_tokens")?.as_i64()?;
+
+    let field = |name: &str| usage.get(name).and_then(Value::as_i64).unwrap_or(0);
+    let cache_read_tokens = field("cache_read_input_tokens");
+    let cache_creation_total = field("cache_creation_input_tokens");
+
+    let split = usage.get("cache_creation");
+    let short = split
+        .and_then(|s| s.get("ephemeral_5m_input_tokens"))
+        .and_then(Value::as_i64);
+    let long = split
+        .and_then(|s| s.get("ephemeral_1h_input_tokens"))
+        .and_then(Value::as_i64);
+
+    let (cache_write_5m_tokens, cache_write_1h_tokens) = match (short, long) {
+        (Some(short), Some(long)) => (short, long),
+        // No split reported: bill all of it at the cheaper 5-minute
+        // multiplier rather than guessing (or defaulting to) the dearer
+        // 1-hour rate — never overcharge on a missing split.
+        _ => (cache_creation_total, 0),
+    };
+
+    Some(UsageTokens {
+        input_tokens,
+        output_tokens,
+        cache_read_tokens,
+        cache_write_5m_tokens,
+        cache_write_1h_tokens,
+    })
 }
 
 /// Pass-through charge arithmetic (M-D-0023): deduct exactly the whole
@@ -1176,20 +1244,143 @@ mod tests {
             .into_iter()
             .find(|m| m.model_id == "claude-sonnet-5")
             .unwrap();
+        // `input_tokens` is Anthropic's own `usage.input_tokens` — already
+        // exclusive of `cache_read_tokens` and the cache-write tokens, so it
+        // is not a total any of the other fields subtract from.
         let usage = UsageTokens {
-            input_tokens: 3_000,
+            input_tokens: 2_000,
             output_tokens: 1_000,
             cache_read_tokens: 1_000,
             cache_write_5m_tokens: 500,
             cache_write_1h_tokens: 200,
         };
-        // uncached input: (3_000 - 1_000) tokens * 2_000 micros/1k = 4_000
+        // regular input: 2_000 tokens * 2_000 micros/1k = 4_000
         // cache read: 1_000 * 2_000 * 0.1 / 1k = 200
         // cache write 5m: 500 * 2_000 * 1.25 / 1k = 1_250
         // cache write 1h: 200 * 2_000 * 2 / 1k = 800
         // output: 1_000 * 10_000 / 1k = 10_000
         let expected = 4_000 + 200 + 1_250 + 800 + 10_000;
         assert_eq!(cost_micro_usd(&rate, &usage), expected as u64);
+    }
+
+    #[test]
+    fn parse_usage_reads_a_realistic_anthropic_body_with_the_cache_split() {
+        // A realistic `usage` object with the 5m/1h cache-creation split
+        // Anthropic reports today.
+        let usage = serde_json::json!({
+            "input_tokens": 1_200,
+            "output_tokens": 340,
+            "cache_read_input_tokens": 800,
+            "cache_creation_input_tokens": 900,
+            "cache_creation": {
+                "ephemeral_5m_input_tokens": 600,
+                "ephemeral_1h_input_tokens": 300,
+            }
+        });
+        let tokens = parse_usage(&usage).unwrap();
+        assert_eq!(
+            tokens,
+            UsageTokens {
+                input_tokens: 1_200,
+                output_tokens: 340,
+                cache_read_tokens: 800,
+                cache_write_5m_tokens: 600,
+                cache_write_1h_tokens: 300,
+            }
+        );
+
+        let rate = seed_models()
+            .into_iter()
+            .find(|m| m.model_id == "claude-sonnet-5")
+            .unwrap();
+        // regular input: 1_200 * 2_000 / 1_000 = 2_400
+        // cache read: 800 * 2_000 * 0.1 / 1_000 = 160
+        // cache write 5m: 600 * 2_000 * 1.25 / 1_000 = 1_500
+        // cache write 1h: 300 * 2_000 * 2 / 1_000 = 1_200
+        // output: 340 * 10_000 / 1_000 = 3_400
+        let expected = 2_400 + 160 + 1_500 + 1_200 + 3_400;
+        assert_eq!(cost_micro_usd(&rate, &tokens), expected as u64);
+    }
+
+    #[test]
+    fn parse_usage_without_the_cache_split_bills_every_write_at_the_cheaper_5m_rate() {
+        // Anthropic does not always report `cache_creation`'s 5m/1h split.
+        // M-D-0023: never guess the dearer rate — bill the whole write at
+        // 1.25x, never 2x, when the split is missing.
+        let usage = serde_json::json!({
+            "input_tokens": 500,
+            "output_tokens": 100,
+            "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 400,
+        });
+        let tokens = parse_usage(&usage).unwrap();
+        assert_eq!(
+            tokens,
+            UsageTokens {
+                input_tokens: 500,
+                output_tokens: 100,
+                cache_read_tokens: 0,
+                cache_write_5m_tokens: 400,
+                cache_write_1h_tokens: 0,
+            }
+        );
+
+        let rate = seed_models()
+            .into_iter()
+            .find(|m| m.model_id == "claude-sonnet-5")
+            .unwrap();
+        // regular input: 500 * 2_000 / 1_000 = 1_000
+        // cache write 5m (all of it, cheaper default): 400 * 2_000 * 1.25 / 1_000 = 1_000
+        // output: 100 * 10_000 / 1_000 = 1_000
+        let expected = 1_000 + 1_000 + 1_000;
+        assert_eq!(cost_micro_usd(&rate, &tokens), expected as u64);
+    }
+
+    #[test]
+    fn parse_usage_refuses_rather_than_zero_a_body_missing_input_or_output_tokens() {
+        // `{}` and `null` must never become `Some(UsageTokens::default())` —
+        // that would settle an unpriceable call at 0 instead of leaving it
+        // unresolved for reconciliation (M-D-0023).
+        assert_eq!(parse_usage(&serde_json::json!({})), None);
+        assert_eq!(parse_usage(&serde_json::json!(null)), None);
+
+        // Missing just one of the two required fields is just as unpriceable
+        // as missing both.
+        assert_eq!(parse_usage(&serde_json::json!({"input_tokens": 10})), None);
+        assert_eq!(parse_usage(&serde_json::json!({"output_tokens": 10})), None);
+
+        // A string-valued token count is not the integer this must be priced
+        // from — refuse it rather than coerce or truncate it.
+        assert_eq!(
+            parse_usage(&serde_json::json!({"input_tokens": "12", "output_tokens": 5})),
+            None
+        );
+        assert_eq!(
+            parse_usage(&serde_json::json!({"input_tokens": 12, "output_tokens": "5"})),
+            None
+        );
+    }
+
+    #[test]
+    fn parse_usage_defaults_only_the_cache_fields_to_zero_when_absent() {
+        // `input_tokens`/`output_tokens` present, every cache field absent
+        // (no caching used) is a common, legitimately-zero-cache-activity
+        // body, and must still parse — only the cache fields default here.
+        let tokens = parse_usage(&serde_json::json!({
+            "input_tokens": 500,
+            "output_tokens": 100
+        }))
+        .unwrap();
+        assert_eq!(
+            tokens,
+            UsageTokens {
+                input_tokens: 500,
+                output_tokens: 100,
+                cache_read_tokens: 0,
+                cache_write_5m_tokens: 0,
+                cache_write_1h_tokens: 0,
+            }
+        );
     }
 
     #[test]

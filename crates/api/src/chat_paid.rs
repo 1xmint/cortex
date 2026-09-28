@@ -1158,6 +1158,7 @@ mod tests {
                         input_tokens,
                         cached_input_tokens: 0,
                         output_tokens,
+                        ..Default::default()
                     }),
                 }),
             }
@@ -1499,6 +1500,7 @@ mod tests {
                 input_tokens,
                 cached_input_tokens: 0,
                 output_tokens,
+                ..Default::default()
             }),
         })
     }
@@ -2892,6 +2894,7 @@ mod tests {
                     input_tokens,
                     cached_input_tokens: 0,
                     output_tokens,
+                    ..Default::default()
                 }),
             }))
         }
@@ -3133,6 +3136,7 @@ mod tests {
                         input_tokens,
                         cached_input_tokens: 0,
                         output_tokens,
+                        ..Default::default()
                     }),
                 })
             }
