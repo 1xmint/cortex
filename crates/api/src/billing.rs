@@ -1567,8 +1567,9 @@ pub async fn stripe_webhook(
 /// amount that could exceed what was actually paid.
 ///
 /// Returns `Ok(())` for every non-retryable refusal: missing id, missing
-/// user, not yet paid, non-usd, a non-positive amount, a discount present,
-/// or an already-granted replay. These are not errors Stripe should retry —
+/// user, not yet paid, non-usd, a non-positive amount, a discount present, an
+/// amount that rounds down to zero credits, or an already-granted replay.
+/// These are not errors Stripe should retry —
 /// retrying would just repeat the same refusal. Returns `Err` only when
 /// [`crate::db::Database::grant_topup_credits`] itself fails (e.g. a
 /// database error), so the caller can turn that into a 5xx and let Stripe's
@@ -1637,6 +1638,15 @@ fn grant_credit_topup(
         return Ok(());
     }
     let credits_from_amount = amount_subtotal_cents / 10;
+    if credits_from_amount <= 0 {
+        tracing::error!(
+            session_id,
+            amount_subtotal_cents,
+            "credit topup amount_subtotal is under 10 cents, rounding down to zero \
+             credits; granting no credits"
+        );
+        return Ok(());
+    }
 
     if let Some(metadata_credits) = obj["metadata"]["credits"]
         .as_str()
@@ -1936,11 +1946,7 @@ mod topup_tests {
     // not `grant_credit_topup` directly, so signature verification and the
     // empty-secret guard are exercised too) ---
 
-    fn stripe_event_body(
-        event_id: &str,
-        event_type: &str,
-        session: &serde_json::Value,
-    ) -> Vec<u8> {
+    fn stripe_event_body(event_id: &str, event_type: &str, session: &serde_json::Value) -> Vec<u8> {
         serde_json::json!({
             "id": event_id,
             "type": event_type,

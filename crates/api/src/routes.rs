@@ -35,7 +35,7 @@ pub struct RouteResponse {
     pub decision: RoutingDecision,
 }
 
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 pub struct ErrorResponse {
     pub error: String,
 }
