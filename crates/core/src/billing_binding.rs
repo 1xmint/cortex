@@ -104,9 +104,7 @@ pub enum AttemptSettlement {
 pub fn settle_attempt(end_cause: AttemptEndCause) -> AttemptSettlement {
     use AttemptEndCause::*;
     match end_cause {
-        Verified | Unverified | Failed | ExamTampered | CustomerCancel => {
-            AttemptSettlement::Charge
-        }
+        Verified | Unverified | Failed | ExamTampered | CustomerCancel => AttemptSettlement::Charge,
         RunnerDown | LeaseExpired | CortexCrash => AttemptSettlement::Absorb(end_cause),
     }
 }

@@ -457,8 +457,10 @@ async fn finish_and_bill(
             }
         }
         AttemptSettlement::Absorb(cause) => {
-            let description =
-                format!("{}: {cause:?}", billing_binding::reason::TASK_ATTEMPT_ABSORBED);
+            let description = format!(
+                "{}: {cause:?}",
+                billing_binding::reason::TASK_ATTEMPT_ABSORBED
+            );
             match db.absorb_attempt_cost(&user_id, cost_micro_usd, &description, &key) {
                 Ok(()) => tracing::info!(
                     run_id = %facts.run_id,

@@ -676,7 +676,10 @@ impl Database {
             )
             .unwrap_or(0);
         if already > 0 {
-            tracing::debug!(idempotency_key, "absorbed-cost record replayed; nothing written again");
+            tracing::debug!(
+                idempotency_key,
+                "absorbed-cost record replayed; nothing written again"
+            );
             return Ok(());
         }
 
@@ -787,8 +790,10 @@ impl Database {
                 }
             }
             AttemptSettlement::Absorb(cause) => {
-                let description =
-                    format!("{}: {cause:?}", billing_binding::reason::TASK_ATTEMPT_ABSORBED);
+                let description = format!(
+                    "{}: {cause:?}",
+                    billing_binding::reason::TASK_ATTEMPT_ABSORBED
+                );
                 match self.absorb_attempt_cost(clerk_user_id, cost_micro_usd, &description, &key) {
                     Ok(()) => tracing::info!(
                         attempt_id,
@@ -1657,7 +1662,14 @@ impl Database {
                 )
                 .ok();
 
-            (verification_id, attempt, tree_hash, executions, egress, attempt_id)
+            (
+                verification_id,
+                attempt,
+                tree_hash,
+                executions,
+                egress,
+                attempt_id,
+            )
         };
 
         // Declared at plan time, before this step ran -- read back from the
@@ -2709,7 +2721,10 @@ mod tests {
     #[test]
     fn an_attempt_with_no_provider_calls_owes_nothing() {
         let db = test_db();
-        assert_eq!(db.attempt_settled_cost_micro_usd("attempt-never-dispatched"), 0);
+        assert_eq!(
+            db.attempt_settled_cost_micro_usd("attempt-never-dispatched"),
+            0
+        );
     }
 
     #[test]
@@ -2757,7 +2772,11 @@ mod tests {
         // Never dispatched far enough to make a priced call -- there is
         // nothing to charge and nothing to absorb, so this must be silent:
         // no ledger row, whether the cause would have charged or absorbed.
-        db.settle_ended_attempt(user, "attempt-nothing-spent", AttemptEndCause::CustomerCancel);
+        db.settle_ended_attempt(
+            user,
+            "attempt-nothing-spent",
+            AttemptEndCause::CustomerCancel,
+        );
         db.settle_ended_attempt(user, "attempt-nothing-spent-2", AttemptEndCause::RunnerDown);
 
         assert_eq!(db.get_credit_balance(user).subscription_remaining, 1_000);
@@ -2775,7 +2794,10 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(rows, 0, "an attempt with no settled calls must write no ledger row");
+        assert_eq!(
+            rows, 0,
+            "an attempt with no settled calls must write no ledger row"
+        );
     }
 
     #[test]
