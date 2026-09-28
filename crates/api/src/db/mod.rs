@@ -10994,7 +10994,10 @@ impl Database {
 
         tx.commit().expect("expire_stale_leases: commit");
 
-        candidates.into_iter().map(|(step_id, ..)| step_id).collect()
+        candidates
+            .into_iter()
+            .map(|(step_id, ..)| step_id)
+            .collect()
     }
 
     pub fn expire_stale_resource_leases(&self) -> Vec<String> {

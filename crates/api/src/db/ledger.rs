@@ -683,8 +683,13 @@ impl Database {
         conn.execute("BEGIN IMMEDIATE", [])
             .map_err(|e| format!("failed to begin transaction: {e}"))?;
 
-        match Self::absorb_attempt_cost_in_tx(&conn, clerk_user_id, cost_micro_usd, description, key)
-        {
+        match Self::absorb_attempt_cost_in_tx(
+            &conn,
+            clerk_user_id,
+            cost_micro_usd,
+            description,
+            key,
+        ) {
             Ok(()) => {
                 conn.execute("COMMIT", [])
                     .map_err(|e| format!("failed to commit transaction: {e}"))?;
@@ -758,7 +763,9 @@ impl Database {
                 params![attempt_id],
                 |row| row.get(0),
             )
-            .map_err(|e| format!("failed to check reservation readiness for attempt {attempt_id}: {e}"))?;
+            .map_err(|e| {
+                format!("failed to check reservation readiness for attempt {attempt_id}: {e}")
+            })?;
         if blocking > 0 {
             return Err(format!(
                 "attempt {attempt_id} has {blocking} reservation(s) still reserved/unresolved/mismatched; not ready to settle"
@@ -888,7 +895,13 @@ impl Database {
                         "{}: {cause:?}",
                         billing_binding::reason::TASK_ATTEMPT_ABSORBED
                     );
-                    Self::absorb_attempt_cost_in_tx(conn, &user_id, cost_micro_usd, &description, &key)?;
+                    Self::absorb_attempt_cost_in_tx(
+                        conn,
+                        &user_id,
+                        cost_micro_usd,
+                        &description,
+                        &key,
+                    )?;
                 }
             }
         }
@@ -3037,7 +3050,13 @@ mod tests {
         let claims = attempt_capability(&db, "attempt-replay");
         settle_call(&db, &claims, "replay-1", 300_000);
 
-        end_and_settle_attempt(&db, user, "attempt-replay", "step-replay", AttemptEndCause::Verified);
+        end_and_settle_attempt(
+            &db,
+            user,
+            "attempt-replay",
+            "step-replay",
+            AttemptEndCause::Verified,
+        );
         assert_eq!(db.get_credit_balance(user).subscription_remaining, 997);
         assert_eq!(db.get_credit_carry_micro_usd(user), 0);
 
@@ -3046,7 +3065,13 @@ mod tests {
         // `attempt_endings` insert a no-op on the same primary key, and even
         // if it weren't, `ChargeKey::for_attempt` makes the second charge see
         // its own idempotency key already spent and write nothing further.
-        end_and_settle_attempt(&db, user, "attempt-replay", "step-replay", AttemptEndCause::Verified);
+        end_and_settle_attempt(
+            &db,
+            user,
+            "attempt-replay",
+            "step-replay",
+            AttemptEndCause::Verified,
+        );
         assert_eq!(db.get_credit_balance(user).subscription_remaining, 997);
         assert_eq!(db.get_credit_carry_micro_usd(user), 0);
     }
@@ -3107,7 +3132,13 @@ mod tests {
         let claims = attempt_capability(&db, "attempt-absorb");
         settle_call(&db, &claims, "absorb-1", 300_000);
 
-        end_and_settle_attempt(&db, user, "attempt-absorb", "step-absorb", AttemptEndCause::RunnerDown);
+        end_and_settle_attempt(
+            &db,
+            user,
+            "attempt-absorb",
+            "step-absorb",
+            AttemptEndCause::RunnerDown,
+        );
 
         assert_eq!(
             db.get_credit_balance(user).subscription_remaining,

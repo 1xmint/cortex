@@ -175,7 +175,8 @@ fn a_failed_attempt_that_never_spent_anything_has_no_billing_effect_authored() {
         false,
     )
     .expect("record attempt ended");
-    db.settle_pending_attempts().expect("settle pending attempts");
+    db.settle_pending_attempts()
+        .expect("settle pending attempts");
 
     let (sub_total, pack_total) = db.credit_ledger_totals(user);
     assert_eq!(
@@ -205,7 +206,8 @@ fn a_failed_attempt_that_never_spent_anything_has_no_billing_effect_strong() {
         false,
     )
     .expect("record attempt ended");
-    db.settle_pending_attempts().expect("settle pending attempts");
+    db.settle_pending_attempts()
+        .expect("settle pending attempts");
 
     let (sub_total, pack_total) = db.credit_ledger_totals(user);
     assert_eq!(sub_total + pack_total, 0);

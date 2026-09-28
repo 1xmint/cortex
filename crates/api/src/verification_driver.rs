@@ -425,8 +425,13 @@ async fn finish_and_bill(
     // CortexCrash/RunnerDown) -- `settle_attempt` maps those directly with no
     // dependence on worker ownership. `false` is the schema's own default for
     // a record where the field is not meaningful.
-    if let Err(e) = db.record_attempt_ended(&facts.attempt_id, &user_id, &facts.step_id, end_cause, false)
-    {
+    if let Err(e) = db.record_attempt_ended(
+        &facts.attempt_id,
+        &user_id,
+        &facts.step_id,
+        end_cause,
+        false,
+    ) {
         tracing::error!(
             run_id = %facts.run_id,
             step_id = %facts.step_id,

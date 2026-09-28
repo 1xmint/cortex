@@ -2234,7 +2234,12 @@ mod attempt_end_paths {
              must never produce an attempt_endings row"
         );
         assert_eq!(
-            state.db.as_ref().unwrap().get_step_status(&step_id).as_deref(),
+            state
+                .db
+                .as_ref()
+                .unwrap()
+                .get_step_status(&step_id)
+                .as_deref(),
             Some("leased"),
             "the step must be untouched when the reported attempt id is rejected"
         );
@@ -2313,7 +2318,12 @@ mod attempt_end_paths {
              must never produce an attempt_endings row"
         );
         assert_eq!(
-            state.db.as_ref().unwrap().get_step_status(&step_id).as_deref(),
+            state
+                .db
+                .as_ref()
+                .unwrap()
+                .get_step_status(&step_id)
+                .as_deref(),
             Some("leased"),
             "the step must be untouched when the reported attempt id is rejected"
         );
