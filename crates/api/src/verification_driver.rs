@@ -25,15 +25,19 @@
 //!    working directory: the moment a worker can influence its own verdict the
 //!    product claim is void.
 //! 4. Execute, record, compute the verdict, seal it.
-//! 5. Settle the attempt: sum its settled observed provider cost and either
-//!    charge it (via `ChargeKey::for_attempt`, so a replay of the same
-//!    attempt writes no second row) or absorb it against Cortex.
+//! 5. Record the attempt's end durably (`attempt_endings`, the single source
+//!    of truth that it ended and why) and settle it: sum its settled observed
+//!    provider cost and either charge it (via `ChargeKey::for_attempt`, so a
+//!    replay of the same attempt writes no second row) or absorb it against
+//!    Cortex. The record and the settlement are two separate, idempotent
+//!    steps — see [`crate::db::Database::settle_pending_attempts`] — so a
+//!    crash between them still leaves a trail the scheduler finishes later.
 //!
 //! See `cortex/plan/VERIFIER.md` and `cortex/plan/V3-LAUNCH-SPEC.md`.
 
 use std::path::{Path, PathBuf};
 
-use cortex_core::billing_binding::{self, AttemptEndCause, AttemptSettlement};
+use cortex_core::billing_binding::AttemptEndCause;
 use cortex_core::check_derivation::EcosystemFacts;
 use cortex_core::diff_surface::{self, ClassOutcome, VerdictClass};
 use cortex_core::verification::{
@@ -62,11 +66,11 @@ pub struct DeliveryFacts {
     /// The commit the worker delivered. This is what gets graded.
     pub head_commit: String,
     /// Credits quoted for this step at dispatch time, kept for display only.
-    /// **Not what the customer is charged** — `finish_and_bill` charges the
-    /// attempt's actual settled observed provider cost
-    /// (`Database::attempt_settled_cost_micro_usd`) via `settle_attempt`,
-    /// never this quote. `None` means no quote was reachable; that has no
-    /// effect on billing either way.
+    /// **Not what the customer is charged** — `finish_and_bill` records the
+    /// attempt's end and `settle_pending_attempts` settles it from the
+    /// attempt's actual settled observed provider cost, never this quote.
+    /// `None` means no quote was reachable; that has no effect on billing
+    /// either way.
     pub quoted_credits: Option<i64>,
 }
 
@@ -291,7 +295,8 @@ pub async fn verify_delivery<R: CheckRunner>(
 }
 
 /// Seal an integrity refusal without reaching the runner, then settle the
-/// attempt for the given cause (see [`billing_binding::settle_attempt`]).
+/// attempt for the given cause (see
+/// [`cortex_core::billing_binding::settle_attempt`]).
 async fn finish_inconclusive_without_grading(
     db: &Database,
     verification_id: &str,
@@ -383,9 +388,20 @@ async fn run_with_retries<R: CheckRunner>(
     }
 }
 
-/// Seal the verdict, then settle the attempt: charge its settled observed
-/// cost to the customer, or have Cortex absorb it. Never a refund — see the
-/// module doc comment and [`billing_binding::settle_attempt`].
+/// Seal the verdict, then record the attempt's end durably and settle it:
+/// charge its settled observed cost to the customer, or have Cortex absorb
+/// it. Never a refund — see the module doc comment and
+/// [`cortex_core::billing_binding::settle_attempt`].
+///
+/// This no longer computes the settled cost or writes the ledger row itself.
+/// It writes one `attempt_endings` row (the durable, single source of truth
+/// that this attempt ended and why) and then runs the shared settler,
+/// [`Database::settle_pending_attempts`], immediately — so the ledger still
+/// reflects the outcome by the time this returns, matching every existing
+/// caller's and test's expectations. Splitting the record from the charge
+/// this way means a crash between the two still leaves a durable trail: the
+/// scheduler's tick and startup passes call the same settler and will finish
+/// the job even if this in-request call never returns.
 async fn finish_and_bill(
     db: &Database,
     verification_id: &str,
@@ -398,86 +414,38 @@ async fn finish_and_bill(
         return;
     }
 
-    // An attempt that never made a settled provider call writes no ledger
-    // row at all, whether it would have been charged or absorbed — there is
-    // nothing to charge and nothing to absorb.
-    let cost_micro_usd = db.attempt_settled_cost_micro_usd(&facts.attempt_id);
-    if cost_micro_usd == 0 {
-        tracing::debug!(
+    let Some(user_id) = db.get_run_user_id(&facts.run_id) else {
+        tracing::warn!(run_id = %facts.run_id, "no owner for run; skipping attempt-ended record");
+        return;
+    };
+
+    // `worker_owned_by_cortex` only matters to `classify_lease_expiry` and
+    // `classify_worker_failure`, neither of which produces the causes this
+    // module ever passes here (Verified/Unverified/Failed/ExamTampered/
+    // CortexCrash/RunnerDown) -- `settle_attempt` maps those directly with no
+    // dependence on worker ownership. `false` is the schema's own default for
+    // a record where the field is not meaningful.
+    if let Err(e) = db.record_attempt_ended(&facts.attempt_id, &user_id, &facts.step_id, end_cause, false)
+    {
+        tracing::error!(
             run_id = %facts.run_id,
             step_id = %facts.step_id,
             attempt_id = %facts.attempt_id,
-            ?verdict,
-            ?end_cause,
-            "attempt made no settled provider calls; no ledger row"
+            error = %e,
+            "failed to record attempt ending"
         );
         return;
     }
 
-    let Some(user_id) = db.get_run_user_id(&facts.run_id) else {
-        tracing::warn!(run_id = %facts.run_id, "no owner for run; skipping ledger write");
-        return;
-    };
-
-    let key = billing_binding::ChargeKey::for_attempt(&facts.attempt_id);
-
-    match billing_binding::settle_attempt(end_cause) {
-        AttemptSettlement::Charge => {
-            let Some(price_list) = db.active_price_list() else {
-                tracing::error!(
-                    run_id = %facts.run_id,
-                    step_id = %facts.step_id,
-                    attempt_id = %facts.attempt_id,
-                    "no active price list; cannot convert the attempt's observed cost to credits"
-                );
-                return;
-            };
-            match db.charge_settled_cost(
-                &user_id,
-                cost_micro_usd,
-                price_list.micros_per_credit,
-                billing_binding::reason::TASK_ATTEMPT_CHARGED,
-                &key,
-            ) {
-                Ok(settled) => tracing::info!(
-                    run_id = %facts.run_id,
-                    verification_id,
-                    attempt_id = %facts.attempt_id,
-                    cost_micro_usd,
-                    credits_charged = settled.credits_charged,
-                    ?end_cause,
-                    "charged the attempt's settled observed cost"
-                ),
-                Err(e) => tracing::error!(
-                    run_id = %facts.run_id,
-                    verification_id,
-                    error = %e,
-                    "settled-cost charge failed"
-                ),
-            }
-        }
-        AttemptSettlement::Absorb(cause) => {
-            let description = format!(
-                "{}: {cause:?}",
-                billing_binding::reason::TASK_ATTEMPT_ABSORBED
-            );
-            match db.absorb_attempt_cost(&user_id, cost_micro_usd, &description, &key) {
-                Ok(()) => tracing::info!(
-                    run_id = %facts.run_id,
-                    verification_id,
-                    attempt_id = %facts.attempt_id,
-                    cost_micro_usd,
-                    ?cause,
-                    "absorbed the attempt's settled observed cost"
-                ),
-                Err(e) => tracing::error!(
-                    run_id = %facts.run_id,
-                    verification_id,
-                    error = %e,
-                    "failed to record the absorbed cost"
-                ),
-            }
-        }
+    if let Err(e) = db.settle_pending_attempts() {
+        tracing::error!(
+            run_id = %facts.run_id,
+            verification_id,
+            attempt_id = %facts.attempt_id,
+            error = %e,
+            "settle_pending_attempts failed after recording attempt ending; \
+             the scheduler's next tick will retry"
+        );
     }
 }
 

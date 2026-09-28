@@ -30,6 +30,130 @@ pub struct Database {
     conn: Mutex<Connection>,
 }
 
+/// The stable, storage-level spelling of an [`AttemptEndCause`]
+/// (`cortex_core::billing_binding`) — the `attempt_endings.cause` column and
+/// `settle_pending_attempts`'s replay of it. Kept separate from `serde`'s own
+/// snake_case rendering of the enum: a database column's format is a contract
+/// with rows already on disk, and must not silently drift if the enum's
+/// `#[serde]` attributes ever change for an unrelated (e.g. wire-format)
+/// reason. Exhaustive match with no default arm, so a new cause added to the
+/// enum fails to compile here until this table is updated too.
+pub(crate) fn attempt_end_cause_str(
+    cause: cortex_core::billing_binding::AttemptEndCause,
+) -> &'static str {
+    use cortex_core::billing_binding::AttemptEndCause::*;
+    match cause {
+        Verified => "verified",
+        Unverified => "unverified",
+        Failed => "failed",
+        ExamTampered => "exam_tampered",
+        CustomerCancel => "customer_cancel",
+        RunnerDown => "runner_down",
+        LeaseExpired => "lease_expired",
+        CortexCrash => "cortex_crash",
+        WorkerInfraDown => "worker_infra_down",
+    }
+}
+
+/// The inverse of [`attempt_end_cause_str`]. `None` for a value this build
+/// does not recognise (an older or newer row's cause) — the settler treats
+/// that as an error, not a guess.
+pub(crate) fn attempt_end_cause_from_str(
+    s: &str,
+) -> Option<cortex_core::billing_binding::AttemptEndCause> {
+    use cortex_core::billing_binding::AttemptEndCause::*;
+    Some(match s {
+        "verified" => Verified,
+        "unverified" => Unverified,
+        "failed" => Failed,
+        "exam_tampered" => ExamTampered,
+        "customer_cancel" => CustomerCancel,
+        "runner_down" => RunnerDown,
+        "lease_expired" => LeaseExpired,
+        "cortex_crash" => CortexCrash,
+        "worker_infra_down" => WorkerInfraDown,
+        _ => return None,
+    })
+}
+
+impl Database {
+    /// Record, durably and exactly once, that an attempt ended and why.
+    ///
+    /// Every path that ends an attempt (a sealed verdict, a customer cancel,
+    /// a lease expiry, a worker-reported failure, a rejected verifier
+    /// outcome, ...) calls this **inside the same transaction** as its own
+    /// state change, so the ending is never lost to a crash between the two.
+    /// `INSERT OR IGNORE` on the `attempt_id` primary key means the first
+    /// ending wins outright: if two different end paths race for the same
+    /// attempt (a cancel landing the instant a verdict seals), whichever
+    /// commits first is the cause that gets billed, and the second is a
+    /// silent no-op rather than a second, contradictory row. The actual
+    /// ledger effect happens later, out of band, in
+    /// [`Database::settle_pending_attempts`] — never here.
+    pub(crate) fn insert_attempt_ending_in_tx(
+        conn: &Connection,
+        attempt_id: &str,
+        user_id: &str,
+        step_id: &str,
+        cause: cortex_core::billing_binding::AttemptEndCause,
+        worker_owned_by_cortex: bool,
+        now: i64,
+    ) -> rusqlite::Result<()> {
+        conn.execute(
+            "INSERT OR IGNORE INTO attempt_endings
+                (attempt_id, user_id, step_id, cause, worker_owned_by_cortex, ended_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                attempt_id,
+                user_id,
+                step_id,
+                attempt_end_cause_str(cause),
+                worker_owned_by_cortex as i64,
+                now,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Standalone wrapper around [`Self::insert_attempt_ending_in_tx`] for a
+    /// caller that has no transaction of its own already open — a step's end
+    /// path that is not otherwise writing to the database in the same breath
+    /// (an integration test driving the real entry point rather than a
+    /// hand-rolled substitute; a future end path with nothing else to commit
+    /// alongside it). Opens and closes its own transaction; a caller that
+    /// already holds one (`cancel_run`, `expire_stale_leases`) should call
+    /// [`Self::insert_attempt_ending_in_tx`] directly instead, so the ending
+    /// lands atomically with its own state change rather than in a second,
+    /// separately-committed transaction.
+    pub fn record_attempt_ended(
+        &self,
+        attempt_id: &str,
+        user_id: &str,
+        step_id: &str,
+        cause: cortex_core::billing_binding::AttemptEndCause,
+        worker_owned_by_cortex: bool,
+    ) -> Result<(), String> {
+        let now = Utc::now().timestamp_millis();
+        let mut conn = self.conn();
+        let tx = conn
+            .transaction()
+            .map_err(|e| format!("failed to begin transaction: {e}"))?;
+        Self::insert_attempt_ending_in_tx(
+            &tx,
+            attempt_id,
+            user_id,
+            step_id,
+            cause,
+            worker_owned_by_cortex,
+            now,
+        )
+        .map_err(|e| format!("failed to record attempt ending: {e}"))?;
+        tx.commit()
+            .map_err(|e| format!("failed to commit transaction: {e}"))?;
+        Ok(())
+    }
+}
+
 // --- Conversation types (existing) ---
 
 #[derive(Debug, Serialize, Clone)]
@@ -9011,6 +9135,23 @@ impl Database {
         .ok();
     }
 
+    /// Whether `worker_id` authenticated with a Cortex-operated worker key
+    /// (see [`Self::register_worker`]'s doc comment). Used to classify a
+    /// lease expiry or infrastructure failure as Cortex's own machinery
+    /// faulting (absorbed) versus a customer's own worker failing (charged)
+    /// -- see `cortex_core::billing_binding::classify_worker_failure` and
+    /// `classify_lease_expiry`. `false` (charged) if the worker is unknown,
+    /// matching the schema's own default for the column.
+    pub fn worker_owned_by_cortex(&self, worker_id: &str) -> bool {
+        let conn = self.conn();
+        conn.query_row(
+            "SELECT owned_by_cortex FROM workers WHERE id = ?1",
+            params![worker_id],
+            |row| row.get::<_, bool>(0),
+        )
+        .unwrap_or(false)
+    }
+
     pub fn update_worker_seen(&self, worker_id: &str) {
         let conn = self.conn();
         let now = Utc::now().timestamp_millis();
@@ -9606,11 +9747,18 @@ impl Database {
 
         // Steps already leased/running are the ones a worker may be spending
         // money on right now; the caller needs their worker + lease_gen to
-        // signal the worker and to record their partial usage.
-        let in_flight: Vec<(String, Option<String>, i64)> = tx
+        // signal the worker and to record their partial usage. Also pull each
+        // step's scheduler-minted `server_attempt_id` (never a worker-reported
+        // id) and its worker's `owned_by_cortex` snapshot here, while status is
+        // still 'leased'/'running', so the attempt_endings row inserted below
+        // can be written in this same transaction.
+        let in_flight_full: Vec<(String, Option<String>, i64, Option<String>, bool)> = tx
             .prepare(
-                "SELECT id, assigned_worker, lease_gen FROM steps
-                 WHERE run_id = ?1 AND status IN ('leased', 'running')",
+                "SELECT steps.id, steps.assigned_worker, steps.lease_gen,
+                        steps.server_attempt_id, COALESCE(workers.owned_by_cortex, 0)
+                 FROM steps
+                 LEFT JOIN workers ON workers.id = steps.assigned_worker
+                 WHERE steps.run_id = ?1 AND steps.status IN ('leased', 'running')",
             )
             .and_then(|mut stmt| {
                 stmt.query_map(params![run_id], |row| {
@@ -9618,11 +9766,18 @@ impl Database {
                         row.get::<_, String>(0)?,
                         row.get::<_, Option<String>>(1)?,
                         row.get::<_, i64>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, bool>(4)?,
                     ))
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()
             })
             .map_err(|err| CancelError::Internal(err.to_string()))?;
+
+        let in_flight: Vec<(String, Option<String>, i64)> = in_flight_full
+            .iter()
+            .map(|(step_id, worker, lease_gen, _, _)| (step_id.clone(), worker.clone(), *lease_gen))
+            .collect();
 
         // Everything still queued or in flight gets cancelled. Delivered and
         // verifying steps are deliberately excluded: their verdict is already
@@ -9696,32 +9851,34 @@ impl Database {
         update_run_status_tx(&tx, run_id, "cancelled", Some(reason), now)
             .map_err(|err| CancelError::Internal(err.to_string()))?;
 
-        tx.commit()
-            .map_err(|err| CancelError::Internal(err.to_string()))?;
-
-        // Release the connection lock before settling attempts below: each
-        // settlement call re-acquires it via `self.conn()`, and this mutex
-        // (a single shared `Connection` behind a `MutexGuard`) is not
-        // reentrant — holding `conn` here while calling back into `self`
-        // would deadlock.
-        drop(conn);
-
         // A step that was leased or running when the run was cancelled may
-        // already have made priced provider calls; settle its attempt now as
-        // a customer-initiated cancellation (charge or absorb, never a
-        // refund — see `billing_binding::settle_attempt`). `execution_jobs`
-        // is the only place `(step_id, lease_gen)` maps to the attempt's UUID
-        // id: no row there means the worker never got far enough to spend
-        // anything, so there is nothing to settle.
-        for (step_id, _worker, lease_gen) in &in_flight {
-            if let Some(attempt_id) = self.attempt_id_for_step_lease(step_id, *lease_gen) {
-                self.settle_ended_attempt(
+        // already have made priced provider calls. Record the ending now,
+        // inside this same transaction, as a customer-initiated cancellation
+        // (charge or absorb later, never a refund — see
+        // `billing_binding::settle_attempt`); `settle_pending_attempts` (item
+        // C) is the only thing that later charges or absorbs it. A NULL
+        // `server_attempt_id` means the step was never leased since the
+        // settlement-redesign migration (or never leased at all), so there is
+        // nothing to settle.
+        for (step_id, _worker, _lease_gen, server_attempt_id, worker_owned_by_cortex) in
+            &in_flight_full
+        {
+            if let Some(attempt_id) = server_attempt_id {
+                Self::insert_attempt_ending_in_tx(
+                    &tx,
+                    attempt_id,
                     user_id,
-                    &attempt_id,
+                    step_id,
                     cortex_core::billing_binding::AttemptEndCause::CustomerCancel,
-                );
+                    *worker_owned_by_cortex,
+                    now,
+                )
+                .map_err(|err| CancelError::Internal(err.to_string()))?;
             }
         }
+
+        tx.commit()
+            .map_err(|err| CancelError::Internal(err.to_string()))?;
 
         Ok(CancelOutcome {
             already_terminal: false,
@@ -10749,53 +10906,95 @@ impl Database {
     }
 
     pub fn expire_stale_leases(&self) -> Vec<String> {
-        let expired: Vec<(String, String, i64)> = {
-            let conn = self.conn();
-            let now = Utc::now().timestamp_millis();
-            let mut stmt = conn.prepare(
-                "UPDATE steps SET status = 'orphaned', assigned_worker = NULL, lease_deadline = NULL,
-                     updated_at = ?1, version = version + 1
-                 WHERE status IN ('leased', 'running') AND lease_deadline < ?1
-                 RETURNING id, run_id, lease_gen"
-            ).unwrap();
+        let mut conn = self.conn();
+        let now = Utc::now().timestamp_millis();
+        let tx = conn
+            .transaction()
+            .expect("expire_stale_leases: begin transaction");
 
+        // Gather the worker-ownership snapshot and scheduler-minted
+        // `server_attempt_id` *before* the UPDATE below clears
+        // `assigned_worker` — `RETURNING` on that UPDATE would only ever see
+        // the post-update (NULLed) value, so this has to be a separate SELECT
+        // ahead of it, not a `RETURNING` subquery. Both run inside the same
+        // transaction against the same mutex-guarded connection, so nothing
+        // else can observe or mutate these rows in between.
+        let candidates: Vec<(String, String, i64, Option<String>, bool)> = {
+            let mut stmt = tx
+                .prepare(
+                    "SELECT steps.id, steps.run_id, steps.lease_gen, steps.server_attempt_id,
+                            COALESCE(workers.owned_by_cortex, 0)
+                     FROM steps
+                     LEFT JOIN workers ON workers.id = steps.assigned_worker
+                     WHERE steps.status IN ('leased', 'running') AND steps.lease_deadline < ?1",
+                )
+                .expect("expire_stale_leases: prepare select");
             stmt.query_map(params![now], |row| {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
                     row.get::<_, i64>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, bool>(4)?,
                 ))
             })
-            .unwrap()
+            .expect("expire_stale_leases: query_map select")
             .filter_map(|r| r.ok())
             .collect()
-            // `conn` (and the `stmt` borrowing it) are dropped at the end of
-            // this block, before the settlement calls below re-acquire the
-            // same mutex-guarded connection via `self.conn()`.
         };
+
+        tx.execute(
+            "UPDATE steps SET status = 'orphaned', assigned_worker = NULL, lease_deadline = NULL,
+                 updated_at = ?1, version = version + 1
+             WHERE status IN ('leased', 'running') AND lease_deadline < ?1",
+            params![now],
+        )
+        .expect("expire_stale_leases: update");
 
         // A worker that never renewed its lease is gone — this is this
         // codebase's only mechanism for noticing that (see
         // `billing_binding`'s doc comment on why `WorkerLost` is not a
-        // separate `AttemptEndCause` from `LeaseExpired`). Any priced calls
-        // the vanished worker's attempt already made still get settled:
-        // charged or absorbed, never refunded.
-        for (step_id, run_id, lease_gen) in &expired {
-            let Some(attempt_id) = self.attempt_id_for_step_lease(step_id, *lease_gen) else {
+        // separate `AttemptEndCause` from `LeaseExpired`). Record the ending
+        // now, in this same transaction, classified by whether the worker
+        // that held the lease was Cortex's own (`LeaseExpired`, ours to
+        // absorb) or the customer's (`Failed`, charged normally) —
+        // `settle_pending_attempts` (item C) is the only thing that later
+        // charges or absorbs it. A NULL `server_attempt_id` means the step
+        // was never leased since the settlement-redesign migration, so there
+        // is nothing to settle.
+        for (step_id, run_id, _lease_gen, server_attempt_id, worker_owned_by_cortex) in &candidates
+        {
+            let Some(attempt_id) = server_attempt_id else {
                 continue;
             };
-            let Some(user_id) = self.get_run_user_id(run_id) else {
+            let user_id: Option<String> = tx
+                .query_row(
+                    "SELECT user_id FROM runs WHERE id = ?1",
+                    params![run_id],
+                    |row| row.get(0),
+                )
+                .ok();
+            let Some(user_id) = user_id else {
                 tracing::warn!(run_id = %run_id, "no owner for run; skipping ledger write for expired lease");
                 continue;
             };
-            self.settle_ended_attempt(
+            let cause =
+                cortex_core::billing_binding::classify_lease_expiry(*worker_owned_by_cortex);
+            Self::insert_attempt_ending_in_tx(
+                &tx,
+                attempt_id,
                 &user_id,
-                &attempt_id,
-                cortex_core::billing_binding::AttemptEndCause::LeaseExpired,
-            );
+                step_id,
+                cause,
+                *worker_owned_by_cortex,
+                now,
+            )
+            .expect("expire_stale_leases: insert attempt_ending");
         }
 
-        expired.into_iter().map(|(step_id, _, _)| step_id).collect()
+        tx.commit().expect("expire_stale_leases: commit");
+
+        candidates.into_iter().map(|(step_id, ..)| step_id).collect()
     }
 
     pub fn expire_stale_resource_leases(&self) -> Vec<String> {
@@ -11716,6 +11915,25 @@ impl Database {
             |row| row.get::<_, String>(0),
         )
         .ok()
+    }
+
+    /// The scheduler-minted attempt id for a step's current lease
+    /// (`steps.server_attempt_id`, stamped by [`Self::lease_step`] in the same
+    /// statement that grants the lease).
+    ///
+    /// This is the only attempt id worker-message validation trusts — never a
+    /// worker-reported one — per migration v73's rule (see `migrate_v73`'s
+    /// doc comment). `None` means the step has never been leased since that
+    /// migration, or does not exist.
+    pub fn get_step_server_attempt_id(&self, step_id: &str) -> Option<String> {
+        let conn = self.conn();
+        conn.query_row(
+            "SELECT server_attempt_id FROM steps WHERE id = ?1",
+            params![step_id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .ok()
+        .flatten()
     }
 
     /// True iff `step_id` is still recorded as assigned to `worker_id`

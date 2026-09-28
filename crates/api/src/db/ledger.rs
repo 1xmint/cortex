@@ -17,6 +17,7 @@
 //! receipt assembled from it, and billing events.
 
 use super::*;
+use rusqlite::OptionalExtension;
 
 /// What [`Database::charge_settled_cost`] actually did: how many whole
 /// credits it took and what fractional remainder carries forward.
@@ -420,6 +421,45 @@ impl Database {
         description: &str,
         key: &cortex_core::billing_binding::ChargeKey,
     ) -> Result<SettledCharge, String> {
+        let conn = self.conn();
+
+        conn.execute("BEGIN IMMEDIATE", [])
+            .map_err(|e| format!("failed to begin transaction: {e}"))?;
+
+        match Self::charge_settled_cost_in_tx(
+            &conn,
+            clerk_user_id,
+            cost_micro_usd,
+            micros_per_credit,
+            description,
+            key,
+        ) {
+            Ok(settled) => {
+                conn.execute("COMMIT", [])
+                    .map_err(|e| format!("failed to commit transaction: {e}"))?;
+                Ok(settled)
+            }
+            Err(e) => {
+                conn.execute("ROLLBACK", []).ok();
+                Err(e)
+            }
+        }
+    }
+
+    /// The core of [`Self::charge_settled_cost`], for a caller that already
+    /// holds a transaction it controls the boundaries of — namely
+    /// [`Self::settle_one_pending_attempt`], which must run this as one step
+    /// of a single larger transaction rather than its own. Does no `BEGIN`,
+    /// `COMMIT`, or `ROLLBACK` of its own: an `Err` here leaves the caller's
+    /// transaction exactly as it found it, for the caller to roll back.
+    fn charge_settled_cost_in_tx(
+        conn: &Connection,
+        clerk_user_id: &str,
+        cost_micro_usd: u64,
+        micros_per_credit: i64,
+        description: &str,
+        key: &cortex_core::billing_binding::ChargeKey,
+    ) -> Result<SettledCharge, String> {
         let idempotency_key = key.as_str();
         if idempotency_key.trim().is_empty() {
             return Err("idempotency key is required for a settled charge".into());
@@ -427,11 +467,6 @@ impl Database {
         if micros_per_credit <= 0 {
             return Err("micros_per_credit must be positive".into());
         }
-
-        let conn = self.conn();
-
-        conn.execute("BEGIN IMMEDIATE", [])
-            .map_err(|e| format!("failed to begin transaction: {e}"))?;
 
         let read_balance = |conn: &Connection| {
             conn.query_row(
@@ -448,15 +483,9 @@ impl Database {
             )
         };
 
-        let (sub_rem, pack_rem, carry_micro_usd) = match read_balance(&conn) {
-            Ok(v) => v,
-            Err(_) => {
-                conn.execute("ROLLBACK", []).ok();
-                return Err(
-                    "no credit balance row — unmetered (refusing to invent a balance)".into(),
-                );
-            }
-        };
+        let (sub_rem, pack_rem, carry_micro_usd) = read_balance(conn).map_err(|_| {
+            "no credit balance row — unmetered (refusing to invent a balance)".to_string()
+        })?;
 
         // Replay check inside the transaction, so it can't race a concurrent
         // charge of the same key.
@@ -468,7 +497,6 @@ impl Database {
             )
             .unwrap_or(0);
         if already > 0 {
-            conn.execute("ROLLBACK", []).ok();
             tracing::debug!(
                 user_id = clerk_user_id,
                 idempotency_key,
@@ -513,12 +541,8 @@ impl Database {
                  WHERE clerk_user_id = ?4",
                 params![new_sub_rem, new_pack_rem, new_carry_i64, clerk_user_id],
             )
-            .map_err(|e| {
-                conn.execute("ROLLBACK", []).ok();
-                format!("failed to update credit balance: {e}")
-            })?;
+            .map_err(|e| format!("failed to update credit balance: {e}"))?;
         if updated == 0 {
-            conn.execute("ROLLBACK", []).ok();
             return Err("no credit balance row — unmetered (refusing to invent a balance)".into());
         }
 
@@ -537,7 +561,7 @@ impl Database {
         };
 
         let tx_id = Uuid::new_v4().to_string();
-        if let Err(e) = conn.execute(
+        conn.execute(
             "INSERT INTO credit_transactions
                 (id, clerk_user_id, amount, balance_type, reason, description,
                  idempotency_key, cost_micro_usd)
@@ -550,15 +574,13 @@ impl Database {
                 idempotency_key,
                 cost_i64
             ],
-        ) {
-            conn.execute("ROLLBACK", []).ok();
-            return Err(format!("failed to record settled charge: {e}"));
-        }
+        )
+        .map_err(|e| format!("failed to record settled charge: {e}"))?;
 
         if from_pack > 0 {
             let pack_tx_id = Uuid::new_v4().to_string();
             let pack_key = format!("{idempotency_key}:pack");
-            if let Err(e) = conn.execute(
+            conn.execute(
                 "INSERT INTO credit_transactions
                     (id, clerk_user_id, amount, balance_type, reason, description,
                      idempotency_key, cost_micro_usd)
@@ -570,14 +592,9 @@ impl Database {
                     row_description,
                     pack_key
                 ],
-            ) {
-                conn.execute("ROLLBACK", []).ok();
-                return Err(format!("failed to record settled pack charge: {e}"));
-            }
+            )
+            .map_err(|e| format!("failed to record settled pack charge: {e}"))?;
         }
-
-        conn.execute("COMMIT", [])
-            .map_err(|e| format!("failed to commit transaction: {e}"))?;
 
         Ok(SettledCharge {
             credits_charged: actual_charged,
@@ -661,12 +678,40 @@ impl Database {
         description: &str,
         key: &cortex_core::billing_binding::ChargeKey,
     ) -> Result<(), String> {
+        let conn = self.conn();
+
+        conn.execute("BEGIN IMMEDIATE", [])
+            .map_err(|e| format!("failed to begin transaction: {e}"))?;
+
+        match Self::absorb_attempt_cost_in_tx(&conn, clerk_user_id, cost_micro_usd, description, key)
+        {
+            Ok(()) => {
+                conn.execute("COMMIT", [])
+                    .map_err(|e| format!("failed to commit transaction: {e}"))?;
+                Ok(())
+            }
+            Err(e) => {
+                conn.execute("ROLLBACK", []).ok();
+                Err(e)
+            }
+        }
+    }
+
+    /// The core of [`Self::absorb_attempt_cost`], for a caller
+    /// ([`Self::settle_one_pending_attempt`]) that already holds a
+    /// transaction it controls the boundaries of. Does no `BEGIN`, `COMMIT`,
+    /// or `ROLLBACK` of its own.
+    fn absorb_attempt_cost_in_tx(
+        conn: &Connection,
+        clerk_user_id: &str,
+        cost_micro_usd: u64,
+        description: &str,
+        key: &cortex_core::billing_binding::ChargeKey,
+    ) -> Result<(), String> {
         let idempotency_key = key.as_str();
         if idempotency_key.trim().is_empty() {
             return Err("idempotency key is required to record an absorbed cost".into());
         }
-
-        let conn = self.conn();
 
         let already: i64 = conn
             .query_row(
@@ -697,118 +742,201 @@ impl Database {
         Ok(())
     }
 
-    /// Recover the attempt id a step's current (or most recently expired)
-    /// lease was executing under, from `execution_jobs`.
-    ///
-    /// `verification_driver.rs`'s `DeliveryFacts` carries `attempt_id`
-    /// because it comes from the worker's own delivery report — but an
-    /// attempt that never delivers (the customer cancelled it, or its lease
-    /// expired with the worker never reporting back) has no delivery report
-    /// to read it from. `execution_jobs` is written when the worker submits
-    /// the job to its sandbox, keyed by `(attempt_id, lease_gen)` and indexed
-    /// by `(run_id, step_id)` — before any provider call, but after dispatch
-    /// minted the attempt id — so it is the one place server-side that still
-    /// has it for a still-in-flight attempt.
-    ///
-    /// Returns `None` when the step never got far enough to submit a job (no
-    /// row was ever written). That is not a bug to work around: nothing was
-    /// spent either, so the caller's settlement short-circuits on zero cost
-    /// regardless of whether an attempt id was found.
-    pub fn attempt_id_for_step_lease(&self, step_id: &str, lease_gen: i64) -> Option<String> {
-        self.conn()
+    /// The same sum [`Self::attempt_settled_cost_micro_usd`] computes, for a
+    /// caller ([`Self::settle_one_pending_attempt`]) that already holds the
+    /// settler's transaction and must see a real error rather than a
+    /// swallowed `0` if the read fails — a silent `0` here would read as "no
+    /// cost" and skip billing entirely, instead of retrying next tick.
+    fn attempt_settled_cost_micro_usd_in_tx(
+        conn: &Connection,
+        attempt_id: &str,
+    ) -> Result<u64, String> {
+        let blocking: i64 = conn
             .query_row(
-                "SELECT attempt_id FROM execution_jobs WHERE step_id = ?1 AND lease_gen = ?2",
-                params![step_id, lease_gen],
+                "SELECT COUNT(*) FROM provider_request_reservations
+                 WHERE attempt_id = ?1 AND status IN ('reserved', 'unresolved', 'mismatch')",
+                params![attempt_id],
                 |row| row.get(0),
             )
-            .ok()
+            .map_err(|e| format!("failed to check reservation readiness for attempt {attempt_id}: {e}"))?;
+        if blocking > 0 {
+            return Err(format!(
+                "attempt {attempt_id} has {blocking} reservation(s) still reserved/unresolved/mismatched; not ready to settle"
+            ));
+        }
+
+        let settled: i64 = conn
+            .query_row(
+                "SELECT COALESCE(SUM(observed_micro_usd), 0)
+                 FROM provider_request_reservations
+                 WHERE attempt_id = ?1 AND status = 'settled'",
+                params![attempt_id],
+                |row| row.get(0),
+            )
+            .map_err(|e| format!("failed to sum settled cost for attempt {attempt_id}: {e}"))?;
+        Ok(settled.max(0) as u64)
     }
 
-    /// Settle one attempt's ledger effect for an `AttemptEndCause`, charging
-    /// or absorbing its settled observed cost exactly as `finish_and_bill`
-    /// (`verification_driver.rs`) does after sealing a verdict.
+    /// Mirrors [`Self::active_price_list`]'s `ORDER BY version DESC LIMIT 1`
+    /// selection, reading only the one column [`Self::settle_one_pending_attempt`]
+    /// needs, for a caller that already holds the settler's transaction (and
+    /// so cannot call `active_price_list`, which opens its own `self.conn()`
+    /// and would deadlock against the plain, non-reentrant connection mutex).
+    fn active_micros_per_credit_in_tx(conn: &Connection) -> Option<i64> {
+        conn.query_row(
+            "SELECT micros_per_credit FROM price_lists ORDER BY version DESC LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .ok()
+    }
+
+    /// Settle exactly one unsettled `attempt_endings` row: charge or absorb
+    /// its settled observed cost per `billing_binding::settle_attempt`, then
+    /// mark it settled — all inside one `BEGIN IMMEDIATE` transaction, so a
+    /// crash between the ledger write and the `settled_at` stamp is
+    /// impossible; either both happen or neither does, and
+    /// `settle_pending_attempts` retries it next tick.
     ///
-    /// This is that same decision and those same two ledger writes, factored
-    /// out so a verdict is not the only door into the ledger: `cancel_run`
-    /// (`CustomerCancel`) and lease expiry (`LeaseExpired`) end an attempt
-    /// without ever producing one, and must settle whatever it already spent
-    /// through the identical path — not a hand-rolled copy that could drift
-    /// from it on which causes charge and which absorb.
-    ///
-    /// An attempt with no settled provider calls writes no ledger row either
-    /// way, and `charge`/`absorb` are each idempotent on
-    /// `ChargeKey::for_attempt`, so calling this twice for the same attempt
-    /// (a cancel racing a verdict, say) is a no-op the second time, not a
-    /// double charge.
-    pub fn settle_ended_attempt(
-        &self,
-        clerk_user_id: &str,
-        attempt_id: &str,
-        end_cause: cortex_core::billing_binding::AttemptEndCause,
-    ) {
+    /// Order inside the transaction: (1) re-read the row, so a concurrent
+    /// settle of the same attempt (a race that shouldn't happen given the
+    /// single connection mutex, but is cheap to make impossible anyway) is a
+    /// silent no-op if it's already settled or gone; (2) the settled-cost
+    /// sum, which also enforces that no reservation for this attempt is
+    /// still `reserved`/`unresolved`/`mismatch` — if one is, this returns
+    /// `Ok(())` without settling, so the next tick retries once the gateway
+    /// finishes reconciling; (3) the charge or the zero-amount absorb
+    /// insert, or neither at all when the settled cost is exactly zero; (4)
+    /// stamp `settled_at`.
+    fn settle_one_pending_attempt(&self, attempt_id: &str) -> Result<(), String> {
+        let conn = self.conn();
+
+        conn.execute("BEGIN IMMEDIATE", [])
+            .map_err(|e| format!("failed to begin transaction: {e}"))?;
+
+        let outcome = Self::settle_one_pending_attempt_in_tx(&conn, attempt_id);
+
+        match outcome {
+            Ok(()) => {
+                conn.execute("COMMIT", [])
+                    .map_err(|e| format!("failed to commit transaction: {e}"))?;
+                Ok(())
+            }
+            Err(e) => {
+                conn.execute("ROLLBACK", []).ok();
+                Err(e)
+            }
+        }
+    }
+
+    /// The core of [`Self::settle_one_pending_attempt`]: the four ordered
+    /// steps documented there, run against a transaction its caller already
+    /// opened. Does no `BEGIN`, `COMMIT`, or `ROLLBACK` of its own.
+    fn settle_one_pending_attempt_in_tx(conn: &Connection, attempt_id: &str) -> Result<(), String> {
         use cortex_core::billing_binding::{self, AttemptSettlement};
 
-        let cost_micro_usd = self.attempt_settled_cost_micro_usd(attempt_id);
-        if cost_micro_usd == 0 {
-            tracing::debug!(
-                attempt_id,
-                ?end_cause,
-                "ended attempt made no settled provider calls; no ledger row"
-            );
-            return;
+        let row: Option<(String, String, String, bool)> = conn
+            .query_row(
+                "SELECT user_id, step_id, cause, worker_owned_by_cortex
+                 FROM attempt_endings WHERE attempt_id = ?1 AND settled_at IS NULL",
+                params![attempt_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)? != 0,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|e| format!("failed to read attempt_endings row for {attempt_id}: {e}"))?;
+
+        let Some((user_id, _step_id, cause_str, _worker_owned_by_cortex)) = row else {
+            // Already settled (a race) or no such attempt at all: nothing to
+            // do.
+            return Ok(());
+        };
+        let end_cause = super::attempt_end_cause_from_str(&cause_str).ok_or_else(|| {
+            format!("attempt {attempt_id} has unrecognised stored cause {cause_str:?}")
+        })?;
+
+        let now = Utc::now().timestamp_millis();
+        let cost_micro_usd = Self::attempt_settled_cost_micro_usd_in_tx(conn, attempt_id)?;
+
+        if cost_micro_usd > 0 {
+            let key = billing_binding::ChargeKey::for_attempt(attempt_id);
+            match billing_binding::settle_attempt(end_cause) {
+                AttemptSettlement::Charge => {
+                    let micros_per_credit =
+                        Self::active_micros_per_credit_in_tx(conn).ok_or_else(|| {
+                            "no active price list; cannot convert the ended attempt's \
+                             observed cost to credits"
+                                .to_string()
+                        })?;
+                    Self::charge_settled_cost_in_tx(
+                        conn,
+                        &user_id,
+                        cost_micro_usd,
+                        micros_per_credit,
+                        billing_binding::reason::TASK_ATTEMPT_CHARGED,
+                        &key,
+                    )?;
+                }
+                AttemptSettlement::Absorb(cause) => {
+                    let description = format!(
+                        "{}: {cause:?}",
+                        billing_binding::reason::TASK_ATTEMPT_ABSORBED
+                    );
+                    Self::absorb_attempt_cost_in_tx(conn, &user_id, cost_micro_usd, &description, &key)?;
+                }
+            }
         }
 
-        let key = billing_binding::ChargeKey::for_attempt(attempt_id);
-        match billing_binding::settle_attempt(end_cause) {
-            AttemptSettlement::Charge => {
-                let Some(price_list) = self.active_price_list() else {
-                    tracing::error!(
-                        attempt_id,
-                        "no active price list; cannot convert the ended attempt's observed cost to credits"
-                    );
-                    return;
-                };
-                match self.charge_settled_cost(
-                    clerk_user_id,
-                    cost_micro_usd,
-                    price_list.micros_per_credit,
-                    billing_binding::reason::TASK_ATTEMPT_CHARGED,
-                    &key,
-                ) {
-                    Ok(settled) => tracing::info!(
-                        attempt_id,
-                        cost_micro_usd,
-                        credits_charged = settled.credits_charged,
-                        ?end_cause,
-                        "charged the ended attempt's settled observed cost"
-                    ),
-                    Err(e) => tracing::error!(
-                        attempt_id,
-                        error = %e,
-                        "settled-cost charge failed for ended attempt"
-                    ),
-                }
-            }
-            AttemptSettlement::Absorb(cause) => {
-                let description = format!(
-                    "{}: {cause:?}",
-                    billing_binding::reason::TASK_ATTEMPT_ABSORBED
+        conn.execute(
+            "UPDATE attempt_endings SET settled_at = ?1 WHERE attempt_id = ?2",
+            params![now, attempt_id],
+        )
+        .map_err(|e| format!("failed to stamp settled_at for attempt {attempt_id}: {e}"))?;
+
+        Ok(())
+    }
+
+    /// The one place that turns a durable `attempt_endings` record into a
+    /// ledger effect. Driven by the scheduler's tick loop and a startup pass,
+    /// not by any end path directly — every end path (a sealed verdict,
+    /// `cancel_run`, `expire_stale_leases`, a `ws.rs` failure/rejection/block
+    /// path) only ever writes the durable record
+    /// (`Database::insert_attempt_ending_in_tx` /
+    /// `Database::record_attempt_ended`); this is what reads it back and
+    /// charges or absorbs.
+    ///
+    /// One attempt's failure (a stuck reservation, a missing price list) is
+    /// logged and skipped, not propagated — it stays unsettled and is
+    /// retried next call, without blocking every other attempt's tick.
+    pub fn settle_pending_attempts(&self) -> Result<(), String> {
+        let pending: Vec<String> = {
+            let conn = self.conn();
+            let mut stmt = conn
+                .prepare("SELECT attempt_id FROM attempt_endings WHERE settled_at IS NULL")
+                .map_err(|e| format!("failed to list pending attempt endings: {e}"))?;
+            let rows = stmt
+                .query_map([], |row| row.get::<_, String>(0))
+                .map_err(|e| format!("failed to list pending attempt endings: {e}"))?;
+            rows.filter_map(|r| r.ok()).collect()
+        };
+
+        for attempt_id in pending {
+            if let Err(e) = self.settle_one_pending_attempt(&attempt_id) {
+                tracing::error!(
+                    attempt_id,
+                    error = %e,
+                    "failed to settle pending attempt; will retry next tick"
                 );
-                match self.absorb_attempt_cost(clerk_user_id, cost_micro_usd, &description, &key) {
-                    Ok(()) => tracing::info!(
-                        attempt_id,
-                        cost_micro_usd,
-                        ?cause,
-                        "absorbed the ended attempt's settled observed cost"
-                    ),
-                    Err(e) => tracing::error!(
-                        attempt_id,
-                        error = %e,
-                        "failed to record the absorbed cost for ended attempt"
-                    ),
-                }
             }
         }
+
+        Ok(())
     }
 
     /// The carry alone: the fractional micro-USD remainder from previous
@@ -2762,7 +2890,7 @@ mod tests {
         assert!(!db.run_has_pending_verification("run-sealed"));
     }
 
-    // --- settle_ended_attempt / attempt_settled_cost_micro_usd ---
+    // --- settle_pending_attempts / attempt_settled_cost_micro_usd ---
     //
     // These settle real `provider_request_reservations` rows through the same
     // two calls a gateway `forward()` makes (`reserve_provider_request` then
@@ -2776,6 +2904,37 @@ mod tests {
     use cortex_core::billing_binding::AttemptEndCause;
 
     const ATTEMPT_NOW: i64 = 1_800_000_000_000;
+
+    /// Drives the real two-step production path instead of the deleted
+    /// direct-dispatch `settle_ended_attempt`: write the durable
+    /// `attempt_endings` record (exactly what `cancel_run` /
+    /// `expire_stale_leases` / a sealed verdict do), then run the settler
+    /// that turns unsettled records into ledger effects. `step_id` has no FK
+    /// constraint on `attempt_endings`, so any distinguishing string works.
+    fn end_and_settle_attempt(
+        db: &Database,
+        user_id: &str,
+        attempt_id: &str,
+        step_id: &str,
+        cause: AttemptEndCause,
+    ) {
+        {
+            let mut conn = db.conn();
+            let tx = conn.transaction().expect("begin");
+            Database::insert_attempt_ending_in_tx(
+                &tx,
+                attempt_id,
+                user_id,
+                step_id,
+                cause,
+                false,
+                ATTEMPT_NOW,
+            )
+            .expect("insert ending");
+            tx.commit().expect("commit");
+        }
+        db.settle_pending_attempts().expect("settle");
+    }
 
     /// A funded spend authorization scoped to one attempt, ready for
     /// `reserve_provider_request`.
@@ -2849,7 +3008,7 @@ mod tests {
     }
 
     #[test]
-    fn settle_ended_attempt_charges_the_exact_settled_sum_for_a_chargeable_cause() {
+    fn settle_pending_attempts_charges_the_exact_settled_sum_for_a_chargeable_cause() {
         // 300_000 + 150_000 micro-USD at the seeded 100_000-micro-USD credit
         // (`SEED_MICROS_PER_CREDIT`) is exactly 4 whole credits with a
         // 50_000 remainder -- pass-through billing, no rounding up.
@@ -2859,46 +3018,61 @@ mod tests {
         settle_call(&db, &claims, "charge-1", 300_000);
         settle_call(&db, &claims, "charge-2", 150_000);
 
-        db.settle_ended_attempt(user, "attempt-charge", AttemptEndCause::CustomerCancel);
+        end_and_settle_attempt(
+            &db,
+            user,
+            "attempt-charge",
+            "step-charge",
+            AttemptEndCause::CustomerCancel,
+        );
 
         assert_eq!(db.get_credit_balance(user).subscription_remaining, 996);
         assert_eq!(db.get_credit_carry_micro_usd(user), 50_000);
     }
 
     #[test]
-    fn settle_ended_attempt_replay_is_a_noop_not_a_double_charge() {
+    fn settle_pending_attempts_replay_is_a_noop_not_a_double_charge() {
         let db = test_db();
         let user = subscriber(&db, 1_000);
         let claims = attempt_capability(&db, "attempt-replay");
         settle_call(&db, &claims, "replay-1", 300_000);
 
-        db.settle_ended_attempt(user, "attempt-replay", AttemptEndCause::Verified);
+        end_and_settle_attempt(&db, user, "attempt-replay", "step-replay", AttemptEndCause::Verified);
         assert_eq!(db.get_credit_balance(user).subscription_remaining, 997);
         assert_eq!(db.get_credit_carry_micro_usd(user), 0);
 
-        // Same attempt, same cause, called again (e.g. a cancel racing a
-        // verdict that already settled): `ChargeKey::for_attempt` makes the
-        // second call see its own idempotency key already spent and write
-        // nothing further.
-        db.settle_ended_attempt(user, "attempt-replay", AttemptEndCause::Verified);
+        // Same attempt, same cause, settled again (e.g. a cancel racing a
+        // verdict that already settled): `INSERT OR IGNORE` makes the second
+        // `attempt_endings` insert a no-op on the same primary key, and even
+        // if it weren't, `ChargeKey::for_attempt` makes the second charge see
+        // its own idempotency key already spent and write nothing further.
+        end_and_settle_attempt(&db, user, "attempt-replay", "step-replay", AttemptEndCause::Verified);
         assert_eq!(db.get_credit_balance(user).subscription_remaining, 997);
         assert_eq!(db.get_credit_carry_micro_usd(user), 0);
     }
 
     #[test]
-    fn settle_ended_attempt_with_no_settled_calls_writes_no_ledger_row_at_all() {
+    fn settle_pending_attempts_with_no_settled_calls_writes_no_ledger_row_at_all() {
         let db = test_db();
         let user = subscriber(&db, 1_000);
 
         // Never dispatched far enough to make a priced call -- there is
         // nothing to charge and nothing to absorb, so this must be silent:
         // no ledger row, whether the cause would have charged or absorbed.
-        db.settle_ended_attempt(
+        end_and_settle_attempt(
+            &db,
             user,
             "attempt-nothing-spent",
+            "step-nothing-spent",
             AttemptEndCause::CustomerCancel,
         );
-        db.settle_ended_attempt(user, "attempt-nothing-spent-2", AttemptEndCause::RunnerDown);
+        end_and_settle_attempt(
+            &db,
+            user,
+            "attempt-nothing-spent-2",
+            "step-nothing-spent-2",
+            AttemptEndCause::RunnerDown,
+        );
 
         assert_eq!(db.get_credit_balance(user).subscription_remaining, 1_000);
         assert_eq!(db.get_credit_carry_micro_usd(user), 0);
@@ -2922,7 +3096,7 @@ mod tests {
     }
 
     #[test]
-    fn settle_ended_attempt_absorbs_as_a_zero_amount_row_never_a_refund() {
+    fn settle_pending_attempts_absorbs_as_a_zero_amount_row_never_a_refund() {
         // An infrastructure-caused end (the worker vanished, or Cortex itself
         // crashed) must never touch the customer's balance -- Cortex eats the
         // cost. This is recorded as a `credit_transactions` row with
@@ -2933,7 +3107,7 @@ mod tests {
         let claims = attempt_capability(&db, "attempt-absorb");
         settle_call(&db, &claims, "absorb-1", 300_000);
 
-        db.settle_ended_attempt(user, "attempt-absorb", AttemptEndCause::RunnerDown);
+        end_and_settle_attempt(&db, user, "attempt-absorb", "step-absorb", AttemptEndCause::RunnerDown);
 
         assert_eq!(
             db.get_credit_balance(user).subscription_remaining,

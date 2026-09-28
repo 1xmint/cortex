@@ -58,6 +58,7 @@ async fn scheduler_loop(state: Arc<AppState>, mut rx: mpsc::Receiver<SchedulerEv
                 expire_stale_leases(&state, &mut sched).await;
                 expire_stale_resource_leases(&state).await;
                 expire_grace_periods(&state, &mut sched).await;
+                settle_pending_attempts_tick(&state).await;
                 cleanup_expired_keys(&state);
                 state.rate_limiter.cleanup();
                 reconcile_ready_steps(&state, &mut sched).await;
@@ -2043,6 +2044,21 @@ async fn expire_stale_resource_leases(state: &AppState) {
     }
 }
 
+/// Ticks the durable-record settler: for every `attempt_endings` row not yet
+/// settled, converts its observed settled cost to a ledger charge or a
+/// zero-amount absorb row. Idempotent and retryable, so a failure here just
+/// waits for the next tick rather than blocking the reconcile loop.
+async fn settle_pending_attempts_tick(state: &AppState) {
+    let db = match &state.db {
+        Some(db) => db,
+        None => return,
+    };
+
+    if let Err(e) = db.settle_pending_attempts() {
+        tracing::error!(error = %e, "settle_pending_attempts tick failed");
+    }
+}
+
 async fn reconcile_ready_steps(state: &AppState, sched: &mut SchedulerState) {
     let db = match &state.db {
         Some(db) => db,
@@ -2103,6 +2119,14 @@ async fn recover_from_db(state: &AppState, sched: &mut SchedulerState) {
             "recovery: expired {} stale resource leases",
             expired_resources.len()
         );
+    }
+
+    // Any `attempt_endings` row left unsettled by a crash between its own
+    // write and the settler's next tick gets picked up here, once, at
+    // startup — the durable record survived; only the ledger effect was
+    // pending.
+    if let Err(e) = db.settle_pending_attempts() {
+        tracing::error!(error = %e, "recovery: settle_pending_attempts failed");
     }
 
     let active_runs = db.get_active_run_ids();

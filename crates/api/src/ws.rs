@@ -10,6 +10,7 @@ use axum::response::{IntoResponse, Response};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
+use cortex_core::billing_binding::{classify_worker_failure, AttemptEndCause};
 use cortex_core::failure::WorkerFailureKind;
 use cortex_core::protocol::{BrainMessage, StepOutput, WorkerMessage, PROTOCOL_VERSION};
 use cortex_core::routing::RiskLevel;
@@ -341,6 +342,25 @@ async fn handle_worker_msg(
                 // worker cannot write a job row.
                 match &execution_job {
                     Some(job) => {
+                        // `steps.server_attempt_id`, stamped by `lease_step` in
+                        // the same statement that grants the lease, is the only
+                        // attempt id worker-message validation trusts (migration
+                        // v73's rule). A job whose own attempt_id disagrees with
+                        // it is either stale or forged, and recording it as
+                        // provenance would let a mismatched id anchor a later
+                        // charge or absorb decision.
+                        if let Some(server_attempt_id) = db.get_step_server_attempt_id(&step_id) {
+                            if job.attempt_id != server_attempt_id {
+                                tracing::warn!(
+                                    "SECURITY: worker {worker_id} reported StepStarted \
+                                     execution_job for step {step_id} with attempt_id {} but \
+                                     the scheduler-minted attempt id is {server_attempt_id} — \
+                                     dropping message (msg={message_id})",
+                                    job.attempt_id
+                                );
+                                return;
+                            }
+                        }
                         let run_id =
                             resolve_run_id(step_run_cache, state, &step_id).unwrap_or_default();
                         if !db.record_execution_job(&run_id, job) {
@@ -458,6 +478,23 @@ async fn handle_worker_msg(
                          which is not assigned to it — dropping message (msg={message_id})"
                     );
                     return;
+                }
+
+                // `steps.server_attempt_id` is the only attempt id worker-message
+                // validation trusts, never a worker-reported one (migration
+                // v73's rule). Settlement, receipts and everything downstream
+                // key off this attempt_id, so a mismatch here must be rejected
+                // before any of it runs.
+                if let Some(server_attempt_id) = db.get_step_server_attempt_id(&step_id) {
+                    if attempt_id != server_attempt_id {
+                        tracing::warn!(
+                            "SECURITY: worker {worker_id} reported StepCompleted for step \
+                             {step_id} with attempt_id {attempt_id} but the scheduler-minted \
+                             attempt id is {server_attempt_id} — dropping message \
+                             (msg={message_id})"
+                        );
+                        return;
+                    }
                 }
             }
 
@@ -657,6 +694,50 @@ async fn handle_worker_msg(
                             Some("VerifierRejected"),
                             Some(&verifier_failure),
                         );
+
+                        // The verifier itself rejected the worker's claimed
+                        // completion as implausible -- an agent/task-level
+                        // outcome, not Cortex's fault, so it is charged like
+                        // any other `Failed` end cause. Item B: every end path
+                        // records a durable `attempt_endings` row; the shared
+                        // settler (also driven by the scheduler's tick and
+                        // startup passes, so a crash right here still gets
+                        // settled later) is run immediately so the ledger
+                        // reflects it by the time this returns.
+                        if let Some(user_id) = resolved_run_id
+                            .as_deref()
+                            .and_then(|run_id| db.get_run_user_id(run_id))
+                        {
+                            if let Err(e) = db.record_attempt_ended(
+                                &attempt_id,
+                                &user_id,
+                                &step_id,
+                                AttemptEndCause::Failed,
+                                false,
+                            ) {
+                                tracing::error!(
+                                    step_id = %step_id,
+                                    attempt_id = %attempt_id,
+                                    error = %e,
+                                    "failed to record attempt ending for verifier-rejected step"
+                                );
+                            } else if let Err(e) = db.settle_pending_attempts() {
+                                tracing::error!(
+                                    step_id = %step_id,
+                                    attempt_id = %attempt_id,
+                                    error = %e,
+                                    "settle_pending_attempts failed after verifier rejection; \
+                                     the scheduler's next tick will retry"
+                                );
+                            }
+                        } else {
+                            tracing::warn!(
+                                step_id = %step_id,
+                                attempt_id = %attempt_id,
+                                "no resolvable owner for verifier-rejected step; skipping \
+                                 attempt-ended record"
+                            );
+                        }
                     } else {
                         tracing::warn!(
                             "fail_step returned false for verifier-rejected step {step_id} lease_gen={lease_gen} — \
@@ -829,6 +910,7 @@ async fn handle_worker_msg(
         WorkerMessage::StepFailed {
             message_id,
             step_id,
+            attempt_id,
             lease_gen,
             failure,
             ..
@@ -862,6 +944,21 @@ async fn handle_worker_msg(
                          which is not assigned to it — dropping message (msg={message_id})"
                     );
                     return;
+                }
+
+                // `steps.server_attempt_id` is the only attempt id
+                // worker-message validation trusts, never a worker-reported one
+                // (migration v73's rule).
+                if let Some(server_attempt_id) = db.get_step_server_attempt_id(&step_id) {
+                    if attempt_id != server_attempt_id {
+                        tracing::warn!(
+                            "SECURITY: worker {worker_id} reported StepFailed for step \
+                             {step_id} with attempt_id {attempt_id} but the scheduler-minted \
+                             attempt id is {server_attempt_id} — dropping message \
+                             (msg={message_id})"
+                        );
+                        return;
+                    }
                 }
             }
 
@@ -900,6 +997,51 @@ async fn handle_worker_msg(
                     return;
                 }
                 db.fail_attempt(&step_id, lease_gen, Some(&kind_str), Some(error_msg));
+
+                // Item B: every worker-failure end path records a durable
+                // `attempt_endings` row. `classify_worker_failure` already
+                // distinguishes a customer cancellation, a plain task/agent
+                // failure, and infrastructure trouble that is only Cortex's
+                // fault when the worker itself is Cortex-owned -- it covers
+                // both the cancel and fail_step branches above uniformly, so
+                // there is no need to special-case `is_cancelled` again here.
+                // The shared settler runs immediately after, matching
+                // `finish_and_bill`'s pattern; the scheduler's tick and
+                // startup passes retry it if this in-request call fails.
+                let worker_owned_by_cortex = db.worker_owned_by_cortex(worker_id);
+                let end_cause = classify_worker_failure(failure.kind, worker_owned_by_cortex);
+                if let Some(user_id) = resolve_run_id(step_run_cache, state, &step_id)
+                    .and_then(|run_id| db.get_run_user_id(&run_id))
+                {
+                    if let Err(e) = db.record_attempt_ended(
+                        &attempt_id,
+                        &user_id,
+                        &step_id,
+                        end_cause,
+                        worker_owned_by_cortex,
+                    ) {
+                        tracing::error!(
+                            step_id = %step_id,
+                            attempt_id = %attempt_id,
+                            error = %e,
+                            "failed to record attempt ending for failed step"
+                        );
+                    } else if let Err(e) = db.settle_pending_attempts() {
+                        tracing::error!(
+                            step_id = %step_id,
+                            attempt_id = %attempt_id,
+                            error = %e,
+                            "settle_pending_attempts failed after step failure; the \
+                             scheduler's next tick will retry"
+                        );
+                    }
+                } else {
+                    tracing::warn!(
+                        step_id = %step_id,
+                        attempt_id = %attempt_id,
+                        "no resolvable owner for failed step; skipping attempt-ended record"
+                    );
+                }
 
                 // Record usage even on failure (still consumed tokens/time)
                 record_step_usage(
@@ -991,6 +1133,21 @@ async fn handle_worker_msg(
                     );
                     return;
                 }
+
+                // `steps.server_attempt_id` is the only attempt id
+                // worker-message validation trusts, never a worker-reported one
+                // (migration v73's rule).
+                if let Some(server_attempt_id) = db.get_step_server_attempt_id(&step_id) {
+                    if attempt_id != server_attempt_id {
+                        tracing::warn!(
+                            "SECURITY: worker {worker_id} reported StepBlocked for step \
+                             {step_id} with attempt_id {attempt_id} but the scheduler-minted \
+                             attempt id is {server_attempt_id} — dropping message \
+                             (msg={message_id})"
+                        );
+                        return;
+                    }
+                }
             }
 
             // The worker refused to execute because it could not establish the
@@ -1023,6 +1180,46 @@ async fn handle_worker_msg(
                 );
 
                 if transitioned {
+                    // Item B: the worker refused to execute because Cortex's own
+                    // isolation setup failed -- never the customer's fault, so
+                    // this always absorbs (`AttemptEndCause::CortexCrash`,
+                    // unconditionally `Absorb` in `settle_attempt`'s table),
+                    // matching the "nothing is charged" comment above. The
+                    // shared settler runs immediately; the scheduler's tick and
+                    // startup passes retry it if this in-request call fails.
+                    if let Some(user_id) = resolve_run_id(step_run_cache, state, &step_id)
+                        .and_then(|run_id| db.get_run_user_id(&run_id))
+                    {
+                        if let Err(e) = db.record_attempt_ended(
+                            &attempt_id,
+                            &user_id,
+                            &step_id,
+                            AttemptEndCause::CortexCrash,
+                            false,
+                        ) {
+                            tracing::error!(
+                                step_id = %step_id,
+                                attempt_id = %attempt_id,
+                                error = %e,
+                                "failed to record attempt ending for blocked step"
+                            );
+                        } else if let Err(e) = db.settle_pending_attempts() {
+                            tracing::error!(
+                                step_id = %step_id,
+                                attempt_id = %attempt_id,
+                                error = %e,
+                                "settle_pending_attempts failed after step blocked; the \
+                                 scheduler's next tick will retry"
+                            );
+                        }
+                    } else {
+                        tracing::warn!(
+                            step_id = %step_id,
+                            attempt_id = %attempt_id,
+                            "no resolvable owner for blocked step; skipping attempt-ended record"
+                        );
+                    }
+
                     if let Some(run_id) = resolve_run_id(step_run_cache, state, &step_id) {
                         state
                             .emit_scheduler_event(SchedulerEvent::StepFailed {
@@ -1934,6 +2131,232 @@ mod worker_credential {
         assert!(!listed.contains(&secret), "plaintext must never be listed");
         assert!(!listed.contains(&hash), "the hash must never be listed");
         assert!(listed.contains("user_frank"));
+    }
+}
+
+/// Item A-rest (the scheduler-minted `attempt_id` is the only one
+/// worker-message validation trusts) and item B (every worker-failure /
+/// worker-refusal end path records a durable `attempt_endings` row and
+/// settles it) for the two handlers that decide charge vs. absorb:
+/// `StepFailed` and `StepBlocked`. These call [`handle_worker_msg`] directly
+/// — the same private entry point the real websocket loop drives — against a
+/// real `Database`, rather than a hand-rolled substitute.
+#[cfg(test)]
+mod attempt_end_paths {
+    use super::*;
+    use cortex_core::execution_job::{Blocked, BlockedReason};
+    use cortex_core::failure::WorkerFailureReport;
+
+    async fn state() -> std::sync::Arc<AppState> {
+        let temporary = tempfile::tempdir().expect("temporary workspace");
+        let workspace = temporary.path().to_path_buf();
+        std::fs::create_dir_all(workspace.join(".cortex")).expect("workspace metadata");
+        let state = AppState::new(workspace.join(".cortex/ledger.jsonl"), workspace, None).await;
+        // The tempdir must outlive the state's open database handle.
+        std::mem::forget(temporary);
+        state
+    }
+
+    const OWNER: &str = "user-fixture";
+
+    /// A run with one step, leased to a fresh worker under `attempt_id` --
+    /// exactly what `lease_step` stamps onto `steps.server_attempt_id` in the
+    /// same statement that grants the lease (migration v73's rule).
+    fn lease_fixture(state: &AppState, attempt_id: &str) -> (String, String, i64) {
+        let db = state.db.as_ref().expect("database");
+        let worker_id = format!("w-{}", &uuid::Uuid::new_v4().to_string()[..8]);
+        db.register_worker(&worker_id, OWNER, false);
+        let run_id = db.create_run(OWNER, "goal", "default", &[]);
+        let step_id = db.create_step(&run_id, "execute", "strong", "low", "do the thing");
+        let lease_gen = db
+            .lease_step(
+                &step_id,
+                &worker_id,
+                chrono::Utc::now().timestamp_millis() + 60_000,
+                attempt_id,
+            )
+            .expect("lease_step must succeed against a freshly created, pending step");
+        (worker_id, step_id, lease_gen)
+    }
+
+    /// Reads back an `attempt_endings` row exactly as the schema stores it:
+    /// the snake_case cause string and whether the settler has run.
+    fn ending_row(state: &AppState, attempt_id: &str) -> Option<(String, Option<i64>)> {
+        let db = state.db.as_ref().expect("database");
+        let conn = db.conn();
+        conn.query_row(
+            "SELECT cause, settled_at FROM attempt_endings WHERE attempt_id = ?1",
+            rusqlite::params![attempt_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<i64>>(1)?)),
+        )
+        .ok()
+    }
+
+    fn failure(kind: WorkerFailureKind) -> WorkerFailureReport {
+        WorkerFailureReport {
+            kind,
+            exit_code: None,
+            stderr_excerpt: Some("boom".into()),
+            tool: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_stepfailed_attempt_id_mismatch_is_dropped_without_recording_anything() {
+        let state = state().await;
+        let (worker_id, step_id, lease_gen) = lease_fixture(&state, "real-attempt");
+        let (brain_tx, _brain_rx) = mpsc::channel(8);
+        let mut registered = true;
+        let mut authed_user_id = Some(OWNER.to_string());
+        let mut step_run_cache = HashMap::new();
+
+        handle_worker_msg(
+            &state,
+            &worker_id,
+            "session-1",
+            &mut registered,
+            &mut authed_user_id,
+            &brain_tx,
+            WorkerMessage::StepFailed {
+                message_id: "m1".into(),
+                step_id: step_id.clone(),
+                attempt_id: "wrong-attempt".into(),
+                lease_gen,
+                failure: failure(WorkerFailureKind::ProcessKilled),
+            },
+            &mut step_run_cache,
+        )
+        .await;
+
+        assert!(
+            ending_row(&state, "wrong-attempt").is_none(),
+            "a worker-reported attempt id that disagrees with the scheduler-minted one \
+             must never produce an attempt_endings row"
+        );
+        assert_eq!(
+            state.db.as_ref().unwrap().get_step_status(&step_id).as_deref(),
+            Some("leased"),
+            "the step must be untouched when the reported attempt id is rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_matching_stepfailed_records_and_settles_the_classified_cause() {
+        let state = state().await;
+        let (worker_id, step_id, lease_gen) = lease_fixture(&state, "real-attempt");
+        let (brain_tx, _brain_rx) = mpsc::channel(8);
+        let mut registered = true;
+        let mut authed_user_id = Some(OWNER.to_string());
+        let mut step_run_cache = HashMap::new();
+
+        handle_worker_msg(
+            &state,
+            &worker_id,
+            "session-1",
+            &mut registered,
+            &mut authed_user_id,
+            &brain_tx,
+            WorkerMessage::StepFailed {
+                message_id: "m2".into(),
+                step_id: step_id.clone(),
+                attempt_id: "real-attempt".into(),
+                lease_gen,
+                failure: failure(WorkerFailureKind::ProcessKilled),
+            },
+            &mut step_run_cache,
+        )
+        .await;
+
+        let (cause, settled_at) = ending_row(&state, "real-attempt")
+            .expect("a matching attempt id must record an attempt_endings row");
+        assert_eq!(
+            cause, "failed",
+            "ProcessKilled from a customer-owned worker is classify_worker_failure's \
+             Failed case and must be charged, not absorbed"
+        );
+        assert!(
+            settled_at.is_some(),
+            "the settler runs inline in the same request and must mark the row settled"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stepblocked_attempt_id_mismatch_is_dropped_without_recording_anything() {
+        let state = state().await;
+        let (worker_id, step_id, lease_gen) = lease_fixture(&state, "real-attempt");
+        let (brain_tx, _brain_rx) = mpsc::channel(8);
+        let mut registered = true;
+        let mut authed_user_id = Some(OWNER.to_string());
+        let mut step_run_cache = HashMap::new();
+
+        handle_worker_msg(
+            &state,
+            &worker_id,
+            "session-1",
+            &mut registered,
+            &mut authed_user_id,
+            &brain_tx,
+            WorkerMessage::StepBlocked {
+                message_id: "m3".into(),
+                step_id: step_id.clone(),
+                attempt_id: "wrong-attempt".into(),
+                lease_gen,
+                blocked: Blocked::new(BlockedReason::SandboxUnavailable, "no sandbox"),
+            },
+            &mut step_run_cache,
+        )
+        .await;
+
+        assert!(
+            ending_row(&state, "wrong-attempt").is_none(),
+            "a worker-reported attempt id that disagrees with the scheduler-minted one \
+             must never produce an attempt_endings row"
+        );
+        assert_eq!(
+            state.db.as_ref().unwrap().get_step_status(&step_id).as_deref(),
+            Some("leased"),
+            "the step must be untouched when the reported attempt id is rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_matching_stepblocked_always_absorbs_and_settles() {
+        let state = state().await;
+        let (worker_id, step_id, lease_gen) = lease_fixture(&state, "real-attempt");
+        let (brain_tx, _brain_rx) = mpsc::channel(8);
+        let mut registered = true;
+        let mut authed_user_id = Some(OWNER.to_string());
+        let mut step_run_cache = HashMap::new();
+
+        handle_worker_msg(
+            &state,
+            &worker_id,
+            "session-1",
+            &mut registered,
+            &mut authed_user_id,
+            &brain_tx,
+            WorkerMessage::StepBlocked {
+                message_id: "m4".into(),
+                step_id: step_id.clone(),
+                attempt_id: "real-attempt".into(),
+                lease_gen,
+                blocked: Blocked::new(BlockedReason::SandboxUnavailable, "no sandbox"),
+            },
+            &mut step_run_cache,
+        )
+        .await;
+
+        let (cause, settled_at) = ending_row(&state, "real-attempt")
+            .expect("a matching attempt id must record an attempt_endings row");
+        assert_eq!(
+            cause, "cortex_crash",
+            "a worker's own refusal to execute is Cortex's infrastructure fault, \
+             never the customer's, so it must always absorb"
+        );
+        assert!(
+            settled_at.is_some(),
+            "the settler runs inline in the same request and must mark the row settled"
+        );
     }
 }
 

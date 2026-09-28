@@ -133,15 +133,17 @@ fn a_strong_task_is_charged_the_full_price() {
 // any other end cause; see the module doc on `billing_binding.rs`). What the
 // old tests actually proved -- a step that froze a quote but never spent
 // anything touches the ledger for nothing when it ends -- still holds, and
-// still needs proving at the real entry point: `settle_ended_attempt` reads
-// `attempt_settled_cost_micro_usd` first and returns with no ledger write at
-// all when that is zero, regardless of which `AttemptEndCause` it's given.
-// These replacements drive that exact function with `Failed`, for both
-// classes, instead of a decision table that no longer exists. (The narrower,
-// DB-level version of this invariant -- including that literally zero rows
-// are written, not just that the balance nets to zero -- is also covered by
-// `settle_ended_attempt_with_no_settled_calls_writes_no_ledger_row_at_all` in
-// `crates/api/src/db/ledger.rs`.)
+// still needs proving at the real entry point: `settle_pending_attempts`
+// reads the settled cost for the `attempt_endings` record first and returns
+// with no ledger write at all when that is zero, regardless of which
+// `AttemptEndCause` the record carries. These replacements drive that exact
+// path (`record_attempt_ended` then `settle_pending_attempts`) with `Failed`,
+// for both classes, instead of a decision table that no longer exists. (The
+// narrower, DB-level version of this invariant -- including that literally
+// zero rows are written, not just that the balance nets to zero -- is also
+// covered by
+// `settle_pending_attempts_with_no_settled_calls_writes_no_ledger_row_at_all`
+// in `crates/api/src/db/ledger.rs`.)
 #[test]
 fn a_failed_attempt_that_never_spent_anything_has_no_billing_effect_authored() {
     use cortex_core::billing_binding::AttemptEndCause;
@@ -164,8 +166,16 @@ fn a_failed_attempt_that_never_spent_anything_has_no_billing_effect_authored() {
     );
 
     // No provider call was ever reserved or settled for this attempt, so its
-    // settled cost is zero and `settle_ended_attempt` must write nothing.
-    db.settle_ended_attempt(user, "attempt-authored-2", AttemptEndCause::Failed);
+    // settled cost is zero and `settle_pending_attempts` must write nothing.
+    db.record_attempt_ended(
+        "attempt-authored-2",
+        user,
+        "step-authored-2",
+        AttemptEndCause::Failed,
+        false,
+    )
+    .expect("record attempt ended");
+    db.settle_pending_attempts().expect("settle pending attempts");
 
     let (sub_total, pack_total) = db.credit_ledger_totals(user);
     assert_eq!(
@@ -187,7 +197,15 @@ fn a_failed_attempt_that_never_spent_anything_has_no_billing_effect_strong() {
 
     let _quoted = freeze(&db, "run-4", "step-4", &list, &class, VerdictClass::Strong);
 
-    db.settle_ended_attempt(user, "attempt-strong-2", AttemptEndCause::Failed);
+    db.record_attempt_ended(
+        "attempt-strong-2",
+        user,
+        "step-strong-2",
+        AttemptEndCause::Failed,
+        false,
+    )
+    .expect("record attempt ended");
+    db.settle_pending_attempts().expect("settle pending attempts");
 
     let (sub_total, pack_total) = db.credit_ledger_totals(user);
     assert_eq!(sub_total + pack_total, 0);
