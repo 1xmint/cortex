@@ -382,24 +382,33 @@ impl Database {
     /// (including `carry_micro_usd`), runs `pricing::charge(carry, cost,
     /// micros_per_credit)` to decide how many whole credits are owed and what
     /// remainder carries forward, debits the credits, writes the new carry,
-    /// and inserts exactly one `credit_transactions` row keyed by `key` with
-    /// `cost_micro_usd` set to the full nominal cost.
+    /// and inserts one `credit_transactions` row per bucket actually drawn
+    /// from, matching the convention `deduct_credits`/`deduct_credits_up_to`
+    /// use elsewhere.
     ///
-    /// Unlike `deduct_credits`/`deduct_credits_up_to`, this never splits one
-    /// charge into `:subscription`/`:pack`-suffixed idempotency keys: the
-    /// caller's `key` is used as-is for the single row, and a row is written
+    /// The bare `key` always gets a `'subscription'`-typed row (amount
+    /// `-from_sub`, `0` allowed) carrying the full `cost_micro_usd`, since
+    /// that is the row the replay check below looks up; when the charge also
+    /// draws from the pack, `{key}:pack` gets a second, `'pack'`-typed row
+    /// (amount `-from_pack`, `cost_micro_usd` left `NULL` so the full cost
+    /// isn't double-counted by any reader that sums it). A row is written
     /// even when it debits `0` whole credits — a reply costing less than one
-    /// credit still must record its cost and advance the carry.
+    /// credit still must record its cost and advance the carry. This keeps
+    /// `credit_ledger_totals`'s per-bucket sums in agreement with the balance
+    /// cache; a single `'mixed'`-typed row would be invisible to that sum.
     ///
     /// In normal operation `credits_owed` can never exceed the balance:
     /// callers must reserve a spend cap that fits *before* making the call
     /// this charges for. If it ever does anyway (e.g. a concurrent charge
     /// shrank the balance after this call's own reservation succeeded), the
     /// deduction is clamped to what's left — balances never go negative and
-    /// this never invents credit — but `cost_micro_usd` on the ledger row
-    /// still records the full, true cost, and the carry still advances by
-    /// the full amount, so the shortfall is never hidden even though this
-    /// one payment fell short of it. A `tracing::warn!` marks the clamp.
+    /// this never invents credit. `cost_micro_usd` on the ledger row still
+    /// records the full, true cost, and the carry still advances by the
+    /// pricing math's full total (carry + cost) — but the whole credits this
+    /// call could not collect are simply not collected from anyone, ever:
+    /// Cortex absorbs them. That absorption is recorded, not hidden — the
+    /// shortfall (owed vs. charged) is written into the ledger row's own
+    /// `description`, alongside a `tracing::warn!` that marks the clamp.
     ///
     /// Idempotent on `key`: a replay changes nothing and returns
     /// `credits_charged: 0` with the balance's current carry.
@@ -513,31 +522,45 @@ impl Database {
             return Err("no credit balance row — unmetered (refusing to invent a balance)".into());
         }
 
-        let balance_type = match (from_sub > 0, from_pack > 0) {
-            (true, true) => "mixed",
-            (_, true) => "pack",
-            _ => "subscription",
+        // Unpaid whole credits (owed > charged) are never collected from
+        // anyone — Cortex absorbs them. Record that in the row's own
+        // description rather than only in a log line, so it's durable and
+        // auditable from the ledger itself.
+        let cost_i64 = i64::try_from(cost_micro_usd).unwrap_or(i64::MAX);
+        let row_description = if actual_charged < credits_owed_i64 {
+            format!(
+                "{description} (owed {credits_owed_i64}, charged {actual_charged}; \
+                 shortfall absorbed by Cortex)"
+            )
+        } else {
+            description.to_string()
         };
 
         let tx_id = Uuid::new_v4().to_string();
-        let cost_i64 = i64::try_from(cost_micro_usd).unwrap_or(i64::MAX);
         if let Err(e) = conn.execute(
             "INSERT INTO credit_transactions
                 (id, clerk_user_id, amount, balance_type, reason, description,
                  idempotency_key, cost_micro_usd)
-             VALUES (?1, ?2, ?3, ?4, 'spend', ?5, ?6, ?7)",
-            params![
-                tx_id,
-                clerk_user_id,
-                -actual_charged,
-                balance_type,
-                description,
-                idempotency_key,
-                cost_i64
-            ],
+             VALUES (?1, ?2, ?3, 'subscription', 'spend', ?4, ?5, ?6)",
+            params![tx_id, clerk_user_id, -from_sub, row_description, idempotency_key, cost_i64],
         ) {
             conn.execute("ROLLBACK", []).ok();
             return Err(format!("failed to record settled charge: {e}"));
+        }
+
+        if from_pack > 0 {
+            let pack_tx_id = Uuid::new_v4().to_string();
+            let pack_key = format!("{idempotency_key}:pack");
+            if let Err(e) = conn.execute(
+                "INSERT INTO credit_transactions
+                    (id, clerk_user_id, amount, balance_type, reason, description,
+                     idempotency_key, cost_micro_usd)
+                 VALUES (?1, ?2, ?3, 'pack', 'spend', ?4, ?5, NULL)",
+                params![pack_tx_id, clerk_user_id, -from_pack, row_description, pack_key],
+            ) {
+                conn.execute("ROLLBACK", []).ok();
+                return Err(format!("failed to record settled pack charge: {e}"));
+            }
         }
 
         conn.execute("COMMIT", [])
@@ -1809,6 +1832,93 @@ mod tests {
             )
             .expect("count query");
         assert_eq!(row_count, 1, "a replay must not write a second row");
+    }
+
+    #[test]
+    fn a_charge_spanning_both_buckets_writes_one_row_per_bucket_not_mixed() {
+        // Every other writer (`deduct_credits`, `refund_credits`) writes one
+        // row per bucket under `<key>`/`<key>:pack`, and `credit_ledger_totals`
+        // sums per bucket -- the documented derivation the balance cache must
+        // agree with. A single `'mixed'`-typed row is invisible to that sum,
+        // so reconciliation would silently disagree with the cache the moment
+        // a chat reply's exact cost happened to straddle both buckets.
+        let db = test_db();
+        let user = subscriber(&db, 1);
+        db.add_pack_credits(user, 5).expect("pack");
+        db.conn()
+            .execute(
+                "UPDATE credit_balances SET carry_micro_usd = 90000 WHERE clerk_user_id = ?1",
+                params![user],
+            )
+            .expect("seed carry");
+
+        let key = ChargeKey::for_chat_reply("reply-mixed");
+        // total = carry 90_000 + cost 150_000 = 240_000; 240_000 / 100_000 =
+        // 2 credits owed, 40_000 carried forward. 1 comes from the lone
+        // subscription credit, the other spills into the pack.
+        let settled = db
+            .charge_settled_cost(user, 150_000, 100_000, "Cortex-paid chat reply", &key)
+            .expect("settle");
+        assert_eq!(settled.credits_charged, 2);
+        assert_eq!(settled.new_carry_micro_usd, 40_000);
+
+        let balance = db.get_credit_balance(user);
+        assert_eq!(
+            balance.subscription_remaining, 0,
+            "the one subscription credit is spent first"
+        );
+        assert_eq!(
+            balance.pack_remaining, 4,
+            "the other owed credit spills into the pack"
+        );
+        assert_eq!(db.get_credit_carry_micro_usd(user), 40_000);
+        assert_eq!(
+            db.credit_ledger_totals(user),
+            (-1, -1),
+            "one credit came from each bucket, not one 'mixed' row invisible to this sum"
+        );
+
+        let pack_key = format!("{}:pack", key.as_str());
+        let pack_rows: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM credit_transactions WHERE idempotency_key = ?1",
+                params![pack_key],
+                |r| r.get(0),
+            )
+            .expect("count query");
+        assert_eq!(pack_rows, 1, "exactly one pack row for this charge");
+
+        let (bare_type, bare_cost): (String, Option<i64>) = db
+            .conn()
+            .query_row(
+                "SELECT balance_type, cost_micro_usd FROM credit_transactions
+                 WHERE idempotency_key = ?1",
+                params![key.as_str()],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("bare row");
+        assert_eq!(bare_type, "subscription", "the replay-checked key is never 'mixed'");
+        assert_eq!(bare_cost, Some(150_000), "the bare row carries the full nominal cost");
+
+        // Replaying the same key charges nothing and inserts no further rows.
+        let replay = db
+            .charge_settled_cost(user, 150_000, 100_000, "Cortex-paid chat reply", &key)
+            .expect("replay is a no-op, not an error");
+        assert_eq!(replay.credits_charged, 0);
+        assert_eq!(replay.new_carry_micro_usd, 40_000);
+        assert_eq!(db.credit_ledger_totals(user), (-1, -1), "a replay must not add more rows");
+
+        let total_rows: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM credit_transactions
+                 WHERE idempotency_key = ?1 OR idempotency_key = ?2",
+                params![key.as_str(), pack_key],
+                |r| r.get(0),
+            )
+            .expect("count query");
+        assert_eq!(total_rows, 2, "replay must not insert additional rows");
     }
 
     #[test]
