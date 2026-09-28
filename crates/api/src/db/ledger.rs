@@ -1690,8 +1690,10 @@ impl Database {
             return Err(format!("failed to record topup transaction: {e}"));
         }
 
-        conn.execute("COMMIT", [])
-            .map_err(|e| format!("failed to commit transaction: {e}"))?;
+        if let Err(e) = conn.execute("COMMIT", []) {
+            conn.execute("ROLLBACK", []).ok();
+            return Err(format!("failed to commit transaction: {e}"));
+        }
 
         Ok(true)
     }

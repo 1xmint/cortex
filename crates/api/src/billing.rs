@@ -1326,12 +1326,21 @@ pub async fn stripe_webhook(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
-    let webhook_secret = state.stripe_webhook_secret.as_deref().ok_or((
-        StatusCode::SERVICE_UNAVAILABLE,
-        Json(ErrorResponse {
-            error: "webhook not configured".into(),
-        }),
-    ))?;
+    // A `None` secret means Stripe isn't configured at all; an empty-string
+    // secret (e.g. `STRIPE_SECRET_KEY` set but `STRIPE_WEBHOOK_SECRET` left
+    // unset, which `StripeClient::from_env` defaults to `""`) is just as
+    // unusable — `verify_webhook_signature` would HMAC against an empty key,
+    // which proves nothing. Treat both as "not configured".
+    let webhook_secret = state
+        .stripe_webhook_secret
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .ok_or((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse {
+                error: "webhook not configured".into(),
+            }),
+        ))?;
 
     let sig = headers
         .get("stripe-signature")
@@ -1412,7 +1421,15 @@ pub async fn stripe_webhook(
                     && obj["metadata"]["kind"].as_str() == Some("credit_topup")
                     && obj["payment_status"].as_str() == Some("paid")
                 {
-                    grant_credit_topup(db, obj, event_id);
+                    grant_credit_topup(db, obj, event_id).map_err(|e| {
+                        tracing::error!(event_id, "credit topup grant failed: {e}");
+                        (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(ErrorResponse {
+                                error: "credit grant failed; retry".into(),
+                            }),
+                        )
+                    })?;
                 }
                 // A payment-mode session with a delayed payment method
                 // completes with payment_status "unpaid" — Stripe follows up
@@ -1426,7 +1443,15 @@ pub async fn stripe_webhook(
             if mode.eq_ignore_ascii_case("payment")
                 && obj["metadata"]["kind"].as_str() == Some("credit_topup")
             {
-                grant_credit_topup(db, obj, event_id);
+                grant_credit_topup(db, obj, event_id).map_err(|e| {
+                    tracing::error!(event_id, "credit topup grant failed: {e}");
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(ErrorResponse {
+                            error: "credit grant failed; retry".into(),
+                        }),
+                    )
+                })?;
             }
         }
         "customer.subscription.updated" => {
@@ -1530,17 +1555,34 @@ pub async fn stripe_webhook(
 /// first grants the credits and any later replay — the same event id, or the
 /// other event type for the same session — grants nothing further.
 ///
-/// The amount granted is derived from what Stripe reports as actually paid
-/// (`amount_subtotal`, which excludes tax), not from the `metadata.credits`
-/// value recorded when the session was created, since that metadata cannot
-/// be trusted to still match what the customer paid. A mismatch is logged
-/// as an error for operator follow-up, but the paid-based amount is still
+/// The amount granted is derived from `amount_subtotal` (Stripe's line-item
+/// total before tax), not from the `metadata.credits` value recorded when
+/// the session was created, since that metadata cannot be trusted to still
+/// match what the customer paid. A mismatch is logged as an error for
+/// operator follow-up, but the `amount_subtotal`-based amount is still
 /// granted so the customer is not shorted credits they already paid for.
-fn grant_credit_topup(db: &Database, obj: &serde_json::Value, event_id: &str) {
+/// `amount_subtotal` is also *pre-discount* — it does not reflect any coupon
+/// or promotion applied to the session — so a session with a non-zero
+/// `total_details.amount_discount` is refused outright rather than grant an
+/// amount that could exceed what was actually paid.
+///
+/// Returns `Ok(())` for every non-retryable refusal: missing id, missing
+/// user, not yet paid, non-usd, a non-positive amount, a discount present,
+/// or an already-granted replay. These are not errors Stripe should retry —
+/// retrying would just repeat the same refusal. Returns `Err` only when
+/// [`crate::db::Database::grant_topup_credits`] itself fails (e.g. a
+/// database error), so the caller can turn that into a 5xx and let Stripe's
+/// webhook retry logic take another pass instead of the customer's paid
+/// credits silently vanishing.
+fn grant_credit_topup(
+    db: &Database,
+    obj: &serde_json::Value,
+    event_id: &str,
+) -> Result<(), String> {
     let session_id = obj["id"].as_str().unwrap_or("");
     if session_id.is_empty() {
         tracing::error!("credit topup session missing an id; cannot grant credits");
-        return;
+        return Ok(());
     }
 
     let clerk_user_id = obj["metadata"]["clerk_user_id"]
@@ -1548,7 +1590,7 @@ fn grant_credit_topup(db: &Database, obj: &serde_json::Value, event_id: &str) {
         .or_else(|| obj["client_reference_id"].as_str());
     let Some(clerk_user_id) = clerk_user_id else {
         tracing::error!(session_id, "credit topup session missing clerk_user_id");
-        return;
+        return Ok(());
     };
 
     let payment_status = obj["payment_status"].as_str().unwrap_or("");
@@ -1558,7 +1600,7 @@ fn grant_credit_topup(db: &Database, obj: &serde_json::Value, event_id: &str) {
             payment_status,
             "credit topup session is not paid yet; granting no credits"
         );
-        return;
+        return Ok(());
     }
 
     let currency = obj["currency"].as_str().unwrap_or("");
@@ -1568,7 +1610,7 @@ fn grant_credit_topup(db: &Database, obj: &serde_json::Value, event_id: &str) {
             currency,
             "credit topup settled in a non-usd currency; granting no credits"
         );
-        return;
+        return Ok(());
     }
 
     let amount_subtotal_cents = obj["amount_subtotal"].as_i64().unwrap_or(0);
@@ -1578,7 +1620,21 @@ fn grant_credit_topup(db: &Database, obj: &serde_json::Value, event_id: &str) {
             amount_subtotal_cents,
             "credit topup has no positive amount_subtotal; granting no credits"
         );
-        return;
+        return Ok(());
+    }
+
+    let amount_discount_cents = obj["total_details"]["amount_discount"]
+        .as_i64()
+        .unwrap_or(0);
+    if amount_discount_cents != 0 {
+        tracing::error!(
+            session_id,
+            amount_discount_cents,
+            "credit topup session has a discount applied; amount_subtotal is \
+             pre-discount so granting based on it would over-credit — granting \
+             no credits"
+        );
+        return Ok(());
     }
     let credits_from_amount = amount_subtotal_cents / 10;
 
@@ -1614,15 +1670,18 @@ fn grant_credit_topup(db: &Database, obj: &serde_json::Value, event_id: &str) {
                 credits_from_amount,
                 "credit topup granted"
             );
+            Ok(())
         }
         Ok(false) => {
             tracing::debug!(
                 session_id,
                 "credit topup already granted; webhook replay ignored"
             );
+            Ok(())
         }
         Err(e) => {
             tracing::error!(session_id, "failed to grant credit topup: {e}");
+            Err(e)
         }
     }
 }
@@ -1669,6 +1728,7 @@ mod topup_tests {
             "amount_subtotal": amount_subtotal_cents,
             "payment_status": payment_status,
             "client_reference_id": user_id,
+            "customer": "cus_test",
             "metadata": {
                 "clerk_user_id": user_id,
                 "credits": metadata_credits.to_string(),
@@ -1682,7 +1742,7 @@ mod topup_tests {
         let (_dir, db) = test_db();
         let obj = topup_session("cs_1", "user-1", "usd", 2500, "paid", 250);
 
-        grant_credit_topup(&db, &obj, "evt_1");
+        grant_credit_topup(&db, &obj, "evt_1").unwrap();
 
         let balance = db.get_credit_balance_row("user-1").expect("balance row");
         assert_eq!(balance.subscription_remaining, 0);
@@ -1696,7 +1756,7 @@ mod topup_tests {
         assert!(db.get_credit_balance_row("user-1").is_none());
         let obj = topup_session("cs_2", "user-1", "usd", 1000, "paid", 100);
 
-        grant_credit_topup(&db, &obj, "evt_1");
+        grant_credit_topup(&db, &obj, "evt_1").unwrap();
 
         let balance = db.get_credit_balance_row("user-1").expect("balance row");
         assert_eq!(balance.subscription_remaining, 0);
@@ -1709,8 +1769,8 @@ mod topup_tests {
         let (_dir, db) = test_db();
         let obj = topup_session("cs_3", "user-1", "usd", 2500, "paid", 250);
 
-        grant_credit_topup(&db, &obj, "evt_1");
-        grant_credit_topup(&db, &obj, "evt_1"); // Stripe's at-least-once redelivery
+        grant_credit_topup(&db, &obj, "evt_1").unwrap();
+        grant_credit_topup(&db, &obj, "evt_1").unwrap(); // Stripe's at-least-once redelivery
 
         let balance = db.get_credit_balance_row("user-1").expect("balance row");
         assert_eq!(balance.pack_remaining, 250);
@@ -1726,8 +1786,8 @@ mod topup_tests {
         let (_dir, db) = test_db();
         let obj = topup_session("cs_4", "user-1", "usd", 2500, "paid", 250);
 
-        grant_credit_topup(&db, &obj, "evt_completed");
-        grant_credit_topup(&db, &obj, "evt_async_succeeded");
+        grant_credit_topup(&db, &obj, "evt_completed").unwrap();
+        grant_credit_topup(&db, &obj, "evt_async_succeeded").unwrap();
 
         let balance = db.get_credit_balance_row("user-1").expect("balance row");
         assert_eq!(balance.pack_remaining, 250);
@@ -1739,7 +1799,7 @@ mod topup_tests {
         let (_dir, db) = test_db();
         let obj = topup_session("cs_5", "user-1", "usd", 2500, "unpaid", 250);
 
-        grant_credit_topup(&db, &obj, "evt_1");
+        grant_credit_topup(&db, &obj, "evt_1").unwrap();
 
         assert!(db.get_credit_balance_row("user-1").is_none());
     }
@@ -1754,18 +1814,18 @@ mod topup_tests {
         // payment has actually settled.
         let (_dir, db) = test_db();
         let unpaid = topup_session("cs_6", "user-1", "usd", 2500, "unpaid", 250);
-        grant_credit_topup(&db, &unpaid, "evt_completed");
+        grant_credit_topup(&db, &unpaid, "evt_completed").unwrap();
         assert!(db.get_credit_balance_row("user-1").is_none());
 
         let paid = topup_session("cs_6", "user-1", "usd", 2500, "paid", 250);
-        grant_credit_topup(&db, &paid, "evt_async_succeeded");
+        grant_credit_topup(&db, &paid, "evt_async_succeeded").unwrap();
 
         let balance = db.get_credit_balance_row("user-1").expect("balance row");
         assert_eq!(balance.pack_remaining, 250);
         assert_eq!(db.get_billing_history("user-1", 10, 0).len(), 1);
 
         // A duplicate async_payment_succeeded redelivery still grants nothing more.
-        grant_credit_topup(&db, &paid, "evt_async_succeeded_retry");
+        grant_credit_topup(&db, &paid, "evt_async_succeeded_retry").unwrap();
         let balance = db.get_credit_balance_row("user-1").expect("balance row");
         assert_eq!(balance.pack_remaining, 250);
     }
@@ -1775,9 +1835,46 @@ mod topup_tests {
         let (_dir, db) = test_db();
         let obj = topup_session("cs_7", "user-1", "eur", 2500, "paid", 250);
 
-        grant_credit_topup(&db, &obj, "evt_1");
+        grant_credit_topup(&db, &obj, "evt_1").unwrap();
 
         assert!(db.get_credit_balance_row("user-1").is_none());
+    }
+
+    #[test]
+    fn a_discounted_session_grants_nothing_since_amount_subtotal_is_pre_discount() {
+        let (_dir, db) = test_db();
+        let mut obj = topup_session("cs_8", "user-1", "usd", 2500, "paid", 250);
+        obj["total_details"] = serde_json::json!({ "amount_discount": 500 });
+
+        let result = grant_credit_topup(&db, &obj, "evt_1");
+
+        assert!(
+            result.is_ok(),
+            "a discounted session is a refusal, not a retryable error"
+        );
+        assert!(db.get_credit_balance_row("user-1").is_none());
+    }
+
+    #[test]
+    fn a_db_failure_during_the_grant_is_returned_as_err_not_swallowed() {
+        let (_dir, db) = test_db();
+        // Break the database so `grant_topup_credits` can't record the
+        // ledger row, simulating a transient DB failure mid-grant. Money
+        // review: this must surface as `Err` so the webhook 500s and Stripe
+        // retries, rather than silently losing the customer's credits.
+        db.conn()
+            .execute("DROP TABLE credit_transactions", [])
+            .expect("drop table");
+        let obj = topup_session("cs_9", "user-1", "usd", 2500, "paid", 250);
+
+        let result = grant_credit_topup(&db, &obj, "evt_1");
+
+        assert!(result.is_err(), "a db failure must not be swallowed");
+        assert!(
+            db.get_credit_balance_row("user-1").is_none(),
+            "the failed grant must not have left a partial balance update \
+             (grant_topup_credits rolls back on failure)"
+        );
     }
 
     async fn test_state() -> (tempfile::TempDir, std::sync::Arc<AppState>) {
@@ -1833,6 +1930,128 @@ mod topup_tests {
             .await
             .expect_err("a cancelled subscription may not buy credits");
         assert_eq!(err.0, StatusCode::CONFLICT);
+    }
+
+    // --- Signed webhook dispatch (drives the real `stripe_webhook` handler,
+    // not `grant_credit_topup` directly, so signature verification and the
+    // empty-secret guard are exercised too) ---
+
+    fn stripe_event_body(
+        event_id: &str,
+        event_type: &str,
+        session: &serde_json::Value,
+    ) -> Vec<u8> {
+        serde_json::json!({
+            "id": event_id,
+            "type": event_type,
+            "data": { "object": session },
+        })
+        .to_string()
+        .into_bytes()
+    }
+
+    /// Signs `payload` exactly the way [`StripeClient::verify_webhook_signature`]
+    /// expects: `v1` is HMAC-SHA256 of `"{timestamp}." + payload`, hex-encoded.
+    fn sign_stripe_payload(secret: &str, payload: &[u8]) -> String {
+        use hmac::{Hmac, KeyInit, Mac};
+        use sha2::Sha256;
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let mut mac =
+            Hmac::<Sha256>::new_from_slice(secret.as_bytes()).expect("hmac accepts any key");
+        mac.update(format!("{timestamp}.").as_bytes());
+        mac.update(payload);
+        let sig = hex::encode(mac.finalize().into_bytes());
+        format!("t={timestamp},v1={sig}")
+    }
+
+    async fn test_state_with_webhook_secret(
+        secret: &str,
+    ) -> (tempfile::TempDir, std::sync::Arc<AppState>) {
+        let (dir, mut state) = test_state().await;
+        Arc::get_mut(&mut state)
+            .expect("sole owner right after construction")
+            .stripe_webhook_secret = Some(secret.to_string());
+        (dir, state)
+    }
+
+    #[tokio::test]
+    async fn stripe_webhook_grants_a_paid_topup_once_and_ignores_redelivery() {
+        let secret = "whsec_test_secret";
+        let (_dir, state) = test_state_with_webhook_secret(secret).await;
+        let session = topup_session("cs_dispatch_1", "user-1", "usd", 2500, "paid", 250);
+        let body = stripe_event_body("evt_dispatch_1", "checkout.session.completed", &session);
+        let sig = sign_stripe_payload(secret, &body);
+        let mut headers = HeaderMap::new();
+        headers.insert("stripe-signature", sig.parse().unwrap());
+
+        let status = stripe_webhook(
+            State(state.clone()),
+            headers.clone(),
+            Bytes::from(body.clone()),
+        )
+        .await
+        .expect("a signed, paid top-up event is accepted");
+        assert_eq!(status, StatusCode::OK);
+
+        let db = state.db.as_ref().expect("db configured");
+        let balance = db.get_credit_balance_row("user-1").expect("balance row");
+        assert_eq!(balance.pack_remaining, 250);
+
+        // Stripe's at-least-once delivery may redeliver the same event —
+        // must still 200 (so Stripe stops retrying) but grant nothing further.
+        let status = stripe_webhook(State(state.clone()), headers, Bytes::from(body))
+            .await
+            .expect("redelivery is still acked with 200");
+        assert_eq!(status, StatusCode::OK);
+        let balance = db.get_credit_balance_row("user-1").expect("balance row");
+        assert_eq!(balance.pack_remaining, 250);
+    }
+
+    #[tokio::test]
+    async fn stripe_webhook_grants_once_for_async_payment_succeeded() {
+        let secret = "whsec_test_secret";
+        let (_dir, state) = test_state_with_webhook_secret(secret).await;
+        let session = topup_session("cs_dispatch_2", "user-1", "usd", 1000, "paid", 100);
+        let body = stripe_event_body(
+            "evt_dispatch_2",
+            "checkout.session.async_payment_succeeded",
+            &session,
+        );
+        let sig = sign_stripe_payload(secret, &body);
+        let mut headers = HeaderMap::new();
+        headers.insert("stripe-signature", sig.parse().unwrap());
+
+        let status = stripe_webhook(State(state.clone()), headers, Bytes::from(body))
+            .await
+            .expect("a delayed payment method settling grants credits once");
+        assert_eq!(status, StatusCode::OK);
+
+        let db = state.db.as_ref().expect("db configured");
+        let balance = db.get_credit_balance_row("user-1").expect("balance row");
+        assert_eq!(balance.pack_remaining, 100);
+    }
+
+    #[tokio::test]
+    async fn stripe_webhook_rejects_an_empty_webhook_secret() {
+        // `STRIPE_SECRET_KEY` set with `STRIPE_WEBHOOK_SECRET` unset yields
+        // `Some("")`, not `None` — this must still be treated as "webhook not
+        // configured" rather than verifying signatures against an empty key.
+        let (_dir, state) = test_state_with_webhook_secret("").await;
+        let session = topup_session("cs_dispatch_3", "user-1", "usd", 2500, "paid", 250);
+        let body = stripe_event_body("evt_dispatch_3", "checkout.session.completed", &session);
+        let mut headers = HeaderMap::new();
+        headers.insert("stripe-signature", "t=1,v1=deadbeef".parse().unwrap());
+
+        let err = stripe_webhook(State(state.clone()), headers, Bytes::from(body))
+            .await
+            .expect_err("an empty configured secret must never verify");
+        assert_eq!(err.0, StatusCode::SERVICE_UNAVAILABLE);
+
+        let db = state.db.as_ref().expect("db configured");
+        assert!(db.get_credit_balance_row("user-1").is_none());
     }
 }
 

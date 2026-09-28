@@ -291,6 +291,12 @@ pub fn build_topup_checkout_params(
     let mut params = HashMap::new();
     params.insert("customer", customer_id.to_string());
     params.insert("mode", "payment".to_string());
+    // Pin to card so the session settles immediately (payment_status "paid"
+    // on `checkout.session.completed`) instead of depending on whichever
+    // delayed payment methods the Stripe dashboard has enabled — those still
+    // work via `checkout.session.async_payment_succeeded`, but requiring
+    // card removes that dependency for the common case.
+    params.insert("payment_method_types[0]", "card".to_string());
     params.insert("line_items[0][price_data][currency]", "usd".to_string());
     params.insert(
         "line_items[0][price_data][product_data][name]",
@@ -326,6 +332,11 @@ mod tests {
         );
 
         assert_eq!(params.get("mode").map(String::as_str), Some("payment"));
+        assert_eq!(
+            params.get("payment_method_types[0]").map(String::as_str),
+            Some("card"),
+            "card must be pinned so the session doesn't depend on delayed payment methods"
+        );
         assert_eq!(
             params
                 .get("line_items[0][price_data][unit_amount]")
