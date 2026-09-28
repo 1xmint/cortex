@@ -334,7 +334,9 @@ mod tests {
             "$25 must be exactly 2500 cents — no markup"
         );
         assert_eq!(
-            params.get("line_items[0][price_data][currency]").map(String::as_str),
+            params
+                .get("line_items[0][price_data][currency]")
+                .map(String::as_str),
             Some("usd")
         );
         assert_eq!(

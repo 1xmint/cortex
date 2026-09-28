@@ -714,7 +714,7 @@ pub struct CheckoutRequest {
     pub referral_choice: Option<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 pub struct CheckoutResponse {
     pub checkout_url: String,
     pub session_id: String,
@@ -1572,8 +1572,9 @@ fn grant_credit_topup(db: &Database, obj: &serde_json::Value, event_id: &str) {
     }
     let credits_from_amount = amount_subtotal_cents / 10;
 
-    if let Some(metadata_credits) =
-        obj["metadata"]["credits"].as_str().and_then(|s| s.parse::<i64>().ok())
+    if let Some(metadata_credits) = obj["metadata"]["credits"]
+        .as_str()
+        .and_then(|s| s.parse::<i64>().ok())
     {
         if metadata_credits != credits_from_amount {
             tracing::error!(
@@ -1605,7 +1606,10 @@ fn grant_credit_topup(db: &Database, obj: &serde_json::Value, event_id: &str) {
             );
         }
         Ok(false) => {
-            tracing::debug!(session_id, "credit topup already granted; webhook replay ignored");
+            tracing::debug!(
+                session_id,
+                "credit topup already granted; webhook replay ignored"
+            );
         }
         Err(e) => {
             tracing::error!(session_id, "failed to grant credit topup: {e}");
@@ -1798,10 +1802,9 @@ mod topup_tests {
             user_id: "user-1".into(),
         };
 
-        let err =
-            create_topup_checkout(State(state), user, Json(TopupRequest { amount_usd: 25 }))
-                .await
-                .expect_err("no subscription row exists for this user");
+        let err = create_topup_checkout(State(state), user, Json(TopupRequest { amount_usd: 25 }))
+            .await
+            .expect_err("no subscription row exists for this user");
         assert_eq!(err.0, StatusCode::CONFLICT);
     }
 
@@ -1816,10 +1819,9 @@ mod topup_tests {
             user_id: "user-1".into(),
         };
 
-        let err =
-            create_topup_checkout(State(state), user, Json(TopupRequest { amount_usd: 25 }))
-                .await
-                .expect_err("a cancelled subscription may not buy credits");
+        let err = create_topup_checkout(State(state), user, Json(TopupRequest { amount_usd: 25 }))
+            .await
+            .expect_err("a cancelled subscription may not buy credits");
         assert_eq!(err.0, StatusCode::CONFLICT);
     }
 }
