@@ -366,6 +366,38 @@ async fn dispatch_step(state: &AppState, step: &StepRef) -> DispatchOutcome {
         return DispatchOutcome::RetryLater;
     }
 
+    // --- Money gate: production dispatch requires a usable provider gateway ---
+    //
+    // Separate from the balance/spend-cap check just above. This answers a
+    // different question — "can Cortex make a priced call at all right now" —
+    // and belongs before any lease or path is spent: a step dispatched to a
+    // worker with no working gateway cannot make a priced call, so the worker
+    // would discover that failure itself, after Cortex already paid for the
+    // lease and the sandbox setup. A balance check has no place here; that is
+    // `check_usage_gate` above, on purpose (see `dispatch_money_gate`'s doc).
+    let gateway_on = crate::provider_gateway_http::is_gateway_on();
+    match cortex_core::billing_binding::dispatch_money_gate(crate::is_production_env(), gateway_on)
+    {
+        cortex_core::billing_binding::DispatchGate::Allow => {}
+        cortex_core::billing_binding::DispatchGate::AllowWithWarning => {
+            if !gateway_on {
+                tracing::warn!(
+                    step_id = %step.step_id,
+                    "provider gateway is off outside production — dispatching anyway"
+                );
+            }
+        }
+        cortex_core::billing_binding::DispatchGate::Block => {
+            tracing::error!(
+                step_id = %step.step_id,
+                user_id = %step.user_id,
+                "{} (step stays pending, will retry next tick)",
+                cortex_core::billing_binding::GATEWAY_DOWN_MESSAGE
+            );
+            return DispatchOutcome::RetryLater;
+        }
+    }
+
     // --- Path leases, at step scope ---
     //
     // Acquired here rather than at run creation. A run-scoped lease is held

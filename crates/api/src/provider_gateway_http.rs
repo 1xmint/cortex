@@ -342,6 +342,15 @@ pub(crate) fn gateway_usable() -> Option<GatewayUsable> {
     })
 }
 
+/// Thin boolean view of [`gateway_usable`] for callers that only need to know
+/// whether the gateway can be called right now, not what to call it with —
+/// the scheduler's dispatch-time money gate (`billing_binding::dispatch_money_gate`)
+/// is one of these: it must never construct or discard a `GatewayUsable` just
+/// to answer "is it on".
+pub(crate) fn is_gateway_on() -> bool {
+    gateway_usable().is_some()
+}
+
 pub async fn messages(
     State(state): State<std::sync::Arc<AppState>>,
     headers: HeaderMap,
