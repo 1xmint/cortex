@@ -6,7 +6,9 @@
 //! (`provider_gateway.rs`) called in-process with a capability scoped to one
 //! reply. The gateway reserves a spend cap before it calls the supplier and
 //! settles on what the supplier actually reports; this module never guesses
-//! that number, only reads it back and turns it into whole credits.
+//! that number, only reads it back and hands the exact micro-USD total to
+//! [`crate::db::Database::charge_settled_cost`], which turns it into whole
+//! credits against the user's balance and carry.
 //!
 //! # What decides the price
 //!
@@ -121,9 +123,9 @@ fn reset_turn_windows_for_test() {
 /// anything, each get authorized against the full balance, and each run
 /// real (billable-to-Cortex) supplier turns — only for the second one's
 /// final charge to be clamped down to whatever the first left behind (see
-/// `deduct_credits_up_to`), handing out real work for free. Serializing
-/// per user means the second reply's turn-by-turn balance checks see what
-/// the first actually spent.
+/// `charge_settled_cost`), handing out real work for free. Serializing per
+/// user means the second reply's turn-by-turn balance checks see what the
+/// first actually spent.
 ///
 /// In-process only, same as `TURN_WINDOWS` above: `CORTEX_SINGLE_NODE=1` is
 /// required for this server (see `AGENTS.md`), so one process holds every
@@ -174,13 +176,6 @@ async fn acquire_user_reply_permit(user_id: &str) -> UserReplyPermit {
     }
 }
 
-/// Round a micro-USD cost up to the nearest whole credit. `i64::div_ceil` is
-/// still unstable on this toolchain, so this spells out the same arithmetic
-/// by hand rather than reaching for a nightly feature.
-fn ceil_div(numerator: i64, denominator: i64) -> i64 {
-    (numerator + denominator - 1) / denominator
-}
-
 /// The chat model tiers, mapped to Claude model ids that are already priced
 /// on every seeded list, so picking them here never needs a second place to
 /// keep in sync with what the price list actually publishes.
@@ -217,7 +212,7 @@ impl PaidReplyError {
     fn user_message(&self) -> String {
         match self {
             PaidReplyError::Unavailable => {
-                "Cortex chat is temporarily unavailable. Please try again in a moment.".into()
+                "Cortex can't reach the model right now. Try again in a few minutes.".into()
             }
             PaidReplyError::NoCredits => {
                 "You're out of credits. Go to Settings → Billing to buy more or subscribe.".into()
@@ -341,11 +336,26 @@ async fn send_one_turn<T: ProviderTransport + Clone>(
         .forward(request, now_ms)
         .await
         .map_err(|e| match e {
-            // The reservation is refused when the cap (at most the user's
-            // balance) cannot cover the worst-case cost of this turn.
-            GatewayError::Reservation(detail) => {
+            // A reservation is refused for one of several reasons, and only
+            // one of them is actually the user's balance: "authorization
+            // exhausted: ..." (db/provider_gateway.rs), meaning this turn's
+            // reservation would exceed the spend cap this module itself
+            // computed from the user's credits, is the sole genuine
+            // insufficient-credit case. Every other `Reservation` string --
+            // "supplier capacity is not funded" / "supplier capacity
+            // exhausted: ...", a DB lock or IO failure, an amount overflow, a
+            // missing/expired/revoked authorization, a capability mismatch, a
+            // request-key replay conflict -- is a Cortex-side problem the
+            // user did nothing to cause, and telling them they're out of
+            // credits would be false; those get the same outage message as a
+            // gateway that's off or has no price row for this model.
+            GatewayError::Reservation(detail) if detail.starts_with("authorization exhausted") => {
                 tracing::info!(user_id, %detail, turn, "chat: spend reservation refused");
                 PaidReplyError::NotEnoughCredits
+            }
+            GatewayError::Reservation(detail) => {
+                tracing::warn!(user_id, %detail, turn, "chat: reservation unavailable");
+                PaidReplyError::Unavailable
             }
             other => {
                 tracing::error!(user_id, error = %other, turn, "chat: gateway call failed");
@@ -431,7 +441,7 @@ pub(crate) enum VoiceConfirm {
 ///
 /// One charge per reply, not one per turn: every turn's observed cost is
 /// summed and settled in a single ledger line at the end (see the
-/// `deduct_credits_up_to` call below), even for a reply that took three
+/// `charge_settled_cost` call below), even for a reply that took three
 /// turns to answer. Before each turn this checks that the user's balance
 /// still covers a reservation and that the conversation has not spent its
 /// per-minute turn allowance (`CORTEX_CHAT_AGENT_TURN_CAP_PER_MINUTE`,
@@ -543,10 +553,11 @@ pub(crate) async fn send_paid_reply<T: ProviderTransport + Clone>(
 
         // Read the balance unfiltered. It is not decremented until the
         // single end-of-reply charge (see below), so what earlier turns in
-        // *this* loop already cost is subtracted here — as whole credits,
-        // rounded up the same way the final charge will round, so "credits
-        // used so far" mid-loop always matches what actually gets deducted
-        // at the end. Nothing left on turn 1 is a hard refusal — nothing
+        // *this* loop already cost is subtracted here at its exact
+        // micro-USD value (`total_observed_micro_usd`, not rounded to whole
+        // credits), so "credits used so far" mid-loop always matches what
+        // the final charge will actually settle. Nothing left on turn 1 is
+        // a hard refusal — nothing
         // has been reserved or charged yet, so there is nothing to
         // preserve. Nothing left on turn 2+ is a graceful stop: earlier
         // turns already did billable work that must still be charged once,
@@ -582,14 +593,25 @@ pub(crate) async fn send_paid_reply<T: ProviderTransport + Clone>(
             break;
         }
 
-        let credits_used_so_far = if total_observed_micro_usd > 0 {
-            ceil_div(total_observed_micro_usd, price_list.micros_per_credit)
-        } else {
-            0
-        };
-        let remaining_credits =
-            balance.subscription_remaining + balance.pack_remaining - credits_used_so_far;
-        if remaining_credits <= 0 {
+        // Exact-billing, carry-aware gate. What this reply can still spend is
+        // the user's whole balance converted to micro-USD, minus the carry
+        // already owed from previous replies (a fractional debt that never
+        // shows up in `subscription_remaining`/`pack_remaining` until it
+        // crosses a whole credit, but is real and must be paid first), minus
+        // whatever this reply has already spent in earlier turns of this
+        // same loop (not yet deducted from the balance -- the whole reply is
+        // one charge at the end; see `send_one_turn`'s doc comment):
+        //
+        //   payable = balance_credits * micros_per_credit - carry - spent_so_far
+        //
+        // `max_micro_usd`, the cap handed to this turn's reservation, is the
+        // smaller of the operator's own spend limit and this payable amount.
+        let carry_micro_usd = db.get_credit_carry_micro_usd(user_id) as i64;
+        let payable_micro_usd = (balance.subscription_remaining + balance.pack_remaining)
+            .saturating_mul(price_list.micros_per_credit)
+            .saturating_sub(carry_micro_usd)
+            .saturating_sub(total_observed_micro_usd);
+        if payable_micro_usd <= 0 {
             if turn == 1 {
                 return Err(PaidReplyError::NoCredits);
             }
@@ -605,9 +627,7 @@ pub(crate) async fn send_paid_reply<T: ProviderTransport + Clone>(
             );
             break;
         }
-        let max_micro_usd = limits
-            .max_micro_usd
-            .min(remaining_credits.saturating_mul(price_list.micros_per_credit));
+        let max_micro_usd = limits.max_micro_usd.min(payable_micro_usd);
 
         if !try_acquire_turn_slot(&turn_cap_key, turn_cap, now_ms) {
             if turn == 1 {
@@ -886,20 +906,25 @@ pub(crate) async fn send_paid_reply<T: ProviderTransport + Clone>(
     // cost — including a reply that stopped early, so the turns that did
     // run are never given away for free.
     let charged_credits_total = if total_observed_micro_usd > 0 {
-        let credits = ceil_div(total_observed_micro_usd, price_list.micros_per_credit);
         // Never discard the reply over the final charge: `?` here would turn
         // a billing hiccup (or a balance that shrank mid-loop, e.g. another
         // reply spending concurrently) into a lost answer the user already
-        // paid the supplier for. `deduct_credits_up_to` clamps to whatever is
-        // actually left instead of erroring, so this only fails on a real
-        // database error, which we log and still answer past.
-        match db.deduct_credits_up_to(
+        // paid the supplier for. `charge_settled_cost` clamps the deduction
+        // to whatever is actually left instead of erroring — the full
+        // nominal cost still lands in `cost_micro_usd`, but any whole
+        // credits it could not collect are not collected from anyone:
+        // Cortex absorbs them, and that absorption is recorded in the
+        // ledger row's own description rather than hidden — so this only
+        // fails on a real database error, which we log and still answer
+        // past.
+        match db.charge_settled_cost(
             user_id,
-            credits,
+            total_observed_micro_usd as u64,
+            price_list.micros_per_credit,
             "Cortex-paid chat reply",
             &ChargeKey::for_chat_reply(reply_id),
         ) {
-            Ok(charged) => charged,
+            Ok(settled) => settled.credits_charged,
             Err(e) => {
                 tracing::error!(user_id, reply_id, error = %e, "chat: failed to charge for reply");
                 0
@@ -1164,15 +1189,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_reply_charges_exactly_the_ceiling_of_observed_cost() {
+    async fn a_reply_charges_exactly_its_observed_cost_and_carries_the_remainder() {
         let (_dir, db) = test_db();
         db.init_credit_balance("user-1", 100).unwrap();
         let price_list = db.active_price_list().unwrap();
         let rate = price_list.model("claude", MODEL).unwrap();
-        // 10 input, 10 output tokens at the seeded haiku rate.
+        // 10 input, 10 output tokens at the seeded haiku rate: 60 micro-USD,
+        // far under one credit (100_000 micro-USD) -- exact billing charges
+        // 0 whole credits and carries the full cost forward instead of
+        // rounding it up to 1.
         let observed_micros = rate.cost_micros(10, 0, 10);
         assert!(observed_micros > 0, "fixture must actually cost something");
-        let expected_credits = ceil_div(observed_micros, price_list.micros_per_credit);
+        assert!(
+            observed_micros < price_list.micros_per_credit,
+            "fixture must cost less than one credit for this test to be meaningful"
+        );
 
         let limits = SpendLimits {
             max_micro_usd: 1000000000,
@@ -1200,9 +1231,13 @@ mod tests {
         .expect("reply should succeed");
 
         assert_eq!(reply.text, "hello there");
-        assert_eq!(reply.charged_credits, expected_credits);
+        assert_eq!(reply.charged_credits, 0);
         let balance = db.get_credit_balance_row("user-1").unwrap();
-        assert_eq!(balance.subscription_remaining, 100 - expected_credits);
+        assert_eq!(balance.subscription_remaining, 100);
+        assert_eq!(
+            db.get_credit_carry_micro_usd("user-1"),
+            observed_micros as u64
+        );
     }
 
     #[tokio::test]
@@ -1238,6 +1273,11 @@ mod tests {
         assert!(matches!(error, PaidReplyError::Provider(_)));
         let balance = db.get_credit_balance_row("user-1").unwrap();
         assert_eq!(balance.subscription_remaining, 100, "nothing was charged");
+        assert_eq!(
+            db.get_credit_carry_micro_usd("user-1"),
+            0,
+            "no cost was observed, so the carry must not move either"
+        );
     }
 
     #[tokio::test]
@@ -1318,12 +1358,16 @@ mod tests {
 
         let price_list = db.active_price_list().unwrap();
         let rate = price_list.model("claude", MODEL).unwrap();
-        let expected_credits = ceil_div(rate.cost_micros(10, 0, 10), price_list.micros_per_credit);
+        let observed_micros = rate.cost_micros(10, 0, 10);
         let balance = db.get_credit_balance_row("user-1").unwrap();
         assert_eq!(
-            balance.subscription_remaining,
-            100 - expected_credits,
-            "the replayed reply must not charge twice"
+            balance.subscription_remaining, 100,
+            "the tiny fixture cost is under one credit either way"
+        );
+        assert_eq!(
+            db.get_credit_carry_micro_usd("user-1"),
+            observed_micros as u64,
+            "the carry must have moved only once, not twice"
         );
     }
 
@@ -1372,7 +1416,57 @@ mod tests {
             reservation.reserved_micro_usd,
             price_list.micros_per_credit
         );
-        assert_eq!(reply.charged_credits, 1);
+        assert_eq!(reply.charged_credits, 0, "6 micro-USD is under one credit");
+        assert_eq!(db.get_credit_carry_micro_usd("user-1"), 6);
+    }
+
+    #[tokio::test]
+    async fn turn_ones_authorization_cap_subtracts_the_outstanding_carry() {
+        // The gate that gets turned into `max_micro_usd` is `balance_credits *
+        // micros_per_credit - carry - spent_so_far`: a fractional debt from
+        // earlier replies is real money owed and must come off the top
+        // before this turn gets to spend anything, or the same micro-USD
+        // would effectively get spent twice.
+        let (_dir, db) = test_db();
+        db.init_credit_balance("user-1", 1).unwrap();
+        db.conn()
+            .execute(
+                "UPDATE credit_balances SET carry_micro_usd = 40000 WHERE clerk_user_id = ?1",
+                rusqlite::params!["user-1"],
+            )
+            .unwrap();
+
+        send_paid_reply(
+            &db,
+            SIGNING_KEY,
+            SUPPLIER_KEY,
+            FixedTransport::ok(1, 1, "tiny reply"),
+            big_limits(),
+            "user-1",
+            Some("conv-gate-1"),
+            MODEL,
+            "system",
+            "hi",
+            "reply-gate-1",
+            NOW,
+            20,
+            None,
+            VoiceConfirm::Off,
+            None,
+        )
+        .await
+        .expect("reply should succeed");
+
+        let max_micro_usd: i64 = db
+            .conn()
+            .query_row(
+                "SELECT max_micro_usd FROM provider_spend_authorizations WHERE id = ?1",
+                rusqlite::params!["gateway-auth:chat-reply:reply-gate-1:turn1"],
+                |r| r.get(0),
+            )
+            .expect("turn 1 authorization row");
+        // 1 credit (100_000 micro-USD) minus the 40_000 carry already owed.
+        assert_eq!(max_micro_usd, 60_000);
     }
 
     fn text_response(
@@ -1490,10 +1584,10 @@ mod tests {
         let price_list = db.active_price_list().unwrap();
         let rate = price_list.model("claude", MODEL).unwrap();
         let per_turn_micro = rate.cost_micros(10, 0, 10);
-        // One ledger line for the whole reply, for the ceiling of the sum of
-        // every turn's observed cost — not one line (and one separate
-        // rounding-up) per turn.
-        let expected_credits = ceil_div(per_turn_micro * 2, price_list.micros_per_credit);
+        // One ledger line for the whole reply, for the exact sum of every
+        // turn's observed cost — not one line (and one separate rounding
+        // step) per turn.
+        let total_observed_micros = per_turn_micro * 2;
 
         let transport = SequenceTransport::new(vec![
             tool_use_response(10, 10, "toolu_1", "list_runs", serde_json::json!({})),
@@ -1523,12 +1617,18 @@ mod tests {
 
         assert_eq!(transport.call_count(), 2, "one turn per gateway call");
         assert_eq!(reply.text, "here is your answer");
-        assert_eq!(reply.charged_credits, expected_credits);
+        assert_eq!(
+            reply.charged_credits, 0,
+            "120 micro-USD is under one credit"
+        );
         let balance = db.get_credit_balance_row("user-1").unwrap();
         assert_eq!(
-            balance.subscription_remaining,
-            1000 - expected_credits,
-            "the ledger reflects one deduction for the whole reply"
+            balance.subscription_remaining, 1000,
+            "the ledger reflects one deduction for the whole reply, not one per turn"
+        );
+        assert_eq!(
+            db.get_credit_carry_micro_usd("user-1"),
+            total_observed_micros as u64
         );
         assert_eq!(
             reply.tool_activity,
@@ -1536,6 +1636,80 @@ mod tests {
                 tool_name: "list_runs".into(),
                 ok: true
             }]
+        );
+    }
+
+    #[tokio::test]
+    async fn turn_twos_authorization_cap_subtracts_turn_ones_observed_cost() {
+        // `spent_so_far` in the payable gate is this loop's own running
+        // total, not yet deducted from the balance -- so turn 2's cap must
+        // be smaller than turn 1's by exactly what turn 1 was observed to
+        // cost, on top of the carry already owed.
+        let (_dir, db) = test_db();
+        db.init_credit_balance("user-1", 1).unwrap();
+        db.conn()
+            .execute(
+                "UPDATE credit_balances SET carry_micro_usd = 40000 WHERE clerk_user_id = ?1",
+                rusqlite::params!["user-1"],
+            )
+            .unwrap();
+
+        let price_list = db.active_price_list().unwrap();
+        let rate = price_list.model("claude", MODEL).unwrap();
+        let turn_one_observed = rate.cost_micros(10, 0, 10);
+        assert_eq!(
+            turn_one_observed, 60,
+            "haiku fixture cost must be 60 micro-USD for this test's numbers to hold"
+        );
+
+        let transport = SequenceTransport::new(vec![
+            tool_use_response(10, 10, "toolu_1", "list_runs", serde_json::json!({})),
+            text_response(10, 10, "here is your answer"),
+        ]);
+
+        send_paid_reply(
+            &db,
+            SIGNING_KEY,
+            SUPPLIER_KEY,
+            transport,
+            big_limits(),
+            "user-1",
+            Some("conv-gate-2"),
+            MODEL,
+            "system",
+            "how are my runs?",
+            "reply-gate-2",
+            NOW,
+            20,
+            None,
+            VoiceConfirm::Off,
+            None,
+        )
+        .await
+        .expect("reply should succeed");
+
+        let turn1_max: i64 = db
+            .conn()
+            .query_row(
+                "SELECT max_micro_usd FROM provider_spend_authorizations WHERE id = ?1",
+                rusqlite::params!["gateway-auth:chat-reply:reply-gate-2:turn1"],
+                |r| r.get(0),
+            )
+            .expect("turn 1 authorization row");
+        assert_eq!(turn1_max, 60_000);
+
+        let turn2_max: i64 = db
+            .conn()
+            .query_row(
+                "SELECT max_micro_usd FROM provider_spend_authorizations WHERE id = ?1",
+                rusqlite::params!["gateway-auth:chat-reply:reply-gate-2:turn2"],
+                |r| r.get(0),
+            )
+            .expect("turn 2 authorization row");
+        assert_eq!(
+            turn2_max,
+            60_000 - turn_one_observed,
+            "turn 2's payable cap must subtract what turn 1 already spent this loop"
         );
     }
 
@@ -2263,35 +2437,101 @@ mod tests {
             "partial answer must say why it stopped: {}",
             reply.text
         );
-        let expected_credits = ceil_div(rate.cost_micros(10, 0, 10), price_list.micros_per_credit);
-        assert_eq!(reply.charged_credits, expected_credits);
+        let observed_micros = rate.cost_micros(10, 0, 10);
+        assert_eq!(reply.charged_credits, 0, "60 micro-USD is under one credit");
         let balance = db.get_credit_balance_row("user-1").unwrap();
-        assert_eq!(balance.subscription_remaining, 1_000_000 - expected_credits);
+        assert_eq!(balance.subscription_remaining, 1_000_000);
+        assert_eq!(
+            db.get_credit_carry_micro_usd("user-1"),
+            observed_micros as u64
+        );
+    }
+
+    /// Drains a user's balance to zero from a second connection right after
+    /// answering a turn, while still asking for a tool call so the loop
+    /// actually attempts a second turn — standing in for a concurrent spend
+    /// (another reply, another device) landing between turn 1 and the
+    /// in-loop balance check before turn 2.
+    ///
+    /// Exact billing makes a small per-turn cost (60 micro-USD against a
+    /// 100_000-micro-USD credit) essentially unable to exhaust a balance on
+    /// its own within `MAX_AGENT_TURNS`, since the gateway's own worst-case
+    /// reservation check would refuse turn 1 long before that many small
+    /// charges could add up — so a real concurrent drain is what actually
+    /// exercises the in-loop `payable <= 0` stop.
+    #[derive(Clone)]
+    struct DrainBalanceAndCallToolTransport {
+        db_path: std::path::PathBuf,
+        user_id: &'static str,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl ProviderTransport for DrainBalanceAndCallToolTransport {
+        fn forward(
+            &self,
+            _supplier_key: &str,
+            _request: &GatewayRequest,
+        ) -> impl Future<Output = Result<TransportResponse, TransportFailure>> + Send {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let concurrent_db = Database::open(&self.db_path);
+            let balance = concurrent_db
+                .get_credit_balance_row(self.user_id)
+                .expect("balance row");
+            let available = balance.subscription_remaining + balance.pack_remaining;
+            if available > 0 {
+                concurrent_db
+                    .deduct_credits(
+                        self.user_id,
+                        available,
+                        "concurrent drain",
+                        &ChargeKey::for_verification("concurrent-drain-mid-loop"),
+                    )
+                    .expect("concurrent drain should succeed");
+            }
+            std::future::ready(Ok(TransportResponse {
+                body: serde_json::json!({
+                    "id": "msg_test",
+                    "type": "message",
+                    "role": "assistant",
+                    "model": MODEL,
+                    "content": [{"type": "tool_use", "id": "toolu_1", "name": "list_runs", "input": {}}],
+                    "stop_reason": "tool_use",
+                    "stop_sequence": null,
+                    "usage": {"input_tokens": 10, "output_tokens": 10}
+                }),
+                upstream_request_id: Some("upstream-1".into()),
+                usage: Some(ObservedUsage {
+                    input_tokens: 10,
+                    cached_input_tokens: 0,
+                    output_tokens: 10,
+                    ..Default::default()
+                }),
+            }))
+        }
     }
 
     #[tokio::test]
     async fn insufficient_credits_mid_loop_stops_without_charge() {
-        let (_dir, db) = test_db();
-        let price_list = db.active_price_list().unwrap();
-        let rate = price_list.model("claude", MODEL).unwrap();
-        let per_turn_credits = ceil_div(rate.cost_micros(10, 0, 10), price_list.micros_per_credit);
-        // Exactly enough for one turn; the balance check before turn 2 must
-        // see zero remaining and stop without a second charge.
-        db.init_credit_balance("user-1", per_turn_credits).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("chat-paid.sqlite");
+        let db = Database::open(&db_path);
+        // Plenty of headroom for turn 1's reservation (well above the
+        // worst-case floor); the transport drains it to zero right after
+        // answering, so turn 2's in-loop balance check sees nothing left.
+        db.init_credit_balance("user-1", 5).unwrap();
 
-        let transport = SequenceTransport::new(vec![tool_use_response(
-            10,
-            10,
-            "toolu_1",
-            "list_runs",
-            serde_json::json!({}),
-        )]);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let transport = DrainBalanceAndCallToolTransport {
+            db_path: db_path.clone(),
+            user_id: "user-1",
+            calls: calls.clone(),
+        };
 
         let reply = send_paid_reply(
             &db,
             SIGNING_KEY,
             SUPPLIER_KEY,
-            transport.clone(),
+            transport,
             big_limits(),
             "user-1",
             Some("conv-tool-3"),
@@ -2309,13 +2549,13 @@ mod tests {
         .expect("a partial answer, not an error, once at least one turn ran");
 
         assert_eq!(
-            transport.call_count(),
+            calls.load(Ordering::SeqCst),
             1,
-            "no gateway call once credits are gone"
+            "no second gateway call once the concurrent drain leaves nothing payable"
         );
         assert_eq!(
-            reply.charged_credits, per_turn_credits,
-            "only the turn that ran is charged"
+            reply.charged_credits, 0,
+            "60 micro-USD from the one turn that ran is under one credit"
         );
         assert!(
             reply.text.contains("out of credits"),
@@ -2323,7 +2563,16 @@ mod tests {
             reply.text
         );
         let balance = db.get_credit_balance_row("user-1").unwrap();
-        assert_eq!(balance.subscription_remaining + balance.pack_remaining, 0);
+        assert_eq!(
+            balance.subscription_remaining + balance.pack_remaining,
+            0,
+            "the concurrent drain left nothing"
+        );
+        assert_eq!(
+            db.get_credit_carry_micro_usd("user-1"),
+            60,
+            "the one turn that ran still owes its cost"
+        );
     }
 
     /// Wraps another transport and flips a shared flag right after that
@@ -2406,10 +2655,15 @@ mod tests {
 
         let price_list = db.active_price_list().unwrap();
         let rate = price_list.model("claude", MODEL).unwrap();
-        let expected_credits = ceil_div(rate.cost_micros(10, 0, 10), price_list.micros_per_credit);
+        let observed_micros = rate.cost_micros(10, 0, 10);
         assert_eq!(
-            reply.charged_credits, expected_credits,
-            "only the turn that actually ran must be charged"
+            reply.charged_credits, 0,
+            "60 micro-USD from the one turn that ran is under one credit"
+        );
+        assert_eq!(
+            db.get_credit_carry_micro_usd("user-1"),
+            observed_micros as u64,
+            "only the turn that actually ran must be charged, into the carry"
         );
 
         let reservation = db
@@ -2525,10 +2779,15 @@ mod tests {
             "partial answer must say why it stopped: {}",
             reply.text
         );
-        let expected_credits = ceil_div(rate.cost_micros(10, 0, 10), price_list.micros_per_credit);
+        let observed_micros = rate.cost_micros(10, 0, 10);
         assert_eq!(
-            reply.charged_credits, expected_credits,
-            "turn 1's work is still charged even though turn 2 failed"
+            reply.charged_credits, 0,
+            "60 micro-USD from turn 1 is under one credit"
+        );
+        assert_eq!(
+            db.get_credit_carry_micro_usd("user-1"),
+            observed_micros as u64,
+            "turn 1's work is still charged (into the carry) even though turn 2 failed"
         );
     }
 
@@ -2650,20 +2909,27 @@ mod tests {
         db.init_credit_balance("user-1", 100).unwrap();
 
         // Usage must stay inside the per-turn reservation (MAX_OUTPUT_TOKENS
-        // of output) or the gateway refuses it before the loop sees it. A
-        // haiku turn that size costs under one credit, so this test uses a
-        // pricier model to make one in-bounds turn cost more than the 1
-        // credit left after the concurrent drain.
-        const PRICEY_MODEL: &str = "claude-opus-5";
+        // of output) or the gateway refuses it before the loop sees it; the
+        // *observed* cost settled here also can't exceed that reservation's
+        // own upper bound (computed off the real, tiny request body plus
+        // MAX_OUTPUT_TOKENS), so inflating input_tokens in the fabricated
+        // response usage is not an option -- it would make the observed
+        // cost exceed the reservation and the call would be rejected before
+        // the clamp this test targets is ever reached. Instead this uses
+        // Cortex's priciest model (claude-fable-5, $10/$50 per million
+        // tokens) so that one near-max-output turn alone costs just over 2
+        // credits, leaving a nonzero shortfall (owed 2, charged 1) after the
+        // clamp to the 1 credit left post-drain.
+        const PRICEY_MODEL: &str = "claude-fable-5";
         let input_tokens = 10;
         let output_tokens = MAX_OUTPUT_TOKENS - 96;
         let price_list = db.active_price_list().unwrap();
         let rate = price_list.model("claude", PRICEY_MODEL).unwrap();
         let observed_micros = rate.cost_micros(input_tokens, 0, output_tokens);
-        let expected_credits = ceil_div(observed_micros, price_list.micros_per_credit);
         assert!(
-            expected_credits > 1,
-            "fixture must cost more than the 1 credit left after the concurrent drain"
+            observed_micros > 2 * price_list.micros_per_credit,
+            "fixture must cost more than 2 credits (200_000 micro-USD) so that, clamped to \
+             the 1 credit left after the concurrent drain, a nonzero shortfall remains"
         );
 
         let transport = ShrinkingBalanceTransport {
@@ -2706,11 +2972,132 @@ mod tests {
         .expect("a shortfall at final-charge time must not discard the reply");
 
         assert_eq!(reply.text, "hello there");
+        assert_eq!(
+            reply.charged_credits, 1,
+            "clamped to the 1 credit left, not the full amount owed"
+        );
         let balance = db.get_credit_balance_row("user-1").unwrap();
         assert_eq!(
             balance.subscription_remaining + balance.pack_remaining,
             0,
             "the clamped charge must take exactly what was left, not go negative"
+        );
+        let recorded_cost: i64 = db
+            .conn()
+            .query_row(
+                "SELECT cost_micro_usd FROM credit_transactions \
+                 WHERE idempotency_key = ?1",
+                rusqlite::params![ChargeKey::for_chat_reply("reply-shortfall").as_str()],
+                |row| row.get(0),
+            )
+            .expect("settled charge row");
+        assert_eq!(
+            recorded_cost, observed_micros,
+            "cost_micro_usd must record the full nominal cost, not the clamped amount \
+             actually charged"
+        );
+
+        // The carry must still advance by the pricing math's full total
+        // (starting carry, here 0, plus the observed cost), mod
+        // micros_per_credit -- not clamped down to what was actually
+        // collected. This is a fresh balance, so starting carry is 0.
+        let expected_carry = (observed_micros as u64) % (price_list.micros_per_credit as u64);
+        assert_eq!(
+            db.get_credit_carry_micro_usd("user-1"),
+            expected_carry,
+            "carry must equal (starting carry + observed) % micros_per_credit"
+        );
+
+        // The whole credits this charge could not collect (owed - charged)
+        // must be recorded, not hidden: they are absorbed by Cortex, and
+        // that absorption lives in the ledger row's own description.
+        let credits_owed = (observed_micros as u64) / (price_list.micros_per_credit as u64);
+        assert!(
+            credits_owed > reply.charged_credits as u64,
+            "this test only proves anything if the shortfall is nonzero"
+        );
+        let description: String = db
+            .conn()
+            .query_row(
+                "SELECT description FROM credit_transactions WHERE idempotency_key = ?1",
+                rusqlite::params![ChargeKey::for_chat_reply("reply-shortfall").as_str()],
+                |row| row.get(0),
+            )
+            .expect("settled charge row");
+        assert!(
+            description.contains(&format!(
+                "owed {credits_owed}, charged {}",
+                reply.charged_credits
+            )) && description.contains("shortfall absorbed by Cortex"),
+            "description must record the shortfall instead of hiding it: {description}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_non_exhaustion_reservation_error_is_unavailable_not_no_credits() {
+        // Only "authorization exhausted: ..." (db/provider_gateway.rs) is
+        // genuinely the user's balance. Every other `GatewayError::Reservation`
+        // -- a DB/IO failure, an amount overflow, a missing/expired/revoked
+        // authorization, or (exercised here) a request-key replay conflict --
+        // is Cortex's own problem, and telling the user they're out of
+        // credits over it would be false.
+        let (_dir, db) = test_db();
+        db.init_credit_balance("user-1", 100).unwrap();
+
+        let messages_1 = vec![serde_json::json!({"role": "user", "content": "hi"})];
+        send_one_turn(
+            &db,
+            SIGNING_KEY,
+            SUPPLIER_KEY,
+            FixedTransport::ok(10, 10, "first"),
+            1_000_000,
+            1_000_000,
+            "user-1",
+            "reply-conflict",
+            "claude",
+            MODEL,
+            "system",
+            &messages_1,
+            &[],
+            true,
+            "reply-conflict",
+            1,
+            NOW,
+        )
+        .await
+        .expect("first call reserves and settles turn 1");
+
+        // Same reply id and turn number (same request key), a different
+        // message body (different request digest): the reservation this
+        // replays onto was settled for a different digest, so the gateway
+        // refuses it as a replay conflict rather than an authorization-cap
+        // refusal.
+        let messages_2 =
+            vec![serde_json::json!({"role": "user", "content": "a different message"})];
+        let result = send_one_turn(
+            &db,
+            SIGNING_KEY,
+            SUPPLIER_KEY,
+            FixedTransport::ok(10, 10, "second"),
+            1_000_000,
+            1_000_000,
+            "user-1",
+            "reply-conflict",
+            "claude",
+            MODEL,
+            "system",
+            &messages_2,
+            &[],
+            true,
+            "reply-conflict",
+            1,
+            NOW,
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(PaidReplyError::Unavailable)),
+            "a request-key replay conflict is Cortex's problem, not the user's balance: {result:?}"
         );
     }
 
@@ -2768,10 +3155,11 @@ mod tests {
         let (_dir, db) = test_db();
         let price_list = db.active_price_list().unwrap();
         let rate = price_list.model("claude", MODEL).unwrap();
-        let per_reply_credits = ceil_div(rate.cost_micros(10, 0, 10), price_list.micros_per_credit);
-        // Enough for both replies run one at a time, not enough to give
-        // either of them a second helping.
-        let initial_balance = per_reply_credits * 2;
+        // One credit is comfortably more than either reply's ~60 micro-USD
+        // observed cost, or the gateway's own worst-case per-call reservation
+        // ceiling -- this test is about the per-user lock serializing the
+        // ledger writes, not about exhausting a tight balance.
+        let initial_balance = 1;
         db.init_credit_balance("user-1", initial_balance).unwrap();
 
         let limits = SpendLimits {
@@ -2836,14 +3224,21 @@ mod tests {
         let total_charged =
             initial_balance - (balance.subscription_remaining + balance.pack_remaining);
         assert_eq!(
-            total_charged,
-            per_reply_credits * 2,
-            "each reply should be charged exactly its own cost, with nothing left over or overspent"
+            total_charged, 0,
+            "120 micro-USD total is well under one credit, so nothing should be deducted \
+             from the balance"
         );
         assert_eq!(
             reply_a.charged_credits + reply_b.charged_credits,
             total_charged,
             "the sum of what each reply reports charging must match the actual balance delta"
+        );
+        let observed_micros = rate.cost_micros(10, 0, 10);
+        assert_eq!(
+            db.get_credit_carry_micro_usd("user-1"),
+            (observed_micros * 2) as u64,
+            "both replies' costs must land in the carry exactly once each, with nothing lost \
+             to a race"
         );
     }
 }

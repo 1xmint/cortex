@@ -315,7 +315,8 @@ pub async fn chat(
                 let _ = tx
                     .send(StepEvent::Output {
                         step_id: "chat".into(),
-                        line: "Cortex chat is unavailable right now. Please try again shortly."
+                        line: "Cortex can't reach the model right now. Try again in a few \
+                               minutes."
                             .into(),
                     })
                     .await;
