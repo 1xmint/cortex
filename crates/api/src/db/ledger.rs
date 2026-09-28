@@ -18,6 +18,19 @@
 
 use super::*;
 
+/// What [`Database::charge_settled_cost`] actually did: how many whole
+/// credits it took and what fractional remainder carries forward.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SettledCharge {
+    /// Whole credits actually debited from the balance this call. `0` when
+    /// the cost (plus whatever carry preceded it) is still under one credit,
+    /// or when this call replayed an already-charged key.
+    pub credits_charged: i64,
+    /// `credit_balances.carry_micro_usd` after this charge: the fractional
+    /// micro-USD remainder still owed, always `< micros_per_credit`.
+    pub new_carry_micro_usd: u64,
+}
+
 impl Database {
     /// Honest credit balance read: returns `None` when no ledger row exists.
     /// Never invents a default (e.g. 200) — product APIs must use this.
@@ -362,6 +375,192 @@ impl Database {
             .map_err(|e| format!("failed to commit transaction: {e}"))?;
 
         Ok(clamped_amount)
+    }
+
+    /// Settle a chat reply's exact observed cost against the user's balance
+    /// and carry, in one atomic transaction: reads `credit_balances`
+    /// (including `carry_micro_usd`), runs `pricing::charge(carry, cost,
+    /// micros_per_credit)` to decide how many whole credits are owed and what
+    /// remainder carries forward, debits the credits, writes the new carry,
+    /// and inserts exactly one `credit_transactions` row keyed by `key` with
+    /// `cost_micro_usd` set to the full nominal cost.
+    ///
+    /// Unlike `deduct_credits`/`deduct_credits_up_to`, this never splits one
+    /// charge into `:subscription`/`:pack`-suffixed idempotency keys: the
+    /// caller's `key` is used as-is for the single row, and a row is written
+    /// even when it debits `0` whole credits — a reply costing less than one
+    /// credit still must record its cost and advance the carry.
+    ///
+    /// In normal operation `credits_owed` can never exceed the balance:
+    /// callers must reserve a spend cap that fits *before* making the call
+    /// this charges for. If it ever does anyway (e.g. a concurrent charge
+    /// shrank the balance after this call's own reservation succeeded), the
+    /// deduction is clamped to what's left — balances never go negative and
+    /// this never invents credit — but `cost_micro_usd` on the ledger row
+    /// still records the full, true cost, and the carry still advances by
+    /// the full amount, so the shortfall is never hidden even though this
+    /// one payment fell short of it. A `tracing::warn!` marks the clamp.
+    ///
+    /// Idempotent on `key`: a replay changes nothing and returns
+    /// `credits_charged: 0` with the balance's current carry.
+    pub fn charge_settled_cost(
+        &self,
+        clerk_user_id: &str,
+        cost_micro_usd: u64,
+        micros_per_credit: i64,
+        description: &str,
+        key: &cortex_core::billing_binding::ChargeKey,
+    ) -> Result<SettledCharge, String> {
+        let idempotency_key = key.as_str();
+        if idempotency_key.trim().is_empty() {
+            return Err("idempotency key is required for a settled charge".into());
+        }
+        if micros_per_credit <= 0 {
+            return Err("micros_per_credit must be positive".into());
+        }
+
+        let conn = self.conn();
+
+        conn.execute("BEGIN IMMEDIATE", [])
+            .map_err(|e| format!("failed to begin transaction: {e}"))?;
+
+        let read_balance = |conn: &Connection| {
+            conn.query_row(
+                "SELECT subscription_remaining, pack_remaining, carry_micro_usd
+                 FROM credit_balances WHERE clerk_user_id = ?1",
+                params![clerk_user_id],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+        };
+
+        let (sub_rem, pack_rem, carry_micro_usd) = match read_balance(&conn) {
+            Ok(v) => v,
+            Err(_) => {
+                conn.execute("ROLLBACK", []).ok();
+                return Err(
+                    "no credit balance row — unmetered (refusing to invent a balance)".into(),
+                );
+            }
+        };
+
+        // Replay check inside the transaction, so it can't race a concurrent
+        // charge of the same key.
+        let already: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM credit_transactions WHERE idempotency_key = ?1",
+                params![idempotency_key],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        if already > 0 {
+            conn.execute("ROLLBACK", []).ok();
+            tracing::debug!(
+                user_id = clerk_user_id,
+                idempotency_key,
+                "settled charge replayed; balance and carry unchanged"
+            );
+            return Ok(SettledCharge {
+                credits_charged: 0,
+                new_carry_micro_usd: carry_micro_usd as u64,
+            });
+        }
+
+        let (credits_owed, new_carry) = crate::pricing::charge(
+            carry_micro_usd as u64,
+            cost_micro_usd,
+            micros_per_credit as u64,
+        );
+
+        let total_available = sub_rem + pack_rem;
+        let credits_owed_i64 = i64::try_from(credits_owed).unwrap_or(i64::MAX);
+        let actual_charged = credits_owed_i64.min(total_available).max(0);
+        if actual_charged < credits_owed_i64 {
+            tracing::warn!(
+                user_id = clerk_user_id,
+                idempotency_key,
+                owed = credits_owed_i64,
+                available = total_available,
+                charged = actual_charged,
+                "settled cost exceeds balance; clamping the deduction, not the recorded cost"
+            );
+        }
+
+        let from_sub = actual_charged.min(sub_rem);
+        let from_pack = actual_charged - from_sub;
+        let new_sub_rem = sub_rem - from_sub;
+        let new_pack_rem = pack_rem - from_pack;
+        let new_carry_i64 = i64::try_from(new_carry).unwrap_or(i64::MAX);
+
+        let updated = conn
+            .execute(
+                "UPDATE credit_balances
+                 SET subscription_remaining = ?1, pack_remaining = ?2, carry_micro_usd = ?3
+                 WHERE clerk_user_id = ?4",
+                params![new_sub_rem, new_pack_rem, new_carry_i64, clerk_user_id],
+            )
+            .map_err(|e| {
+                conn.execute("ROLLBACK", []).ok();
+                format!("failed to update credit balance: {e}")
+            })?;
+        if updated == 0 {
+            conn.execute("ROLLBACK", []).ok();
+            return Err("no credit balance row — unmetered (refusing to invent a balance)".into());
+        }
+
+        let balance_type = match (from_sub > 0, from_pack > 0) {
+            (true, true) => "mixed",
+            (_, true) => "pack",
+            _ => "subscription",
+        };
+
+        let tx_id = Uuid::new_v4().to_string();
+        let cost_i64 = i64::try_from(cost_micro_usd).unwrap_or(i64::MAX);
+        if let Err(e) = conn.execute(
+            "INSERT INTO credit_transactions
+                (id, clerk_user_id, amount, balance_type, reason, description,
+                 idempotency_key, cost_micro_usd)
+             VALUES (?1, ?2, ?3, ?4, 'spend', ?5, ?6, ?7)",
+            params![
+                tx_id,
+                clerk_user_id,
+                -actual_charged,
+                balance_type,
+                description,
+                idempotency_key,
+                cost_i64
+            ],
+        ) {
+            conn.execute("ROLLBACK", []).ok();
+            return Err(format!("failed to record settled charge: {e}"));
+        }
+
+        conn.execute("COMMIT", [])
+            .map_err(|e| format!("failed to commit transaction: {e}"))?;
+
+        Ok(SettledCharge {
+            credits_charged: actual_charged,
+            new_carry_micro_usd: new_carry,
+        })
+    }
+
+    /// The carry alone: the fractional micro-USD remainder from previous
+    /// exact charges that hasn't yet added up to one whole credit. `0` for a
+    /// user with no balance row.
+    pub fn get_credit_carry_micro_usd(&self, clerk_user_id: &str) -> u64 {
+        self.conn()
+            .query_row(
+                "SELECT carry_micro_usd FROM credit_balances WHERE clerk_user_id = ?1",
+                params![clerk_user_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|v| v.max(0) as u64)
+            .unwrap_or(0)
     }
 
     /// Give back exactly what a charge took, when a verdict says the work
@@ -1506,6 +1705,107 @@ mod tests {
             (0, 0),
             "each bucket's append-only log nets to zero on its own"
         );
+    }
+
+    #[test]
+    fn settled_charges_accumulate_carry_and_deduct_exactly_when_it_crosses_a_credit() {
+        // Exact pass-through billing: a reply that costs far less than one
+        // credit deducts nothing and leaves the whole cost sitting in carry.
+        // Repeating it keeps accumulating carry until it crosses one whole
+        // credit (100_000 micro-USD here), at which point exactly one credit
+        // is deducted and the remainder keeps carrying forward.
+        let db = test_db();
+        let user = subscriber(&db, 100);
+        let mpc: i64 = 100_000;
+
+        let first = db
+            .charge_settled_cost(
+                user,
+                12_345,
+                mpc,
+                "Cortex-paid chat reply",
+                &ChargeKey::for_chat_reply("reply-1"),
+            )
+            .expect("first charge");
+        assert_eq!(first.credits_charged, 0);
+        assert_eq!(first.new_carry_micro_usd, 12_345);
+        assert_eq!(db.get_credit_balance(user).subscription_remaining, 100);
+        assert_eq!(db.get_credit_carry_micro_usd(user), 12_345);
+
+        let second = db
+            .charge_settled_cost(
+                user,
+                12_345,
+                mpc,
+                "Cortex-paid chat reply",
+                &ChargeKey::for_chat_reply("reply-2"),
+            )
+            .expect("second charge");
+        assert_eq!(second.credits_charged, 0);
+        assert_eq!(second.new_carry_micro_usd, 24_690);
+        assert_eq!(db.get_credit_carry_micro_usd(user), 24_690);
+
+        // Keep charging the same amount until the accumulated carry crosses
+        // one whole credit (100_000 micro-USD): 24_690 + 12_345*7 = 111_105,
+        // which owes exactly 1 credit and carries the 11_105 remainder.
+        let mut reply_n = 3;
+        loop {
+            let charge = db
+                .charge_settled_cost(
+                    user,
+                    12_345,
+                    mpc,
+                    "Cortex-paid chat reply",
+                    &ChargeKey::for_chat_reply(&format!("reply-{reply_n}")),
+                )
+                .expect("repeated charge");
+            if charge.credits_charged > 0 {
+                assert_eq!(charge.credits_charged, 1, "one carry-crossing is one credit");
+                assert_eq!(charge.new_carry_micro_usd, 11_105);
+                break;
+            }
+            reply_n += 1;
+            assert!(reply_n < 20, "carry should have crossed a credit by now");
+        }
+        assert_eq!(db.get_credit_balance(user).subscription_remaining, 99);
+        assert_eq!(db.get_credit_carry_micro_usd(user), 11_105);
+    }
+
+    #[test]
+    fn a_settled_charge_replayed_by_key_charges_once() {
+        // The same reply id must never be charged twice: a retry, a page
+        // refresh mid-stream, or a crashed-then-resumed request must all
+        // collapse onto the single row the first attempt wrote.
+        let db = test_db();
+        let user = subscriber(&db, 100);
+        let key = ChargeKey::for_chat_reply("reply-1");
+
+        let first = db
+            .charge_settled_cost(user, 60, 100_000, "Cortex-paid chat reply", &key)
+            .expect("first charge");
+        assert_eq!(first.credits_charged, 0);
+        assert_eq!(first.new_carry_micro_usd, 60);
+
+        let replay = db
+            .charge_settled_cost(user, 60, 100_000, "Cortex-paid chat reply", &key)
+            .expect("replay is a no-op, not an error");
+        assert_eq!(replay.credits_charged, 0, "a replay charges nothing more");
+        assert_eq!(
+            replay.new_carry_micro_usd, 60,
+            "a replay must not advance the carry a second time"
+        );
+        assert_eq!(db.get_credit_balance(user).subscription_remaining, 100);
+        assert_eq!(db.get_credit_carry_micro_usd(user), 60);
+
+        let row_count: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM credit_transactions WHERE idempotency_key = ?1",
+                params![key.as_str()],
+                |r| r.get(0),
+            )
+            .expect("count query");
+        assert_eq!(row_count, 1, "a replay must not write a second row");
     }
 
     #[test]
