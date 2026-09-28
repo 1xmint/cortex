@@ -61,9 +61,12 @@ pub struct DeliveryFacts {
     pub workspace_dir: PathBuf,
     /// The commit the worker delivered. This is what gets graded.
     pub head_commit: String,
-    /// Credits quoted for this step. `None` means no quote was reachable, in
-    /// which case the verdict is still recorded and the ledger is left alone.
-    /// Inventing a price is never correct — pricing is a product decision.
+    /// Credits quoted for this step at dispatch time, kept for display only.
+    /// **Not what the customer is charged** — `finish_and_bill` charges the
+    /// attempt's actual settled observed provider cost
+    /// (`Database::attempt_settled_cost_micro_usd`) via `settle_attempt`,
+    /// never this quote. `None` means no quote was reachable; that has no
+    /// effect on billing either way.
     pub quoted_credits: Option<i64>,
 }
 
@@ -188,7 +191,14 @@ pub async fn verify_delivery<R: CheckRunner>(
                 exam_paths = ?paths,
                 "declared verdict_class=strong and then edited the exam; inconclusive"
             );
-            finish_inconclusive_without_grading(db, &verification_id, facts, &detail);
+            finish_inconclusive_without_grading(
+                db,
+                &verification_id,
+                facts,
+                &detail,
+                AttemptEndCause::ExamTampered,
+            )
+            .await;
             return Some(Verdict::Inconclusive);
         }
         ExamIntegrity::Unknown { reason } => {
@@ -199,7 +209,14 @@ pub async fn verify_delivery<R: CheckRunner>(
                 reason = %reason,
                 "could not establish frozen exam integrity; grading refused"
             );
-            finish_inconclusive_without_grading(db, &verification_id, facts, &detail);
+            finish_inconclusive_without_grading(
+                db,
+                &verification_id,
+                facts,
+                &detail,
+                AttemptEndCause::CortexCrash,
+            )
+            .await;
             return Some(Verdict::Inconclusive);
         }
     }
@@ -208,16 +225,23 @@ pub async fn verify_delivery<R: CheckRunner>(
         Ok(c) => c,
         Err(e) => {
             // We could not produce a tree to grade. That is our failure, so it
-            // is Inconclusive: no charge, no refund, and an operator hears
-            // about it. Leaving the row 'pending' would strand the attempt.
+            // is Inconclusive and Cortex absorbs whatever the attempt had
+            // already spent — an operator still hears about it. Leaving the
+            // row 'pending' would strand the attempt.
             tracing::error!(
                 run_id = %facts.run_id,
                 step_id = %facts.step_id,
                 error = %e,
                 "could not snapshot the delivered tree; verification is inconclusive"
             );
-            let _ = db.finish_verification(&verification_id, Verdict::Inconclusive);
-            project_verdict(db, facts, Verdict::Inconclusive, Some(&e));
+            finish_inconclusive_without_grading(
+                db,
+                &verification_id,
+                facts,
+                &e,
+                AttemptEndCause::CortexCrash,
+            )
+            .await;
             return Some(Verdict::Inconclusive);
         }
     };
@@ -251,19 +275,31 @@ pub async fn verify_delivery<R: CheckRunner>(
         "verification complete"
     );
 
-    finish_and_bill(db, &verification_id, report.verdict, facts).await;
+    // A real verdict maps straight to its matching end cause. `Inconclusive`
+    // reaching here can only mean `run_with_retries` exhausted its retries --
+    // our runner, not the customer's work, failed to produce a result -- so
+    // it absorbs rather than charges.
+    let end_cause = match report.verdict {
+        Verdict::Verified => AttemptEndCause::Verified,
+        Verdict::Unverified => AttemptEndCause::Unverified,
+        Verdict::Failed => AttemptEndCause::Failed,
+        Verdict::Inconclusive => AttemptEndCause::RunnerDown,
+    };
+    finish_and_bill(db, &verification_id, report.verdict, end_cause, facts).await;
     project_verdict(db, facts, report.verdict, None);
     Some(report.verdict)
 }
 
-/// Seal an integrity refusal without reaching either the runner or billing.
-fn finish_inconclusive_without_grading(
+/// Seal an integrity refusal without reaching the runner, then settle the
+/// attempt for the given cause (see [`billing_binding::settle_attempt`]).
+async fn finish_inconclusive_without_grading(
     db: &Database,
     verification_id: &str,
     facts: &DeliveryFacts,
     detail: &str,
+    cause: AttemptEndCause,
 ) {
-    let _ = db.finish_verification(verification_id, Verdict::Inconclusive);
+    finish_and_bill(db, verification_id, Verdict::Inconclusive, cause, facts).await;
     project_verdict(db, facts, Verdict::Inconclusive, Some(detail));
 }
 
@@ -347,11 +383,14 @@ async fn run_with_retries<R: CheckRunner>(
     }
 }
 
-/// Seal the verdict, then move money if the verdict says to.
+/// Seal the verdict, then settle the attempt: charge its settled observed
+/// cost to the customer, or have Cortex absorb it. Never a refund — see the
+/// module doc comment and [`billing_binding::settle_attempt`].
 async fn finish_and_bill(
     db: &Database,
     verification_id: &str,
     verdict: Verdict,
+    end_cause: AttemptEndCause,
     facts: &DeliveryFacts,
 ) {
     if let Err(e) = db.finish_verification(verification_id, verdict) {
@@ -359,13 +398,18 @@ async fn finish_and_bill(
         return;
     }
 
-    if !verdict.has_billing_effect() {
-        // Inconclusive. Our problem, so it costs us time and not the
-        // customer's money — but somebody should look at it.
-        tracing::error!(
+    // An attempt that never made a settled provider call writes no ledger
+    // row at all, whether it would have been charged or absorbed — there is
+    // nothing to charge and nothing to absorb.
+    let cost_micro_usd = db.attempt_settled_cost_micro_usd(&facts.attempt_id);
+    if cost_micro_usd == 0 {
+        tracing::debug!(
             run_id = %facts.run_id,
             step_id = %facts.step_id,
-            "verification inconclusive; no ledger write, operator attention needed"
+            attempt_id = %facts.attempt_id,
+            ?verdict,
+            ?end_cause,
+            "attempt made no settled provider calls; no ledger row"
         );
         return;
     }
@@ -375,65 +419,62 @@ async fn finish_and_bill(
         return;
     };
 
-    let charge_key = billing_binding::ChargeKey::for_verification(verification_id);
-    let refund_key = billing_binding::RefundKey::for_verification(verification_id);
+    let key = billing_binding::ChargeKey::for_attempt(&facts.attempt_id);
 
-    // Derive the billing state from the ledger, not from a status column. The
-    // ledger is where the money actually is, so it cannot disagree with itself.
-    let state = if db.ledger_has_key(refund_key.as_str()) {
-        BillingState::Refunded
-    } else if db.ledger_has_key(charge_key.as_str()) {
-        BillingState::Charged
-    } else {
-        BillingState::Unbilled
-    };
-
-    let reason = billing_binding::ledger_reason(verdict).unwrap_or("verdict");
-
-    match billing_binding::billing_effect(verdict, state, verification_id) {
-        BillingEffect::Charge { idempotency_key } => {
-            let Some(amount) = facts.quoted_credits else {
-                // Never invent a price. The verdict still stands; the charge
-                // simply does not happen, and that is visible.
-                tracing::warn!(
+    match billing_binding::settle_attempt(end_cause) {
+        AttemptSettlement::Charge => {
+            let Some(price_list) = db.active_price_list() else {
+                tracing::error!(
                     run_id = %facts.run_id,
                     step_id = %facts.step_id,
-                    "verdict is billable but no quoted price was reachable; no charge written"
+                    attempt_id = %facts.attempt_id,
+                    "no active price list; cannot convert the attempt's observed cost to credits"
                 );
                 return;
             };
-            match db.deduct_credits(&user_id, amount, reason, &idempotency_key) {
-                Ok(_) => tracing::info!(
+            match db.charge_settled_cost(
+                &user_id,
+                cost_micro_usd,
+                price_list.micros_per_credit,
+                billing_binding::reason::TASK_ATTEMPT_CHARGED,
+                &key,
+            ) {
+                Ok(settled) => tracing::info!(
                     run_id = %facts.run_id,
                     verification_id,
-                    amount,
-                    "charged for a verified outcome"
+                    attempt_id = %facts.attempt_id,
+                    cost_micro_usd,
+                    credits_charged = settled.credits_charged,
+                    ?end_cause,
+                    "charged the attempt's settled observed cost"
                 ),
                 Err(e) => tracing::error!(
                     run_id = %facts.run_id,
                     verification_id,
                     error = %e,
-                    "charge failed"
+                    "settled-cost charge failed"
                 ),
             }
         }
-        BillingEffect::Refund { idempotency_key } => {
-            match db.refund_credits(&user_id, &charge_key, &idempotency_key, reason) {
-                Ok(_) => tracing::info!(
+        AttemptSettlement::Absorb(cause) => {
+            let description =
+                format!("{}: {cause:?}", billing_binding::reason::TASK_ATTEMPT_ABSORBED);
+            match db.absorb_attempt_cost(&user_id, cost_micro_usd, &description, &key) {
+                Ok(()) => tracing::info!(
                     run_id = %facts.run_id,
                     verification_id,
-                    "refunded a failed outcome"
+                    attempt_id = %facts.attempt_id,
+                    cost_micro_usd,
+                    ?cause,
+                    "absorbed the attempt's settled observed cost"
                 ),
                 Err(e) => tracing::error!(
                     run_id = %facts.run_id,
                     verification_id,
                     error = %e,
-                    "refund failed"
+                    "failed to record the absorbed cost"
                 ),
             }
-        }
-        BillingEffect::None => {
-            tracing::debug!(verification_id, ?verdict, ?state, "no ledger effect");
         }
     }
 }
@@ -752,8 +793,8 @@ mod tests {
         );
         assert_eq!(
             receipt.charged_credits, None,
-            "facts_for this test carries no quoted_credits, so finish_and_bill \
-             never charges and no ledger row exists to read back"
+            "this attempt made no settled provider calls, so finish_and_bill's \
+             attempt_settled_cost_micro_usd is 0 and no ledger row exists to read back"
         );
     }
 
