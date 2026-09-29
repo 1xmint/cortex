@@ -9124,14 +9124,17 @@ impl Database {
 
     // --- Workers ---
 
-    /// `owned_by_cortex` records, at connection time, whether this worker
-    /// authenticated with a Cortex-operated worker key (see
-    /// `mark_worker_key_cortex_owned`) rather than a customer's own `cwk_`
-    /// key. Settlement's absorption classification (item D of the M-D-0024
-    /// settlement redesign) reads this column, snapshotted onto each
-    /// `attempt_endings` row at end-time, to decide whether a lease expiry
-    /// or infrastructure failure is Cortex's own machinery faulting (free)
-    /// or a customer's own worker failing (charged).
+    /// `owned_by_cortex` says whether this worker authenticated with a
+    /// Cortex-operated worker key (see `mark_worker_key_cortex_owned`) rather
+    /// than a customer's own `cwk_` key. It is written only when the worker
+    /// id is first inserted, from the key type of that first connection; a
+    /// reconnect never changes it (a reconnect does rewrite `user_id`,
+    /// `status` and `last_seen`). The value is copied onto each
+    /// `attempt_endings` row when an attempt ends, and settlement's
+    /// absorption classification (item D of the M-D-0024 settlement
+    /// redesign) reads that copy to decide whether a lease expiry or
+    /// infrastructure failure is Cortex's own machinery faulting (free) or a
+    /// customer's own worker failing (charged).
     pub fn register_worker(&self, worker_id: &str, user_id: &str, owned_by_cortex: bool) {
         let conn = self.conn();
         let now = Utc::now().timestamp_millis();
@@ -9141,11 +9144,10 @@ impl Database {
             // once, the first time a worker id is ever registered, so a
             // later reconnect -- or a colliding worker id presenting a
             // different key -- can never rewrite an existing row's
-            // ownership flag. Only the operator's own provisioning path sets
-            // it, by inserting the row in the first place; everything after
-            // that is a fresh INSERT for a genuinely new id (`owned_by_cortex`
-            // takes its bound value) or a reconnect of an existing one
-            // (the column keeps whatever it already was).
+            // ownership flag. Whichever connection first registers an id
+            // decides it, from the type of key that connection presented:
+            // a genuinely new id takes the bound value, and a reconnect of
+            // an existing one keeps whatever the column already was.
             "INSERT INTO workers (id, user_id, status, created_at, last_seen, owned_by_cortex)
              VALUES (?1, ?2, 'connected', ?3, ?3, ?4)
              ON CONFLICT(id) DO UPDATE SET

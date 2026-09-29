@@ -176,14 +176,15 @@ impl Database {
 
         let mut dead = 0;
         for (job_id, step_id, attempt_id, lease_gen) in &dying {
-            if self.record_execution_failure_and_end(
+            let ended = self.record_execution_failure_and_end(
                 step_id,
                 attempt_id,
                 *lease_gen,
                 "verification claim expired after exhausting attempts",
                 cortex_core::billing_binding::AttemptEndCause::CortexCrash,
                 false,
-            ) {
+            );
+            if ended {
                 if let Err(e) = self.settle_pending_attempts() {
                     tracing::error!(
                         job_id = %job_id,
@@ -200,6 +201,15 @@ impl Database {
                     "record_execution_failure_and_end returned false for a reclaim \
                      dead-letter -- likely stale lease_gen"
                 );
+                // Retire the job only if the step has genuinely moved on
+                // (a stale lease_gen: something else already ended it). If
+                // the transition failed on a database error the step is
+                // still `verifying` and its attempt has no ending yet;
+                // burying the job now would strand it with nothing left to
+                // retry the ending. Leave it claimed for the next reclaim.
+                if self.get_step_status(step_id).as_deref() == Some("verifying") {
+                    continue;
+                }
             }
             let updated = self
                 .conn()
@@ -259,14 +269,21 @@ impl Database {
             .ok();
 
         if let Some((step_id, attempt_id, lease_gen)) = &dying {
-            if self.record_execution_failure_and_end(
+            let ended = self.record_execution_failure_and_end(
                 step_id,
                 attempt_id,
                 *lease_gen,
                 "retries exhausted without a verdict",
                 cortex_core::billing_binding::AttemptEndCause::CortexCrash,
                 false,
-            ) {
+            );
+            // Bury the job only if the ending was recorded, or the step has
+            // genuinely left `verifying` (a stale lease_gen: something else
+            // already ended it). A database error leaves the step
+            // `verifying` with no ending; retiring the job then would strand
+            // the attempt, so fall through and leave it for a later retry.
+            let may_retire = ended || self.get_step_status(step_id).as_deref() != Some("verifying");
+            if ended {
                 if let Err(e) = self.settle_pending_attempts() {
                     tracing::error!(
                         job_id = %job_id,
@@ -284,20 +301,22 @@ impl Database {
                      retry-exhausted dead-letter -- likely stale lease_gen"
                 );
             }
-            let retired = self
-                .conn()
-                .execute(
-                    "UPDATE verification_jobs
-                     SET state = 'dead', claim_token = NULL,
-                         terminal_reason = 'retries exhausted without a verdict',
-                         updated_at = ?1, version = version + 1
-                     WHERE job_id = ?2 AND state = 'claimed' AND claim_token = ?3
-                       AND attempt_count >= ?4",
-                    params![now, job_id, claim_token, VERIFICATION_MAX_ATTEMPTS],
-                )
-                .unwrap_or(0);
-            if retired > 0 {
-                return true;
+            if may_retire {
+                let retired = self
+                    .conn()
+                    .execute(
+                        "UPDATE verification_jobs
+                         SET state = 'dead', claim_token = NULL,
+                             terminal_reason = 'retries exhausted without a verdict',
+                             updated_at = ?1, version = version + 1
+                         WHERE job_id = ?2 AND state = 'claimed' AND claim_token = ?3
+                           AND attempt_count >= ?4",
+                        params![now, job_id, claim_token, VERIFICATION_MAX_ATTEMPTS],
+                    )
+                    .unwrap_or(0);
+                if retired > 0 {
+                    return true;
+                }
             }
         }
 

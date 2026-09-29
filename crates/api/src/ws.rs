@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::path::Path;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
@@ -628,16 +627,78 @@ async fn handle_worker_msg(
                             // F2 of the money-review fix pass: verify the
                             // worker's claimed head commit actually resolves
                             // in the workspace repo *before* handing it to
-                            // verification. If it does not resolve, that is
-                            // the worker's own delivery being broken, not a
-                            // Cortex fault -- charged, not absorbed. This
-                            // check happens here, upstream of
-                            // `TreeCheckout::create` in
-                            // verification_driver.rs: once we get there, a
-                            // checkout failure really is Cortex's own
-                            // tooling breaking on a commit that does exist,
-                            // and that stays absorbed.
-                            if !commit_resolves(&state.workspace_dir, &head) {
+                            // verification. Three outcomes, because the
+                            // difference is who pays:
+                            //
+                            // - `Missing` (a healthy repository that does
+                            //   not hold the commit): the worker's own
+                            //   delivery is broken -- charged.
+                            // - `CheckFailed` (git would not start, the
+                            //   workspace is not a healthy repository, a
+                            //   lock or permission error): Cortex's own
+                            //   machinery -- absorbed as `CortexCrash`.
+                            // - `Resolves`: on to verification.
+                            //
+                            // Run on the blocking pool: it shells out to git
+                            // and this is an async handler.
+                            let commit_check = {
+                                let workspace = state.workspace_dir.clone();
+                                let head_to_check = head.clone();
+                                tokio::task::spawn_blocking(move || {
+                                    crate::verification_driver::check_commit(
+                                        &workspace,
+                                        &head_to_check,
+                                    )
+                                })
+                                .await
+                                .unwrap_or_else(|e| {
+                                    crate::verification_driver::CommitCheck::CheckFailed(format!(
+                                        "commit check task did not complete: {e}"
+                                    ))
+                                })
+                            };
+                            if let crate::verification_driver::CommitCheck::CheckFailed(reason) =
+                                &commit_check
+                            {
+                                tracing::error!(
+                                    step_id = %step_id,
+                                    attempt_id = %attempt_id,
+                                    head_commit = %head,
+                                    error = %reason,
+                                    "could not determine whether the worker-reported head \
+                                     commit resolves; Cortex's own fault, absorbed"
+                                );
+                                if db.record_execution_failure_and_end(
+                                    &step_id,
+                                    &attempt_id,
+                                    lease_gen,
+                                    &format!(
+                                        "could not check the worker-reported head commit \
+                                         {head}: {reason}"
+                                    ),
+                                    AttemptEndCause::CortexCrash,
+                                    owned,
+                                ) {
+                                    if let Err(e) = db.settle_pending_attempts() {
+                                        tracing::error!(
+                                            step_id = %step_id,
+                                            attempt_id = %attempt_id,
+                                            error = %e,
+                                            "settle_pending_attempts failed after a failed \
+                                             head-commit check; the scheduler's next tick \
+                                             will retry"
+                                        );
+                                    }
+                                } else {
+                                    tracing::warn!(
+                                        step_id = %step_id,
+                                        "record_execution_failure_and_end returned false for \
+                                         a failed head-commit check — likely stale lease_gen"
+                                    );
+                                }
+                            } else if commit_check
+                                == crate::verification_driver::CommitCheck::Missing
+                            {
                                 tracing::warn!(
                                     step_id = %step_id,
                                     attempt_id = %attempt_id,
@@ -706,6 +767,14 @@ async fn handle_worker_msg(
                                     // that cannot be enqueued must not be left
                                     // `delivered` forever with no ending -- fail
                                     // the step and record why atomically instead.
+                                    //
+                                    // Charged to nobody: the head resolved, so the
+                                    // only way here is `transition_verification`
+                                    // failing on Cortex's own database (a failed
+                                    // transaction or enqueue insert). The worker's
+                                    // delivery had nothing to do with it, so the
+                                    // ending is `CortexCrash` (absorbed), never
+                                    // `Failed`.
                                     tracing::warn!(
                                         step_id = %step_id,
                                         "could not move the delivery to verifying; failing \
@@ -716,7 +785,7 @@ async fn handle_worker_msg(
                                         &attempt_id,
                                         lease_gen,
                                         "could not enqueue delivery for verification",
-                                        AttemptEndCause::Failed,
+                                        AttemptEndCause::CortexCrash,
                                         owned,
                                     ) {
                                         if let Err(e) = db.settle_pending_attempts() {
@@ -810,18 +879,19 @@ async fn handle_worker_msg(
                             false,
                         ),
                         None => {
-                            tracing::warn!(
+                            // No resolvable run means there is no owner to
+                            // bill and no way to record an ending. Do not
+                            // transition the step at all: a plain `fail_step`
+                            // would terminate it with no attempt ending, so
+                            // the attempt's cost would go unrecorded. Left
+                            // alone, lease expiry records the ending.
+                            tracing::error!(
                                 step_id = %step_id,
                                 attempt_id = %attempt_id,
-                                "no resolvable run for verifier-rejected step; transitioning \
-                                 without an attempt-ended record"
+                                "no resolvable run for verifier-rejected step; leaving the \
+                                 step untransitioned so lease expiry records its ending"
                             );
-                            Ok(db.fail_step(
-                                &step_id,
-                                lease_gen,
-                                &verifier_failure,
-                                Some("VerifierRejected"),
-                            ))
+                            return;
                         }
                     };
 
@@ -1147,21 +1217,19 @@ async fn handle_worker_msg(
                         }
                     }
                     None => {
-                        // No resolvable run means there is no owner to bill;
-                        // fall back to the plain (non-billing) transition so
-                        // the step still terminates, and skip the ledger
-                        // write entirely rather than guessing an owner.
-                        tracing::warn!(
+                        // No resolvable run means there is no owner to bill
+                        // and no way to record an ending. Do not transition
+                        // the step at all: a plain `fail_step` /
+                        // `cancel_step` would terminate it with no attempt
+                        // ending, so the attempt's cost would go unrecorded.
+                        // Left alone, lease expiry records the ending.
+                        tracing::error!(
                             step_id = %step_id,
                             attempt_id = %attempt_id,
-                            "no resolvable run for failed step; transitioning without an \
-                             attempt-ended record"
+                            "no resolvable run for failed step; leaving the step \
+                             untransitioned so lease expiry records its ending"
                         );
-                        if is_cancelled {
-                            db.cancel_step(&step_id, lease_gen, error_msg)
-                        } else {
-                            db.fail_step(&step_id, lease_gen, error_msg, Some(&kind_str))
-                        }
+                        return;
                     }
                 };
 
@@ -1761,27 +1829,6 @@ fn verifier_verdict(verdict: VerifierVerdict) -> &'static str {
         VerifierVerdict::Failed => "fail",
         VerifierVerdict::Blocked => "blocked",
     }
-}
-
-/// F2 of the money-review fix pass: does `commit` actually resolve as a
-/// commit object in the workspace repository? A worker can report any
-/// string as its delivered `head_commit`; checking this *before* handing it
-/// to verification means an unresolvable commit is recognized as the
-/// worker's own delivery being broken (charged, `AttemptEndCause::Failed`)
-/// rather than surfacing later as a `TreeCheckout::create` failure in
-/// verification_driver.rs, which is reserved for a checkout failing on a
-/// commit that really does exist -- Cortex's own tooling breaking, and
-/// still absorbed there.
-fn commit_resolves(workspace_dir: &Path, commit: &str) -> bool {
-    std::process::Command::new("git")
-        .arg("-C")
-        .arg(workspace_dir)
-        .arg("cat-file")
-        .arg("-e")
-        .arg(format!("{commit}^{{commit}}"))
-        .output()
-        .map(|out| out.status.success())
-        .unwrap_or(false)
 }
 
 /// Resolve step_id to run_id using a per-connection cache to avoid repeated DB lookups.
@@ -2960,6 +3007,255 @@ mod attempt_end_paths {
                 .as_deref(),
             Some("leased"),
             "the step must be untouched when the reported attempt id is rejected"
+        );
+    }
+
+    // ---- who pays when a delivered head commit cannot be used -------------
+    //
+    // The rule: the customer pays the exact settled cost of every call their
+    // attempt made. A fault in Cortex's own machinery is absorbed as
+    // `CortexCrash` (a zero-amount row); a fault caused by what the worker
+    // delivered is charged.
+
+    fn completed_message(
+        step_id: &str,
+        attempt_id: &str,
+        lease_gen: i64,
+        head: Option<&str>,
+    ) -> WorkerMessage {
+        WorkerMessage::StepCompleted {
+            message_id: "m-completed".into(),
+            step_id: step_id.into(),
+            attempt_id: attempt_id.into(),
+            lease_gen,
+            exit_code: 0,
+            // Same base on the message and (via the fallback contract) the
+            // verifier's own copy, no changed files, so the engine verifier
+            // does not block the delivery.
+            base_commit: Some("base-sha".into()),
+            head_commit: head.map(str::to_string),
+            branch: Some("worker-branch".into()),
+            output: StepOutput {
+                summary: "done".into(),
+                files_found: Vec::new(),
+                files_changed: Vec::new(),
+                evidence: None,
+                tokens_in: None,
+                tokens_out: None,
+                cost_estimate: None,
+                structured: serde_json::Value::Null,
+            },
+        }
+    }
+
+    async fn deliver(state: &std::sync::Arc<AppState>, worker_id: &str, message: WorkerMessage) {
+        let (brain_tx, _brain_rx) = mpsc::channel(8);
+        let mut registered = true;
+        let mut authed_user_id = Some(OWNER.to_string());
+        let mut step_run_cache = HashMap::new();
+        handle_worker_msg(
+            state,
+            worker_id,
+            "session-1",
+            &mut registered,
+            &mut authed_user_id,
+            &brain_tx,
+            message,
+            &mut step_run_cache,
+        )
+        .await;
+    }
+
+    fn git_in(dir: &std::path::Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .expect("git runs");
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// A customer-owned worker's step that has started, on a funded account,
+    /// with one genuinely settled 300_000 micro-USD call.
+    fn running_step_with_settled_call(
+        state: &AppState,
+        attempt_id: &str,
+    ) -> (String, String, i64) {
+        let (worker_id, step_id, lease_gen) = lease_fixture_owned(state, attempt_id, false);
+        let db = state.db.as_ref().expect("database");
+        assert!(db.start_step(&step_id, lease_gen));
+        db.init_credit_balance(OWNER, 1_000).expect("balance row");
+        let claims = attempt_capability(db, OWNER, attempt_id);
+        settle_call(db, &claims, &format!("call-{attempt_id}"), 300_000);
+        (worker_id, step_id, lease_gen)
+    }
+
+    fn assert_charged_three_credits(state: &AppState, attempt_id: &str) {
+        let (cause, settled_at) = ending_row(state, attempt_id)
+            .expect("the delivery must leave a durable attempt_endings row");
+        assert_eq!(
+            cause, "failed",
+            "a delivery the worker broke is the worker's fault and is charged"
+        );
+        assert!(settled_at.is_some(), "the settler must have run");
+        let db = state.db.as_ref().expect("database");
+        assert_eq!(
+            db.get_credit_balance(OWNER).subscription_remaining,
+            997,
+            "300_000 micro-USD at the seeded 100_000-micro-USD credit is exactly 3 \
+             whole credits"
+        );
+        assert_eq!(db.get_credit_carry_micro_usd(OWNER), 0);
+    }
+
+    fn assert_absorbed(state: &AppState, attempt_id: &str) {
+        let (cause, settled_at) = ending_row(state, attempt_id)
+            .expect("the delivery must leave a durable attempt_endings row");
+        assert_eq!(
+            cause, "cortex_crash",
+            "a fault in Cortex's own machinery must be absorbed, never charged"
+        );
+        assert!(settled_at.is_some(), "the settler must have run");
+        let db = state.db.as_ref().expect("database");
+        assert_eq!(
+            db.get_credit_balance(OWNER).subscription_remaining,
+            1_000,
+            "an absorbed attempt must never touch the customer's balance"
+        );
+        assert_eq!(db.get_credit_carry_micro_usd(OWNER), 0);
+        let key = cortex_core::billing_binding::ChargeKey::for_attempt(attempt_id);
+        let (amount, reason): (i64, String) = db
+            .conn()
+            .query_row(
+                "SELECT amount, reason FROM credit_transactions WHERE idempotency_key = ?1",
+                rusqlite::params![key.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("absorbed-cost row");
+        assert_eq!(
+            amount, 0,
+            "an absorbed cost is a zero-amount row, never a refund"
+        );
+        assert_eq!(reason, "absorbed");
+    }
+
+    #[tokio::test]
+    async fn a_head_commit_missing_from_a_healthy_workspace_repo_is_charged() {
+        let state = state().await;
+        git_in(&state.workspace_dir, &["init"]);
+        let (worker_id, step_id, lease_gen) =
+            running_step_with_settled_call(&state, "attempt-head-missing");
+
+        deliver(
+            &state,
+            &worker_id,
+            completed_message(
+                &step_id,
+                "attempt-head-missing",
+                lease_gen,
+                Some("0000000000000000000000000000000000000000"),
+            ),
+        )
+        .await;
+
+        assert_charged_three_credits(&state, "attempt-head-missing");
+    }
+
+    #[tokio::test]
+    async fn a_delivery_with_no_head_commit_is_charged() {
+        let state = state().await;
+        let (worker_id, step_id, lease_gen) =
+            running_step_with_settled_call(&state, "attempt-head-none");
+
+        deliver(
+            &state,
+            &worker_id,
+            completed_message(&step_id, "attempt-head-none", lease_gen, None),
+        )
+        .await;
+
+        assert_charged_three_credits(&state, "attempt-head-none");
+    }
+
+    #[tokio::test]
+    async fn a_workspace_that_is_not_a_git_repo_is_cortexs_fault_and_absorbed() {
+        // The head cannot be looked up because the server's own workspace is
+        // not a repository: Cortex's machinery, not the worker's delivery.
+        let state = state().await;
+        let (worker_id, step_id, lease_gen) =
+            running_step_with_settled_call(&state, "attempt-no-repo");
+
+        deliver(
+            &state,
+            &worker_id,
+            completed_message(
+                &step_id,
+                "attempt-no-repo",
+                lease_gen,
+                Some("0000000000000000000000000000000000000000"),
+            ),
+        )
+        .await;
+
+        assert_absorbed(&state, "attempt-no-repo");
+    }
+
+    #[tokio::test]
+    async fn a_delivery_that_cannot_be_enqueued_is_cortexs_fault_and_absorbed() {
+        // The head resolves, so the only way to fail after that is Cortex's
+        // own database refusing the enqueue. Simulated by removing the
+        // verification queue's table, which makes the enqueue insert error.
+        let state = state().await;
+        git_in(&state.workspace_dir, &["init"]);
+        let head = {
+            git_in(
+                &state.workspace_dir,
+                &[
+                    "-c",
+                    "user.name=Test",
+                    "-c",
+                    "user.email=test@example.com",
+                    "-c",
+                    "commit.gpgsign=false",
+                    "commit",
+                    "--allow-empty",
+                    "-m",
+                    "delivered",
+                ],
+            );
+            git_in(&state.workspace_dir, &["rev-parse", "HEAD"])
+        };
+        let (worker_id, step_id, lease_gen) =
+            running_step_with_settled_call(&state, "attempt-enqueue-fails");
+        {
+            let db = state.db.as_ref().expect("database");
+            db.conn()
+                .execute_batch("DROP TABLE verification_jobs")
+                .expect("drop the queue table");
+        }
+
+        deliver(
+            &state,
+            &worker_id,
+            completed_message(&step_id, "attempt-enqueue-fails", lease_gen, Some(&head)),
+        )
+        .await;
+
+        assert_absorbed(&state, "attempt-enqueue-fails");
+        assert_eq!(
+            state
+                .db
+                .as_ref()
+                .unwrap()
+                .get_step_status(&step_id)
+                .as_deref(),
+            Some("execution_failed"),
+            "the step must not be left stranded in `delivered`"
         );
     }
 }
