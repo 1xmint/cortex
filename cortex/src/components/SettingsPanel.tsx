@@ -391,8 +391,10 @@ export default function SettingsPanel({
             SOMA_API_ENABLED ? <SpendDashboard /> : null
           ) : tab === 'notifications' ? (
             <NotificationsTab />
+          ) : import.meta.env.VITE_CLERK_PUBLISHABLE_KEY ? (
+            <ClerkAccountTab />
           ) : (
-            {import.meta.env.VITE_CLERK_PUBLISHABLE_KEY ? <ClerkAccountTab /> : <AccountTab />}
+            <AccountTab />
           )}
         </div>
       </div>
