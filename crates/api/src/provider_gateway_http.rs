@@ -96,6 +96,7 @@ pub(crate) fn issue_access(
     model: &str,
     lease_deadline_ms: i64,
     now_ms: i64,
+    balance_cap_micro_usd: Option<i64>,
 ) -> Option<cortex_core::protocol::ProviderGatewayAccess> {
     gateway_mode()?;
     let allowed = match provider {
@@ -114,6 +115,15 @@ pub(crate) fn issue_access(
     let signing_key = std::env::var("CORTEX_PROVIDER_GATEWAY_SIGNING_KEY").ok()?;
     let limits = SpendLimits::from_env()?;
     let expires_at_ms = lease_deadline_ms;
+    // The operator's cap is the ceiling. When the owner pays from a credit
+    // balance, the balance at dispatch is a lower ceiling: the gateway's
+    // per-call reservation then stops a call that no longer fits, and that
+    // refusal is what pauses the run (see `pause_for_top_up`). Nothing is held
+    // or set aside; this is only the number the existing refusal compares to.
+    let max_micro_usd = match balance_cap_micro_usd {
+        Some(cap) => limits.max_micro_usd.min(cap.max(1)),
+        None => limits.max_micro_usd,
+    };
     let (authorization_id, signed) = create_authorization_and_capability(
         db,
         &signing_key,
@@ -122,7 +132,7 @@ pub(crate) fn issue_access(
         attempt_id,
         provider_label,
         model,
-        limits.max_micro_usd,
+        max_micro_usd,
         limits.funded_micro_usd,
         expires_at_ms,
         now_ms,
@@ -399,7 +409,7 @@ pub async fn messages(
             .into_response();
     };
     let now_ms = chrono::Utc::now().timestamp_millis();
-    match mode {
+    let response = match mode {
         GatewayMode::Stub => {
             handle_stub_message(db, signing_key.as_bytes(), &headers, body, now_ms).await
         }
@@ -414,7 +424,79 @@ pub async fn messages(
             )
             .await
         }
+    };
+    if response
+        .extensions()
+        .get::<AuthorizationExhausted>()
+        .is_some()
+    {
+        pause_for_top_up(&state, db, signing_key.as_bytes(), &headers).await;
     }
+    response
+}
+
+/// Marks a refusal that came from the authorization's cap ("authorization
+/// exhausted"), as opposed to any other reason a reservation can be refused.
+#[derive(Clone, Copy)]
+struct AuthorizationExhausted;
+
+/// The call's reservation did not fit in the authorization, which for a run
+/// paid from a credit balance is the balance itself. End the attempt (its
+/// calls so far are charged as settled), leave the step to be re-dispatched,
+/// and park the run until the owner tops up. Any other refusal never gets here.
+async fn pause_for_top_up(
+    state: &AppState,
+    db: &crate::db::Database,
+    signing_key: &[u8],
+    headers: &HeaderMap,
+) {
+    let Some(token) = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+    else {
+        return;
+    };
+    let Ok(claims) = crate::provider_gateway::verify_capability(
+        signing_key,
+        &SignedCapability::from_exposed(token),
+    ) else {
+        return;
+    };
+    let Some(limits) = SpendLimits::from_env() else {
+        return;
+    };
+    let Some(paused) = db.pause_attempt_for_top_up(
+        &claims.run_id,
+        &claims.attempt_id,
+        &claims.authorization_id,
+        limits.max_micro_usd,
+    ) else {
+        return;
+    };
+    tracing::info!(
+        run_id = %paused.run_id,
+        step_id = %paused.step_id,
+        "run paused: out of credits, waiting for a top-up"
+    );
+    state
+        .emit_scheduler_event(cortex_engine::captain::SchedulerEvent::RunPaused {
+            run_id: paused.run_id.clone(),
+            step_id: paused.step_id.clone(),
+        })
+        .await;
+    if let Some(worker_id) = paused.worker_id.as_deref() {
+        if let Some(worker) = state.workers.read().await.get(worker_id) {
+            let _ = worker
+                .tx
+                .send(cortex_core::protocol::BrainMessage::CancelStep {
+                    step_id: paused.step_id.clone(),
+                    reason: "out of credits: top up to continue".to_string(),
+                })
+                .await;
+        }
+    }
+    state.remove_step_sender(&paused.step_id).await;
 }
 
 /// Live mode can hold keys for more than one supplier, so which transport and
@@ -776,7 +858,15 @@ fn gateway_error_response(error: GatewayError) -> Response {
         | GatewayError::CredentialExposure
         | GatewayError::Reconciliation(_) => StatusCode::BAD_GATEWAY,
     };
-    (status, error.to_string()).into_response()
+    let exhausted = matches!(
+        &error,
+        GatewayError::Reservation(detail) if detail.starts_with("authorization exhausted")
+    );
+    let mut response = (status, error.to_string()).into_response();
+    if exhausted {
+        response.extensions_mut().insert(AuthorizationExhausted);
+    }
+    response
 }
 
 #[cfg(test)]

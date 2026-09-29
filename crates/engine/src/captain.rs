@@ -12,6 +12,8 @@ pub enum RunStatus {
     Pending,
     Planning,
     Running,
+    /// Out of credits: waiting for a top-up (`POST /api/runs/{id}/resume`).
+    AwaitingTopUp,
     Succeeded,
     Failed,
     Cancelled,
@@ -27,6 +29,7 @@ impl RunStatus {
             Self::Pending => "pending",
             Self::Planning => "planning",
             Self::Running => "running",
+            Self::AwaitingTopUp => "awaiting_top_up",
             Self::Succeeded => "succeeded",
             Self::Failed => "failed",
             Self::Cancelled => "cancelled",
@@ -38,6 +41,7 @@ impl RunStatus {
             "pending" => Some(Self::Pending),
             "planning" => Some(Self::Planning),
             "running" => Some(Self::Running),
+            "awaiting_top_up" => Some(Self::AwaitingTopUp),
             "succeeded" => Some(Self::Succeeded),
             "failed" => Some(Self::Failed),
             "cancelled" => Some(Self::Cancelled),
@@ -278,6 +282,18 @@ pub enum SchedulerEvent {
     RunCancelled {
         run_id: String,
         in_flight: Vec<String>,
+    },
+    /// A run ran out of credits mid-step: its attempt was ended and the step
+    /// returned to pending. The step held a concurrency slot that now needs
+    /// freeing. The run itself is `awaiting_top_up` and will not dispatch.
+    RunPaused {
+        run_id: String,
+        step_id: String,
+    },
+    /// A paused run's owner topped up and resumed it: its pending steps are
+    /// dispatchable again.
+    RunResumed {
+        run_id: String,
     },
     Reconcile,
 }

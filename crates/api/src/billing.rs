@@ -1680,6 +1680,12 @@ fn grant_credit_topup(
                 credits_from_amount,
                 "credit topup granted"
             );
+            // Runs that paused for want of credits resume as soon as the
+            // balance covers them; the scheduler's reconcile tick re-queues
+            // their paused step.
+            for run_id in db.resume_awaiting_runs_for_user(clerk_user_id) {
+                tracing::info!(user_id = clerk_user_id, run_id, "run resumed after top-up");
+            }
             Ok(())
         }
         Ok(false) => {

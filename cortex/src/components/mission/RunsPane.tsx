@@ -71,7 +71,7 @@ const SHIPPABLE = new Set(['verified', 'manual_override', 'completed']);
 // A run is only worth offering a Cancel button while it can still spend
 // money or do work: once it is planning, running, or merely queued, there is
 // something to stop. A terminal run has nothing left to cancel.
-const CANCELLABLE = new Set(['pending', 'planning', 'running']);
+const CANCELLABLE = new Set(['pending', 'planning', 'running', 'awaiting_top_up']);
 
 function StepRow({ step, runId }: { step: RunStep; runId: string }) {
   const [expanded, setExpanded] = useState(false);

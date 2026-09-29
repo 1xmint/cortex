@@ -631,6 +631,7 @@ impl AppState {
                 &decision.model_id,
                 lease_deadline_ms,
                 now,
+                None,
             )
         });
 

@@ -1301,7 +1301,10 @@ export interface RunGraph {
 export interface RunSummary {
   id: string;
   goal: string;
+  /** Includes 'awaiting_top_up': the run paused because credits ran out. */
   status?: string;
+  /** Credits charged to this run so far (exact, settled). */
+  spent_credits?: number;
   profile?: string;
   created_at?: string;
   task_id?: string | null;

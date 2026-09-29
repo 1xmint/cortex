@@ -255,6 +255,20 @@ async fn apply_event(state: &AppState, sched: &mut SchedulerState, event: &Sched
             check_run_done(state, run_id).await;
         }
 
+        SchedulerEvent::RunPaused { run_id, step_id } => {
+            tracing::info!("scheduler: run {run_id} awaiting a top-up, freeing step {step_id}");
+            if let Some(db) = &state.db {
+                // The paused attempt ended without failing: free its slot, and
+                // nothing else (no bandit update, no heal, no cascade).
+                sched.mark_step_done(&get_run_user(db, run_id), step_id);
+            }
+        }
+
+        SchedulerEvent::RunResumed { run_id } => {
+            tracing::info!("scheduler: run {run_id} resumed after a top-up");
+            load_ready_steps_for_run(state, sched, run_id).await;
+        }
+
         SchedulerEvent::Reconcile => {
             tracing::debug!("scheduler: reconcile tick");
         }
@@ -346,6 +360,16 @@ async fn dispatch_step(state: &AppState, step: &StepRef) -> DispatchOutcome {
             step_id = %step.step_id,
             run_id = %step.run_id,
             "run is terminal — dropping step instead of dispatching"
+        );
+        return DispatchOutcome::Drop;
+    }
+    // A run waiting for a top-up dispatches nothing. Its paused step stays
+    // `orphaned` and is queued again by `RunResumed`.
+    if db.get_run_status(&step.run_id).as_deref() == Some("awaiting_top_up") {
+        tracing::info!(
+            step_id = %step.step_id,
+            run_id = %step.run_id,
+            "run is awaiting a top-up — not dispatching"
         );
         return DispatchOutcome::Drop;
     }
@@ -455,7 +479,7 @@ async fn dispatch_step(state: &AppState, step: &StepRef) -> DispatchOutcome {
         );
         let run_terminal = matches!(
             db.get_run_status(&step.run_id).as_deref(),
-            Some("cancelled") | Some("succeeded") | Some("failed")
+            Some("cancelled") | Some("succeeded") | Some("failed") | Some("awaiting_top_up")
         );
         if !step_dispatchable || run_terminal {
             db.release_step_resource_leases(&step.step_id);
@@ -882,6 +906,14 @@ async fn dispatch_step(state: &AppState, step: &StepRef) -> DispatchOutcome {
         &decision.model_id,
         deadline,
         chrono::Utc::now().timestamp_millis(),
+        // Pass-through billing: when credits are enforced, the balance now is
+        // the most this attempt's calls may reserve against. A call that no
+        // longer fits pauses the run instead of failing it.
+        if state.billing_enforced {
+            db.payable_micro_usd(&step.user_id)
+        } else {
+            None
+        },
     );
     if provider_egress.is_deny() {
         // Every `ProviderId` has an endpoint, so this is unreachable today. It
@@ -1785,6 +1817,10 @@ async fn load_ready_steps_for_run(state: &AppState, sched: &mut SchedulerState, 
         None => return,
     };
 
+    // A run waiting for a top-up queues nothing until it is resumed.
+    if db.get_run_status(run_id).as_deref() == Some("awaiting_top_up") {
+        return;
+    }
     let ready_ids = db.find_ready_steps(run_id);
     let user_id = get_run_user(db, run_id);
 
