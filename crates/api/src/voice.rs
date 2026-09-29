@@ -211,7 +211,9 @@ impl OpenAiTranscriber {
             )));
         }
         if !status.is_success() {
-            return Err(ProviderFailure::Rejected(format!("openai returned {status}")));
+            return Err(ProviderFailure::Rejected(format!(
+                "openai returned {status}"
+            )));
         }
         let parsed: Value = serde_json::from_str(&text).map_err(|_| {
             ProviderFailure::Unavailable("openai returned a body that is not JSON".into())
@@ -592,8 +594,13 @@ mod tests {
     #[test]
     fn usage_parses_tokens_seconds_and_absence() {
         assert_eq!(
-            parse_usage(&json!({"text": "x", "usage": {"type": "tokens", "input_tokens": 14, "output_tokens": 45}})),
-            ObservedUsage::Tokens { input: 14, output: 45 }
+            parse_usage(
+                &json!({"text": "x", "usage": {"type": "tokens", "input_tokens": 14, "output_tokens": 45}})
+            ),
+            ObservedUsage::Tokens {
+                input: 14,
+                output: 45
+            }
         );
         assert_eq!(
             parse_usage(&json!({"text": "x", "usage": {"type": "duration", "seconds": 3.5}})),
@@ -656,7 +663,11 @@ mod tests {
         };
         assert_eq!(
             rows,
-            vec![("dictation:request-0001".to_string(), -(cost / mpc), Some(cost))]
+            vec![(
+                "dictation:request-0001".to_string(),
+                -(cost / mpc),
+                Some(cost)
+            )]
         );
     }
 
@@ -669,7 +680,7 @@ mod tests {
         )
         .await;
 
-        call(&state, &base, "request-dup1", vec![1; 512])
+        let _ = call(&state, &base, "request-dup1", vec![1; 512])
             .await
             .expect("first request succeeds");
         let db = state.db.as_ref().unwrap();
@@ -681,8 +692,15 @@ mod tests {
             .await
             .expect_err("a replayed id is refused");
         assert_eq!(status, StatusCode::CONFLICT);
-        assert_eq!(fake.calls.load(Ordering::SeqCst), 1, "no second provider call");
-        assert_eq!(db.get_credit_balance_row(USER).unwrap(), balance_after_first);
+        assert_eq!(
+            fake.calls.load(Ordering::SeqCst),
+            1,
+            "no second provider call"
+        );
+        assert_eq!(
+            db.get_credit_balance_row(USER).unwrap(),
+            balance_after_first
+        );
         assert_eq!(db.get_credit_carry_micro_usd(USER), carry_after_first);
         assert_eq!(ledger_rows(&state), rows_after_first);
     }
@@ -718,7 +736,12 @@ mod tests {
         assert_eq!(body["error"], "Dictation unavailable, try again later");
         assert_eq!(fake.calls.load(Ordering::SeqCst), 1);
         let db = state.db.as_ref().unwrap();
-        assert_eq!(db.get_credit_balance_row(USER).unwrap().subscription_remaining, 10);
+        assert_eq!(
+            db.get_credit_balance_row(USER)
+                .unwrap()
+                .subscription_remaining,
+            10
+        );
         assert_eq!(db.get_credit_carry_micro_usd(USER), 0);
         assert_eq!(ledger_rows(&state), 0);
 
@@ -768,12 +791,17 @@ mod tests {
         let (_dir, state) = test_state(10).await;
         let (base, _fake) = spawn_fake(StatusCode::OK, json!({"text": "no usage"})).await;
 
-        call(&state, &base, "request-dur1", vec![1; 512])
+        let _ = call(&state, &base, "request-dur1", vec![1; 512])
             .await
             .expect("dictation succeeds");
         // 4.2 s at $0.003/min = 50 micro-USD/s = 210 micro-USD, all carry.
         let db = state.db.as_ref().unwrap();
-        assert_eq!(db.get_credit_balance_row(USER).unwrap().subscription_remaining, 10);
+        assert_eq!(
+            db.get_credit_balance_row(USER)
+                .unwrap()
+                .subscription_remaining,
+            10
+        );
         assert_eq!(db.get_credit_carry_micro_usd(USER), 210);
     }
 }

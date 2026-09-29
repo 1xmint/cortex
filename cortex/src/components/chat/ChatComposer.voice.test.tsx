@@ -105,10 +105,10 @@ class FakeMediaRecorder {
   mimeType: string;
   private listeners: Record<string, Array<(event: unknown) => void>> = {};
 
-  constructor(
-    public stream: MediaStream,
-    options?: { mimeType?: string },
-  ) {
+  stream: MediaStream;
+
+  constructor(stream: MediaStream, options?: { mimeType?: string }) {
+    this.stream = stream;
     this.mimeType = options?.mimeType ?? '';
     FakeMediaRecorder.instances.push(this);
   }
