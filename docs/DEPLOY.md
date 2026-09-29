@@ -413,6 +413,13 @@ after migrating.
 
 A few more things worth knowing about this guard before you rely on it:
 
+- **The server creates its own workspace repository.** At startup
+  `cortex-api` and `cortex-server` run `git init` in `$CORTEX_WORKSPACE` (the
+  working directory when unset) if it has no `.git`
+  (`ensure_workspace_repository` in `crates/api/src/state.rs`), because
+  verification reads the delivered commit out of it. Nothing needs to be done
+  by hand on the deploy host; the server refuses to boot only if that
+  initialisation fails.
 - **Builds made before `SCHEMA_VERSION` checking landed have no `SCHEMA` file
   at all**, and builds made before this fingerprint check landed have no
   `SCHEMA_FINGERPRINT` / `ROUTING_SCHEMA_FINGERPRINT` files — `deploy-receive.sh`

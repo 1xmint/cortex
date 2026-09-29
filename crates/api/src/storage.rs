@@ -65,7 +65,13 @@ pub trait Storage: Send + Sync {
 
     /// Attempt to lease a step to a worker.  Returns `Some(lease_gen)` on success,
     /// `None` if the CAS failed (step not in leasable state).
-    fn lease_step(&self, step_id: &str, worker_id: &str, deadline: i64) -> Option<i64>;
+    fn lease_step(
+        &self,
+        step_id: &str,
+        worker_id: &str,
+        deadline: i64,
+        attempt_id: &str,
+    ) -> Option<i64>;
 
     /// Reverse a lease (e.g. when the worker channel fails after leasing).
     /// Returns `true` if the step was successfully unleased.
@@ -265,8 +271,14 @@ impl Storage for Database {
         Database::find_ready_steps(self, run_id)
     }
 
-    fn lease_step(&self, step_id: &str, worker_id: &str, deadline: i64) -> Option<i64> {
-        Database::lease_step(self, step_id, worker_id, deadline)
+    fn lease_step(
+        &self,
+        step_id: &str,
+        worker_id: &str,
+        deadline: i64,
+        attempt_id: &str,
+    ) -> Option<i64> {
+        Database::lease_step(self, step_id, worker_id, deadline, attempt_id)
     }
 
     fn unlease_step(&self, step_id: &str, lease_gen: i64) -> bool {

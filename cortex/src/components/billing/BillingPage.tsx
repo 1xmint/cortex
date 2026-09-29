@@ -3,6 +3,7 @@ import { useState } from 'react';
 import type { BillingStatus } from '../../lib/cortexApi';
 import { createBillingPortal } from '../../lib/cortexApi';
 import BillingHistory from './BillingHistory';
+import CreditsCard from './CreditsCard';
 import PricingCards from './PricingCards';
 import { formatDate, formatMoney } from './format';
 
@@ -236,6 +237,8 @@ export default function BillingPage({ billing }: BillingPageProps) {
           isLoading={portalLoading}
         />
       )}
+
+      <CreditsCard />
 
       {/* Usage summary */}
       <UsageSummary isPro={isPro} />

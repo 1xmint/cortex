@@ -1915,12 +1915,13 @@ mod tests {
             None,
         );
         let step_id = db.create_step(&run_id, "implement", "standard", "medium", "Ship it");
-        db.register_worker("worker-1", "user-1");
+        db.register_worker("worker-1", "user-1", false);
         let lease_gen = db
             .lease_step(
                 &step_id,
                 "worker-1",
                 chrono::Utc::now().timestamp_millis() + 60_000,
+                "attempt-1",
             )
             .unwrap();
         assert!(db.start_step(&step_id, lease_gen));

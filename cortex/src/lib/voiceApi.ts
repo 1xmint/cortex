@@ -19,10 +19,16 @@ export interface DictationTokenResponse {
  * header.
  */
 export async function requestDictationToken(idempotencyKey: string): Promise<DictationTokenResponse> {
-  return requestJson<DictationTokenResponse>('/api/voice/dictation/token', {
-    method: 'POST',
-    headers: { 'Idempotency-Key': idempotencyKey },
-  });
+  // No 503 retry: the server answers 503 to say dictation is switched off, and
+  // the caller shows that instead of waiting through a backoff.
+  return requestJson<DictationTokenResponse>(
+    '/api/voice/dictation/token',
+    {
+      method: 'POST',
+      headers: { 'Idempotency-Key': idempotencyKey },
+    },
+    { retryOn503: false },
+  );
 }
 
 /**

@@ -437,6 +437,13 @@ fn validate_pr_authority(
     Ok(())
 }
 
+/// Item F of the M-D-0024 settlement redesign: should `create_run` refuse a
+/// new run? Yes only in production with no usable provider gateway. Pure so
+/// it can be tested without touching the process environment.
+fn run_creation_refused(production: bool, gateway_on: bool) -> bool {
+    production && !gateway_on
+}
+
 pub async fn create_run(
     State(state): State<Arc<AppState>>,
     user: PremiumUser,
@@ -512,6 +519,26 @@ pub async fn create_run(
             }),
         )
     })?;
+
+    // Item F of the M-D-0024 settlement redesign: production dispatch
+    // requires a usable provider gateway. Refusing here, before a run row
+    // even exists, is cheaper for the customer than accepting the run and
+    // letting every one of its steps discover the same thing one at a time
+    // in the scheduler's own `dispatch_money_gate` check (which still runs,
+    // for runs created before an outage started or outside this endpoint).
+    // No run means nothing downstream can be dispatched, leased or charged
+    // for a call that was never going to be possible.
+    if run_creation_refused(
+        crate::is_production_env(),
+        crate::provider_gateway_http::is_gateway_on(),
+    ) {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse {
+                error: cortex_core::billing_binding::GATEWAY_DOWN_MESSAGE.into(),
+            }),
+        ));
+    }
 
     if req.task_id.is_some() || req.conversation_id.is_some() {
         if let (Some(task_id), Some(group_id)) = (req.task_id.as_deref(), req.group_id.as_deref()) {
@@ -1671,6 +1698,21 @@ mod validate_run_for_pr_tests {
         )
         .await;
         (dir, state)
+    }
+
+    /// Item F of the M-D-0024 settlement redesign: in production, with no
+    /// usable provider gateway, `create_run` must refuse before a run row
+    /// even exists -- a customer must never be told a run is under way when
+    /// nothing behind it can make a priced call. The decision is a pure
+    /// function of its two inputs, so it is tested directly: the handler
+    /// reads `HEYVERA_ENV`, and mutating the process environment from a
+    /// test would race every other test in this binary.
+    #[test]
+    fn run_creation_is_refused_only_in_production_without_a_gateway() {
+        assert!(run_creation_refused(true, false));
+        assert!(!run_creation_refused(true, true));
+        assert!(!run_creation_refused(false, false));
+        assert!(!run_creation_refused(false, true));
     }
 
     fn write_lease(path: &str) -> ResourceLeaseRequest {
