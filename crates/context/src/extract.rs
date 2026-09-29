@@ -340,6 +340,13 @@ fn helper(raw: &str) -> bool { !raw.is_empty() }
             std::fs::create_dir_all(&root).expect("create scratch repo");
             Self(root)
         }
+
+        /// Write `contents` at repo-relative `name`, creating parents.
+        fn write(&self, name: &str, contents: &str) {
+            let path = self.0.join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).expect("create parents");
+            std::fs::write(path, contents).expect("write file");
+        }
     }
 
     impl Drop for Scratch {
@@ -351,20 +358,15 @@ fn helper(raw: &str) -> bool { !raw.is_empty() }
     #[test]
     fn a_gitignored_build_tree_is_not_visited() {
         let scratch = Scratch::new("ignored");
-        let root = &scratch.0;
-        std::fs::write(root.join(".gitignore"), "target-shared/
-").unwrap();
-        std::fs::write(root.join("lib.rs"), "pub fn kept() {}
-").unwrap();
-        let build = root.join("target-shared").join("debug");
-        std::fs::create_dir_all(&build).unwrap();
+        scratch.write(".gitignore", "target-shared/\n");
+        scratch.write("lib.rs", "pub fn kept() {}\n");
         for i in 0..5_000 {
-            std::fs::write(build.join(format!("gen_{i}.rs")), "fn generated() {}
-").unwrap();
+            let name = format!("target-shared/debug/gen_{i}.rs");
+            scratch.write(&name, "fn generated() {}\n");
         }
 
         let mut files = Vec::new();
-        let visited = collect_files(root, &mut files);
+        let visited = collect_files(&scratch.0, &mut files);
 
         let relative: Vec<&str> = files.iter().map(|(_, rel)| rel.as_str()).collect();
         assert_eq!(relative, vec!["lib.rs"]);
@@ -376,17 +378,13 @@ fn helper(raw: &str) -> bool { !raw.is_empty() }
     #[test]
     fn skip_dirs_still_apply_without_a_gitignore() {
         let scratch = Scratch::new("skipdirs");
-        let root = &scratch.0;
-        std::fs::write(root.join("main.rs"), "fn main() {}
-").unwrap();
+        scratch.write("main.rs", "fn main() {}\n");
         for dir in ["node_modules", "target", "vendor"] {
-            std::fs::create_dir_all(root.join(dir)).unwrap();
-            std::fs::write(root.join(dir).join("dep.rs"), "fn dep() {}
-").unwrap();
+            scratch.write(&format!("{dir}/dep.rs"), "fn dep() {}\n");
         }
 
         let mut files = Vec::new();
-        collect_files(root, &mut files);
+        collect_files(&scratch.0, &mut files);
 
         let relative: Vec<&str> = files.iter().map(|(_, rel)| rel.as_str()).collect();
         assert_eq!(relative, vec!["main.rs"]);

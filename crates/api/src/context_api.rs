@@ -348,7 +348,9 @@ static LAST_SYNC: LazyLock<Mutex<HashMap<PathBuf, SyncRecord>>> =
 fn last_sync() -> std::sync::MutexGuard<'static, HashMap<PathBuf, SyncRecord>> {
     // The map holds plain `Copy` values, so a panic elsewhere cannot leave it
     // half-updated; recover the guard rather than failing every later request.
-    LAST_SYNC.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    LAST_SYNC
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// The indexed-file total from `repo`'s last sync, if that sync is still
@@ -643,8 +645,8 @@ mod ownership_tests {
     #[tokio::test]
     async fn impact_requests_within_the_window_sync_once() {
         let (dir, state) = test_state().await;
-        std::fs::write(dir.path().join("a.rs"), "pub fn a() {}
-").unwrap();
+        let source = dir.path().join("a.rs");
+        std::fs::write(source, "pub fn a() {}\n").unwrap();
         let request = || ImpactQuery {
             files: "a.rs".to_string(),
             depth: None,

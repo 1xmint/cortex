@@ -1,0 +1,17 @@
+name: lockgen-tmp
+on:
+  push:
+    branches: [fix/impact-hang]
+jobs:
+  lockgen:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install 1.97.1 --profile minimal
+          rustup default 1.97.1
+      - name: Regenerate lock minimally
+        run: cargo metadata --format-version 1 > /dev/null
+      - name: Show lock diff
+        run: git diff --ignore-space-at-eol Cargo.lock
