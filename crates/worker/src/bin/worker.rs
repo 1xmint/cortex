@@ -17,7 +17,9 @@ use cortex_core::protocol::{
 use cortex_worker::executor::{detect_available_providers, Executor, StepExecution};
 // In the library, not here, so the end-to-end test sends the frame this binary
 // would have sent rather than one it built itself. See `report`'s module docs.
-use cortex_worker::repo_transport::{default_cache_root, http_base_from_ws, RepoTransport, StepRepo};
+use cortex_worker::repo_transport::{
+    default_cache_root, http_base_from_ws, RepoTransport, StepRepo,
+};
 use cortex_worker::report::worker_event_to_message;
 use cortex_worker::stream::WorkerEvent;
 

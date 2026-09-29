@@ -16,8 +16,8 @@ use cortex_core::routing::RoutingDecision;
 use cortex_core::task::TaskContract;
 use tokio::sync::mpsc;
 
-use crate::sandbox::{OutputStream, SandboxExit, SandboxRequest, SandboxRunner};
 use crate::repo_transport::{self, StepRepo, UploadError};
+use crate::sandbox::{OutputStream, SandboxExit, SandboxRequest, SandboxRunner};
 use crate::stream::WorkerEvent;
 use crate::worktree;
 
@@ -564,7 +564,9 @@ impl Executor {
                             lease_gen: step.lease_gen,
                             blocked: Blocked::new(
                                 BlockedReason::WorktreeUnavailable,
-                                format!("could not deliver the step's commits to the brain: {detail}"),
+                                format!(
+                                    "could not deliver the step's commits to the brain: {detail}"
+                                ),
                             ),
                         },
                     };

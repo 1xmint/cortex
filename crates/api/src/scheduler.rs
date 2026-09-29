@@ -2579,7 +2579,9 @@ pub async fn create_run_from_goal(
             if let Err(cancel) = db.cancel_run(&run_id, user_id, "run repository unavailable") {
                 tracing::error!(run_id = %run_id, error = ?cancel, "could not cancel the run");
             }
-            return Err(format!("run repository: could not prepare the repository: {e}"));
+            return Err(format!(
+                "run repository: could not prepare the repository: {e}"
+            ));
         }
     }
 

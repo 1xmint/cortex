@@ -522,7 +522,10 @@ fn kill_git(child: &mut std::process::Child) {
 /// A hand-rolled deadline rather than coreutils `timeout`: with `timeout`, a
 /// missing git binary is an exit status of 127, indistinguishable from git
 /// failing, and a spawn failure is exactly what must stay Cortex's.
-pub(crate) fn run_git(mut command: std::process::Command, deadline: Duration) -> std::io::Result<GitRun> {
+pub(crate) fn run_git(
+    mut command: std::process::Command,
+    deadline: Duration,
+) -> std::io::Result<GitRun> {
     command
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());

@@ -44,7 +44,10 @@ fn db_unavailable() -> (StatusCode, Json<ErrorResponse>) {
 /// request without writing the token to disk. GitHub accepts a Basic auth
 /// header of `x-access-token:<token>`.
 fn auth_extraheader(token: &str) -> String {
-    format!("http.https://github.com/.extraheader={}", extraheader_value(token))
+    format!(
+        "http.https://github.com/.extraheader={}",
+        extraheader_value(token)
+    )
 }
 
 /// The header itself (`Authorization: Basic ...`), for callers that hand it to

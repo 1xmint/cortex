@@ -185,12 +185,7 @@ pub fn fetch_base_bundle(repo: &Path, bundle: &Path, sha: &str) -> Result<(), St
     }
     let mut fetch = git(repo);
     fetch
-        .args([
-            "-c",
-            "transfer.fsckObjects=true",
-            "fetch",
-            "--quiet",
-        ])
+        .args(["-c", "transfer.fsckObjects=true", "fetch", "--quiet"])
         .arg(bundle)
         .arg("+refs/cortex/dispatch/*:refs/cortex/dispatch/*");
     git_ok(fetch, "fetch of the base bundle")?;
@@ -254,7 +249,9 @@ fn temp_bundle(cache_root: &Path) -> Result<TempFile, String> {
     let dir = cache_root.join("tmp");
     std::fs::create_dir_all(&dir)
         .map_err(|e| format!("could not create {}: {e}", dir.display()))?;
-    Ok(TempFile(dir.join(format!("{}.bundle", uuid::Uuid::new_v4()))))
+    Ok(TempFile(
+        dir.join(format!("{}.bundle", uuid::Uuid::new_v4())),
+    ))
 }
 
 fn client() -> Result<reqwest::Client, String> {
@@ -289,8 +286,8 @@ pub async fn ensure_base(repo: &StepRepo, step_id: &str) -> Result<PathBuf, Stri
         blocking(move || init_bare(&cache)).await?;
     }
     {
-        let (cache, base) = (cache.clone(), repo.base_commit.clone());
-        if blocking(move || Ok(has_commit(&cache, &base))).await? {
+        let (probe, base) = (cache.clone(), repo.base_commit.clone());
+        if blocking(move || Ok(has_commit(&probe, &base))).await? {
             tracing::info!(step_id, "base commit already cached; skipping the download");
             return Ok(cache);
         }
@@ -450,7 +447,13 @@ mod tests {
         let out = scratch().join("base.bundle");
         run(
             src,
-            &["bundle", "create", "--quiet", out.to_str().unwrap(), "refs/cortex/dispatch/x"],
+            &[
+                "bundle",
+                "create",
+                "--quiet",
+                out.to_str().unwrap(),
+                "refs/cortex/dispatch/x",
+            ],
         );
         run(src, &["update-ref", "-d", "refs/cortex/dispatch/x"]);
         out
@@ -561,9 +564,15 @@ mod tests {
                 "+refs/cortex/upload/step-1:refs/cortex/step/step-1",
             ],
         );
-        assert_eq!(run(&run_repo, &["rev-parse", "refs/cortex/step/step-1"]), second);
+        assert_eq!(
+            run(&run_repo, &["rev-parse", "refs/cortex/step/step-1"]),
+            second
+        );
         // The cache keeps the upload ref so the commits stay reachable.
-        assert_eq!(run(&src, &["rev-parse", "refs/cortex/upload/step-1"]), second);
+        assert_eq!(
+            run(&src, &["rev-parse", "refs/cortex/upload/step-1"]),
+            second
+        );
         // Bad input is refused before git runs.
         assert!(create_head_bundle(&src, "bad id", &first, &second, &out).is_err());
         assert!(create_head_bundle(&src, "step-1", "nope", &second, &out).is_err());

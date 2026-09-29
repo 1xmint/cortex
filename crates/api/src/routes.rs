@@ -607,17 +607,16 @@ pub async fn create_run(
             .map_err(|e| {
                 let status = match &e {
                     crate::run_repo::PrepareError::BadRepo(_) => StatusCode::BAD_REQUEST,
-                    crate::run_repo::PrepareError::Reconnect(_) => {
-                        StatusCode::UNPROCESSABLE_ENTITY
-                    }
-                    crate::run_repo::PrepareError::TryLater(_) => {
-                        StatusCode::SERVICE_UNAVAILABLE
-                    }
+                    crate::run_repo::PrepareError::Reconnect(_) => StatusCode::UNPROCESSABLE_ENTITY,
+                    crate::run_repo::PrepareError::TryLater(_) => StatusCode::SERVICE_UNAVAILABLE,
                     crate::run_repo::PrepareError::Ours(_) => StatusCode::INTERNAL_SERVER_ERROR,
                 };
-                (status, Json(ErrorResponse {
+                (
+                    status,
+                    Json(ErrorResponse {
                         error: e.message().to_string(),
-                    }))
+                    }),
+                )
             })?,
         ),
         _ if production => {
@@ -1157,7 +1156,12 @@ pub(crate) fn validate_run_for_pr(
 const RECONNECT_GITHUB: &str = "GitHub did not accept Cortex's access. Reconnect GitHub in your      Cortex settings (the connection may have expired or may not include private      repositories), then try again.";
 
 fn pr_error(status: StatusCode, msg: &str) -> (StatusCode, Json<ErrorResponse>) {
-    (status, Json(ErrorResponse { error: msg.to_string() }))
+    (
+        status,
+        Json(ErrorResponse {
+            error: msg.to_string(),
+        }),
+    )
 }
 
 /// The shared core behind `POST /api/runs/{id}/pr` and the `open_pr` agent
@@ -1200,8 +1204,7 @@ pub(crate) async fn create_pr_core(
     })?;
     // Cortex does the GitHub I/O with the run owner's own token; workers
     // never hold one.
-    let token = match github::github_oauth_token(state.clerk_secret_key.as_deref(), user_id).await
-    {
+    let token = match github::github_oauth_token(state.clerk_secret_key.as_deref(), user_id).await {
         Ok(Some(t)) => t,
         Ok(None) => return Err(pr_error(StatusCode::UNPROCESSABLE_ENTITY, RECONNECT_GITHUB)),
         Err(e) => {
@@ -1214,12 +1217,13 @@ pub(crate) async fn create_pr_core(
     };
 
     // Push the run's head from the run repository.
-    let repo_dir = crate::run_repo::run_repo_path(&state.workspace_dir, run_id).ok_or_else(|| {
-        pr_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "run id is not a valid repository name",
-        )
-    })?;
+    let repo_dir =
+        crate::run_repo::run_repo_path(&state.workspace_dir, run_id).ok_or_else(|| {
+            pr_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "run id is not a valid repository name",
+            )
+        })?;
     let push = {
         let (owner, repo, token, commit, branch) = (
             owner.clone(),

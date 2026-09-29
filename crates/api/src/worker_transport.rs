@@ -114,7 +114,10 @@ fn authorize_user(
     headers: &HeaderMap,
 ) -> Result<Leased, Response> {
     let Some(db) = state.db.as_ref() else {
-        return Err(reply(StatusCode::SERVICE_UNAVAILABLE, "database not available"));
+        return Err(reply(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "database not available",
+        ));
     };
     let worker_id = headers
         .get(WORKER_ID_HEADER)
@@ -123,13 +126,19 @@ fn authorize_user(
         .filter(|v| !v.is_empty())
         .ok_or_else(|| reply(StatusCode::FORBIDDEN, "missing worker id"))?;
     if db.worker_user_id(worker_id).as_deref() != Some(user_id) {
-        return Err(reply(StatusCode::FORBIDDEN, "worker does not belong to you"));
+        return Err(reply(
+            StatusCode::FORBIDDEN,
+            "worker does not belong to you",
+        ));
     }
     let info = db
         .step_transport_info(step_id)
         .ok_or_else(|| reply(StatusCode::NOT_FOUND, "unknown step"))?;
     if info.worker_id != worker_id || !db.verify_step_worker(step_id, worker_id) {
-        return Err(reply(StatusCode::FORBIDDEN, "step is not leased to this worker"));
+        return Err(reply(
+            StatusCode::FORBIDDEN,
+            "step is not leased to this worker",
+        ));
     }
     let repo = run_repo::run_repo_path(&state.workspace_dir, &info.run_id)
         .ok_or_else(|| reply(StatusCode::NOT_FOUND, "unknown run"))?;
@@ -175,15 +184,23 @@ async fn serve_base(state: &AppState, leased: &Leased, base: Option<&str>) -> Re
         Ok(temp) => temp,
         Err(e) => {
             tracing::error!(error = %e, "could not prepare a base bundle file");
-            return reply(StatusCode::INTERNAL_SERVER_ERROR, "could not prepare bundle");
+            return reply(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "could not prepare bundle",
+            );
         }
     };
     let repo = leased.repo.clone();
     let base = base.to_string();
     let out = temp.0.clone();
-    let made = tokio::task::spawn_blocking(move || run_repo::create_base_bundle(&repo, &base, &out))
-        .await
-        .unwrap_or_else(|e| Err(BundleError::Ours(format!("bundle task did not complete: {e}"))));
+    let made =
+        tokio::task::spawn_blocking(move || run_repo::create_base_bundle(&repo, &base, &out))
+            .await
+            .unwrap_or_else(|e| {
+                Err(BundleError::Ours(format!(
+                    "bundle task did not complete: {e}"
+                )))
+            });
     match made {
         Ok(()) => {}
         Err(BundleError::NotFound(why)) | Err(BundleError::Worker(why)) => {
@@ -208,7 +225,9 @@ async fn serve_base(state: &AppState, leased: &Leased, base: Option<&str>) -> Re
         header::HeaderValue::from_static("application/octet-stream"),
     );
     if let Some(len) = len {
-        response.headers_mut().insert(header::CONTENT_LENGTH, len.into());
+        response
+            .headers_mut()
+            .insert(header::CONTENT_LENGTH, len.into());
     }
     response
 }
@@ -224,7 +243,15 @@ pub async fn put_head_bundle(
         Ok(leased) => leased,
         Err(response) => return response,
     };
-    ingest_head(&state, &leased, &step_id, &headers, body, max_bundle_bytes()).await
+    ingest_head(
+        &state,
+        &leased,
+        &step_id,
+        &headers,
+        body,
+        max_bundle_bytes(),
+    )
+    .await
 }
 
 async fn ingest_head(
@@ -251,15 +278,25 @@ async fn ingest_head(
     let temp = match TempFile::new(&run_repo::runs_root(&state.workspace_dir)) {
         Ok(temp) => temp,
         Err(e) => {
-            return our_failure(state, leased, step_id, &format!("could not prepare a file: {e}"))
-                .await;
+            return our_failure(
+                state,
+                leased,
+                step_id,
+                &format!("could not prepare a file: {e}"),
+            )
+            .await;
         }
     };
     let mut file = match tokio::fs::File::create(&temp.0).await {
         Ok(file) => file,
         Err(e) => {
-            return our_failure(state, leased, step_id, &format!("could not create a file: {e}"))
-                .await;
+            return our_failure(
+                state,
+                leased,
+                step_id,
+                &format!("could not create a file: {e}"),
+            )
+            .await;
         }
     };
     let mut stream = body.into_data_stream();
@@ -268,7 +305,10 @@ async fn ingest_head(
         let chunk = match chunk {
             Ok(chunk) => chunk,
             Err(e) => {
-                return reply(StatusCode::BAD_REQUEST, format!("upload was interrupted: {e}"));
+                return reply(
+                    StatusCode::BAD_REQUEST,
+                    format!("upload was interrupted: {e}"),
+                );
             }
         };
         received = received.saturating_add(chunk.len() as u64);
@@ -279,12 +319,23 @@ async fn ingest_head(
             );
         }
         if let Err(e) = file.write_all(&chunk).await {
-            return our_failure(state, leased, step_id, &format!("could not write a file: {e}"))
-                .await;
+            return our_failure(
+                state,
+                leased,
+                step_id,
+                &format!("could not write a file: {e}"),
+            )
+            .await;
         }
     }
     if let Err(e) = file.flush().await {
-        return our_failure(state, leased, step_id, &format!("could not write a file: {e}")).await;
+        return our_failure(
+            state,
+            leased,
+            step_id,
+            &format!("could not write a file: {e}"),
+        )
+        .await;
     }
     drop(file);
     if received == 0 {
@@ -298,7 +349,9 @@ async fn ingest_head(
         tokio::task::spawn_blocking(move || run_repo::ingest_head_bundle(&repo, &id, &path))
             .await
             .unwrap_or_else(|e| {
-                Err(BundleError::Ours(format!("ingest task did not complete: {e}")))
+                Err(BundleError::Ours(format!(
+                    "ingest task did not complete: {e}"
+                )))
             });
     match ingested {
         Ok(head) => (
@@ -317,12 +370,7 @@ async fn ingest_head(
 /// Cortex's own failure while taking a worker's code: end the attempt as
 /// `CortexCrash` (absorbed, never charged) and tell the scheduler, then answer
 /// `500`. The worker's own report that follows finds the step already ended.
-async fn our_failure(
-    state: &AppState,
-    leased: &Leased,
-    step_id: &str,
-    reason: &str,
-) -> Response {
+async fn our_failure(state: &AppState, leased: &Leased, step_id: &str, reason: &str) -> Response {
     tracing::error!(
         step_id,
         error = %reason,
@@ -360,7 +408,10 @@ async fn our_failure(
             );
         }
     }
-    reply(StatusCode::INTERNAL_SERVER_ERROR, "could not store the bundle")
+    reply(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "could not store the bundle",
+    )
 }
 
 #[cfg(test)]
@@ -433,7 +484,11 @@ mod tests {
         let base = git(&scratch, &["rev-parse", "HEAD"]);
         git(
             &scratch,
-            &["push", repo.to_str().expect("utf8"), "HEAD:refs/cortex/base"],
+            &[
+                "push",
+                repo.to_str().expect("utf8"),
+                "HEAD:refs/cortex/base",
+            ],
         );
         Fixture {
             state,
@@ -476,14 +531,21 @@ mod tests {
         assert!(ok.is_ok());
 
         // Another user's credential, same worker id.
-        let wrong_user = authorize_user(&f.state, "someone-else", &f.step_id, &headers(&f.worker_id));
-        assert_eq!(wrong_user.err().expect("refused").status(), StatusCode::FORBIDDEN);
+        let wrong_user =
+            authorize_user(&f.state, "someone-else", &f.step_id, &headers(&f.worker_id));
+        assert_eq!(
+            wrong_user.err().expect("refused").status(),
+            StatusCode::FORBIDDEN
+        );
 
         // Another worker of the same user that does not hold the lease.
         let db = f.state.db.as_ref().expect("database");
         db.register_worker("w-other", OWNER, false);
         let other = authorize_user(&f.state, OWNER, &f.step_id, &headers("w-other"));
-        assert_eq!(other.err().expect("refused").status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            other.err().expect("refused").status(),
+            StatusCode::FORBIDDEN
+        );
 
         // No worker id at all.
         let none = authorize_user(&f.state, OWNER, &f.step_id, &HeaderMap::new());
@@ -491,7 +553,10 @@ mod tests {
 
         // A step that does not exist.
         let unknown = authorize_user(&f.state, OWNER, "no-such-step", &headers(&f.worker_id));
-        assert_eq!(unknown.err().expect("refused").status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            unknown.err().expect("refused").status(),
+            StatusCode::NOT_FOUND
+        );
     }
 
     #[tokio::test]
@@ -531,12 +596,19 @@ mod tests {
     /// A worker-side bundle of one new commit on top of `f.base`, under the
     /// upload ref the server insists on.
     fn worker_bundle(f: &Fixture) -> (Vec<u8>, String) {
-        let work = f.state.workspace_dir.join(format!("work-{}", uuid::Uuid::new_v4()));
+        let work = f
+            .state
+            .workspace_dir
+            .join(format!("work-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&work).expect("dir");
         git(&work, &["init"]);
         git(
             &work,
-            &["fetch", f.repo.to_str().expect("utf8"), "refs/cortex/base:refs/cortex/base"],
+            &[
+                "fetch",
+                f.repo.to_str().expect("utf8"),
+                "refs/cortex/base:refs/cortex/base",
+            ],
         );
         git(&work, &["checkout", "-q", "-b", "step", &f.base]);
         std::fs::write(work.join("b.txt"), "two\n").expect("write");
@@ -548,7 +620,13 @@ mod tests {
         let bundle = work.join("head.bundle");
         git(
             &work,
-            &["bundle", "create", bundle.to_str().expect("utf8"), &upload, &format!("^{}", f.base)],
+            &[
+                "bundle",
+                "create",
+                bundle.to_str().expect("utf8"),
+                &upload,
+                &format!("^{}", f.base),
+            ],
         );
         (std::fs::read(&bundle).expect("read"), head)
     }
@@ -572,7 +650,10 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let resolved = git(
             &f.repo,
-            &["rev-parse", &format!("{}^{{commit}}", run_repo::step_ref(&f.step_id))],
+            &[
+                "rev-parse",
+                &format!("{}^{{commit}}", run_repo::step_ref(&f.step_id)),
+            ],
         );
         assert_eq!(resolved, head);
     }
@@ -618,6 +699,9 @@ mod tests {
                 |row| row.get(0),
             )
             .ok();
-        assert!(ended.is_none(), "a worker's bad bundle must not be absorbed");
+        assert!(
+            ended.is_none(),
+            "a worker's bad bundle must not be absorbed"
+        );
     }
 }
