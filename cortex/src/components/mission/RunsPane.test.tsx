@@ -75,7 +75,7 @@ describe('RunsPane pull request block', () => {
 describe('RunsPane awaiting top-up banner', () => {
   it('says the run is out of credits and links to the billing top-up', async () => {
     renderWith('awaiting_top_up');
-    expect(await screen.findByText('Out of credits — top up to continue')).toBeInTheDocument();
+    expect(await screen.findByText('Out of credits â€” top up to continue')).toBeInTheDocument();
     expect(screen.getByRole('link', { name: 'Top up' })).toHaveAttribute('href', '/?settings=billing');
     expect(screen.getByRole('button', { name: 'Resume' })).toBeInTheDocument();
   });
@@ -99,6 +99,6 @@ describe('RunsPane awaiting top-up banner', () => {
   it('shows no banner for a run that is not waiting for credits', async () => {
     renderWith('running');
     await screen.findByRole('heading', { name: 'ship it' });
-    expect(screen.queryByText('Out of credits — top up to continue')).not.toBeInTheDocument();
+    expect(screen.queryByText('Out of credits â€” top up to continue')).not.toBeInTheDocument();
   });
 });

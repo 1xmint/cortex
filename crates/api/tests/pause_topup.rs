@@ -635,17 +635,22 @@ async fn a_webhook_top_up_resumes_a_paused_run() {
         "currency": "usd",
         "amount_subtotal": 1000,
     });
-    cortex_api::billing::grant_credit_topup(db, &session, "evt_topup_1").expect("grant");
-
+    let resumed =
+        cortex_api::billing::grant_credit_topup(db, &session, "evt_topup_1").expect("grant");
     assert_eq!(
-        db.get_run_status(&paused.run_id).as_deref(),
-        Some("running"),
+        resumed,
+        vec![paused.run_id.clone()],
         "the grant resumes the paused run"
     );
-    paused
-        .state
-        .emit_scheduler_event(cortex_engine::captain::SchedulerEvent::Reconcile)
-        .await;
+    assert_eq!(db.get_run_status(&paused.run_id).as_deref(), Some("running"));
+
+    // The webhook handler passes each resumed run to the scheduler.
+    for run_id in resumed {
+        paused
+            .state
+            .emit_scheduler_event(cortex_engine::captain::SchedulerEvent::RunResumed { run_id })
+            .await;
+    }
     let dispatched = execute_steps_within(&mut paused.stream, Duration::from_secs(20)).await;
     assert_eq!(dispatched, vec![paused.step_id.clone()]);
 }
@@ -726,7 +731,8 @@ async fn an_operator_cap_refusal_does_not_pause() {
     let base_url = serve_app(app.clone()).await;
     let db = state.db.as_ref().unwrap();
     // Far more credit than any reservation: the balance is never the problem.
-    db.add_pack_credits(USER, 100_000_000).expect("seed credits");
+    db.add_pack_credits(USER, 100_000_000)
+        .expect("seed credits");
 
     let (_sink, mut stream) = connect_worker(&base_url, issue_worker_key(&state)).await;
     let run_id = create_run(&app, "make the arithmetic in src/lib.rs correct").await;
@@ -745,7 +751,10 @@ async fn an_operator_cap_refusal_does_not_pause() {
 
     let (status, body) = gateway_call(&app, &access, "call-1").await;
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
-    assert!(body.to_string().contains("authorization exhausted"), "{body}");
+    assert!(
+        body.to_string().contains("authorization exhausted"),
+        "{body}"
+    );
     assert!(!body.to_string().contains("insufficient credits"), "{body}");
 
     // Give the pause path every chance to (wrongly) run.

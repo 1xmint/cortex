@@ -416,11 +416,7 @@ pub async fn messages(
             .await
         }
     };
-    if response
-        .extensions()
-        .get::<InsufficientCredits>()
-        .is_some()
-    {
+    if response.extensions().get::<InsufficientCredits>().is_some() {
         pause_for_top_up(&state, db, signing_key.as_bytes(), &headers).await;
     }
     response
