@@ -115,10 +115,7 @@ async fn serve_app(app: axum::Router) -> String {
     format!("http://{addr}")
 }
 
-async fn send(
-    app: &axum::Router,
-    request: Request<Body>,
-) -> (StatusCode, serde_json::Value) {
+async fn send(app: &axum::Router, request: Request<Body>) -> (StatusCode, serde_json::Value) {
     let resp = app.clone().oneshot(request).await.unwrap();
     let status = resp.status();
     let bytes = resp.into_body().collect().await.unwrap().to_bytes();
@@ -268,13 +265,13 @@ async fn execute_step_within(
     let deadline = tokio::time::Instant::now() + wait;
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        match next_brain_message(stream, remaining).await? {
-            BrainMessage::ExecuteStep {
-                step_id,
-                provider_gateway,
-                ..
-            } => return Some((step_id, provider_gateway)),
-            _ => {}
+        if let BrainMessage::ExecuteStep {
+            step_id,
+            provider_gateway,
+            ..
+        } = next_brain_message(stream, remaining).await?
+        {
+            return Some((step_id, provider_gateway));
         }
     }
 }
@@ -476,7 +473,10 @@ async fn balance_below_one_reservation_pauses_the_run_and_dispatches_nothing_mor
 async fn resume_without_enough_credits_is_402_with_the_exact_shortfall() {
     let paused = paused_run().await;
     let need = expected_need_credits(&paused.state);
-    assert!(need > 1, "the test needs a price list where 1 credit is short");
+    assert!(
+        need > 1,
+        "the test needs a price list where 1 credit is short"
+    );
 
     let (status, body) = resume(&paused.app, &paused.run_id).await;
     assert_eq!(status, StatusCode::PAYMENT_REQUIRED, "{body}");
@@ -557,9 +557,11 @@ async fn a_server_restart_leaves_a_paused_run_paused() {
             .as_deref(),
         Some("awaiting_top_up")
     );
-    assert!(execute_steps_within(&mut paused.stream, Duration::from_millis(500))
-        .await
-        .is_empty());
+    assert!(
+        execute_steps_within(&mut paused.stream, Duration::from_millis(500))
+            .await
+            .is_empty()
+    );
     let _ = &paused.base_url;
 }
 
@@ -569,7 +571,10 @@ async fn cancelling_a_paused_run_charges_nothing_more() {
     let workspace = paused._repo.path();
     let ledger_rows = "SELECT COUNT(*) FROM credit_transactions";
     let endings = "SELECT COUNT(*) FROM attempt_endings";
-    let before = (raw_count(workspace, ledger_rows), raw_count(workspace, endings));
+    let before = (
+        raw_count(workspace, ledger_rows),
+        raw_count(workspace, endings),
+    );
 
     let (status, body) = cancel(&paused.app, &paused.run_id).await;
     assert_eq!(status, StatusCode::OK, "{body}");
@@ -586,7 +591,10 @@ async fn cancelling_a_paused_run_charges_nothing_more() {
 
     // Give the scheduler's settle tick every chance to charge something.
     tokio::time::sleep(Duration::from_secs(2)).await;
-    let after = (raw_count(workspace, ledger_rows), raw_count(workspace, endings));
+    let after = (
+        raw_count(workspace, ledger_rows),
+        raw_count(workspace, endings),
+    );
     assert_eq!(
         before, after,
         "cancelling a paused run added ledger or ending rows"

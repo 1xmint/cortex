@@ -22,11 +22,11 @@ mod run_pause;
 mod verification_queue;
 
 pub use pending_actions::{ConfirmActionError, PendingAction, PENDING_ACTION_TTL_SECS};
-pub use run_pause::{PausedAttempt, ResumeOutcome};
 pub use provider_gateway::{
     AdminHoldError, ProviderHoldRow, ProviderHoldsSummary, ProviderReservation, SpendAuthorization,
     HOLD_CAPACITY_WARN_SHARE, STALE_RESERVATION_AGE_MS,
 };
+pub use run_pause::{PausedAttempt, ResumeOutcome};
 
 pub struct Database {
     conn: Mutex<Connection>,
