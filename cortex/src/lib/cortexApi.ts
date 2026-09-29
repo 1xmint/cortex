@@ -47,7 +47,11 @@ const RETRYABLE_STATUSES = new Set([503]);
 async function fetchWithRetry(
   url: string,
   init?: RequestInit,
+  retry = true,
 ): Promise<Response> {
+  // A caller that treats 503 as an answer (e.g. a feature switched off
+  // server-side) must not sit through the backoff or resend the request.
+  if (!retry) return fetch(url, init);
   let lastError: unknown;
   for (let attempt = 0; attempt <= RETRY_DELAYS_MS.length; attempt++) {
     try {
@@ -113,7 +117,7 @@ export async function getAuthToken(opts?: AuthTokenOptions): Promise<string | nu
   return _tokenGetter(opts);
 }
 
-async function authedFetch(url: string, init?: RequestInit): Promise<Response> {
+async function authedFetch(url: string, init?: RequestInit, retry = true): Promise<Response> {
   const headers = new Headers(init?.headers);
   if (_somaDelegation) {
     headers.set('Authorization', `Soma ${JSON.stringify(_somaDelegation)}`);
@@ -124,7 +128,7 @@ async function authedFetch(url: string, init?: RequestInit): Promise<Response> {
   if (!headers.has('Content-Type') && init?.method && init.method !== 'GET') {
     headers.set('Content-Type', 'application/json');
   }
-  return noteAuthorized(url, await fetchWithRetry(url, { ...init, headers }), headers);
+  return noteAuthorized(url, await fetchWithRetry(url, { ...init, headers }, retry), headers);
 }
 
 async function bearerFetch(url: string, init?: RequestInit): Promise<Response> {
@@ -253,8 +257,12 @@ function dispatchUnauthorized() {
   }
 }
 
-export async function requestJson<T>(path: string, init?: RequestInit): Promise<T> {
-  const res = await authedFetch(apiUrl(path), init);
+export async function requestJson<T>(
+  path: string,
+  init?: RequestInit,
+  options?: { retryOn503?: boolean },
+): Promise<T> {
+  const res = await authedFetch(apiUrl(path), init, options?.retryOn503 ?? true);
   if (!res.ok) {
     if (res.status === 401) dispatchUnauthorized();
     throw new CortexApiError(res.status, await readErrorMessage(res), res.headers.get('Retry-After'));

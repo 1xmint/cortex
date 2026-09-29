@@ -156,12 +156,13 @@ jobs:
       # an inconclusive step never ran its checks, so there is nothing it
       # failed.
       #
-      # 43 -> 59 with sixteen for the dollars frontend: formatDollars (6),
+      # 43 -> 60 with seventeen for the dollars frontend: formatDollars (6),
       # CreditsCard balance/top-up (2), two more Receipt cases (dollars, and
       # "not charged (Cortex issue)"), the Settings panel rendering with no
       # ClerkProvider (1), the TrialBanner never rendering "You're in ." (2),
       # and the RunsPane pull request block for engine statuses `succeeded` and
-      # `recovered` (3).
+      # `recovered` (3), and dictation disabling itself on a 503 from the token
+      # route with no alert (1, in `ChatComposer.voice.test.tsx`).
       - name: Test Cortex
         run: |
           set -euo pipefail
@@ -171,8 +172,8 @@ jobs:
           echo "$output"
           passed=$(echo "$output" | grep -oE "Tests +[0-9]+ passed" | grep -oE "[0-9]+" | tail -1)
           echo "cortex tests passed: ${passed:-0}"
-          if [ "${passed:-0}" -lt 59 ]; then
-            echo "::error::expected at least 59 Cortex tests to run, saw ${passed:-0}"
+          if [ "${passed:-0}" -lt 60 ]; then
+            echo "::error::expected at least 60 Cortex tests to run, saw ${passed:-0}"
             exit 1
           fi
 
