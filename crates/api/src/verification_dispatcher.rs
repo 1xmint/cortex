@@ -156,6 +156,39 @@ async fn run_claimed_job(
     let specs = db.load_check_specs(&job.run_id, &job.step_id);
     let digest = crate::db::spec_set_digest(&specs);
     if job.spec_set_digest != "unknown" && digest != job.spec_set_digest {
+        // O1 of the money-review fix pass: grading against a different exam
+        // than the one the customer was promised is Cortex's own scheduling
+        // ordering failing, never the customer's work, so the attempt is
+        // failed and its ending recorded as `CortexCrash` (absorbed) before
+        // the job itself is sealed -- in that order, so a crash between the
+        // two just leaves a `claimed` job to retry or dead-letter later,
+        // never a step stuck in `verifying` with no billing decision ever
+        // recorded for it.
+        if db.record_execution_failure_and_end(
+            &job.step_id,
+            &job.attempt_id,
+            job.lease_gen,
+            "the frozen check specs changed between enqueue and claim",
+            cortex_core::billing_binding::AttemptEndCause::CortexCrash,
+            false,
+        ) {
+            if let Err(e) = db.settle_pending_attempts() {
+                tracing::error!(
+                    job_id = %job.job_id,
+                    step_id = %job.step_id,
+                    error = %e,
+                    "settle_pending_attempts failed after a spec-set-changed \
+                     dead-letter; the scheduler's next tick will retry"
+                );
+            }
+        } else {
+            tracing::warn!(
+                job_id = %job.job_id,
+                step_id = %job.step_id,
+                "record_execution_failure_and_end returned false for a spec-set-changed \
+                 dead-letter -- likely stale lease_gen"
+            );
+        }
         seal(
             state,
             db,
@@ -396,6 +429,104 @@ mod tests {
         assert!(
             (HEARTBEAT_INTERVAL.as_millis() as i64) < VERIFICATION_LEASE_MS,
             "a heartbeat must refresh a claim before it expires"
+        );
+    }
+}
+
+#[cfg(test)]
+mod spec_changed_dead_letter {
+    // O1 of the money-review fix pass: a spec set that changed between
+    // enqueue and claim used to only seal the verification job as
+    // "inconclusive" -- the step itself stayed stuck in `verifying` forever,
+    // with no attempt_endings row ever written, so the attempt was never
+    // billed one way or the other. This proves the step is now failed and
+    // the ending recorded and settled as an absorbed `cortex_crash`, exactly
+    // like any other Cortex-caused failure.
+    use super::*;
+
+    const OWNER: &str = "user-fixture";
+
+    async fn state() -> std::sync::Arc<AppState> {
+        let temporary = tempfile::tempdir().expect("temporary workspace");
+        let workspace = temporary.path().to_path_buf();
+        std::fs::create_dir_all(workspace.join(".cortex")).expect("workspace metadata");
+        let state = AppState::new(workspace.join(".cortex/ledger.jsonl"), workspace, None).await;
+        // The tempdir must outlive the state's open database handle.
+        std::mem::forget(temporary);
+        state
+    }
+
+    #[tokio::test]
+    async fn a_spec_set_changed_at_claim_fails_the_step_and_absorbs_the_ending() {
+        let state = state().await;
+        let db = state.db.as_ref().expect("database");
+
+        let run_id = db.create_run(OWNER, "goal", "default", &[]);
+        let step_id = db.create_step(&run_id, "execute", "strong", "low", "do the thing");
+        let worker_id = format!("w-{}", &uuid::Uuid::new_v4().to_string()[..8]);
+        db.register_worker(&worker_id, OWNER, false);
+        let lease_gen = db
+            .lease_step(
+                &step_id,
+                &worker_id,
+                chrono::Utc::now().timestamp_millis() + 60_000,
+                "a1",
+            )
+            .expect("lease_step must succeed against a freshly created, pending step");
+        assert!(db.start_step(&step_id, lease_gen));
+        assert!(db.deliver_step(&step_id, "a1", lease_gen, None, None, None, Some("c0ffee")));
+
+        // Enqueue with a digest that does not, and will never, match this
+        // step's real (empty) check set -- standing in for the exam having
+        // changed between enqueue and claim.
+        let job_id = uuid::Uuid::new_v4().to_string();
+        assert!(db.begin_verifying_step(
+            &step_id,
+            "a1",
+            lease_gen,
+            Some(crate::db::VerificationEnqueue {
+                job_id: &job_id,
+                run_id: &run_id,
+                delivered_commit: "c0ffee",
+                spec_set_digest: "sha256:not-the-real-digest",
+                runner_policy_ver: "runner-policy-1",
+            }),
+        ));
+
+        let job = db
+            .claim_verification_job("dispatcher-a")
+            .expect("claimable");
+        run_claimed_job(&state, db, "dispatcher-a", job).await;
+
+        assert_eq!(
+            db.get_step_status(&step_id).as_deref(),
+            Some("execution_failed"),
+            "a spec set that changed under the job must fail the step, not leave it \
+             stuck in verifying forever"
+        );
+
+        let (cause, settled_at): (String, Option<i64>) = db
+            .conn()
+            .query_row(
+                "SELECT cause, settled_at FROM attempt_endings WHERE attempt_id = 'a1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("a matching attempt id must record an attempt_endings row");
+        assert_eq!(
+            cause, "cortex_crash",
+            "grading against a changed exam is Cortex's own scheduling ordering \
+             failing, not the customer's work, so it must absorb, not charge"
+        );
+        assert!(
+            settled_at.is_some(),
+            "settle_pending_attempts is called inline and must mark the row settled"
+        );
+
+        assert_eq!(
+            db.get_verification_job(&job_id).unwrap().state,
+            "inconclusive",
+            "the job itself is still sealed as inconclusive alongside the ending"
         );
     }
 }
