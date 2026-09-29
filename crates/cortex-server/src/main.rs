@@ -45,6 +45,14 @@ async fn main() {
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|_| std::env::current_dir().unwrap_or_else(|_| ".".into()));
 
+    if let Err(msg) = cortex_api::state::ensure_workspace_repository(&workspace_dir) {
+        tracing::error!("workspace: {msg}");
+        eprintln!("workspace: {msg}");
+        std::process::exit(1);
+    }
+    // Best effort: drop verification scratch a killed process left behind.
+    cortex_api::verification_driver::sweep_stale_scratch(&std::env::temp_dir());
+
     let auth_config = match cortex_api::clerk::load_heyvera_auth_config() {
         Ok(config) => config,
         Err(msg) => {

@@ -6,9 +6,10 @@
 //! moves through `deduct_credits`/`refund_credits`, the same calls
 //! `verification_driver::finish_and_bill` makes.
 
-use cortex_api::db::Database;
+use cortex_api::db::{Database, SpendAuthorization};
 use cortex_api::pricing::{self, PriceStatus, StepQuote};
-use cortex_core::billing_binding::{ChargeKey, RefundKey};
+use cortex_api::provider_gateway::GatewayCapability;
+use cortex_core::billing_binding::{AttemptEndCause, ChargeKey, RefundKey};
 use cortex_core::diff_surface::VerdictClass;
 use cortex_core::routing::RiskLevel;
 use cortex_core::task::WorkKind;
@@ -65,6 +66,52 @@ fn freeze(
     };
     db.freeze_step_quote(&quote).expect("freeze quote");
     credits
+}
+
+/// A funded spend authorization scoped to one attempt, ready for
+/// `reserve_provider_request` -- the same shape
+/// `ledger.rs`'s internal `attempt_capability` test helper builds, using
+/// the crate's public re-exports (`cortex_api::db::SpendAuthorization`,
+/// `cortex_api::provider_gateway::GatewayCapability`) since this is an
+/// external integration-test crate.
+fn attempt_capability(db: &Database, user_id: &str, attempt_id: &str) -> GatewayCapability {
+    let now = 0;
+    let price_list_id = db.active_price_list().expect("seed list publishes").id;
+    db.set_supplier_capacity("claude", 10_000_000, now)
+        .expect("fund supplier capacity");
+    let authorization = SpendAuthorization {
+        id: format!("auth-{attempt_id}"),
+        user_id: user_id.to_string(),
+        run_id: "run-verdict-class".to_string(),
+        attempt_id: attempt_id.to_string(),
+        provider: "claude".to_string(),
+        model: "claude-sonnet-5".to_string(),
+        price_list_id,
+        max_micro_usd: 10_000_000,
+        expires_at_ms: now + 60_000,
+    };
+    db.create_spend_authorization(&authorization, now)
+        .expect("create spend authorization");
+    GatewayCapability::new(
+        authorization.id,
+        authorization.user_id,
+        authorization.run_id,
+        authorization.attempt_id,
+        authorization.provider,
+        authorization.model,
+        authorization.expires_at_ms,
+    )
+}
+
+/// Reserve and settle one provider call for `claims.attempt_id`, exactly
+/// as a real gateway `forward()` would once the supplier confirms a cost.
+fn settle_call(db: &Database, claims: &GatewayCapability, request_key: &str, observed: i64) {
+    db.reserve_provider_request(claims, request_key, "digest", observed, 0)
+        .expect("reserve");
+    let settled = db
+        .settle_provider_request(request_key, observed, Some("upstream-1"), 0)
+        .expect("settle");
+    assert_eq!(settled.status, "settled");
 }
 
 #[test]
@@ -125,18 +172,28 @@ fn a_strong_task_is_charged_the_full_price() {
 
 // The two tests this replaces hand-called `deduct_credits` then
 // `refund_credits` back to back to assert a net-zero ledger for a "failed"
-// task. That is not a shape `finish_and_bill` ever produces: per
-// `billing_binding::billing_effect`, `(Failed, Unbilled) => None` -- a step
-// that never got charged in the first place is never billed at all, so there
-// is nothing to refund and no ledger row is ever written for it. Charging
-// then immediately refunding under a `"task failed"` reason describes a state
-// transition production's terminal, once-per-verification verdict write can
-// never reach. These replacements assert the real invariant instead: a
-// `Failed` verdict from an unbilled state touches nothing, for either class.
+// task, reading the old verdict-driven `billing_effect(Verdict, BillingState)`
+// table for `(Failed, Unbilled) => None`. That function, `BillingEffect` and
+// `BillingState` are gone -- billing no longer keys off a verdict at all
+// (`cortex_core::billing_binding::settle_attempt` takes an `AttemptEndCause`,
+// and a `Failed` attempt that *did* spend money is charged for it, same as
+// any other end cause; see the module doc on `billing_binding.rs`). What the
+// old tests actually proved -- a step that froze a quote but never spent
+// anything touches the ledger for nothing when it ends -- still holds, and
+// still needs proving at the real entry point: `settle_pending_attempts`
+// reads the settled cost for the `attempt_endings` record first and returns
+// with no ledger write at all when that is zero, regardless of which
+// `AttemptEndCause` the record carries. These replacements drive that exact
+// path (`record_attempt_ended` then `settle_pending_attempts`) with `Failed`,
+// for both classes, instead of a decision table that no longer exists. (The
+// narrower, DB-level version of this invariant -- including that literally
+// zero rows are written, not just that the balance nets to zero -- is also
+// covered by
+// `settle_pending_attempts_with_no_settled_calls_writes_no_ledger_row_at_all`
+// in `crates/api/src/db/ledger.rs`.)
 #[test]
-fn a_failed_task_from_an_unbilled_state_has_no_billing_effect_authored() {
-    use cortex_core::billing_binding::{billing_effect, BillingEffect, BillingState};
-    use cortex_core::verification::Verdict;
+fn a_failed_attempt_that_never_spent_anything_has_no_billing_effect_authored() {
+    use cortex_core::billing_binding::AttemptEndCause;
 
     let (_dir, db) = db();
     let (list, class) = billable_list(&db);
@@ -144,7 +201,6 @@ fn a_failed_task_from_an_unbilled_state_has_no_billing_effect_authored() {
     let user = "user_authored_never_charged";
     db.init_credit_balance(user, 10_000).expect("init balance");
 
-    let verification_id = "verify-authored-2";
     // Freezing the quote records what the step *would* cost; it is not a
     // charge, and a `Failed` delivery must never turn it into one.
     let _quoted = freeze(
@@ -156,24 +212,30 @@ fn a_failed_task_from_an_unbilled_state_has_no_billing_effect_authored() {
         VerdictClass::Authored,
     );
 
-    assert_eq!(
-        billing_effect(Verdict::Failed, BillingState::Unbilled, verification_id),
-        BillingEffect::None,
-        "a failed step that was never charged must not be refunded"
-    );
+    // No provider call was ever reserved or settled for this attempt, so its
+    // settled cost is zero and `settle_pending_attempts` must write nothing.
+    db.record_attempt_ended(
+        "attempt-authored-2",
+        user,
+        "step-authored-2",
+        AttemptEndCause::Failed,
+        false,
+    )
+    .expect("record attempt ended");
+    db.settle_pending_attempts()
+        .expect("settle pending attempts");
 
     let (sub_total, pack_total) = db.credit_ledger_totals(user);
     assert_eq!(
         sub_total + pack_total,
         0,
-        "no ledger row exists for this verification, so the balance is untouched"
+        "no ledger row exists for this attempt, so the balance is untouched"
     );
 }
 
 #[test]
-fn a_failed_task_from_an_unbilled_state_has_no_billing_effect_strong() {
-    use cortex_core::billing_binding::{billing_effect, BillingEffect, BillingState};
-    use cortex_core::verification::Verdict;
+fn a_failed_attempt_that_never_spent_anything_has_no_billing_effect_strong() {
+    use cortex_core::billing_binding::AttemptEndCause;
 
     let (_dir, db) = db();
     let (list, class) = billable_list(&db);
@@ -181,17 +243,77 @@ fn a_failed_task_from_an_unbilled_state_has_no_billing_effect_strong() {
     let user = "user_strong_never_charged";
     db.init_credit_balance(user, 10_000).expect("init balance");
 
-    let verification_id = "verify-strong-2";
     let _quoted = freeze(&db, "run-4", "step-4", &list, &class, VerdictClass::Strong);
 
-    assert_eq!(
-        billing_effect(Verdict::Failed, BillingState::Unbilled, verification_id),
-        BillingEffect::None,
-        "a failed step that was never charged must not be refunded"
-    );
+    db.record_attempt_ended(
+        "attempt-strong-2",
+        user,
+        "step-strong-2",
+        AttemptEndCause::Failed,
+        false,
+    )
+    .expect("record attempt ended");
+    db.settle_pending_attempts()
+        .expect("settle pending attempts");
 
     let (sub_total, pack_total) = db.credit_ledger_totals(user);
     assert_eq!(sub_total + pack_total, 0);
+}
+
+// A `Failed` attempt is not special-cased: if it actually spent provider
+// money before it failed, that settled cost is charged just like any other
+// end cause -- billing is pass-through on real spend, not on the verdict.
+// The two tests above prove the zero-spend side of that rule at this same
+// entry point (`record_attempt_ended` then `settle_pending_attempts`); this
+// proves the non-zero side, which nothing else at this entry point covers
+// (`ledger.rs`'s equivalent, `settle_pending_attempts_charges_the_exact_settled_sum_for_a_chargeable_cause`,
+// only exercises `AttemptEndCause::CustomerCancel`).
+#[test]
+fn a_failed_attempt_that_spent_money_is_charged_the_exact_settled_cost() {
+    let (_dir, db) = db();
+    let (list, class) = billable_list(&db);
+
+    let user = "user_failed_charged";
+    db.init_credit_balance(user, 10_000).expect("init balance");
+
+    let attempt_id = "attempt-failed-charged";
+    let _quoted = freeze(
+        &db,
+        "run-failed-charged",
+        "step-failed-charged",
+        &list,
+        &class,
+        VerdictClass::Authored,
+    );
+
+    // 450_000 micro-USD at the seeded 100_000-micro-USD credit is exactly
+    // 4 whole credits with a 50_000 remainder -- pass-through billing, no
+    // rounding up, same as `ledger.rs`'s settled-sum test.
+    let claims = attempt_capability(&db, user, attempt_id);
+    settle_call(&db, &claims, "call-failed-charged", 450_000);
+
+    db.record_attempt_ended(
+        attempt_id,
+        user,
+        "step-failed-charged",
+        AttemptEndCause::Failed,
+        false,
+    )
+    .expect("record attempt ended");
+    db.settle_pending_attempts()
+        .expect("settle pending attempts");
+
+    let (sub_total, pack_total) = db.credit_ledger_totals(user);
+    assert_eq!(
+        sub_total + pack_total,
+        -4,
+        "a Failed attempt that spent money must be charged for exactly what it spent"
+    );
+    assert_eq!(
+        db.get_credit_carry_micro_usd(user),
+        50_000,
+        "the sub-credit remainder must be carried, not dropped or rounded up"
+    );
 }
 
 #[test]

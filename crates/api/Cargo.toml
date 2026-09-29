@@ -74,6 +74,11 @@ opentelemetry_sdk = { version = "0.32.1", optional = true, features = ["rt-tokio
 opentelemetry-otlp = { version = "0.32", optional = true, features = ["grpc-tonic"] }
 tracing-opentelemetry = { version = "0.33", optional = true }
 
+# `statvfs`, for the free-space check before a control checkout. Already in the
+# lockfile through other crates; no new package.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [features]
 default = []
 # Compile in the Soma identity/delegation surface: the Cortex heart, the

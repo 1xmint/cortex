@@ -50,6 +50,14 @@ fi
 log_info "Creating directory structure..."
 mkdir -p "$CORTEX_HOME" "$WORKSPACE_DIR" "$DATA_DIR" "$BIN_DIR" "$FRONTEND_DIR"
 
+# The server refuses to boot unless its workspace is a git repository
+# (ensure_workspace_repository). Idempotent: git init on an existing
+# repository only reinitializes it. Run as the service user so the
+# repository is owned by the user that runs the server.
+log_info "Ensuring the workspace is a git repository..."
+chown "$CORTEX_USER:$CORTEX_USER" "$WORKSPACE_DIR"
+runuser -u "$CORTEX_USER" -- git -C "$WORKSPACE_DIR" init -q
+
 # Build Rust backend
 log_info "Building Rust backend..."
 cd "$(dirname "$0")/.."

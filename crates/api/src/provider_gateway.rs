@@ -988,6 +988,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unpriced_model_is_refused_before_any_reservation() {
+        // "gpt-4.1-mini" is a real model id that is deliberately absent from
+        // `pricing::seed_models` — Cortex must never guess a cost for a model
+        // it has no cited rate for. A spend authorization can still be minted
+        // for it (authorization creation does not check pricing), so this
+        // proves the refusal actually lives in `forward`, at the
+        // `gateway_model_rate` lookup, not merely somewhere earlier.
+        let fixture = Fixture::with_model(100_000, 100_000, "openai", "gpt-4.1-mini");
+        let gateway = fixture.gateway(success(Some(ObservedUsage {
+            input_tokens: 100,
+            cached_input_tokens: 0,
+            output_tokens: 10,
+            ..Default::default()
+        })));
+
+        let error = gateway
+            .forward(fixture.request(&gateway, "unpriced"), NOW)
+            .await
+            .unwrap_err();
+
+        assert_eq!(error, GatewayError::MissingRate);
+        // No reservation was created and the supplier was never called: an
+        // unpriced model is refused before any spend, not charged nothing
+        // after the fact.
+        assert!(fixture.db.get_provider_reservation("unpriced").is_none());
+        assert_eq!(fixture.db.provider_spend_row_count("unpriced"), 0);
+        assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
     async fn bounded_cli_tool_definitions_are_admitted() {
         let fixture = Fixture::new(100_000, 100_000);
         let gateway = fixture.gateway(success(Some(ObservedUsage {

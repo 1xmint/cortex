@@ -19,6 +19,8 @@ fn production_without_clerk_trust_anchors_exits_nonzero_and_says_why() {
     let bin = env!("CARGO_BIN_EXE_cortex-server");
     let dir = tempfile::tempdir().unwrap();
     let ledger_path = dir.path().join("ledger.jsonl");
+    // Pre-create `.git` so this test exercises only the auth check.
+    std::fs::create_dir(dir.path().join(".git")).unwrap();
 
     let mut child = Command::new(bin)
         .env("CORTEX_ENV", "production")
@@ -91,4 +93,56 @@ fn production_without_clerk_trust_anchors_exits_nonzero_and_says_why() {
         stderr.contains("CLERK_SECRET_KEY is required in HeyVera production"),
         "stderr did not explain the failure: {stderr}"
     );
+}
+
+#[test]
+fn a_workspace_with_no_git_gets_one_at_boot() {
+    let bin = env!("CARGO_BIN_EXE_cortex-server");
+    let dir = tempfile::tempdir().unwrap();
+    let ledger_path = dir.path().join("ledger.jsonl");
+
+    // No `.git` in the workspace: the server initializes one itself instead of
+    // making the owner run `git init` by hand on the deploy host.
+    assert!(!dir.path().join(".git").exists());
+    let mut child = Command::new(bin)
+        .env_remove("CORTEX_ENV")
+        .env("CORTEX_AUTH_DISABLED", "1")
+        .env("CORTEX_SINGLE_NODE", "1")
+        .env("CORTEX_PORT", "0")
+        .env("CORTEX_LEDGER_PATH", &ledger_path)
+        .env("CORTEX_WORKSPACE", dir.path())
+        .env_remove("CLERK_SECRET_KEY")
+        .env_remove("CLERK_ISSUER")
+        .env_remove("CLERK_AUTHORIZED_PARTY")
+        .env_remove("HEYVERA_REQUIRE_AUTH")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("failed to spawn cortex-server binary");
+
+    // Poll for the repository while the server is still running; a server that
+    // exits before creating it, or never creates it, fails the test.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let outcome = loop {
+        if dir.path().join(".git").is_dir() {
+            break Ok(());
+        }
+        if let Some(status) = child.try_wait().expect("failed to poll child status") {
+            break Err(format!(
+                "the server exited ({status}) without creating .git"
+            ));
+        }
+        if Instant::now() >= deadline {
+            break Err("no .git appeared within 30s of starting the server".to_string());
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let _ = child.kill();
+    let _ = child.wait();
+
+    if let Err(why) = outcome {
+        panic!("{why}");
+    }
+    assert!(dir.path().join(".git").is_dir());
 }

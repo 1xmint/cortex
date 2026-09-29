@@ -342,6 +342,29 @@ pub(crate) fn gateway_usable() -> Option<GatewayUsable> {
     })
 }
 
+/// Thin boolean view of [`gateway_usable`] for callers that only need to know
+/// whether the gateway can be called right now, not what to call it with —
+/// the scheduler's dispatch-time money gate (`billing_binding::dispatch_money_gate`)
+/// is one of these: it must never construct or discard a `GatewayUsable` just
+/// to answer "is it on".
+///
+/// Stub mode is never "on" in production (item G of the M-D-0024 settlement
+/// redesign): `StubTransport` never calls a real supplier and never produces
+/// a real charge, so treating it as "on" in production would let
+/// `dispatch_money_gate` wave runs through as if a paying provider call could
+/// happen, when nothing would actually be billed or delivered. Stub is only
+/// meant for CI and local development, both of which are non-production.
+pub(crate) fn is_gateway_on() -> bool {
+    match gateway_usable() {
+        Some(GatewayUsable {
+            transport: GatewayTransport::Stub(_),
+            ..
+        }) => !crate::is_production_env(),
+        Some(_) => true,
+        None => false,
+    }
+}
+
 pub async fn messages(
     State(state): State<std::sync::Arc<AppState>>,
     headers: HeaderMap,
