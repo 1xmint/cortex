@@ -4,7 +4,7 @@ import { createTopupCheckout, getCreditsBalance } from '../../lib/cortexApi';
 import { creditsForDollars, formatCreditGrant, formatDollars } from '../../lib/formatDollars';
 
 // Must match `credits_for_topup_amount` (crates/api/src/billing.rs).
-export const TOPUP_AMOUNTS_USD = [10, 25, 50, 100] as const;
+const TOPUP_AMOUNTS_USD = [10, 25, 50, 100] as const;
 
 /**
  * Balance and top-up. The balance is shown in dollars. The purchase buttons are
@@ -35,7 +35,7 @@ export default function CreditsCard() {
     setPending(amountUsd);
     try {
       const { checkout_url } = await createTopupCheckout(amountUsd);
-      window.location.href = checkout_url;
+      window.location.assign(checkout_url);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Could not start checkout');
       setPending(null);
