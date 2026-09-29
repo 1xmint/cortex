@@ -2299,10 +2299,13 @@ mod tests {
     }
 
     #[test]
-    fn a_git_dir_git_refuses_is_missing_and_charged_not_could_not_check() {
-        // `.git` exists but git will not open it (a repository format from
-        // the future). The workspace is worker-writable, so that is the
-        // worker's doing: `Missing`, never `CheckFailed`.
+    fn a_workspace_config_git_would_refuse_is_never_read_and_never_absorbs() {
+        // The worker rewrites `.git/config` to a repository format from the
+        // future, which makes git refuse to open the workspace repository.
+        // Cortex never opens it: git runs in Cortex's scratch repository and
+        // reads only the workspace's objects, so the config is not read at
+        // all and the real commit still resolves. Either way the answer is
+        // never `CheckFailed`, so nothing here can be absorbed.
         let (dir, head) = repo_with_one_commit();
         assert_eq!(check_commit(&dir, &head), CommitCheck::Resolves);
         let config = dir.join(".git/config");
@@ -2316,7 +2319,11 @@ mod tests {
             ),
         )
         .unwrap();
-        assert_eq!(check_commit(&dir, &head), CommitCheck::Missing);
+        assert_eq!(check_commit(&dir, &head), CommitCheck::Resolves);
+        assert_eq!(
+            check_commit(&dir, "0000000000000000000000000000000000000000"),
+            CommitCheck::Missing
+        );
     }
 
     #[test]
@@ -2458,10 +2465,7 @@ mod tests {
             ExamIntegrity::Unknown {
                 delivered_tree_caused,
                 ..
-            } => assert!(
-                delivered_tree_caused,
-                "a workspace with no .git is charged"
-            ),
+            } => assert!(delivered_tree_caused, "a workspace with no .git is charged"),
             other => panic!("expected unknown integrity, got {other:?}"),
         }
     }

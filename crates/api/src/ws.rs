@@ -3263,10 +3263,11 @@ mod attempt_end_paths {
 
     #[tokio::test]
     async fn a_workspace_git_dir_git_refuses_is_the_workers_doing_and_charged() {
-        // `.git` exists but git will not open it (a repository format from
-        // the future). The workspace is worker-writable, so a worker that
+        // The worker rewrites its `.git/config` to a repository format from
+        // the future. The workspace is worker-writable, so a worker that
         // breaks its `.git` must not buy a free attempt: charged, not
-        // absorbed.
+        // absorbed (Cortex never reads that config; the head is simply not
+        // in the object store).
         let state = state().await;
         git_in(&state.workspace_dir, &["init"]);
         let config = state.workspace_dir.join(".git/config");
