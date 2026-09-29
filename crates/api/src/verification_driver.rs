@@ -1957,7 +1957,10 @@ mod tests {
 
     #[test]
     fn the_free_space_floor_only_applies_when_the_space_is_known() {
-        assert_eq!(has_room(&std::env::temp_dir().join("no-such-dir-xyz")), Ok(()));
+        assert_eq!(
+            has_room(&std::env::temp_dir().join("no-such-dir-xyz")),
+            Ok(())
+        );
         #[cfg(unix)]
         assert!(free_bytes(&std::env::temp_dir()).is_some());
     }
@@ -1974,7 +1977,10 @@ mod tests {
         assert!(text.contains("repositoryformatversion = 0"), "{text}");
         std::fs::write(
             &config,
-            text.replace("repositoryformatversion = 0", "repositoryformatversion = 99"),
+            text.replace(
+                "repositoryformatversion = 0",
+                "repositoryformatversion = 99",
+            ),
         )
         .unwrap();
         assert_eq!(check_commit(&dir, &head), CommitCheck::Missing);

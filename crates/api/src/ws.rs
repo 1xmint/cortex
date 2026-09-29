@@ -3265,7 +3265,10 @@ mod attempt_end_paths {
         assert!(text.contains("repositoryformatversion = 0"), "{text}");
         std::fs::write(
             &config,
-            text.replace("repositoryformatversion = 0", "repositoryformatversion = 99"),
+            text.replace(
+                "repositoryformatversion = 0",
+                "repositoryformatversion = 99",
+            ),
         )
         .expect("rewrite repository config");
         let (worker_id, step_id, lease_gen) =
