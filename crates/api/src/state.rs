@@ -123,7 +123,10 @@ pub fn ensure_workspace_repository(workspace_dir: &std::path::Path) -> Result<()
             String::from_utf8_lossy(&output.stderr).trim()
         ));
     }
-    tracing::info!("workspace: initialized a git repository in {}", workspace_dir.display());
+    tracing::info!(
+        "workspace: initialized a git repository in {}",
+        workspace_dir.display()
+    );
     Ok(())
 }
 

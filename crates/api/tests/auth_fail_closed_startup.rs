@@ -123,7 +123,9 @@ fn a_workspace_with_no_git_gets_one_at_boot() {
             break Ok(());
         }
         if let Some(status) = child.try_wait().expect("failed to poll child status") {
-            break Err(format!("the server exited ({status}) without creating .git"));
+            break Err(format!(
+                "the server exited ({status}) without creating .git"
+            ));
         }
         if Instant::now() >= deadline {
             break Err("no .git appeared within 30s of starting the server".to_string());
