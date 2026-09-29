@@ -945,6 +945,10 @@ async fn run_billing_loop(
     // settle and charge for everything actually observed instead of
     // treating a mid-flight drop as zero usage since the last renewal.
     let mut last_observed_total_micro: i64 = 0;
+    // Cumulative seconds from the last usage event that carried a readable
+    // `usage.seconds`. An event with that field missing or not an integer
+    // must never read as zero usage: it falls back to this.
+    let mut last_observed_seconds: i64 = 0;
     let now_ms = || chrono::Utc::now().timestamp_millis();
 
     // Delegation state, local to this session's billing task. The task text
@@ -1113,10 +1117,14 @@ async fn run_billing_loop(
                         }
                     }
                     Some("session.usage.updated") => {
+                        // Usage is cumulative: a missing/non-integer field, or a
+                        // value below what was already reported, never lowers it.
                         let seconds = event
                             .pointer("/usage/seconds")
                             .and_then(Value::as_i64)
-                            .unwrap_or(0);
+                            .unwrap_or(last_observed_seconds)
+                            .max(last_observed_seconds);
+                        last_observed_seconds = seconds;
                         let observed_total = rate.cost_micros(seconds, 0, 0);
                         last_observed_total_micro = observed_total;
                         budget_exhausted |= settle_up_to(
@@ -1217,10 +1225,16 @@ async fn run_billing_loop(
                         }
                     }
                     Some("session.closed") => {
+                        // Bill the larger of the closing report and the last
+                        // usage already observed: a close that omits or
+                        // understates `usage.seconds` cannot erase cost that
+                        // was already reported.
                         let seconds = event
                             .pointer("/usage/seconds")
                             .and_then(Value::as_i64)
-                            .unwrap_or(0);
+                            .unwrap_or(last_observed_seconds)
+                            .max(last_observed_seconds);
+                        last_observed_seconds = seconds;
                         let observed_total = rate.cost_micros(seconds, 0, 0);
                         last_observed_total_micro = observed_total;
                         settle_up_to(
@@ -1280,18 +1294,33 @@ async fn run_billing_loop(
             now_ms(),
         );
 
-        // Whatever is still open was never confirmed by a `session.closed`,
-        // so its cost cannot be observed: it is not guessed at and not
-        // charged. Cortex absorbs it (0 credits) and says so in the log;
-        // segments that already settled above were charged exactly.
+        // Usage already reported by `session.usage.updated` is a known call
+        // cost, so it is charged: whatever part of `last_observed_total_micro`
+        // the settles above did not cover is billed under one `:drop` key
+        // (idempotent, carry kept). Only the tail the sideband never got to
+        // report before it dropped cannot be observed; that is not guessed at
+        // and Cortex absorbs it (0 credits), logged below.
+        let unsettled_observed = last_observed_total_micro - settled_so_far_micro;
+        if unsettled_observed > 0 {
+            let _ = charge_observed_cost(
+                db,
+                &user_id,
+                &session_id,
+                &format!("voice:{local_id}:drop"),
+                "Cortex live voice (observed before sideband drop)",
+                unsettled_observed,
+                micros_per_credit,
+            );
+            settled_so_far_micro = last_observed_total_micro;
+        }
         let open_segments = segments.lock().unwrap_or_else(|e| e.into_inner()).len();
-        if open_segments > 0 || last_observed_total_micro > settled_so_far_micro {
+        if open_segments > 0 {
             tracing::error!(
                 user_id = %user_id,
                 session_id = %session_id,
                 open_segments,
-                unobserved_micro_usd = last_observed_total_micro - settled_so_far_micro,
-                "voice: sideband dropped before session.closed; cost of the open segment(s) cannot be observed, absorbed by Cortex (0 credits charged)"
+                observed_micro_usd_charged = settled_so_far_micro,
+                "voice: sideband dropped before session.closed; usage already reported was charged, the unreported tail of the open segment(s) cannot be observed and is absorbed by Cortex"
             );
         }
 
@@ -2637,6 +2666,11 @@ mod fake_live {
         /// Counts every `/attach` upgrade this script has completed, so a
         /// test can tell a re-attach after a drop actually happened.
         pub attach_count: Option<StdArc<std::sync::atomic::AtomicUsize>>,
+        /// Send one `session.usage.updated` whose `usage.seconds` is not an
+        /// integer after the scripted events -- a malformed report.
+        pub malformed_usage_after_script: bool,
+        /// Send `session.closed` with no `usage` object at all.
+        pub closed_without_seconds: bool,
     }
 
     impl Default for FakeLiveScript {
@@ -2649,6 +2683,8 @@ mod fake_live {
                 pause_after_first_event: None,
                 hang_attach_for: None,
                 attach_count: None,
+                malformed_usage_after_script: false,
+                closed_without_seconds: false,
             }
         }
     }
@@ -2702,12 +2738,29 @@ mod fake_live {
                 }
             }
         }
-        if script.send_closed_after_script {
+        if script.malformed_usage_after_script {
             let message = serde_json::json!({
-                "type": "session.closed",
-                "usage": {"seconds": last_seconds},
-                "reason": "done",
+                "type": "session.usage.updated",
+                "usage": {"seconds": "not-a-number"},
             });
+            if socket
+                .send(AxumMessage::Text(message.to_string().into()))
+                .await
+                .is_err()
+            {
+                return;
+            }
+        }
+        if script.send_closed_after_script {
+            let message = if script.closed_without_seconds {
+                serde_json::json!({"type": "session.closed", "reason": "done"})
+            } else {
+                serde_json::json!({
+                    "type": "session.closed",
+                    "usage": {"seconds": last_seconds},
+                    "reason": "done",
+                })
+            };
             let _ = socket
                 .send(AxumMessage::Text(message.to_string().into()))
                 .await;
@@ -3048,12 +3101,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_dropped_sideband_is_absorbed_with_zero_credits() {
-        // Neither scripted event (50s, 100s) ever crosses the 80% renewal
+    async fn a_dropped_sideband_charges_the_usage_it_reported() {
+        // Neither scripted event (50s, 100s) crosses the 80% renewal
         // threshold or the segment boundary, so segment 0 never settles and
-        // the session's cost is never confirmed by a `session.closed`. With
-        // the usage feed gone the cost cannot be observed, so it is absorbed
-        // by Cortex: 0 credits, 0 ledger rows, carry untouched.
+        // no `session.closed` confirms the cost. The last report (100s =
+        // 83_333 micro-USD) was still observed, so it is charged under
+        // `:drop` with carry (0 whole credits, 83_333 carried); only usage
+        // that was never reported would be absorbed.
         let (_dir, state) = test_state().await;
         let (http_base, ws_base) = spawn(FakeLiveScript {
             usage_events: vec![50, 100],
@@ -3096,25 +3150,26 @@ mod tests {
         assert_eq!(
             1_000_000_000 - balance.subscription_remaining,
             0,
-            "an unobservable segment must cost the customer 0 credits"
+            "83_333 micro-USD is under one credit, so nothing whole is debited yet"
         );
-        assert_eq!(db.get_credit_carry_micro_usd(USER), 0);
-        assert!(
-            voice_ledger_rows(db, &local_id).is_empty(),
-            "an absorbed segment writes no ledger row"
+        assert_eq!(db.get_credit_carry_micro_usd(USER), 83_333);
+        assert_eq!(
+            voice_ledger_rows(db, &local_id),
+            vec![(format!("voice:{local_id}:drop"), 0, Some(83_333))],
+            "the reported usage is charged once, under the :drop key"
         );
     }
 
     #[tokio::test]
-    async fn a_dropped_sideband_after_850_seconds_charges_two_settled_segments_and_absorbs_the_rest(
-    ) {
+    async fn a_dropped_sideband_after_850_seconds_charges_settled_segments_and_reported_tail() {
         // Crosses the 80% renewal threshold enough times to reserve four
         // 300s segments, but only ever reports usage through 850s: segments
         // 0 (0-300s) and 1 (300-600s) are fully consumed and settle inline
         // (each charged exactly its observed cost); segment 2 (600-900s) is
         // only partially observed (250s of its 300s) so it never settles,
         // and segment 3 (900-1200s) is reserved with no usage at all. The
-        // drop leaves both open segments unresolved and absorbs them.
+        // drop leaves both open segments unresolved, but the 850s that were
+        // reported are charged: the unsettled 250s tail goes through `:drop`.
         let (_dir, state) = test_state().await;
         let (http_base, ws_base) = spawn(FakeLiveScript {
             usage_events: vec![240, 480, 720, 850],
@@ -3162,18 +3217,64 @@ mod tests {
         }
 
         // Two settled 300s segments at 249_999 micro-USD each = 499_998
-        // micro-USD = 4 whole credits + 99_998 carried. The unsettled 250s
-        // of segment 2 was never confirmed, so it is absorbed (not charged).
+        // micro-USD = 4 whole credits + 99_998 carried. The reported 850s
+        // total is 708_333, so the drop charges the remaining 208_335 with
+        // that carry: 308_333 = 3 credits + 8_333 carried. Total 7 credits.
         let balance = db.get_credit_balance_row(USER).unwrap();
-        assert_eq!(1_000_000_000 - balance.subscription_remaining, 4);
-        assert_eq!(db.get_credit_carry_micro_usd(USER), 99_998);
+        assert_eq!(1_000_000_000 - balance.subscription_remaining, 7);
+        assert_eq!(db.get_credit_carry_micro_usd(USER), 8_333);
 
-        let rows = voice_ledger_rows(db, &local_id);
         assert_eq!(
-            rows.iter().map(|r| r.0.clone()).collect::<Vec<_>>(),
-            vec![format!("voice:{local_id}:0"), format!("voice:{local_id}:1")],
-            "only the two settled segments are charged; no :drop or :overrun row"
+            voice_ledger_rows(db, &local_id),
+            vec![
+                (format!("voice:{local_id}:0"), -2, Some(249_999)),
+                (format!("voice:{local_id}:1"), -2, Some(249_999)),
+                (format!("voice:{local_id}:drop"), -3, Some(208_335)),
+            ],
         );
+    }
+
+    #[tokio::test]
+    async fn missing_or_malformed_usage_seconds_never_bill_less_than_the_last_report() {
+        // One real report (200s), then a usage event whose `seconds` is not
+        // an integer, then a `session.closed` with no usage at all. Neither
+        // may reset the count to 0: the session is billed its last observed
+        // 200s = 166_666 micro-USD = 1 credit + 66_666 carried.
+        let (_dir, state) = test_state().await;
+        let (http_base, ws_base) = spawn(FakeLiveScript {
+            usage_events: vec![200],
+            send_closed_after_script: true,
+            malformed_usage_after_script: true,
+            closed_without_seconds: true,
+            ..Default::default()
+        })
+        .await;
+
+        let (session_id, _sdp, local_id) = start_session(
+            &state,
+            LiveVoiceMode::Live("sk-test-supplier-0123456789".into()),
+            &http_base,
+            &ws_base,
+            SIGNING_KEY,
+            ample_limits(),
+            USER,
+            "offer-sdp",
+            0,
+            None,
+        )
+        .await
+        .expect("live start must succeed");
+
+        wait_until_session_gone(&state, &session_id).await;
+
+        let db = state.db.as_ref().unwrap();
+        assert_eq!(
+            voice_ledger_rows(db, &local_id),
+            vec![(format!("voice:{local_id}:0"), -1, Some(166_666))],
+        );
+        let balance = db.get_credit_balance_row(USER).unwrap();
+        assert_eq!(1_000_000_000 - balance.subscription_remaining, 1);
+        assert_eq!(db.get_credit_carry_micro_usd(USER), 66_666);
     }
 
     #[tokio::test]
@@ -3431,14 +3532,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_dropped_sideband_with_usage_past_every_reservation_absorbs_the_excess_and_reattaches_to_close(
+    async fn a_dropped_sideband_with_usage_past_every_reservation_charges_the_reported_excess_and_reattaches_to_close(
     ) {
         // A tight max_micro_usd budget of exactly one segment: the second
         // scripted event lands on the cap and gets no further renewal, and
         // the third event reports usage past every reservation this session
         // ever made, then the fake drops the connection without a
-        // `session.closed`. The excess is unobserved-by-close cost, so it is
-        // absorbed rather than guessed at, and the drop-cleanup path
+        // `session.closed`. The excess was reported, so it is charged under
+        // `:drop` (nothing is guessed beyond the last report), and the
+        // drop-cleanup path
         // attempts one re-attach to send `session.close` rather than
         // leaving the upstream session running unmetered.
         let (_dir, state) = test_state().await;
@@ -3483,21 +3585,23 @@ mod tests {
         // Segment 0 (the only reservation this cap could ever fund) settles
         // for its full reserved amount and is charged exactly: 249_999
         // micro-USD = 2 whole credits + 49_999 carried. The extra 150s
-        // reported on top of it is absorbed.
+        // reported on top of it (450s total = 374_999) is charged as the
+        // 125_000 remainder: 174_999 with carry = 1 credit + 74_999 carried.
         let reservation = db
             .get_provider_reservation(&format!("voice:{local_id}:0"))
             .expect("segment 0 exists");
         assert_eq!(reservation.status, "settled");
 
-        let rows = voice_ledger_rows(db, &local_id);
         assert_eq!(
-            rows.iter().map(|r| r.0.clone()).collect::<Vec<_>>(),
-            vec![format!("voice:{local_id}:0")],
-            "no :drop or :overrun row on a dropped session"
+            voice_ledger_rows(db, &local_id),
+            vec![
+                (format!("voice:{local_id}:0"), -2, Some(249_999)),
+                (format!("voice:{local_id}:drop"), -1, Some(125_000)),
+            ],
         );
         let balance = db.get_credit_balance_row(USER).unwrap();
-        assert_eq!(1_000_000_000 - balance.subscription_remaining, 2);
-        assert_eq!(db.get_credit_carry_micro_usd(USER), 49_999);
+        assert_eq!(1_000_000_000 - balance.subscription_remaining, 3);
+        assert_eq!(db.get_credit_carry_micro_usd(USER), 74_999);
 
         // The drop-cleanup path must have tried a re-attach to send
         // `session.close` on top of the original attach.
