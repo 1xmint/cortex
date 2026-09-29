@@ -205,7 +205,10 @@ pub async fn verify_delivery<R: CheckRunner>(
             .await;
             return Some(Verdict::Inconclusive);
         }
-        ExamIntegrity::Unknown { reason, delivered_tree_caused } => {
+        ExamIntegrity::Unknown {
+            reason,
+            delivered_tree_caused,
+        } => {
             let detail = format!("exam integrity unknown: {reason}");
             tracing::error!(
                 run_id = %facts.run_id,
@@ -447,7 +450,7 @@ async fn finish_and_bill(
             verification_id,
             attempt_id = %facts.attempt_id,
             error = %e,
-            "settle_pending_attempts failed after recording attempt ending;              the scheduler's next tick will retry"
+            "settle_pending_attempts failed after recording attempt ending; the scheduler's next tick will retry"
         );
     }
 }
@@ -457,7 +460,9 @@ async fn finish_and_bill(
 enum ExamIntegrity {
     Intact,
     PermittedAuthoredWork,
-    ModifiedExam { paths: Vec<String> },
+    ModifiedExam {
+        paths: Vec<String>,
+    },
     /// `delivered_tree_caused` distinguishes a failure caused by what the
     /// worker actually delivered (its head commit does not resolve, its
     /// diff against the frozen base cannot be computed) from a failure in
@@ -466,7 +471,10 @@ enum ExamIntegrity {
     /// `classify_exam_integrity_failure` (F2 of the money-review fix pass)
     /// so an unknown result is charged when it stems from delivered content
     /// and absorbed only when it is genuinely ours.
-    Unknown { reason: String, delivered_tree_caused: bool },
+    Unknown {
+        reason: String,
+        delivered_tree_caused: bool,
+    },
 }
 
 fn exam_integrity(db: &Database, facts: &DeliveryFacts) -> ExamIntegrity {

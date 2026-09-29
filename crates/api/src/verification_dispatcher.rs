@@ -493,7 +493,9 @@ mod spec_changed_dead_letter {
             }),
         ));
 
-        let job = db.claim_verification_job("dispatcher-a").expect("claimable");
+        let job = db
+            .claim_verification_job("dispatcher-a")
+            .expect("claimable");
         run_claimed_job(&state, db, "dispatcher-a", job).await;
 
         assert_eq!(

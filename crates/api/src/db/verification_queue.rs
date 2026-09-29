@@ -956,7 +956,6 @@ mod verifier {
         );
     }
 
-
     /// Force a claim's lease into the past, standing in for a dispatcher that
     /// died without releasing it.
     fn expire_claim(db: &Database, job_id: &str) {

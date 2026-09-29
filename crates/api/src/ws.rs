@@ -1784,7 +1784,6 @@ fn commit_resolves(workspace_dir: &Path, commit: &str) -> bool {
         .unwrap_or(false)
 }
 
-
 /// Resolve step_id to run_id using a per-connection cache to avoid repeated DB lookups.
 /// A step producing 100 output lines would otherwise trigger 100 DB queries with Mutex locks.
 fn resolve_run_id(
@@ -2648,7 +2647,10 @@ mod attempt_end_paths {
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .expect("absorbed-cost row");
-        assert_eq!(amount, 0, "an absorbed cost is a zero-amount row, never a refund");
+        assert_eq!(
+            amount, 0,
+            "an absorbed cost is a zero-amount row, never a refund"
+        );
         assert_eq!(reason, "absorbed");
     }
 
