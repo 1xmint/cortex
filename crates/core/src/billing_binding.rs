@@ -18,9 +18,9 @@
 //! charges nothing. Nothing here ever refunds a charge that already
 //! happened — the old verdict-driven `Refund` path (a `Failed` verdict
 //! reversing a charge) is gone. [`RefundKey`] and `Database::refund_credits`
-//! still exist and are still used — by `voice.rs`, for a dictation-token
-//! refund that has nothing to do with a task attempt's verdict — so they are
-//! kept, but nothing in this module reaches them anymore.
+//! still exist — kept for callers outside a task attempt's verdict (dictation
+//! never refunds: it charges only after the provider answers) — but nothing in
+//! this module reaches them anymore.
 //!
 //! Two failure modes this exists to make impossible:
 //!
@@ -290,9 +290,8 @@ pub fn dispatch_money_gate(is_production: bool, gateway_on: bool) -> DispatchGat
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChargeKey(String);
 
-/// The key a refund is written under. Still used by `voice.rs` for a
-/// dictation-token refund — an unrelated feature with its own idempotency
-/// need — even though nothing in this module produces one anymore.
+/// The key a refund is written under. Nothing in this module produces one
+/// anymore; it is kept for refunds outside a task attempt's verdict.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RefundKey(String);
 

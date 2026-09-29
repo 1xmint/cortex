@@ -1,21 +1,19 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { CortexApiError } from '../lib/cortexApi';
-import { requestDictationToken } from '../lib/voiceApi';
+import { transcribeDictation } from '../lib/voiceApi';
 
-/**
- * Where the browser sends its SDP offer for a dictation (transcription-only)
- * session -- straight to OpenAI, with the ephemeral token
- * `/api/voice/dictation/token` minted, never through Cortex. See
- * `crates/api/src/voice.rs`'s module doc for why: dictation has no
- * server-observable usage, so there is nothing for Cortex to sit in the
- * middle of.
- */
-const REALTIME_CALLS_URL = 'https://api.openai.com/v1/realtime/calls';
+export type DictationStatus = 'idle' | 'requesting' | 'listening' | 'transcribing' | 'error';
 
-export type DictationStatus = 'idle' | 'requesting' | 'listening' | 'error';
+/** The longest recording the server accepts (`MAX_AUDIO_SECONDS`). */
+export const MAX_DICTATION_MS = 120_000;
+
+/** Shown on a 402 from `POST /api/voice/dictation`. */
+export const OUT_OF_CREDITS_MESSAGE = 'Out of credits — top up';
+/** Shown on a 503 that survived the one retry. */
+export const UNAVAILABLE_MESSAGE = 'Dictation unavailable, try again later';
 
 interface UseDictationOptions {
-  /** Called with each transcribed text fragment as it arrives. */
+  /** Called once with the transcribed text after a recording is sent. */
   onTranscript: (text: string) => void;
 }
 
@@ -32,30 +30,46 @@ function microphoneErrorMessage(error: unknown): string {
   return 'Could not access the microphone.';
 }
 
+function pickMimeType(): string | undefined {
+  if (typeof MediaRecorder === 'undefined' || typeof MediaRecorder.isTypeSupported !== 'function') {
+    return undefined;
+  }
+  return ['audio/webm;codecs=opus', 'audio/webm', 'audio/mp4', 'audio/ogg;codecs=opus'].find((type) =>
+    MediaRecorder.isTypeSupported(type),
+  );
+}
+
+function failureMessage(err: unknown): string {
+  if (err instanceof CortexApiError) {
+    if (err.status === 402) return OUT_OF_CREDITS_MESSAGE;
+    if (err.status === 503) return UNAVAILABLE_MESSAGE;
+    if (err.status === 413) return 'That recording was too long. Keep dictation under two minutes.';
+    return err.message;
+  }
+  return UNAVAILABLE_MESSAGE;
+}
+
 /**
- * Press-to-dictate: speech becomes text in the composer's draft. The user
- * still presses send -- this never sends a message on its own.
+ * Press-to-dictate: press the mic, speak, press again. The recording is sent
+ * to Cortex (`POST /api/voice/dictation`), which transcribes it and charges
+ * what the transcription cost; the text lands in the composer's draft. The
+ * user still presses send -- this never sends a message on its own.
  */
 export function useDictation({ onTranscript }: UseDictationOptions) {
   const [status, setStatus] = useState<DictationStatus>('idle');
   const [error, setError] = useState<string | null>(null);
-  // Set when the server says dictation is switched off (503 on the token
-  // route). Unlike `error` this is a steady state, not a failure: the button
-  // disables and shows the message instead of raising an alert or retrying.
-  const [unavailable, setUnavailable] = useState<string | null>(null);
 
-  const pcRef = useRef<RTCPeerConnection | null>(null);
-  const dcRef = useRef<RTCDataChannel | null>(null);
+  const recorderRef = useRef<MediaRecorder | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
-  const expiryTimerRef = useRef<number | null>(null);
+  const chunksRef = useRef<Blob[]>([]);
+  const startedAtRef = useRef(0);
+  const limitTimerRef = useRef<number | null>(null);
   // Synchronous re-entrancy guard: React state updates are not visible
   // within the same tick, so a second press before the first `start()` has
   // had a chance to re-render must still be caught here.
-  const startingRef = useRef(false);
-  // Set by an unmount or a user-initiated stop while `start` is still
-  // in-flight -- see `useLiveVoiceToggle`'s `cancelledRef` for the same
-  // pattern and why it matters here too (a stray token request after the
-  // user has already left).
+  const busyRef = useRef(false);
+  // Set by an unmount while a recording or upload is in flight: the result
+  // is dropped instead of written into a composer that is gone.
   const cancelledRef = useRef(false);
   const onTranscriptRef = useRef(onTranscript);
   useEffect(() => {
@@ -67,183 +81,134 @@ export function useDictation({ onTranscript }: UseDictationOptions) {
     streamRef.current = null;
   }, []);
 
-  const teardown = useCallback(() => {
-    if (expiryTimerRef.current !== null) {
-      window.clearTimeout(expiryTimerRef.current);
-      expiryTimerRef.current = null;
+  const clearLimitTimer = useCallback(() => {
+    if (limitTimerRef.current !== null) {
+      window.clearTimeout(limitTimerRef.current);
+      limitTimerRef.current = null;
     }
-    dcRef.current?.close();
-    dcRef.current = null;
-    pcRef.current?.close();
-    pcRef.current = null;
-    releaseMic();
-  }, [releaseMic]);
+  }, []);
 
-  const stop = useCallback(() => {
-    cancelledRef.current = true;
-    teardown();
-    setStatus('idle');
-  }, [teardown]);
+  const upload = useCallback(async (blob: Blob, durationMs: number) => {
+    // One idempotency key per recording, reused by the retry: the server
+    // charges once per key, and a 503 charged nothing.
+    const idempotencyKey = crypto.randomUUID();
+    setStatus('transcribing');
+    try {
+      let result: { text: string };
+      try {
+        result = await transcribeDictation(blob, idempotencyKey, durationMs);
+      } catch (first) {
+        if (!(first instanceof CortexApiError && first.status === 503) || cancelledRef.current) {
+          throw first;
+        }
+        result = await transcribeDictation(blob, idempotencyKey, durationMs);
+      }
+      if (cancelledRef.current) return;
+      const text = result.text.trim();
+      if (text) onTranscriptRef.current(text + ' ');
+      setStatus('idle');
+    } catch (err) {
+      if (cancelledRef.current) return;
+      setError(failureMessage(err));
+      setStatus('idle');
+    } finally {
+      busyRef.current = false;
+    }
+  }, []);
+
+  const finish = useCallback(() => {
+    clearLimitTimer();
+    const recorder = recorderRef.current;
+    if (recorder && recorder.state !== 'inactive') recorder.stop();
+  }, [clearLimitTimer]);
 
   const start = useCallback(async () => {
-    if (startingRef.current || unavailable || status === 'listening' || status === 'requesting') return;
-    startingRef.current = true;
+    if (busyRef.current) return;
+    busyRef.current = true;
     cancelledRef.current = false;
     setError(null);
     setStatus('requesting');
     try {
-      // Ask for the mic before ever calling the token route: a denial or a
-      // missing device must show a message and charge nothing.
+      // Ask for the mic before anything else: a denial or a missing device
+      // must show a message and send nothing.
       let stream: MediaStream;
       try {
-        if (!navigator.mediaDevices?.getUserMedia) {
+        if (!navigator.mediaDevices?.getUserMedia || typeof MediaRecorder === 'undefined') {
           throw new Error('unsupported');
         }
         stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       } catch (mediaError) {
         setError(microphoneErrorMessage(mediaError));
         setStatus('idle');
+        busyRef.current = false;
         return;
       }
       streamRef.current = stream;
       if (cancelledRef.current) {
         releaseMic();
+        busyRef.current = false;
         return;
       }
 
-      const idempotencyKey = crypto.randomUUID();
-      const tokenResponse = await requestDictationToken(idempotencyKey);
-      if (cancelledRef.current) {
+      const mimeType = pickMimeType();
+      const recorder = mimeType ? new MediaRecorder(stream, { mimeType }) : new MediaRecorder(stream);
+      recorderRef.current = recorder;
+      chunksRef.current = [];
+      recorder.addEventListener('dataavailable', (event: BlobEvent) => {
+        if (event.data && event.data.size > 0) chunksRef.current.push(event.data);
+      });
+      recorder.addEventListener('stop', () => {
         releaseMic();
-        return;
-      }
-
-      const pc = new RTCPeerConnection();
-      pcRef.current = pc;
-      const [track] = stream.getTracks();
-      if (track) pc.addTrack(track, stream);
-
-      const dc = pc.createDataChannel('oai-events');
-      dcRef.current = dc;
-      dc.addEventListener('message', (event) => {
-        try {
-          const payload = JSON.parse(event.data as string) as {
-            type?: string;
-            delta?: string;
-          };
-          if (
-            payload.type === 'conversation.item.input_audio_transcription.delta' &&
-            typeof payload.delta === 'string'
-          ) {
-            onTranscriptRef.current(payload.delta);
-          } else if (payload.type === 'conversation.item.input_audio_transcription.completed') {
-            // A completed turn has no trailing space of its own; add one so
-            // the next utterance doesn't run into this one.
-            onTranscriptRef.current(' ');
-          }
-        } catch {
-          // Not JSON, or not a shape we handle -- ignore.
+        recorderRef.current = null;
+        const chunks = chunksRef.current;
+        chunksRef.current = [];
+        if (cancelledRef.current) {
+          busyRef.current = false;
+          return;
         }
-      });
-
-      const offer = await pc.createOffer();
-      if (cancelledRef.current) {
-        teardown();
-        return;
-      }
-      await pc.setLocalDescription(offer);
-      if (cancelledRef.current) {
-        teardown();
-        return;
-      }
-
-      const sdpResponse = await fetch(REALTIME_CALLS_URL, {
-        method: 'POST',
-        body: offer.sdp,
-        headers: {
-          Authorization: `Bearer ${tokenResponse.token}`,
-          'Content-Type': 'application/sdp',
-        },
-      });
-      if (cancelledRef.current) {
-        teardown();
-        return;
-      }
-      if (!sdpResponse.ok) {
-        throw new Error('Dictation is temporarily unavailable. Please try again in a moment.');
-      }
-      const answerSdp = await sdpResponse.text();
-      if (cancelledRef.current) {
-        teardown();
-        return;
-      }
-      await pc.setRemoteDescription({ type: 'answer', sdp: answerSdp });
-      if (cancelledRef.current) {
-        teardown();
-        return;
-      }
-
-      pc.addEventListener('connectionstatechange', () => {
-        if (
-          pc.connectionState === 'failed' ||
-          pc.connectionState === 'closed' ||
-          pc.connectionState === 'disconnected'
-        ) {
-          teardown();
+        const type = recorder.mimeType || mimeType || 'audio/webm';
+        const blob = new Blob(chunks, { type });
+        const durationMs = Math.min(Math.max(Date.now() - startedAtRef.current, 1), MAX_DICTATION_MS);
+        if (blob.size === 0) {
           setStatus('idle');
+          busyRef.current = false;
+          return;
         }
+        void upload(blob, durationMs);
       });
-
-      // The token's lifetime is fixed and charged for up front server-side
-      // (`DICTATION_SECONDS`); stop and release the mic when it runs out
-      // instead of leaving a dead connection open.
-      expiryTimerRef.current = window.setTimeout(() => {
-        stop();
-      }, tokenResponse.seconds * 1000);
-
+      recorder.start();
+      startedAtRef.current = Date.now();
+      // The server refuses anything over two minutes; stop before it can.
+      limitTimerRef.current = window.setTimeout(finish, MAX_DICTATION_MS);
       setStatus('listening');
-    } catch (err) {
-      teardown();
-      if (err instanceof CortexApiError && err.status === 503) {
-        // "Starting up..." is the client's own fallback for a 503 with no
-        // body; the server's message is the one worth showing.
-        setUnavailable(
-          err.message && err.message !== 'Starting up...' ? err.message : 'Dictation is not available yet',
-        );
-        setStatus('idle');
-        return;
-      }
-      setError(
-        err instanceof CortexApiError
-          ? err.message
-          : err instanceof Error
-            ? err.message
-            : 'Dictation is temporarily unavailable. Please try again in a moment.',
-      );
+    } catch {
+      releaseMic();
+      recorderRef.current = null;
+      setError('Could not access the microphone.');
       setStatus('idle');
-    } finally {
-      startingRef.current = false;
+      busyRef.current = false;
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [status, unavailable, teardown, stop]);
+  }, [finish, releaseMic, upload]);
 
   const toggle = useCallback(() => {
-    if (status === 'listening' || status === 'requesting') {
-      stop();
-    } else {
+    if (status === 'listening') {
+      finish();
+    } else if (status === 'idle' || status === 'error') {
       void start();
     }
-  }, [status, start, stop]);
+  }, [status, start, finish]);
 
-  // Release the mic and close the connection on unmount, no matter what
-  // state dictation was in.
+  // Release the mic on unmount and drop any recording or upload in flight.
   useEffect(
     () => () => {
       cancelledRef.current = true;
-      teardown();
+      clearLimitTimer();
+      const recorder = recorderRef.current;
+      if (recorder && recorder.state !== 'inactive') recorder.stop();
+      releaseMic();
     },
-    [teardown],
+    [clearLimitTimer, releaseMic],
   );
 
-  return { status, error, unavailable, toggle };
+  return { status, error, toggle };
 }

@@ -1,31 +1,41 @@
 import { apiUrl, CortexApiError, getAuthToken, requestJson } from './cortexApi';
 
 /**
- * The frontend half of `POST /api/voice/dictation/token`
- * (`crates/api/src/voice.rs`). The route charges up front and mints a
- * short-lived OpenAI ephemeral token; the browser then talks to OpenAI
- * directly with it. Nothing here ever sees a real OpenAI key.
+ * The frontend half of `POST /api/voice/dictation`
+ * (`crates/api/src/voice.rs`). The browser uploads the recorded audio; Cortex
+ * transcribes it with its own supplier key and charges what the transcription
+ * cost, so nothing here ever sees a provider key or token.
  */
-export interface DictationTokenResponse {
-  token: string;
-  expires_at: number;
-  seconds: number;
+export interface DictationResponse {
+  text: string;
 }
 
 /**
- * Mints a dictation token. `idempotencyKey` should be stable for a single
- * user gesture (one mic press) so a client retry of this exact request never
- * charges twice -- the server keys its charge on the `Idempotency-Key`
- * header.
+ * Sends one recording for transcription. `idempotencyKey` must be stable for
+ * a single recording so a retry of this exact request never charges twice --
+ * the server keys its charge on the `Idempotency-Key` header. `durationMs` is
+ * how long the recording ran, which the server checks against its two-minute
+ * cap and uses to price a response that reports no usage.
+ *
+ * A 402 means out of credits and a 503 means the provider is down (nothing was
+ * charged); both surface as a `CortexApiError` for the caller to word.
  */
-export async function requestDictationToken(idempotencyKey: string): Promise<DictationTokenResponse> {
-  // No 503 retry: the server answers 503 to say dictation is switched off, and
-  // the caller shows that instead of waiting through a backoff.
-  return requestJson<DictationTokenResponse>(
-    '/api/voice/dictation/token',
+export async function transcribeDictation(
+  audio: Blob,
+  idempotencyKey: string,
+  durationMs: number,
+): Promise<DictationResponse> {
+  // No built-in 503 backoff: the hook makes exactly one retry of its own.
+  return requestJson<DictationResponse>(
+    '/api/voice/dictation',
     {
       method: 'POST',
-      headers: { 'Idempotency-Key': idempotencyKey },
+      headers: {
+        'Content-Type': audio.type || 'audio/webm',
+        'Idempotency-Key': idempotencyKey,
+        'X-Audio-Duration-Ms': String(Math.max(1, Math.round(durationMs))),
+      },
+      body: audio,
     },
     { retryOn503: false },
   );

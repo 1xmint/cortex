@@ -150,6 +150,17 @@ impl ModelPrice {
     }
 }
 
+/// micro-USD per second of audio for `gpt-4o-mini-transcribe`, from OpenAI's
+/// published "estimated $0.003 / minute" (https://developers.openai.com/api/docs/pricing).
+/// Used only when a transcription response carries no `usage` to charge from.
+pub const TRANSCRIBE_ESTIMATE_MICROS_PER_SECOND: i64 = 50;
+
+/// Cost in micro-USD of `duration_ms` of transcribed audio at the published
+/// per-minute estimate. Integer math, floored.
+pub fn transcribe_duration_cost_micros(duration_ms: i64) -> i64 {
+    duration_ms.max(0) * TRANSCRIBE_ESTIMATE_MICROS_PER_SECOND / 1_000
+}
+
 /// One class's price, and the evidence behind it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClassPrice {
@@ -585,14 +596,22 @@ pub fn seed_models() -> Vec<ModelPrice> {
         // cost through `charge_settled_cost`, whose sub-credit carry keeps
         // the remainder exact per account (no round-up anywhere).
         m("openai", "gpt-live-1", 833_333, 0, 0, 7_200, "voice"),
-        // gpt-4o-mini-transcribe: $0.003/min = 50 micros/s.
+        // gpt-4o-mini-transcribe is priced per TOKEN: $1.25 per 1M input
+        // (audio) tokens and $5.00 per 1M output (text) tokens, i.e. 1_250 and
+        // 5_000 micros per 1k. Verified 2026-09-29 against
+        // https://developers.openai.com/api/docs/pricing (which also lists the
+        // "estimated" $0.003/min used by `transcribe_duration_cost_micros`).
+        // Dictation is pass-through: the `usage` block OpenAI returns with the
+        // transcript is charged exactly, through the same `charge_settled_cost`
+        // carry as live voice. `context_window` is the model's 16_000-token
+        // context.
         m(
             "openai",
             "gpt-4o-mini-transcribe",
-            50_000,
+            1_250,
+            5_000,
             0,
-            0,
-            7_200,
+            16_000,
             "transcribe",
         ),
         m(
@@ -1142,7 +1161,12 @@ mod tests {
         // exactly 137 * 833_333 / 1000 = 114_166.
         assert_eq!(rate("gpt-live-1").cost_micros(60, 0, 0), 49_999);
         assert_eq!(rate("gpt-live-1").cost_micros(137, 0, 0), 114_166);
-        assert_eq!(rate("gpt-4o-mini-transcribe").cost_micros(60, 0, 0), 3_000);
+        // 48_000 audio tokens in at $1.25/1M is 60_000 micros and 9_000 text
+        // tokens out at $5.00/1M is 45_000.
+        assert_eq!(
+            rate("gpt-4o-mini-transcribe").cost_micros(48_000, 0, 9_000),
+            105_000
+        );
     }
 
     #[test]
