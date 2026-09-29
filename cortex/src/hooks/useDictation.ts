@@ -39,6 +39,10 @@ function microphoneErrorMessage(error: unknown): string {
 export function useDictation({ onTranscript }: UseDictationOptions) {
   const [status, setStatus] = useState<DictationStatus>('idle');
   const [error, setError] = useState<string | null>(null);
+  // Set when the server says dictation is switched off (503 on the token
+  // route). Unlike `error` this is a steady state, not a failure: the button
+  // disables and shows the message instead of raising an alert or retrying.
+  const [unavailable, setUnavailable] = useState<string | null>(null);
 
   const pcRef = useRef<RTCPeerConnection | null>(null);
   const dcRef = useRef<RTCDataChannel | null>(null);
@@ -82,7 +86,7 @@ export function useDictation({ onTranscript }: UseDictationOptions) {
   }, [teardown]);
 
   const start = useCallback(async () => {
-    if (startingRef.current || status === 'listening' || status === 'requesting') return;
+    if (startingRef.current || unavailable || status === 'listening' || status === 'requesting') return;
     startingRef.current = true;
     cancelledRef.current = false;
     setError(null);
@@ -200,6 +204,15 @@ export function useDictation({ onTranscript }: UseDictationOptions) {
       setStatus('listening');
     } catch (err) {
       teardown();
+      if (err instanceof CortexApiError && err.status === 503) {
+        // "Starting up..." is the client's own fallback for a 503 with no
+        // body; the server's message is the one worth showing.
+        setUnavailable(
+          err.message && err.message !== 'Starting up...' ? err.message : 'Dictation is not available yet',
+        );
+        setStatus('idle');
+        return;
+      }
       setError(
         err instanceof CortexApiError
           ? err.message
@@ -212,7 +225,7 @@ export function useDictation({ onTranscript }: UseDictationOptions) {
       startingRef.current = false;
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [status, teardown, stop]);
+  }, [status, unavailable, teardown, stop]);
 
   const toggle = useCallback(() => {
     if (status === 'listening' || status === 'requesting') {
@@ -232,5 +245,5 @@ export function useDictation({ onTranscript }: UseDictationOptions) {
     [teardown],
   );
 
-  return { status, error, toggle };
+  return { status, error, unavailable, toggle };
 }

@@ -135,8 +135,25 @@ function NotificationsTab() {
   );
 }
 
-function AccountTab() {
+// The name and email the Account tab shows. Structural, so the tab renders the
+// same whether the values came from Clerk or from nowhere.
+interface AccountUser {
+  fullName?: string | null;
+  username?: string | null;
+  primaryEmailAddress?: { emailAddress?: string | null } | null;
+}
+
+// Clerk's hooks throw when there is no <ClerkProvider>, and main.tsx only
+// mounts one when a publishable key is configured (auth disabled / local dev
+// has none). So the hook lives in its own component that is rendered only when
+// Clerk is actually there; without it the tab shows the same placeholders a
+// signed-out user would see.
+function ClerkAccountTab() {
   const { user } = useUser();
+  return <AccountTab user={user} />;
+}
+
+function AccountTab({ user }: { user?: AccountUser | null }) {
   const [defaultProfile, setDefaultProfile] = useState<RunProfile>(readDefaultProfile);
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
   const [deleteInput, setDeleteInput] = useState('');
@@ -374,6 +391,8 @@ export default function SettingsPanel({
             SOMA_API_ENABLED ? <SpendDashboard /> : null
           ) : tab === 'notifications' ? (
             <NotificationsTab />
+          ) : import.meta.env.VITE_CLERK_PUBLISHABLE_KEY ? (
+            <ClerkAccountTab />
           ) : (
             <AccountTab />
           )}

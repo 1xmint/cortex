@@ -35,7 +35,24 @@ describe('ReceiptCard verdict class', () => {
     expect(
       screen.getByText('Graded by checks this task was allowed to change — the exam was not locked.'),
     ).toBeInTheDocument();
-    expect(screen.getByText('5 credits')).toBeInTheDocument();
+    expect(screen.getByText('$0.50')).toBeInTheDocument();
+  });
+
+  it('shows the charge in dollars and never as a raw credit count', () => {
+    const { container } = render(<ReceiptCard receipt={baseReceipt({ charged_credits: 12 })} />);
+    expect(screen.getByText('$1.20')).toBeInTheDocument();
+    expect(container.textContent).not.toMatch(/\d+ credits/);
+  });
+
+  it("says an inconclusive step was not charged because it is Cortex's issue", () => {
+    render(
+      <ReceiptCard
+        receipt={baseReceipt({
+          gate: { verdict: 'inconclusive', required_total: 2, required_passed: 0, failed: [], not_executed: [] },
+        })}
+      />,
+    );
+    expect(screen.getByText('not charged (Cortex issue)')).toBeInTheDocument();
   });
 
   it('shows the strong claim distinctly from authored', () => {

@@ -283,13 +283,19 @@ export default function ChatComposer({
             {voiceError}
           </p>
         )}
+        {dictation.unavailable && (
+          <p className="px-3 pb-1 text-xs text-[var(--muted)]" role="status">
+            {dictation.unavailable}
+          </p>
+        )}
         <div className="flex items-center justify-between px-1 pb-1">
           <span />
           {/* Action Buttons */}
           <div className="flex items-center gap-2">
             <button
               type="button"
-              disabled={disabled || liveVoice.status !== 'idle'}
+              disabled={disabled || liveVoice.status !== 'idle' || dictation.unavailable !== null}
+              title={dictation.unavailable ?? undefined}
               aria-label="Dictation"
               aria-pressed={dictation.status === 'listening'}
               onClick={dictation.toggle}
