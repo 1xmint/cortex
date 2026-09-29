@@ -105,10 +105,9 @@ pub fn default_cache_root() -> PathBuf {
 pub fn http_base_from_ws(ws_url: &str) -> Option<String> {
     let (scheme, rest) = if let Some(rest) = ws_url.strip_prefix("wss://") {
         ("https", rest)
-    } else if let Some(rest) = ws_url.strip_prefix("ws://") {
-        ("http", rest)
     } else {
-        return None;
+        let rest = ws_url.strip_prefix("ws://")?;
+        ("http", rest)
     };
     let rest = rest.split(['?', '#']).next().unwrap_or(rest);
     let rest = rest.trim_end_matches('/');
