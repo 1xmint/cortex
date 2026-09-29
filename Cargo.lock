@@ -781,6 +781,7 @@ dependencies = [
  "hmac 0.13.0",
  "http-body-util",
  "jsonwebtoken",
+ "libc",
  "once_cell",
  "opentelemetry",
  "opentelemetry-otlp",

@@ -192,6 +192,7 @@ impl Database {
 
         let mut dead = 0;
         for (job_id, step_id, attempt_id, lease_gen, attempt_count) in &dying {
+            let mut gave_up = false;
             let ended = self.record_execution_failure_and_end(
                 step_id,
                 attempt_id,
@@ -227,10 +228,25 @@ impl Database {
                 // claimed for the next reclaim -- but not forever: a run with
                 // no owner makes the transition roll back every time, so each
                 // pass counts against a give-up cap.
-                let moved_on = matches!(
-                    self.get_step_status(step_id).as_deref(),
-                    Some(s) if s != "verifying"
+                //
+                // A step whose lease_gen is no longer the job's has moved on
+                // as well: a newer lease owns it, so this job's ending can
+                // never be recorded and there is nothing left to retry.
+                let lease_moved = matches!(
+                    self.conn()
+                        .query_row(
+                            "SELECT lease_gen FROM steps WHERE id = ?1",
+                            params![step_id],
+                            |row| row.get::<_, i64>(0),
+                        )
+                        .ok(),
+                    Some(g) if g != *lease_gen
                 );
+                let moved_on = lease_moved
+                    || matches!(
+                        self.get_step_status(step_id).as_deref(),
+                        Some(s) if s != "verifying"
+                    );
                 if !moved_on {
                     if *attempt_count < VERIFICATION_ENDING_GIVE_UP_ATTEMPTS {
                         let _ = self.conn().execute(
@@ -251,17 +267,26 @@ impl Database {
                          verification job; the attempt has NO ending row and must \
                          be reconciled by hand"
                     );
+                    gave_up = true;
                 }
             }
+            // A job retired because the cap ran out, with no ending row, must
+            // not read like one whose ending was recorded: an operator
+            // searching for attempts to reconcile by hand looks for this.
+            let reason = if gave_up {
+                "ending_unrecorded"
+            } else {
+                "claim expired after exhausting attempts"
+            };
             let updated = self
                 .conn()
                 .execute(
                     "UPDATE verification_jobs
                      SET state = 'dead', claim_token = NULL,
-                         terminal_reason = 'claim expired after exhausting attempts',
+                         terminal_reason = ?3,
                          updated_at = ?1, version = version + 1
                      WHERE job_id = ?2 AND state = 'claimed'",
-                    params![now, job_id],
+                    params![now, job_id, reason],
                 )
                 .unwrap_or(0);
             dead += updated;
@@ -364,16 +389,23 @@ impl Database {
                 );
             }
             if may_retire {
+                // The cap retired it with no ending row: say so (see the
+                // reclaim path for why the reason differs).
+                let reason = if give_up {
+                    "ending_unrecorded"
+                } else {
+                    "retries exhausted without a verdict"
+                };
                 let retired = self
                     .conn()
                     .execute(
                         "UPDATE verification_jobs
                          SET state = 'dead', claim_token = NULL,
-                             terminal_reason = 'retries exhausted without a verdict',
+                             terminal_reason = ?5,
                              updated_at = ?1, version = version + 1
                          WHERE job_id = ?2 AND state = 'claimed' AND claim_token = ?3
                            AND attempt_count >= ?4",
-                        params![now, job_id, claim_token, VERIFICATION_MAX_ATTEMPTS],
+                        params![now, job_id, claim_token, VERIFICATION_MAX_ATTEMPTS, reason],
                     )
                     .unwrap_or(0);
                 if retired > 0 {
@@ -1097,6 +1129,11 @@ mod verifier {
             job.attempt_count, VERIFICATION_ENDING_GIVE_UP_ATTEMPTS,
             "the job is retired exactly at the give-up cap"
         );
+        assert_eq!(
+            job.terminal_reason.as_deref(),
+            Some("ending_unrecorded"),
+            "a job retired with no ending row says so"
+        );
     }
 
     #[test]
@@ -1139,6 +1176,14 @@ mod verifier {
             }
         }
         assert!(ending_row(&db, "a1").is_none());
+        assert_eq!(
+            db.get_verification_job("job-1")
+                .unwrap()
+                .terminal_reason
+                .as_deref(),
+            Some("ending_unrecorded"),
+            "a job retired with no ending row says so"
+        );
     }
 
     /// Force a claim's lease into the past, standing in for a dispatcher that

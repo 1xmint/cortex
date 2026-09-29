@@ -3253,6 +3253,45 @@ mod attempt_end_paths {
     }
 
     #[tokio::test]
+    async fn a_workspace_git_dir_git_refuses_is_the_workers_doing_and_charged() {
+        // `.git` exists but git will not open it (a repository format from
+        // the future). The workspace is worker-writable, so a worker that
+        // breaks its `.git` must not buy a free attempt: charged, not
+        // absorbed.
+        let state = state().await;
+        git_in(&state.workspace_dir, &["init"]);
+        let config = state.workspace_dir.join(".git/config");
+        let text = std::fs::read_to_string(&config).expect("repository config");
+        assert!(text.contains("repositoryformatversion = 0"), "{text}");
+        std::fs::write(
+            &config,
+            text.replace("repositoryformatversion = 0", "repositoryformatversion = 99"),
+        )
+        .expect("rewrite repository config");
+        let (worker_id, step_id, lease_gen) =
+            running_step_with_settled_call(&state, "attempt-bad-format");
+
+        deliver(
+            &state,
+            &worker_id,
+            completed_message(
+                &step_id,
+                "attempt-bad-format",
+                lease_gen,
+                Some("0000000000000000000000000000000000000000"),
+            ),
+        )
+        .await;
+
+        assert_charged_three_credits(&state, "attempt-bad-format");
+        assert!(
+            terminal_reason(&state, &step_id, "attempt-bad-format")
+                .contains("does not resolve in the workspace repository"),
+            "the unresolvable-head branch must be the one that ran"
+        );
+    }
+
+    #[tokio::test]
     async fn a_delivery_that_cannot_be_enqueued_is_cortexs_fault_and_absorbed() {
         // The head resolves, so the only way to fail after that is Cortex's
         // own database refusing the enqueue. Simulated by removing the
