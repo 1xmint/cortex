@@ -1,16 +1,17 @@
 // @vitest-environment jsdom
 import '@testing-library/jest-dom/vitest';
-import { cleanup, render, screen } from '@testing-library/react';
+import { cleanup, fireEvent, render, screen } from '@testing-library/react';
 import { MemoryRouter } from 'react-router';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import type { RunSummary } from '../../lib/cortexApi';
+import { CortexApiError, type RunSummary } from '../../lib/cortexApi';
 
 const api = vi.hoisted(() => ({
   listRuns: vi.fn(),
   getRun: vi.fn(),
   streamRun: vi.fn(() => new AbortController()),
   cancelRun: vi.fn(),
+  resumeRun: vi.fn(),
   createRunPullRequest: vi.fn(),
 }));
 
@@ -68,5 +69,36 @@ describe('RunsPane pull request block', () => {
     renderWith('failed');
     await screen.findByRole('heading', { name: 'ship it' });
     expect(screen.queryByRole('button', { name: 'Open pull request' })).not.toBeInTheDocument();
+  });
+});
+
+describe('RunsPane awaiting top-up banner', () => {
+  it('says the run is out of credits and links to the billing top-up', async () => {
+    renderWith('awaiting_top_up');
+    expect(await screen.findByText('Out of credits — top up to continue')).toBeInTheDocument();
+    expect(screen.getByRole('link', { name: 'Top up' })).toHaveAttribute('href', '/?settings=billing');
+    expect(screen.getByRole('button', { name: 'Resume' })).toBeInTheDocument();
+  });
+
+  it('resumes the run and reloads it', async () => {
+    renderWith('awaiting_top_up');
+    api.resumeRun.mockResolvedValue({ status: 'running' });
+    fireEvent.click(await screen.findByRole('button', { name: 'Resume' }));
+    await screen.findByRole('heading', { name: 'ship it' });
+    expect(api.resumeRun).toHaveBeenCalledWith('run-1');
+    expect(api.getRun).toHaveBeenCalledTimes(2);
+  });
+
+  it('shows "Top up first" when the balance is still empty (402)', async () => {
+    renderWith('awaiting_top_up');
+    api.resumeRun.mockRejectedValue(new CortexApiError(402, 'need credits'));
+    fireEvent.click(await screen.findByRole('button', { name: 'Resume' }));
+    expect(await screen.findByText('Top up first')).toBeInTheDocument();
+  });
+
+  it('shows no banner for a run that is not waiting for credits', async () => {
+    renderWith('running');
+    await screen.findByRole('heading', { name: 'ship it' });
+    expect(screen.queryByText('Out of credits — top up to continue')).not.toBeInTheDocument();
   });
 });

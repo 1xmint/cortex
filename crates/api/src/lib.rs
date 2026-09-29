@@ -412,6 +412,7 @@ pub fn build_cortex_router(state: Arc<AppState>) -> Router {
         .route("/api/runs/{id}", get(routes::get_run))
         .route("/api/runs/{id}/events", get(routes::get_run_events))
         .route("/api/runs/{id}/cancel", post(routes::cancel_run))
+        .route("/api/runs/{id}/resume", post(routes::resume_run))
         .route(
             "/api/runs/{run_id}/steps/{step_id}/verifier-report/{report_id}",
             get(routes::get_verifier_report),

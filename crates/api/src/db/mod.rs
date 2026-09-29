@@ -18,6 +18,7 @@ use crate::lock::LockRecovering;
 mod ledger;
 mod pending_actions;
 mod provider_gateway;
+mod run_pause;
 mod verification_queue;
 
 pub use pending_actions::{ConfirmActionError, PendingAction, PENDING_ACTION_TTL_SECS};
@@ -25,10 +26,20 @@ pub use provider_gateway::{
     AdminHoldError, ProviderHoldRow, ProviderHoldsSummary, ProviderReservation, SpendAuthorization,
     HOLD_CAPACITY_WARN_SHARE, STALE_RESERVATION_AGE_MS,
 };
+pub use run_pause::{PausedAttempt, ResumeOutcome};
 
 pub struct Database {
     conn: Mutex<Connection>,
+    /// Whether provider reservations are checked against the owner's live
+    /// credit balance. Set once at startup from `billing_enforced`; off for a
+    /// bare `Database` so unit tests that reserve without credits are unaffected.
+    credit_gate: std::sync::atomic::AtomicBool,
 }
+
+/// Prefix of the reservation refusal that means the owner's credits cannot
+/// cover the call. Distinct from "authorization exhausted" (the operator's
+/// cap), because only this one pauses a run.
+pub const INSUFFICIENT_CREDITS_PREFIX: &str = "insufficient credits:";
 
 /// The stable, storage-level spelling of an [`AttemptEndCause`]
 /// (`cortex_core::billing_binding`) — the `attempt_endings.cause` column and
@@ -48,6 +59,7 @@ pub(crate) fn attempt_end_cause_str(
         Failed => "failed",
         ExamTampered => "exam_tampered",
         CustomerCancel => "customer_cancel",
+        OutOfCredits => "out_of_credits",
         RunnerDown => "runner_down",
         LeaseExpired => "lease_expired",
         CortexCrash => "cortex_crash",
@@ -68,6 +80,7 @@ pub(crate) fn attempt_end_cause_from_str(
         "failed" => Failed,
         "exam_tampered" => ExamTampered,
         "customer_cancel" => CustomerCancel,
+        "out_of_credits" => OutOfCredits,
         "runner_down" => RunnerDown,
         "lease_expired" => LeaseExpired,
         "cortex_crash" => CortexCrash,
@@ -5882,6 +5895,12 @@ impl Database {
         self.conn.lock_recovering()
     }
 
+    /// Turn on the live credit check in `reserve_provider_request`.
+    pub fn set_credit_gate(&self, enforced: bool) {
+        self.credit_gate
+            .store(enforced, std::sync::atomic::Ordering::Relaxed);
+    }
+
     pub fn open(path: &Path) -> Self {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).ok();
@@ -5902,6 +5921,7 @@ impl Database {
 
         let db = Self {
             conn: Mutex::new(conn),
+            credit_gate: std::sync::atomic::AtomicBool::new(false),
         };
         db.seed_price_list_if_absent();
         db.publish_gateway_model_revision_if_needed();
@@ -12059,8 +12079,10 @@ impl Database {
              ORDER BY created_at DESC LIMIT ?2 OFFSET ?3"
         ).unwrap();
         stmt.query_map(params![user_id, limit as i64, offset as i64], |row| {
+            let id = row.get::<_, String>(0)?;
+            let spent_credits = Self::run_spent_credits_in(&conn, &id);
             Ok(serde_json::json!({
-                "id": row.get::<_, String>(0)?,
+                "id": id,
                 "goal": row.get::<_, String>(1)?,
                 "status": row.get::<_, String>(2)?,
                 "profile": row.get::<_, String>(3)?,
@@ -12072,6 +12094,7 @@ impl Database {
                 "task_id": row.get::<_, Option<String>>(9)?,
                 "group_id": row.get::<_, Option<String>>(10)?,
                 "conversation_id": row.get::<_, Option<String>>(11)?,
+                "spent_credits": spent_credits,
             }))
         })
         .unwrap()
@@ -12098,8 +12121,10 @@ impl Database {
              FROM runs WHERE id = ?1",
             params![run_id],
             |row| {
+                let id = row.get::<_, String>(0)?;
+                let spent_credits = Self::run_spent_credits_in(&conn, &id);
                 Ok(serde_json::json!({
-                    "id": row.get::<_, String>(0)?,
+                    "id": id,
                     "goal": row.get::<_, String>(1)?,
                     "status": row.get::<_, String>(2)?,
                     "profile": row.get::<_, String>(3)?,
@@ -12110,6 +12135,7 @@ impl Database {
                     "task_id": row.get::<_, Option<String>>(8)?,
                     "group_id": row.get::<_, Option<String>>(9)?,
                     "conversation_id": row.get::<_, Option<String>>(10)?,
+                    "spent_credits": spent_credits,
                 }))
             },
         )

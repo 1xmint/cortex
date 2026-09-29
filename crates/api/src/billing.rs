@@ -1421,7 +1421,7 @@ pub async fn stripe_webhook(
                     && obj["metadata"]["kind"].as_str() == Some("credit_topup")
                     && obj["payment_status"].as_str() == Some("paid")
                 {
-                    grant_credit_topup(db, obj, event_id).map_err(|e| {
+                    let resumed = grant_credit_topup(db, obj, event_id).map_err(|e| {
                         tracing::error!(event_id, "credit topup grant failed: {e}");
                         (
                             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1430,6 +1430,13 @@ pub async fn stripe_webhook(
                             }),
                         )
                     })?;
+                    for run_id in resumed {
+                        state
+                            .emit_scheduler_event(
+                                cortex_engine::captain::SchedulerEvent::RunResumed { run_id },
+                            )
+                            .await;
+                    }
                 }
                 // A payment-mode session with a delayed payment method
                 // completes with payment_status "unpaid" — Stripe follows up
@@ -1443,7 +1450,7 @@ pub async fn stripe_webhook(
             if mode.eq_ignore_ascii_case("payment")
                 && obj["metadata"]["kind"].as_str() == Some("credit_topup")
             {
-                grant_credit_topup(db, obj, event_id).map_err(|e| {
+                let resumed = grant_credit_topup(db, obj, event_id).map_err(|e| {
                     tracing::error!(event_id, "credit topup grant failed: {e}");
                     (
                         StatusCode::INTERNAL_SERVER_ERROR,
@@ -1452,6 +1459,13 @@ pub async fn stripe_webhook(
                         }),
                     )
                 })?;
+                for run_id in resumed {
+                    state
+                        .emit_scheduler_event(cortex_engine::captain::SchedulerEvent::RunResumed {
+                            run_id,
+                        })
+                        .await;
+                }
             }
         }
         "customer.subscription.updated" => {
@@ -1575,15 +1589,15 @@ pub async fn stripe_webhook(
 /// database error), so the caller can turn that into a 5xx and let Stripe's
 /// webhook retry logic take another pass instead of the customer's paid
 /// credits silently vanishing.
-fn grant_credit_topup(
+pub fn grant_credit_topup(
     db: &Database,
     obj: &serde_json::Value,
     event_id: &str,
-) -> Result<(), String> {
+) -> Result<Vec<String>, String> {
     let session_id = obj["id"].as_str().unwrap_or("");
     if session_id.is_empty() {
         tracing::error!("credit topup session missing an id; cannot grant credits");
-        return Ok(());
+        return Ok(Vec::new());
     }
 
     let clerk_user_id = obj["metadata"]["clerk_user_id"]
@@ -1591,7 +1605,7 @@ fn grant_credit_topup(
         .or_else(|| obj["client_reference_id"].as_str());
     let Some(clerk_user_id) = clerk_user_id else {
         tracing::error!(session_id, "credit topup session missing clerk_user_id");
-        return Ok(());
+        return Ok(Vec::new());
     };
 
     let payment_status = obj["payment_status"].as_str().unwrap_or("");
@@ -1601,7 +1615,7 @@ fn grant_credit_topup(
             payment_status,
             "credit topup session is not paid yet; granting no credits"
         );
-        return Ok(());
+        return Ok(Vec::new());
     }
 
     let currency = obj["currency"].as_str().unwrap_or("");
@@ -1611,7 +1625,7 @@ fn grant_credit_topup(
             currency,
             "credit topup settled in a non-usd currency; granting no credits"
         );
-        return Ok(());
+        return Ok(Vec::new());
     }
 
     let amount_subtotal_cents = obj["amount_subtotal"].as_i64().unwrap_or(0);
@@ -1621,7 +1635,7 @@ fn grant_credit_topup(
             amount_subtotal_cents,
             "credit topup has no positive amount_subtotal; granting no credits"
         );
-        return Ok(());
+        return Ok(Vec::new());
     }
 
     let amount_discount_cents = obj["total_details"]["amount_discount"]
@@ -1635,7 +1649,7 @@ fn grant_credit_topup(
              pre-discount so granting based on it would over-credit — granting \
              no credits"
         );
-        return Ok(());
+        return Ok(Vec::new());
     }
     let credits_from_amount = amount_subtotal_cents / 10;
     if credits_from_amount <= 0 {
@@ -1645,7 +1659,7 @@ fn grant_credit_topup(
             "credit topup amount_subtotal is under 10 cents, rounding down to zero \
              credits; granting no credits"
         );
-        return Ok(());
+        return Ok(Vec::new());
     }
 
     if let Some(metadata_credits) = obj["metadata"]["credits"]
@@ -1680,14 +1694,21 @@ fn grant_credit_topup(
                 credits_from_amount,
                 "credit topup granted"
             );
-            Ok(())
+            // Runs that paused for want of credits resume as soon as the
+            // balance covers them. The caller tells the scheduler
+            // (`RunResumed`) so their paused step is queued again.
+            let resumed = db.resume_awaiting_runs_for_user(clerk_user_id);
+            for run_id in &resumed {
+                tracing::info!(user_id = clerk_user_id, run_id, "run resumed after top-up");
+            }
+            Ok(resumed)
         }
         Ok(false) => {
             tracing::debug!(
                 session_id,
                 "credit topup already granted; webhook replay ignored"
             );
-            Ok(())
+            Ok(Vec::new())
         }
         Err(e) => {
             tracing::error!(session_id, "failed to grant credit topup: {e}");

@@ -11,10 +11,12 @@ import {
   XCircle,
 } from 'lucide-react';
 import {
+  CortexApiError,
   cancelRun,
   createRunPullRequest,
   getRun,
   listRuns,
+  resumeRun,
   streamRun,
   type RunListItem,
   ACCEPTED_STEP_STATUSES,
@@ -77,7 +79,7 @@ const SHIPPABLE = new Set(['verified', 'manual_override', 'completed', 'succeede
 // A run is only worth offering a Cancel button while it can still spend
 // money or do work: once it is planning, running, or merely queued, there is
 // something to stop. A terminal run has nothing left to cancel.
-const CANCELLABLE = new Set(['pending', 'planning', 'running']);
+const CANCELLABLE = new Set(['pending', 'planning', 'running', 'awaiting_top_up']);
 
 function StepRow({ step, runId }: { step: RunStep; runId: string }) {
   const [expanded, setExpanded] = useState(false);
@@ -207,6 +209,31 @@ export default function RunsPane() {
     } finally {
       setCancelConfirm(null);
       setCancelPending((current) => (current === runId ? null : current));
+    }
+  }, []);
+
+  const [resumePending, setResumePending] = useState<string | null>(null);
+  const [resumeError, setResumeError] = useState<{ runId: string; message: string } | null>(null);
+
+  const resumeSelectedRun = useCallback(async (runId: string) => {
+    setResumePending(runId);
+    setResumeError(null);
+    try {
+      await resumeRun(runId);
+      const refreshed = await getRun(runId);
+      setDetail((current) => (current?.id === runId ? refreshed : current));
+    } catch (err) {
+      setResumeError({
+        runId,
+        message:
+          err instanceof CortexApiError && err.status === 402
+            ? 'Top up first'
+            : err instanceof Error
+              ? err.message
+              : 'could not resume run',
+      });
+    } finally {
+      setResumePending((current) => (current === runId ? null : current));
     }
   }, []);
 
@@ -411,6 +438,28 @@ export default function RunsPane() {
                         </button>
                       )}
                     </p>
+                    {detail.status === 'awaiting_top_up' && (
+                      <div
+                        role="status"
+                        className="t-micro mt-2 flex flex-wrap items-center gap-2 rounded border border-[var(--warn-line)] bg-[var(--warn-soft)] px-2.5 py-1.5 text-[var(--warn-strong)]"
+                      >
+                        <span>Out of credits — top up to continue</span>
+                        <Link to="/?settings=billing" className="underline">
+                          Top up
+                        </Link>
+                        <button
+                          type="button"
+                          disabled={resumePending === detail.id}
+                          onClick={() => void resumeSelectedRun(detail.id)}
+                          className="rounded-md border border-[var(--warn-line)] px-2 py-0.5 transition-colors hover:bg-[var(--warn-soft)] disabled:cursor-not-allowed disabled:opacity-50"
+                        >
+                          {resumePending === detail.id ? 'Resuming…' : 'Resume'}
+                        </button>
+                        {resumeError?.runId === detail.id && (
+                          <span role="alert">{resumeError.message}</span>
+                        )}
+                      </div>
+                    )}
                     {cancelError?.runId === detail.id && (
                       <p className="t-micro mt-1.5 rounded border border-[var(--err-line)] bg-[var(--err-soft)] px-2.5 py-1.5 text-[var(--err-strong)]">
                         {cancelError.message}

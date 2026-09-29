@@ -1327,7 +1327,10 @@ export interface RunGraph {
 export interface RunSummary {
   id: string;
   goal: string;
+  /** Includes 'awaiting_top_up': the run paused because credits ran out. */
   status?: string;
+  /** Credits charged to this run so far (exact, settled). */
+  spent_credits?: number;
   profile?: string;
   created_at?: string;
   task_id?: string | null;
@@ -2063,6 +2066,18 @@ export async function cancelRun(runId: string, reason?: string): Promise<CancelR
   return requestJson<CancelRunResponse>(`/api/runs/${runId}/cancel`, {
     method: 'POST',
     body: JSON.stringify(reason ? { reason } : {}),
+  });
+}
+
+/**
+ * Resume a run parked as `awaiting_top_up`. A 402 means the balance is still
+ * empty: it throws a `CortexApiError` with status 402, which the caller shows
+ * as "Top up first".
+ */
+export async function resumeRun(runId: string): Promise<{ status: string }> {
+  return requestJson<{ status: string }>(`/api/runs/${runId}/resume`, {
+    method: 'POST',
+    body: JSON.stringify({}),
   });
 }
 
