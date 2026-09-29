@@ -562,8 +562,8 @@ mod tests {
     #[tokio::test]
     async fn base_bundle_carries_the_base_commit() {
         let f = fixture().await;
-        let leased = authorize_user(&f.state, OWNER, &f.step_id, &headers(&f.worker_id))
-            .expect("leased");
+        let leased =
+            authorize_user(&f.state, OWNER, &f.step_id, &headers(&f.worker_id)).expect("leased");
         let response = serve_base(&f.state, &leased, Some(&f.base)).await;
         assert_eq!(response.status(), StatusCode::OK);
         let bytes = body_bytes(response).await;
@@ -633,8 +633,8 @@ mod tests {
     #[tokio::test]
     async fn head_bundle_lands_under_the_step_ref() {
         let f = fixture().await;
-        let leased = authorize_user(&f.state, OWNER, &f.step_id, &headers(&f.worker_id))
-            .expect("leased");
+        let leased =
+            authorize_user(&f.state, OWNER, &f.step_id, &headers(&f.worker_id)).expect("leased");
         let (bytes, head) = worker_bundle(&f);
         let response = ingest_head(
             &f.state,
@@ -659,8 +659,8 @@ mod tests {
     #[tokio::test]
     async fn oversized_and_corrupt_bundles_are_the_workers_fault() {
         let f = fixture().await;
-        let leased = authorize_user(&f.state, OWNER, &f.step_id, &headers(&f.worker_id))
-            .expect("leased");
+        let leased =
+            authorize_user(&f.state, OWNER, &f.step_id, &headers(&f.worker_id)).expect("leased");
         let (bytes, _) = worker_bundle(&f);
 
         let over = ingest_head(
