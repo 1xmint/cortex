@@ -390,7 +390,7 @@ pub fn build_cortex_router(state: Arc<AppState>) -> Router {
 
     let rate_limited = Router::new()
         .route("/api/chat", post(chat::chat))
-        .route("/api/voice/dictation/token", post(voice::dictation_token))
+        .route("/api/voice/dictation", post(voice::dictation))
         .route(
             "/api/voice/live/sessions",
             post(voice_session::live_session_start),

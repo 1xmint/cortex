@@ -5975,6 +5975,7 @@ impl Database {
             ("openai", "gpt-5.4"),
             ("openai", "gpt-5-mini"),
             ("openai", "gpt-live-1"),
+            ("openai", "gpt-4o-mini-transcribe"),
         ];
         // M-D-0023: every Anthropic row is list-price, not a measured rate, so
         // the seed is always authoritative for `provider == "claude"` — an

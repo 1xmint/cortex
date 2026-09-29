@@ -93,6 +93,51 @@ function installFakePeerConnection() {
     FakePeerConnection;
 }
 
+class FakeMediaRecorder {
+  static instances: FakeMediaRecorder[] = [];
+  // Bytes each recorder hands over when stopped; 0 models an empty recording.
+  static chunkBytes = 2048;
+  static isTypeSupported(type: string) {
+    return type === 'audio/webm;codecs=opus';
+  }
+
+  state: 'inactive' | 'recording' = 'inactive';
+  mimeType: string;
+  private listeners: Record<string, Array<(event: unknown) => void>> = {};
+
+  constructor(
+    public stream: MediaStream,
+    options?: { mimeType?: string },
+  ) {
+    this.mimeType = options?.mimeType ?? '';
+    FakeMediaRecorder.instances.push(this);
+  }
+
+  addEventListener(name: string, cb: (event: unknown) => void) {
+    this.listeners[name] ??= [];
+    this.listeners[name].push(cb);
+  }
+
+  start() {
+    this.state = 'recording';
+  }
+
+  stop() {
+    this.state = 'inactive';
+    if (FakeMediaRecorder.chunkBytes > 0) {
+      const data = new Blob([new Uint8Array(FakeMediaRecorder.chunkBytes)], { type: this.mimeType });
+      for (const cb of this.listeners.dataavailable ?? []) cb({ data });
+    }
+    for (const cb of this.listeners.stop ?? []) cb({});
+  }
+}
+
+function installFakeMediaRecorder() {
+  FakeMediaRecorder.instances = [];
+  FakeMediaRecorder.chunkBytes = 2048;
+  (globalThis as unknown as { MediaRecorder: typeof FakeMediaRecorder }).MediaRecorder = FakeMediaRecorder;
+}
+
 function installFakeMediaDevices(overrides: { getUserMedia?: () => Promise<MediaStream> } = {}) {
   const trackListeners: Record<string, Array<() => void>> = {};
   const fakeTrack = {
@@ -129,6 +174,7 @@ const noop = () => {};
 describe('ChatComposer voice controls', () => {
   beforeEach(() => {
     installFakePeerConnection();
+    installFakeMediaRecorder();
     if (!('randomUUID' in crypto)) {
       Object.defineProperty(crypto, 'randomUUID', { value: () => 'fake-uuid', configurable: true });
     }
@@ -151,7 +197,7 @@ describe('ChatComposer voice controls', () => {
     expect(sendIndex).toBeGreaterThan(liveIndex);
   });
 
-  it('does not request a token when microphone permission is denied', async () => {
+  it('does not upload anything when microphone permission is denied', async () => {
     installFakeMediaDevices({
       getUserMedia: vi.fn(async () => {
         const err = new Error('denied');
@@ -169,7 +215,7 @@ describe('ChatComposer voice controls', () => {
     expect(await screen.findByRole('alert')).toHaveTextContent(/microphone access was denied/i);
     // The composer's model picker fetches /api/chat/models on mount regardless
     // of voice state; what this test guards is that denied mic permission never
-    // triggers a voice-token request.
+    // triggers a voice request.
     const voiceCalls = fetchSpy.mock.calls.filter(([input]) => !String(input).includes('/api/chat/models'));
     expect(voiceCalls).toEqual([]);
   });
@@ -1154,7 +1200,28 @@ describe('ChatComposer voice controls', () => {
     await waitFor(() => expect(screen.getByLabelText('Live voice')).toHaveAttribute('aria-pressed', 'false'));
   });
 
-  it('unmounting while the mic prompt is pending never requests a dictation token', async () => {
+  const DICTATION_URL = '/api/voice/dictation';
+
+  function dictationCalls(fetchSpy: { mock: { calls: unknown[][] } }) {
+    return fetchSpy.mock.calls.filter(([input]) => String(input).includes(DICTATION_URL)) as Array<
+      [RequestInfo | URL, RequestInit]
+    >;
+  }
+
+  async function pressMic() {
+    await act(async () => {
+      fireEvent.click(screen.getByLabelText('Dictation'));
+    });
+  }
+
+  /** Presses the mic, waits for the recorder to run, then presses it again. */
+  async function recordOnce() {
+    await pressMic();
+    await waitFor(() => expect(screen.getByLabelText('Dictation')).toHaveAttribute('aria-pressed', 'true'));
+    await pressMic();
+  }
+
+  it('unmounting while the mic prompt is pending never records or uploads', async () => {
     let resolveMedia: (stream: MediaStream) => void = () => {};
     const mediaPromise = new Promise<MediaStream>((resolve) => {
       resolveMedia = resolve;
@@ -1179,102 +1246,165 @@ describe('ChatComposer voice controls', () => {
       await Promise.resolve();
     });
 
-    const tokenCalls = fetchSpy.mock.calls.filter(([url]) => String(url).includes('/api/voice/dictation/token'));
-    expect(tokenCalls.length).toBe(0);
+    expect(dictationCalls(fetchSpy)).toHaveLength(0);
+    expect(FakeMediaRecorder.instances).toHaveLength(0);
     expect(fakeTrack.stop).toHaveBeenCalled();
   });
 
-  it('lands two transcript deltas that arrive before a re-render, and adds a space on completed', async () => {
+  it('uploads the recording to the dictation route and appends the text with a trailing space', async () => {
+    const { fakeTrack } = installFakeMediaDevices();
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
+      if (String(input).includes(DICTATION_URL)) return jsonResponse({ text: 'hello world' });
+      return jsonResponse({}, 404);
+    });
+    let draft = 'note: ';
+    const onDraftChange = vi.fn((value: string) => {
+      draft = value;
+    });
+
+    render(<ChatComposer draft={draft} onDraftChange={onDraftChange} onSend={noop} />);
+    await recordOnce();
+
+    await waitFor(() => expect(draft).toBe('note: hello world '));
+    const calls = dictationCalls(fetchSpy);
+    expect(calls).toHaveLength(1);
+    const [, init] = calls[0];
+    const headers = new Headers(init.headers);
+    expect(init.method).toBe('POST');
+    expect(headers.get('Content-Type')).toBe('audio/webm;codecs=opus');
+    expect(headers.get('Idempotency-Key')).toBeTruthy();
+    expect(Number(headers.get('X-Audio-Duration-Ms'))).toBeGreaterThan(0);
+    expect((init.body as Blob).size).toBe(2048);
+    // The mic is released and usable again once the text is in.
+    expect(fakeTrack.stop).toHaveBeenCalled();
+    expect(screen.getByLabelText('Dictation')).not.toBeDisabled();
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+  });
+
+  it('shows Transcribing and disables the mic while the upload is in flight', async () => {
     installFakeMediaDevices();
-    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
-      const url = String(input);
-      if (url.includes('/api/voice/dictation/token')) {
-        return jsonResponse({ token: 'tok', expires_at: 0, seconds: 60 });
+    let release: (response: Response) => void = () => {};
+    vi.spyOn(globalThis, 'fetch').mockImplementation((input) => {
+      if (String(input).includes(DICTATION_URL)) {
+        return new Promise<Response>((resolve) => {
+          release = resolve;
+        });
       }
-      if (url.includes('api.openai.com')) {
-        return {
-          ok: true,
-          status: 200,
-          headers: new Headers(),
-          json: async () => ({}),
-          text: async () => 'fake-answer-sdp',
-        } as Response;
+      return Promise.resolve(jsonResponse({}, 404));
+    });
+
+    render(<ChatComposer draft="" onDraftChange={noop} onSend={noop} />);
+    await recordOnce();
+
+    expect(await screen.findByText('Transcribing...')).toBeInTheDocument();
+    expect(screen.getByLabelText('Dictation')).toBeDisabled();
+
+    await act(async () => {
+      release(jsonResponse({ text: 'done' }));
+    });
+    await waitFor(() => expect(screen.queryByText('Transcribing...')).not.toBeInTheDocument());
+    expect(screen.getByLabelText('Dictation')).not.toBeDisabled();
+  });
+
+  it('a 402 shows the out-of-credits message, sends once and leaves the mic usable', async () => {
+    installFakeMediaDevices();
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
+      if (String(input).includes(DICTATION_URL)) {
+        return jsonResponse({ error: 'Out of credits.', need_credits: 1, available_credits: 0 }, 402);
       }
       return jsonResponse({}, 404);
     });
 
+    render(<ChatComposer draft="" onDraftChange={noop} onSend={noop} />);
+    await recordOnce();
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('Out of credits — top up');
+    expect(dictationCalls(fetchSpy)).toHaveLength(1);
+    expect(screen.getByLabelText('Dictation')).not.toBeDisabled();
+  });
+
+  it('retries a 503 once with the same idempotency key and lands the text when the retry works', async () => {
+    installFakeMediaDevices();
+    let attempt = 0;
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
+      if (String(input).includes(DICTATION_URL)) {
+        attempt += 1;
+        return attempt === 1
+          ? jsonResponse({ error: 'Dictation unavailable, try again later' }, 503)
+          : jsonResponse({ text: 'second time lucky' });
+      }
+      return jsonResponse({}, 404);
+    });
     let draft = '';
     const onDraftChange = vi.fn((value: string) => {
       draft = value;
     });
-    function Wrapper() {
-      return <ChatComposer draft={draft} onDraftChange={onDraftChange} onSend={noop} />;
-    }
-    const { rerender } = render(<Wrapper />);
 
-    await act(async () => {
-      fireEvent.click(screen.getByLabelText('Dictation'));
-    });
-    await waitFor(() => expect(screen.getByLabelText('Dictation')).toHaveAttribute('aria-pressed', 'true'));
+    render(<ChatComposer draft="" onDraftChange={onDraftChange} onSend={noop} />);
+    await recordOnce();
 
-    const dc = lastPeerConnection?.lastDataChannel;
-    act(() => {
-      dc?.emitMessage({ type: 'conversation.item.input_audio_transcription.delta', delta: 'hello' });
-      dc?.emitMessage({ type: 'conversation.item.input_audio_transcription.delta', delta: ' world' });
-    });
-
-    expect(draft).toBe('hello world');
-
-    act(() => {
-      dc?.emitMessage({ type: 'conversation.item.input_audio_transcription.completed' });
-    });
-    expect(draft).toBe('hello world ');
-
-    rerender(<Wrapper />);
-  });
-
-  it('shows the server refusal message for dictation (e.g. insufficient credits)', async () => {
-    installFakeMediaDevices();
-    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
-      const url = String(input);
-      if (url.includes('/api/voice/dictation/token')) {
-        return jsonResponse({ error: 'Not enough credits for dictation.' }, 402);
-      }
-      return jsonResponse({}, 404);
-    });
-
-    render(<ChatComposer draft="" onDraftChange={noop} onSend={noop} />);
-    await act(async () => {
-      fireEvent.click(screen.getByLabelText('Dictation'));
-    });
-
-    expect(await screen.findByRole('alert')).toHaveTextContent(/not enough credits for dictation/i);
-  });
-
-  it('a 503 on the dictation token disables the mic with the server message, no alert and no retry', async () => {
-    const { fakeTrack } = installFakeMediaDevices();
-    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
-      const url = String(input);
-      if (url.includes('/api/voice/dictation/token')) {
-        return jsonResponse({ error: 'Dictation is not available yet' }, 503);
-      }
-      return jsonResponse({}, 404);
-    });
-
-    render(<ChatComposer draft="" onDraftChange={noop} onSend={noop} />);
-    await act(async () => {
-      fireEvent.click(screen.getByLabelText('Dictation'));
-    });
-
-    expect(await screen.findByRole('status')).toHaveTextContent('Dictation is not available yet');
+    await waitFor(() => expect(draft).toBe('second time lucky '));
+    const calls = dictationCalls(fetchSpy);
+    expect(calls).toHaveLength(2);
+    expect(new Headers(calls[0][1].headers).get('Idempotency-Key')).toBe(
+      new Headers(calls[1][1].headers).get('Idempotency-Key'),
+    );
     expect(screen.queryByRole('alert')).not.toBeInTheDocument();
-    const mic = screen.getByLabelText('Dictation');
-    expect(mic).toBeDisabled();
-    expect(mic).toHaveAttribute('title', 'Dictation is not available yet');
-    // The mic that was opened to ask is released, and the token is asked for once.
-    expect(fakeTrack.stop).toHaveBeenCalled();
-    fireEvent.click(mic);
-    const tokenCalls = fetchSpy.mock.calls.filter(([input]) => String(input).includes('/api/voice/dictation/token'));
-    expect(tokenCalls).toHaveLength(1);
+  });
+
+  it('a 503 that survives the one retry shows try-again-later and keeps the mic enabled', async () => {
+    installFakeMediaDevices();
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
+      if (String(input).includes(DICTATION_URL)) {
+        return jsonResponse({ error: 'Dictation unavailable, try again later' }, 503);
+      }
+      return jsonResponse({}, 404);
+    });
+
+    render(<ChatComposer draft="" onDraftChange={noop} onSend={noop} />);
+    await recordOnce();
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('Dictation unavailable, try again later');
+    expect(dictationCalls(fetchSpy)).toHaveLength(2);
+    expect(screen.getByLabelText('Dictation')).not.toBeDisabled();
+  });
+
+  it('unmounting while the upload is in flight drops the text', async () => {
+    installFakeMediaDevices();
+    let release: (response: Response) => void = () => {};
+    vi.spyOn(globalThis, 'fetch').mockImplementation((input) => {
+      if (String(input).includes(DICTATION_URL)) {
+        return new Promise<Response>((resolve) => {
+          release = resolve;
+        });
+      }
+      return Promise.resolve(jsonResponse({}, 404));
+    });
+    const onDraftChange = vi.fn();
+
+    const { unmount } = render(<ChatComposer draft="" onDraftChange={onDraftChange} onSend={noop} />);
+    await recordOnce();
+    await screen.findByText('Transcribing...');
+
+    unmount();
+    await act(async () => {
+      release(jsonResponse({ text: 'too late' }));
+      await Promise.resolve();
+    });
+
+    expect(onDraftChange).not.toHaveBeenCalled();
+  });
+
+  it('an empty recording sends nothing', async () => {
+    installFakeMediaDevices();
+    FakeMediaRecorder.chunkBytes = 0;
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async () => jsonResponse({}, 404));
+
+    render(<ChatComposer draft="" onDraftChange={noop} onSend={noop} />);
+    await recordOnce();
+
+    await waitFor(() => expect(screen.getByLabelText('Dictation')).toHaveAttribute('aria-pressed', 'false'));
+    expect(dictationCalls(fetchSpy)).toHaveLength(0);
+    expect(screen.getByLabelText('Dictation')).not.toBeDisabled();
   });
 });

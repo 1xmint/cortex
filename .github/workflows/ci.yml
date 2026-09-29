@@ -167,6 +167,13 @@ jobs:
       # 60 -> 64 with four for the run-paused-for-credits banner in RunsPane:
       # the banner and top-up link, Resume reloading the run, a 402 reading
       # "Top up first", and no banner for a run that is not paused.
+      #
+      # 64 -> 68: dictation now posts the recording to Cortex, so the four
+      # token-era dictation cases in `ChatComposer.voice.test.tsx` give way to
+      # eight: unmount while the mic prompt is pending, upload and append the
+      # text, Transcribing while in flight, 402 out of credits, a 503 retried
+      # once with the same key, a 503 that survives the retry, unmount during
+      # the upload, and an empty recording sending nothing.
       - name: Test Cortex
         run: |
           set -euo pipefail
@@ -176,8 +183,8 @@ jobs:
           echo "$output"
           passed=$(echo "$output" | grep -oE "Tests +[0-9]+ passed" | grep -oE "[0-9]+" | tail -1)
           echo "cortex tests passed: ${passed:-0}"
-          if [ "${passed:-0}" -lt 64 ]; then
-            echo "::error::expected at least 64 Cortex tests to run, saw ${passed:-0}"
+          if [ "${passed:-0}" -lt 68 ]; then
+            echo "::error::expected at least 68 Cortex tests to run, saw ${passed:-0}"
             exit 1
           fi
 

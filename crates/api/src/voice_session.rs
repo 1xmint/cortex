@@ -472,7 +472,7 @@ impl Drop for PlaceholderGuard {
 /// Reserve, mint, attach, and start the billing task — the whole live-voice
 /// pipeline, independent of the HTTP plumbing so it can be tested directly
 /// against a loopback `FakeLive` and an in-memory database, the same shape
-/// as `chat_paid::send_paid_reply` and `voice::mint_dictation_token`.
+/// as `chat_paid::send_paid_reply` and `voice::dictation_with`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn start_session(
     state: &Arc<AppState>,
@@ -2138,7 +2138,11 @@ async fn reattach_and_close(ws_base: &str, session_id: &str, supplier_key: &str)
 
 /// What the user can pay for right now, in micro-USD: whole credits in the
 /// balance less the sub-credit carry already owed. Never negative.
-fn payable_micro(db: &crate::db::Database, user_id: &str, micros_per_credit: i64) -> i64 {
+pub(crate) fn payable_micro(
+    db: &crate::db::Database,
+    user_id: &str,
+    micros_per_credit: i64,
+) -> i64 {
     let credits = db
         .get_credit_balance_row(user_id)
         .map(|balance| (balance.subscription_remaining + balance.pack_remaining).max(0))
@@ -2159,7 +2163,7 @@ fn payable_micro(db: &crate::db::Database, user_id: &str, micros_per_credit: i64
 ///
 /// Returns `(credits actually charged, budget exhausted)`, where exhausted
 /// means nothing more can be paid for once this charge has landed.
-fn charge_observed_cost(
+pub(crate) fn charge_observed_cost(
     db: &crate::db::Database,
     user_id: &str,
     session_id: &str,
