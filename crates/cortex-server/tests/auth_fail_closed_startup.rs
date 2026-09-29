@@ -19,6 +19,8 @@ fn production_without_clerk_trust_anchors_exits_nonzero_and_says_why() {
     let bin = env!("CARGO_BIN_EXE_cortex-server");
     let dir = tempfile::tempdir().unwrap();
     let ledger_path = dir.path().join("ledger.jsonl");
+    // The server refuses to boot on a workspace that is not a git repository.
+    std::fs::create_dir(dir.path().join(".git")).unwrap();
 
     let mut child = Command::new(bin)
         .env("CORTEX_ENV", "production")
@@ -89,6 +91,34 @@ fn production_without_clerk_trust_anchors_exits_nonzero_and_says_why() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains("CLERK_SECRET_KEY is required in HeyVera production"),
+        "stderr did not explain the failure: {stderr}"
+    );
+}
+
+
+#[test]
+fn a_workspace_that_is_not_a_git_repository_stops_the_server_from_booting() {
+    let bin = env!("CARGO_BIN_EXE_cortex-server");
+    let dir = tempfile::tempdir().unwrap();
+    let ledger_path = dir.path().join("ledger.jsonl");
+
+    // No `.git` in the workspace: the server must refuse to start rather than
+    // run with a workspace it can never verify a delivery from.
+    let output = Command::new(bin)
+        .env("CORTEX_ENV", "production")
+        .env("CORTEX_SINGLE_NODE", "1")
+        .env("CORTEX_PORT", "0")
+        .env("CORTEX_LEDGER_PATH", &ledger_path)
+        .env("CORTEX_WORKSPACE", dir.path())
+        .env_remove("CORTEX_AUTH_DISABLED")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("failed to run cortex-server binary");
+
+    assert!(!output.status.success(), "the server must not boot");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("is not a git repository"),
         "stderr did not explain the failure: {stderr}"
     );
 }
