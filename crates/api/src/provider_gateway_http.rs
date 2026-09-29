@@ -114,6 +114,7 @@ pub(crate) fn issue_access(
     let signing_key = std::env::var("CORTEX_PROVIDER_GATEWAY_SIGNING_KEY").ok()?;
     let limits = SpendLimits::from_env()?;
     let expires_at_ms = lease_deadline_ms;
+    let max_micro_usd = limits.max_micro_usd;
     let (authorization_id, signed) = create_authorization_and_capability(
         db,
         &signing_key,
@@ -122,7 +123,7 @@ pub(crate) fn issue_access(
         attempt_id,
         provider_label,
         model,
-        limits.max_micro_usd,
+        max_micro_usd,
         limits.funded_micro_usd,
         expires_at_ms,
         now_ms,
@@ -399,7 +400,7 @@ pub async fn messages(
             .into_response();
     };
     let now_ms = chrono::Utc::now().timestamp_millis();
-    match mode {
+    let response = match mode {
         GatewayMode::Stub => {
             handle_stub_message(db, signing_key.as_bytes(), &headers, body, now_ms).await
         }
@@ -414,7 +415,68 @@ pub async fn messages(
             )
             .await
         }
+    };
+    if response.extensions().get::<InsufficientCredits>().is_some() {
+        pause_for_top_up(&state, db, signing_key.as_bytes(), &headers).await;
     }
+    response
+}
+
+/// Marks the one refusal that means the owner's balance cannot cover the
+/// call ("insufficient credits"), as opposed to any other reason a
+/// reservation can be refused (the operator's authorization cap included).
+#[derive(Clone, Copy)]
+struct InsufficientCredits;
+
+/// The call's reservation did not fit in what the owner can still pay for.
+/// End the attempt (its calls so far are charged as settled), leave the step
+/// to be re-dispatched, and park the run until the owner tops up. Any other
+/// refusal never gets here.
+async fn pause_for_top_up(
+    state: &AppState,
+    db: &crate::db::Database,
+    signing_key: &[u8],
+    headers: &HeaderMap,
+) {
+    let Some(token) = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+    else {
+        return;
+    };
+    let Ok(claims) = crate::provider_gateway::verify_capability(
+        signing_key,
+        &SignedCapability::from_exposed(token),
+    ) else {
+        return;
+    };
+    let Some(paused) = db.pause_attempt_for_top_up(&claims.run_id, &claims.attempt_id) else {
+        return;
+    };
+    tracing::info!(
+        run_id = %paused.run_id,
+        step_id = %paused.step_id,
+        "run paused: out of credits, waiting for a top-up"
+    );
+    state
+        .emit_scheduler_event(cortex_engine::captain::SchedulerEvent::RunPaused {
+            run_id: paused.run_id.clone(),
+            step_id: paused.step_id.clone(),
+        })
+        .await;
+    if let Some(worker_id) = paused.worker_id.as_deref() {
+        if let Some(worker) = state.workers.read().await.get(worker_id) {
+            let _ = worker
+                .tx
+                .send(cortex_core::protocol::BrainMessage::CancelStep {
+                    step_id: paused.step_id.clone(),
+                    reason: "out of credits: top up to continue".to_string(),
+                })
+                .await;
+        }
+    }
+    state.remove_step_sender(&paused.step_id).await;
 }
 
 /// Live mode can hold keys for more than one supplier, so which transport and
@@ -776,7 +838,16 @@ fn gateway_error_response(error: GatewayError) -> Response {
         | GatewayError::CredentialExposure
         | GatewayError::Reconciliation(_) => StatusCode::BAD_GATEWAY,
     };
-    (status, error.to_string()).into_response()
+    let out_of_credits = matches!(
+        &error,
+        GatewayError::Reservation(detail)
+            if detail.starts_with(crate::db::INSUFFICIENT_CREDITS_PREFIX)
+    );
+    let mut response = (status, error.to_string()).into_response();
+    if out_of_credits {
+        response.extensions_mut().insert(InsufficientCredits);
+    }
+    response
 }
 
 #[cfg(test)]

@@ -73,6 +73,11 @@ pub enum AttemptEndCause {
     ExamTampered,
     /// The customer cancelled the run. Calls already made were made for them.
     CustomerCancel,
+    /// The customer's credit balance could no longer cover the next model
+    /// call, so the attempt was ended and its run paused until they top up.
+    /// The calls already made were made for the customer and are charged
+    /// exactly as settled; nothing about this is Cortex's outage.
+    OutOfCredits,
     /// The check runner (or a service it depends on) was down, so no verdict
     /// could be produced after retries were exhausted. Cortex's problem.
     RunnerDown,
@@ -115,7 +120,9 @@ pub enum AttemptSettlement {
 pub fn settle_attempt(end_cause: AttemptEndCause) -> AttemptSettlement {
     use AttemptEndCause::*;
     match end_cause {
-        Verified | Unverified | Failed | ExamTampered | CustomerCancel => AttemptSettlement::Charge,
+        Verified | Unverified | Failed | ExamTampered | CustomerCancel | OutOfCredits => {
+            AttemptSettlement::Charge
+        }
         RunnerDown | LeaseExpired | CortexCrash | WorkerInfraDown => {
             AttemptSettlement::Absorb(end_cause)
         }
@@ -382,6 +389,15 @@ mod tests {
         // Calls already made were made for the customer.
         assert_eq!(
             settle_attempt(AttemptEndCause::CustomerCancel),
+            AttemptSettlement::Charge
+        );
+    }
+
+    #[test]
+    fn out_of_credits_charges() {
+        // The calls already made were real; only the next one is refused.
+        assert_eq!(
+            settle_attempt(AttemptEndCause::OutOfCredits),
             AttemptSettlement::Charge
         );
     }

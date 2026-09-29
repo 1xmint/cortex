@@ -753,12 +753,100 @@ pub async fn get_run(
     Ok(Json(serde_json::json!({
         "id": id,
         "goal": goal,
+        "status": db.get_run_status(&id),
+        "spent_credits": db.run_spent_credits(&id),
         "task_id": task_id,
         "group_id": group_id,
         "conversation_id": conversation_id,
         "steps": steps,
         "graph": graph,
     })))
+}
+
+/// `POST /api/runs/{id}/resume` — resume a run that paused because its owner
+/// ran out of credits.
+///
+/// Owner only. If the balance now covers one maximum per-call reservation the
+/// run goes back to `running` and the scheduler re-dispatches its paused step;
+/// otherwise 402 with the credits needed and the credits available, so the
+/// caller knows how much to top up. Nothing is held or charged here.
+pub async fn resume_run(
+    State(state): State<Arc<AppState>>,
+    user: ClerkUser,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> axum::response::Response {
+    let Some(db) = state.db.as_ref() else {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: "database not available".into(),
+            }),
+        )
+            .into_response();
+    };
+    let Some(status) = db.get_run_status(&id) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: "run not found".into(),
+            }),
+        )
+            .into_response();
+    };
+    if !db.verify_run_owner(&id, &user.user_id) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(ErrorResponse {
+                error: "access denied: run belongs to another user".into(),
+            }),
+        )
+            .into_response();
+    }
+    match status.as_str() {
+        "awaiting_top_up" => {}
+        "planning" | "running" => {
+            return Json(serde_json::json!({"run_id": id, "status": status})).into_response();
+        }
+        _ => {
+            return (
+                StatusCode::CONFLICT,
+                Json(ErrorResponse {
+                    error: format!("run is {status}; only a run awaiting a top-up can resume"),
+                }),
+            )
+                .into_response();
+        }
+    }
+    match db.resume_run_after_top_up(&id, &user.user_id) {
+        Ok(crate::db::ResumeOutcome::Resumed) => {
+            state
+                .emit_scheduler_event(cortex_engine::captain::SchedulerEvent::RunResumed {
+                    run_id: id.clone(),
+                })
+                .await;
+            Json(serde_json::json!({"run_id": id, "status": "running"})).into_response()
+        }
+        Ok(crate::db::ResumeOutcome::Insufficient {
+            need_credits,
+            available_credits,
+        }) => (
+            StatusCode::PAYMENT_REQUIRED,
+            Json(serde_json::json!({
+                "need_credits": need_credits,
+                "available_credits": available_credits,
+            })),
+        )
+            .into_response(),
+        Ok(crate::db::ResumeOutcome::NotPaused) => {
+            Json(serde_json::json!({"run_id": id, "status": db.get_run_status(&id)}))
+                .into_response()
+        }
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse { error }),
+        )
+            .into_response(),
+    }
 }
 
 pub async fn get_run_events(

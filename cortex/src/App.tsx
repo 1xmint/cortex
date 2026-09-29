@@ -268,8 +268,18 @@ function CortexShell() {
   const { isLoaded, isSignedIn, userId, clerkEnabled } = useAuthGate();
   // Auto-creates user's Soma identity + session-scoped delegation on sign-in
   useSomaSession(userId ?? 'anonymous', isSignedIn);
-  const [settingsOpen, setSettingsOpen] = useState(false);
-  const [settingsInitialTab, setSettingsInitialTab] = useState<SettingsTab>('account');
+  // `/?settings=billing` is how a page outside the shell (a run waiting for
+  // credits) sends the owner to the billing top-up.
+  const openBillingFromUrl =
+    typeof window !== 'undefined' &&
+    new URLSearchParams(window.location.search).get('settings') === 'billing';
+  const [settingsOpen, setSettingsOpen] = useState(openBillingFromUrl);
+  const [settingsInitialTab, setSettingsInitialTab] = useState<SettingsTab>(
+    openBillingFromUrl ? 'billing' : 'account',
+  );
+  useEffect(() => {
+    if (openBillingFromUrl) window.history.replaceState(null, '', window.location.pathname);
+  }, [openBillingFromUrl]);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const activeConversationId = conversationByGroup[activeGroupId] ?? null;
   const [renamingTitle, setRenamingTitle] = useState(false);

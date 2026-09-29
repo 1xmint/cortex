@@ -47,7 +47,11 @@ const RETRYABLE_STATUSES = new Set([503]);
 async function fetchWithRetry(
   url: string,
   init?: RequestInit,
+  retry = true,
 ): Promise<Response> {
+  // A caller that treats 503 as an answer (e.g. a feature switched off
+  // server-side) must not sit through the backoff or resend the request.
+  if (!retry) return fetch(url, init);
   let lastError: unknown;
   for (let attempt = 0; attempt <= RETRY_DELAYS_MS.length; attempt++) {
     try {
@@ -113,7 +117,7 @@ export async function getAuthToken(opts?: AuthTokenOptions): Promise<string | nu
   return _tokenGetter(opts);
 }
 
-async function authedFetch(url: string, init?: RequestInit): Promise<Response> {
+async function authedFetch(url: string, init?: RequestInit, retry = true): Promise<Response> {
   const headers = new Headers(init?.headers);
   if (_somaDelegation) {
     headers.set('Authorization', `Soma ${JSON.stringify(_somaDelegation)}`);
@@ -124,7 +128,7 @@ async function authedFetch(url: string, init?: RequestInit): Promise<Response> {
   if (!headers.has('Content-Type') && init?.method && init.method !== 'GET') {
     headers.set('Content-Type', 'application/json');
   }
-  return noteAuthorized(url, await fetchWithRetry(url, { ...init, headers }), headers);
+  return noteAuthorized(url, await fetchWithRetry(url, { ...init, headers }, retry), headers);
 }
 
 async function bearerFetch(url: string, init?: RequestInit): Promise<Response> {
@@ -253,8 +257,12 @@ function dispatchUnauthorized() {
   }
 }
 
-export async function requestJson<T>(path: string, init?: RequestInit): Promise<T> {
-  const res = await authedFetch(apiUrl(path), init);
+export async function requestJson<T>(
+  path: string,
+  init?: RequestInit,
+  options?: { retryOn503?: boolean },
+): Promise<T> {
+  const res = await authedFetch(apiUrl(path), init, options?.retryOn503 ?? true);
   if (!res.ok) {
     if (res.status === 401) dispatchUnauthorized();
     throw new CortexApiError(res.status, await readErrorMessage(res), res.headers.get('Retry-After'));
@@ -720,6 +728,24 @@ export async function validateReferralCode(code: string): Promise<ReferralValida
 
 export async function getBillingHistory(): Promise<BillingHistoryEntry[]> {
   return requestBillingJson<BillingHistoryEntry[]>('/api/billing/history');
+}
+
+/**
+ * Credit balance from `GET /api/billing/usage`. The backend counts in whole
+ * credits (1 credit = $0.10) and sends `null` when no ledger row exists
+ * (unmetered). The UI converts to dollars at display time only.
+ */
+export async function getCreditsBalance(): Promise<number | null> {
+  const usage = await requestBillingJson<{ creditsBalance?: number | null }>('/api/billing/usage');
+  return typeof usage.creditsBalance === 'number' ? usage.creditsBalance : null;
+}
+
+/** One-time credit purchase (`POST /api/billing/topup`): $10, $25, $50 or $100. */
+export async function createTopupCheckout(amountUsd: number): Promise<CheckoutResponse> {
+  return requestBillingJson<CheckoutResponse>('/api/billing/topup', {
+    method: 'POST',
+    body: JSON.stringify({ amount_usd: amountUsd }),
+  });
 }
 
 export interface GitHubStatus {
@@ -1301,7 +1327,10 @@ export interface RunGraph {
 export interface RunSummary {
   id: string;
   goal: string;
+  /** Includes 'awaiting_top_up': the run paused because credits ran out. */
   status?: string;
+  /** Credits charged to this run so far (exact, settled). */
+  spent_credits?: number;
   profile?: string;
   created_at?: string;
   task_id?: string | null;
@@ -2037,6 +2066,18 @@ export async function cancelRun(runId: string, reason?: string): Promise<CancelR
   return requestJson<CancelRunResponse>(`/api/runs/${runId}/cancel`, {
     method: 'POST',
     body: JSON.stringify(reason ? { reason } : {}),
+  });
+}
+
+/**
+ * Resume a run parked as `awaiting_top_up`. A 402 means the balance is still
+ * empty: it throws a `CortexApiError` with status 402, which the caller shows
+ * as "Top up first".
+ */
+export async function resumeRun(runId: string): Promise<{ status: string }> {
+  return requestJson<{ status: string }>(`/api/runs/${runId}/resume`, {
+    method: 'POST',
+    body: JSON.stringify({}),
   });
 }
 

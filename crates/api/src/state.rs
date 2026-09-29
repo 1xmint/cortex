@@ -319,6 +319,10 @@ impl AppState {
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(!auth_disabled); // default true in production, false when auth disabled
 
+        // Provider reservations are checked against the live credit balance
+        // whenever billing is enforced.
+        db.set_credit_gate(billing_enforced);
+
         // Configurable usage limits
         let usage_limits = UsageLimits {
             daily_cost_limit: std::env::var("CORTEX_DAILY_COST_LIMIT")
