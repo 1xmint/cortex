@@ -1892,6 +1892,7 @@ mod tests {
     //
     // These are the tests that must fail if the fallback ever comes back.
 
+    use crate::repo_transport::RepoTransport;
     use crate::sandbox::SandboxSession;
     use cortex_core::execution_job::IsolationClass;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -2005,6 +2006,67 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("cortex-sbx-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).expect("temp dir");
         dir
+    }
+
+    #[tokio::test]
+    async fn unchanged_tree_with_repo_completes_without_uploading() {
+        // A search/think step leaves head == base. The base is already in the
+        // run repository, so nothing is uploaded: an unreachable brain must not
+        // turn that step into Blocked.
+        let dir = non_repo_dir();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(["-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false"])
+                .args(args)
+                .current_dir(&dir)
+                .output()
+                .expect("git runs");
+            assert!(out.status.success(), "git {args:?}: {out:?}");
+        };
+        git(&["init", "-q"]);
+        std::fs::write(dir.join("a.txt"), "a").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "base"]);
+
+        let (runner, _) = SpyRunner::new(SpyOutcome::Exit(0));
+        let (tx, mut rx) = mpsc::channel(16);
+        let mut step = spy_step();
+        step.repo = Some(StepRepo {
+            repo_key: "repo-key".to_string(),
+            base_commit: "0".repeat(40),
+            transport: RepoTransport {
+                base_url: "http://127.0.0.1:1".to_string(),
+                token: "t".to_string(),
+                worker_id: "w".to_string(),
+                cache_root: dir.join("cache"),
+            },
+        });
+        let mut task = spy_task();
+        task.tier = cortex_core::provider::Tier::Search;
+
+        let result = Executor::execute(
+            &task,
+            &spy_decision(ProviderId::Claude, "claude-opus-5"),
+            &step,
+            tx,
+            &dir,
+            &runner,
+            &runner,
+        )
+        .await;
+        assert!(result.is_ok(), "{result:?}");
+
+        let (mut completed, mut blocked) = (false, false);
+        while let Ok(event) = rx.try_recv() {
+            match event {
+                WorkerEvent::Completed { .. } => completed = true,
+                WorkerEvent::Blocked { .. } => blocked = true,
+                _ => {}
+            }
+        }
+        assert!(completed && !blocked, "unchanged tree must complete, not block");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
