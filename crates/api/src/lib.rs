@@ -392,8 +392,7 @@ pub fn build_cortex_router(state: Arc<AppState>) -> Router {
         .route("/api/chat", post(chat::chat))
         .route(
             "/api/voice/dictation",
-            post(voice::dictation)
-                .layer(DefaultBodyLimit::max(voice::MAX_AUDIO_BYTES + 64 * 1024)),
+            post(voice::dictation).layer(DefaultBodyLimit::max(voice::MAX_AUDIO_BYTES + 64 * 1024)),
         )
         .route(
             "/api/voice/live/sessions",
