@@ -630,14 +630,18 @@ async fn handle_worker_msg(
                             // verification. Three outcomes, because the
                             // difference is who pays:
                             //
-                            // - `Missing` (a healthy repository that does
-                            //   not hold the commit, or a reported string
-                            //   that is not an object id at all): the
-                            //   worker's own delivery is broken -- charged.
-                            // - `CheckFailed` (git would not start, or the
-                            //   workspace is not a repository git can open):
-                            //   Cortex's own machinery -- absorbed as
-                            //   `CortexCrash`.
+                            // - `Missing` (the object store does not hold
+                            //   the commit, the workspace's `.git` is
+                            //   missing, renamed or broken, or the reported
+                            //   string is not an object id at all): the
+                            //   workspace is worker-writable, so all of it is
+                            //   the worker's doing -- charged.
+                            // - `CheckFailed` (git would not start, or
+                            //   Cortex could not make its own scratch
+                            //   directory on a filesystem the worker does not
+                            //   share): Cortex's own machinery -- absorbed as
+                            //   `CortexCrash`. Git never reads the worker's
+                            //   repository, only its objects, as data.
                             // - `Resolves`: on to verification.
                             //
                             // Run on the blocking pool: it shells out to git
@@ -3230,9 +3234,9 @@ mod attempt_end_paths {
     }
 
     #[tokio::test]
-    async fn a_workspace_that_is_not_a_git_repo_is_cortexs_fault_and_absorbed() {
-        // The head cannot be looked up because the server's own workspace is
-        // not a repository: Cortex's machinery, not the worker's delivery.
+    async fn a_workspace_that_is_not_a_git_repo_is_the_workers_doing_and_charged() {
+        // The workspace is worker-writable, so a missing `.git` is something
+        // the worker could have done. It must never buy a free attempt.
         let state = state().await;
         let (worker_id, step_id, lease_gen) =
             running_step_with_settled_call(&state, "attempt-no-repo");
@@ -3249,7 +3253,12 @@ mod attempt_end_paths {
         )
         .await;
 
-        assert_absorbed(&state, "attempt-no-repo");
+        assert_charged_three_credits(&state, "attempt-no-repo");
+        assert!(
+            terminal_reason(&state, &step_id, "attempt-no-repo")
+                .contains("does not resolve in the workspace repository"),
+            "the unresolvable-head branch must be the one that ran"
+        );
     }
 
     #[tokio::test]

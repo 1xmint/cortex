@@ -80,6 +80,26 @@ pub fn cortex_db_path(workspace_dir: &std::path::Path) -> PathBuf {
     db_path
 }
 
+/// The server's workspace must be a git repository: verification reads the
+/// worker's delivered commits from `<workspace>/.git/objects`, and a
+/// workspace without one would make every delivery unverifiable. Checked once
+/// at startup, so a misconfigured deploy fails to boot instead of billing
+/// customers for deliveries it can never look at. The workspace is
+/// worker-writable, so this is deliberately NOT re-asserted per delivery: a
+/// `.git` that goes missing later is the worker's doing and is charged.
+///
+/// Test constructors of [`AppState`] do not call this.
+pub fn require_workspace_repository(workspace_dir: &std::path::Path) -> Result<(), String> {
+    if workspace_dir.join(".git").is_dir() {
+        Ok(())
+    } else {
+        Err(format!(
+            "CORTEX_WORKSPACE ({}) is not a git repository: it has no .git directory. Point CORTEX_WORKSPACE at the repository checkout workers deliver into.",
+            workspace_dir.display()
+        ))
+    }
+}
+
 pub struct AppState {
     pub providers: RwLock<Vec<ProviderStatus>>,
     pub ledger: Ledger,

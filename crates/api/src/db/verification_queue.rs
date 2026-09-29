@@ -232,16 +232,7 @@ impl Database {
                 // A step whose lease_gen is no longer the job's has moved on
                 // as well: a newer lease owns it, so this job's ending can
                 // never be recorded and there is nothing left to retry.
-                let lease_moved = matches!(
-                    self.conn()
-                        .query_row(
-                            "SELECT lease_gen FROM steps WHERE id = ?1",
-                            params![step_id],
-                            |row| row.get::<_, i64>(0),
-                        )
-                        .ok(),
-                    Some(g) if g != *lease_gen
-                );
+                let lease_moved = self.step_lease_moved(step_id, *lease_gen);
                 let moved_on = lease_moved
                     || matches!(
                         self.get_step_status(step_id).as_deref(),
@@ -264,10 +255,13 @@ impl Database {
                         attempt_id = %attempt_id,
                         attempt_count = *attempt_count,
                         "giving up on recording the ending for a dead-lettered \
-                         verification job; the attempt has NO ending row and must \
-                         be reconciled by hand"
+                         verification job; unless the attempt already has an \
+                         ending row it must be reconciled by hand"
                     );
-                    gave_up = true;
+                    // Only an attempt with no ending row at all is
+                    // `ending_unrecorded`: one that has an ending is not
+                    // waiting for anyone to reconcile it.
+                    gave_up = !self.attempt_has_ending(attempt_id);
                 }
             }
             // A job retired because the cap ran out, with no ending row, must
@@ -352,21 +346,30 @@ impl Database {
             // job then would strand the attempt, so fall through and leave it
             // for a later retry. The give-up cap bounds that retry loop: each
             // retry re-claims the job and bumps `attempt_count`.
-            let moved_on = matches!(
-                self.get_step_status(step_id).as_deref(),
-                Some(s) if s != "verifying"
-            );
+            //
+            // A step whose lease_gen is no longer the job's has moved on as
+            // well (the reclaim path's rule): a newer lease owns it, so this
+            // job's ending can never be recorded.
+            let lease_moved = self.step_lease_moved(step_id, *lease_gen);
+            let moved_on = lease_moved
+                || matches!(
+                    self.get_step_status(step_id).as_deref(),
+                    Some(s) if s != "verifying"
+                );
             let give_up =
                 !ended && !moved_on && *attempt_count >= VERIFICATION_ENDING_GIVE_UP_ATTEMPTS;
+            // Only an attempt with no ending row at all is `ending_unrecorded`.
+            let unrecorded = give_up && !self.attempt_has_ending(attempt_id);
             if give_up {
                 tracing::error!(
                     job_id = %job_id,
                     step_id = %step_id,
                     attempt_id = %attempt_id,
                     attempt_count = *attempt_count,
+                    unrecorded,
                     "giving up on recording the ending for a retry-exhausted \
-                     verification job; the attempt has NO ending row and must be \
-                     reconciled by hand"
+                     verification job; unless the attempt already has an ending \
+                     row it must be reconciled by hand"
                 );
             }
             let may_retire = ended || moved_on || give_up;
@@ -391,7 +394,7 @@ impl Database {
             if may_retire {
                 // The cap retired it with no ending row: say so (see the
                 // reclaim path for why the reason differs).
-                let reason = if give_up {
+                let reason = if unrecorded {
                     "ending_unrecorded"
                 } else {
                     "retries exhausted without a verdict"
@@ -424,6 +427,35 @@ impl Database {
         )
         .unwrap_or(0)
             > 0
+    }
+
+    /// Has a newer lease taken over the step? True only when the step's
+    /// `lease_gen` was READ and differs from `lease_gen`; a step that cannot
+    /// be read proves nothing.
+    fn step_lease_moved(&self, step_id: &str, lease_gen: i64) -> bool {
+        matches!(
+            self.conn()
+                .query_row(
+                    "SELECT lease_gen FROM steps WHERE id = ?1",
+                    params![step_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .ok(),
+            Some(g) if g != lease_gen
+        )
+    }
+
+    /// Does the attempt have a durable `attempt_endings` row? A query error
+    /// counts as no ending: when unsure, the job is flagged for hand
+    /// reconciliation rather than assumed settled.
+    fn attempt_has_ending(&self, attempt_id: &str) -> bool {
+        self.conn()
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM attempt_endings WHERE attempt_id = ?1)",
+                params![attempt_id],
+                |row| row.get::<_, bool>(0),
+            )
+            .unwrap_or(false)
     }
 
     /// Seal a job's terminal state.
@@ -1184,6 +1216,42 @@ mod verifier {
             Some("ending_unrecorded"),
             "a job retired with no ending row says so"
         );
+    }
+
+    #[test]
+    fn retry_retires_a_job_whose_step_lease_has_moved_at_the_normal_limit() {
+        // The step is still `verifying` but a newer lease owns it, so this
+        // job's ending can never be recorded: the same rule the reclaim path
+        // has. It retires at the normal limit rather than idling to the
+        // give-up cap, and it is not flagged `ending_unrecorded`.
+        let db = test_db();
+        let (run_id, gen) = delivered_step(&db, "step-1");
+        let digest = spec_set_digest(&[spec("c1")]);
+        assert!(db.begin_verifying_step(
+            "step-1",
+            "a1",
+            gen,
+            Some(enqueue(&run_id, "job-1", &digest))
+        ));
+        db.conn()
+            .execute(
+                "UPDATE steps SET lease_gen = lease_gen + 1 WHERE id = ?1",
+                params!["step-1"],
+            )
+            .unwrap();
+
+        for _ in 0..VERIFICATION_MAX_ATTEMPTS {
+            db.claim_verification_job("dispatcher-a")
+                .expect("claimable");
+            db.retry_verification_job("job-1", "dispatcher-a", 0);
+        }
+        let job = db.get_verification_job("job-1").unwrap();
+        assert_eq!(job.state, "dead");
+        assert_eq!(
+            job.terminal_reason.as_deref(),
+            Some("retries exhausted without a verdict")
+        );
+        assert!(ending_row(&db, "a1").is_none());
     }
 
     /// Force a claim's lease into the past, standing in for a dispatcher that
