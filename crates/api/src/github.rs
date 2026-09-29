@@ -16,6 +16,19 @@ pub struct PrResponse {
 }
 
 impl GitHubClient {
+    /// A client that acts as the run owner: `token` is their GitHub OAuth
+    /// token (Clerk-brokered), never a server-wide credential.
+    pub fn with_token(token: String) -> Option<Self> {
+        if token.is_empty() {
+            return None;
+        }
+        let client = reqwest::Client::builder()
+            .user_agent("cortex-api")
+            .build()
+            .ok()?;
+        Some(Self { token, client })
+    }
+
     /// Create a client from the `GITHUB_TOKEN` environment variable.
     pub fn from_env() -> Option<Self> {
         let token = std::env::var("GITHUB_TOKEN").ok()?;

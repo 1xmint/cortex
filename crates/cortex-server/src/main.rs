@@ -150,4 +150,5 @@ fn start_verification_dispatcher(state: &std::sync::Arc<cortex_api::state::AppSt
         verification_dispatcher::reconcile_on_startup(db);
     }
     verification_dispatcher::spawn(state.clone());
+    cortex_api::run_repo::spawn_sweeper(state.clone());
 }

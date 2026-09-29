@@ -51,7 +51,7 @@ COPY --from=builder --chown=cortex:cortex /src/target/release/cortex-worker /usr
 USER cortex
 WORKDIR /workspace
 
-ENV CORTEX_BRAIN_URL=ws://brain:3001/ws
+ENV CORTEX_BRAIN_URL=ws://brain:3001/api/ws
 
 # The worker's service credential: a `cwk_` key minted on the host with
 # `cortex-worker-key issue --owner <clerk_user_id>`. Empty here so it must be

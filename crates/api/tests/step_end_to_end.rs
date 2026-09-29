@@ -324,6 +324,7 @@ async fn a_dispatched_step_can_reach_its_model_and_is_told_about_the_repository(
         provider_egress,
         provider_gateway: None,
         context,
+        repo: None,
     };
 
     let job = cortex_worker::executor::build_job_for_test(&step, &task, &decision);
@@ -380,6 +381,42 @@ async fn a_dispatched_step_can_reach_its_model_and_is_told_about_the_repository(
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_dispatched_step_names_its_repository_and_an_old_frame_still_parses() {
+    let repo = real_repository();
+    let (app, state) = test_app(repo.path()).await;
+    let base_url = serve_app(app.clone()).await;
+
+    let (_sink, mut stream) = connect_worker(&base_url, issue_worker_key(&state)).await;
+    let _run_id = create_run(&app, "make the arithmetic in src/lib.rs correct").await;
+    let frame = first_execute_step(&mut stream).await;
+
+    // The frame names the run's repository and the commit to start from.
+    let BrainMessage::ExecuteStep {
+        repo_key,
+        base_commit,
+        ..
+    } = &frame
+    else {
+        unreachable!("first_execute_step only returns ExecuteStep")
+    };
+    let repo_key = repo_key.clone().expect("the frame carries the repo_key");
+    assert!(
+        repo_key.starts_with("local:"),
+        "a non-production run without a GitHub repository works on a local one: {repo_key}"
+    );
+    assert!(base_commit.is_some(), "the frame carries the base commit");
+
+    // A frame from a brain that predates the field still parses.
+    let mut value = serde_json::to_value(&frame).unwrap();
+    value.as_object_mut().unwrap().remove("repo_key");
+    let old: BrainMessage = serde_json::from_value(value).expect("old frame parses");
+    let BrainMessage::ExecuteStep { repo_key, .. } = old else {
+        unreachable!()
+    };
+    assert!(repo_key.is_none());
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_repository_with_no_manifest_still_reaches_its_model() {
     // The two grants are independent, and this is the direction that would be
     // easy to get wrong: a repository with nothing to resolve must still be
@@ -388,6 +425,18 @@ async fn a_repository_with_no_manifest_still_reaches_its_model() {
     let tmp = tempfile::tempdir().expect("temp dir");
     std::fs::create_dir_all(tmp.path().join(".cortex")).unwrap();
     std::fs::write(tmp.path().join("README.md"), "no manifests here\n").unwrap();
+    for args in [
+        vec!["init", "--quiet"],
+        vec!["config", "user.email", "test@example.com"],
+        vec!["config", "user.name", "Cortex Test"],
+        vec!["add", "README.md"],
+        vec!["commit", "--quiet", "-m", "initial"],
+    ] {
+        let _ = std::process::Command::new("git")
+            .args(&args)
+            .current_dir(tmp.path())
+            .output();
+    }
 
     let (app, state) = test_app(tmp.path()).await;
     let base_url = serve_app(app.clone()).await;
@@ -702,6 +751,7 @@ async fn cortex_completes_one_real_task_end_to_end() {
         provider_egress,
         provider_gateway: None,
         context,
+        repo: None,
     };
 
     let (tx, mut rx) = tokio::sync::mpsc::channel::<cortex_worker::stream::WorkerEvent>(64);
@@ -1036,6 +1086,7 @@ async fn drive_one_stubbed_task(scenario: &str) -> StubbedRun {
         provider_egress,
         provider_gateway: None,
         context,
+        repo: None,
     };
 
     let (tx, mut rx) = tokio::sync::mpsc::channel::<cortex_worker::stream::WorkerEvent>(64);

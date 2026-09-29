@@ -17,6 +17,7 @@ use cortex_core::task::TaskContract;
 use tokio::sync::mpsc;
 
 use crate::sandbox::{OutputStream, SandboxExit, SandboxRequest, SandboxRunner};
+use crate::repo_transport::{self, StepRepo, UploadError};
 use crate::stream::WorkerEvent;
 use crate::worktree;
 
@@ -67,6 +68,13 @@ pub struct StepExecution {
     /// reaches a model, and it must arrive already typed as data rather than as
     /// instructions.
     pub context: StepContext,
+    /// The run's repository, when the brain named one: the step's worktree is
+    /// then created in the worker's cache repository for that `repo_key`, at
+    /// exactly `base_commit`, and the commits it makes are uploaded to the
+    /// brain before the step is reported complete. `None` (an older brain, or
+    /// a step with no repository) keeps the worktree in the repository the
+    /// worker was started in.
+    pub repo: Option<StepRepo>,
 }
 
 /// How the provider was invoked, and what the backend did with the effort
@@ -129,7 +137,19 @@ impl Executor {
 
         // An isolated worktree is required, not attempted. There is no
         // fallback to `working_dir`.
-        let mut worktree_guard = match worktree::create_worktree(working_dir, &step.step_id) {
+        let worktree_result = match &step.repo {
+            Some(repo) => match repo_transport::ensure_base(repo, &step.step_id).await {
+                Ok(cache) => worktree::create_worktree_at(
+                    &cache,
+                    working_dir,
+                    &step.step_id,
+                    &repo.base_commit,
+                ),
+                Err(e) => Err(CortexError::WorkerExecution(e)),
+            },
+            None => worktree::create_worktree(working_dir, &step.step_id),
+        };
+        let mut worktree_guard = match worktree_result {
             Ok(guard) => guard,
             Err(e) => {
                 let blocked = Blocked::new(
@@ -508,6 +528,49 @@ impl Executor {
                 };
                 tx.send(event).await.ok();
                 return Ok(code);
+            }
+
+            // The brain verifies the commit from its own repository, so the
+            // commits go there BEFORE the step is reported complete. A bundle
+            // the brain refuses is a bad delivery (the step fails); a brain
+            // or network that could not take it says nothing about the work
+            // (the step is blocked).
+            if let (Some(repo), Some(guard), Some(base), Some(head)) = (
+                step.repo.as_ref(),
+                worktree_guard.as_ref(),
+                base_commit.as_deref(),
+                head_commit.as_deref(),
+            ) {
+                if let Err(e) =
+                    repo_transport::upload_head(repo, &step.step_id, guard.repo_root(), base, head)
+                        .await
+                {
+                    tracing::warn!(step_id = %step.step_id, error = %e, "head upload failed");
+                    let event = match e {
+                        UploadError::Rejected(detail) => WorkerEvent::Failed {
+                            step_id: step.step_id.clone(),
+                            attempt_id: step.attempt_id.clone(),
+                            lease_gen: step.lease_gen,
+                            failure: WorkerFailureReport {
+                                kind: cortex_core::failure::WorkerFailureKind::Unknown,
+                                exit_code: Some(code),
+                                stderr_excerpt: Some(detail),
+                                tool: Some(decision.provider.cli_name().to_string()),
+                            },
+                        },
+                        UploadError::Unavailable(detail) => WorkerEvent::Blocked {
+                            step_id: step.step_id.clone(),
+                            attempt_id: step.attempt_id.clone(),
+                            lease_gen: step.lease_gen,
+                            blocked: Blocked::new(
+                                BlockedReason::WorktreeUnavailable,
+                                format!("could not deliver the step's commits to the brain: {detail}"),
+                            ),
+                        },
+                    };
+                    tx.send(event).await.ok();
+                    return Ok(code);
+                }
             }
 
             let git_evidence = effective_dir.and_then(|dir| {
@@ -1910,6 +1973,7 @@ mod tests {
             provider_egress: EgressPlan::deny(),
             provider_gateway: None,
             context: StepContext::default(),
+            repo: None,
         }
     }
 

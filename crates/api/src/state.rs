@@ -643,6 +643,7 @@ impl AppState {
                 lease_deadline_ms,
                 workspace_id: "default".to_string(),
                 base_commit: None,
+                repo_key: None,
                 allowed_paths: vec![],
                 task,
                 decision,

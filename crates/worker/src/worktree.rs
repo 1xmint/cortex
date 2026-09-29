@@ -32,6 +32,12 @@ impl WorktreeGuard {
         &self.worktree_path
     }
 
+    /// The repository this worktree belongs to (the worker's cache repository
+    /// for a run's `repo_key`, or the repository the worker was started in).
+    pub fn repo_root(&self) -> &Path {
+        &self.repo_root
+    }
+
     /// Returns the branch name created for this worktree (e.g. `cortex/step/{step_id}`).
     pub fn branch_name(&self) -> &str {
         &self.branch_name
@@ -295,6 +301,78 @@ pub fn create_worktree(workspace_dir: &Path, step_id: &str) -> Result<WorktreeGu
     })
 }
 
+/// Create an isolated worktree for a step at exactly `base_commit`, in the
+/// cache repository `repo` (bare; see `repo_transport`).
+///
+/// The worktree lives under `{workspace_dir}/.cortex/worktrees/{step_id}` like
+/// the one `create_worktree` makes. A step id is reused by each retry of a
+/// step, so a leftover worktree directory and branch from an earlier attempt
+/// are cleared first rather than failing the retry.
+pub fn create_worktree_at(
+    repo: &Path,
+    workspace_dir: &Path,
+    step_id: &str,
+    base_commit: &str,
+) -> Result<WorktreeGuard, CortexError> {
+    let worktree_path = workspace_dir
+        .join(".cortex")
+        .join("worktrees")
+        .join(step_id);
+    let branch_name = format!("cortex/step/{step_id}");
+
+    if let Some(parent) = worktree_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| {
+            CortexError::WorkerExecution(format!(
+                "failed to create worktree parent dir {}: {e}",
+                parent.display()
+            ))
+        })?;
+    }
+    if worktree_path.exists() {
+        std::fs::remove_dir_all(&worktree_path).map_err(|e| {
+            CortexError::WorkerExecution(format!(
+                "failed to clear the old worktree {}: {e}",
+                worktree_path.display()
+            ))
+        })?;
+    }
+    let _ = Command::new("git")
+        .current_dir(repo)
+        .args(["worktree", "prune"])
+        .output();
+
+    // `-B` resets a branch left over from an earlier attempt of this step.
+    let add_output = Command::new("git")
+        .current_dir(repo)
+        .args(["worktree", "add", "-B", &branch_name])
+        .arg(&worktree_path)
+        .arg(base_commit)
+        .output()
+        .map_err(|e| CortexError::WorkerExecution(format!("git worktree add failed: {e}")))?;
+
+    if !add_output.status.success() {
+        let stderr = String::from_utf8_lossy(&add_output.stderr);
+        return Err(CortexError::WorkerExecution(format!(
+            "git worktree add failed: {stderr}"
+        )));
+    }
+
+    tracing::info!(
+        worktree = %worktree_path.display(),
+        branch = %branch_name,
+        base = %base_commit,
+        "created isolated worktree for step at the run's base commit"
+    );
+
+    Ok(WorktreeGuard {
+        worktree_path,
+        branch_name,
+        repo_root: repo.to_path_buf(),
+        cleaned: false,
+        keep_branch: false,
+    })
+}
+
 /// Collect git-derived evidence for a completed worker step.
 ///
 /// Returns `None` when `working_dir` is not inside a git worktree. Changed
@@ -425,6 +503,57 @@ fn parse_status_porcelain_paths(status: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn git(dir: &Path, args: &[&str]) -> String {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+            .args(args)
+            .output()
+            .expect("git runs");
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// The step's worktree starts at the commit the brain named, not at
+    /// whatever the cache repository's HEAD or the worker's cwd happens to be.
+    #[test]
+    fn worktree_is_created_at_the_named_base_commit() {
+        let root = std::env::temp_dir().join(format!("cortex-wt-test-{}", uuid::Uuid::new_v4()));
+        let src = root.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        git(&src, &["init", "--quiet", "-b", "main"]);
+        std::fs::write(src.join("a.txt"), "one").unwrap();
+        git(&src, &["add", "-A"]);
+        git(&src, &["commit", "--quiet", "-m", "first"]);
+        let first = git(&src, &["rev-parse", "HEAD"]);
+        std::fs::write(src.join("a.txt"), "two").unwrap();
+        git(&src, &["commit", "--quiet", "-am", "second"]);
+        let cache = root.join("cache.git");
+        git(&root, &["clone", "--quiet", "--bare", "src", "cache.git"]);
+        let work = root.join("work");
+        std::fs::create_dir_all(&work).unwrap();
+
+        let mut guard = create_worktree_at(&cache, &work, "step-1", &first).unwrap();
+        assert_eq!(git(guard.path(), &["rev-parse", "HEAD"]), first);
+        assert_eq!(
+            std::fs::read_to_string(guard.path().join("a.txt")).unwrap(),
+            "one"
+        );
+        assert_eq!(guard.repo_root(), cache.as_path());
+        guard.cleanup().unwrap();
+
+        // A retry of the same step reuses the id and the earlier branch.
+        let mut retry = create_worktree_at(&cache, &work, "step-1", &first).unwrap();
+        assert_eq!(git(retry.path(), &["rev-parse", "HEAD"]), first);
+        retry.cleanup().unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn branch_name_format() {

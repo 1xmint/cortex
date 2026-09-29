@@ -174,6 +174,16 @@ impl Database {
     }
 }
 
+/// A leased step as the worker-transport routes see it
+/// (see [`Database::step_transport_info`]).
+#[derive(Debug, Clone)]
+pub struct StepTransportInfo {
+    pub run_id: String,
+    pub lease_gen: i64,
+    pub attempt_id: String,
+    pub worker_id: String,
+}
+
 // --- Conversation types (existing) ---
 
 #[derive(Debug, Serialize, Clone)]
@@ -12221,6 +12231,75 @@ impl Database {
                     |_| Ok(()),
                 )
                 .is_ok(),
+        }
+    }
+
+    /// What the worker-transport routes need to know about a leased step: the
+    /// run it belongs to, the current lease, the server-minted attempt id and
+    /// the worker it is assigned to. `None` when the step does not exist or was
+    /// never leased.
+    pub fn step_transport_info(&self, step_id: &str) -> Option<StepTransportInfo> {
+        let conn = self.conn();
+        conn.query_row(
+            "SELECT run_id, lease_gen, server_attempt_id, assigned_worker
+             FROM steps WHERE id = ?1",
+            params![step_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<i64>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                ))
+            },
+        )
+        .ok()
+        .and_then(|(run_id, lease_gen, attempt_id, worker_id)| {
+            Some(StepTransportInfo {
+                run_id,
+                lease_gen: lease_gen?,
+                attempt_id: attempt_id?,
+                worker_id: worker_id?,
+            })
+        })
+    }
+
+    /// The user a registered worker belongs to.
+    pub fn worker_user_id(&self, worker_id: &str) -> Option<String> {
+        let conn = self.conn();
+        conn.query_row(
+            "SELECT user_id FROM workers WHERE id = ?1",
+            params![worker_id],
+            |row| row.get::<_, String>(0),
+        )
+        .ok()
+    }
+
+    /// When a run reached a terminal status, for the run-repository sweep:
+    /// `Unknown` for a run that is not in the database, `Active` while it
+    /// still is, else the time it finished.
+    pub fn run_life(&self, run_id: &str) -> crate::run_repo::RunLife {
+        use crate::run_repo::RunLife;
+        let conn = self.conn();
+        match conn.query_row(
+            "SELECT status, finished_at, updated_at FROM runs WHERE id = ?1",
+            params![run_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<i64>>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            },
+        ) {
+            Ok((status, finished_at, updated_at)) => {
+                if matches!(status.as_str(), "succeeded" | "failed" | "cancelled") {
+                    RunLife::FinishedAt(finished_at.unwrap_or(updated_at))
+                } else {
+                    RunLife::Active
+                }
+            }
+            Err(_) => RunLife::Unknown,
         }
     }
 

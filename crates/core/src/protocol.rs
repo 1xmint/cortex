@@ -18,6 +18,12 @@ use crate::task::TaskContract;
 // announce a change whose failure mode is already closed.
 pub const PROTOCOL_VERSION: u32 = 3;
 
+/// HTTP header naming the worker on the git-bundle transport routes
+/// (`/api/worker/steps/{step_id}/base.bundle` and `head.bundle`). It is
+/// checked against the bearer credential's owner and the step's lease, so it
+/// is a claim, never a credential.
+pub const WORKER_ID_HEADER: &str = "x-cortex-worker-id";
+
 // --- Brain → Worker ---
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -36,6 +42,14 @@ pub enum BrainMessage {
         lease_deadline_ms: i64,
         workspace_id: String,
         base_commit: Option<String>,
+        /// The run's repository (`owner/repo`, or `local:<path>` outside
+        /// production). The worker keys its local repository cache on it and
+        /// fetches `base_commit` from the brain as a git bundle (see
+        /// `GET /api/worker/steps/{step_id}/base.bundle`); it never holds a
+        /// GitHub token. `serde(default)`: an old brain does not send it, and a
+        /// worker then falls back to the repository it was started in.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        repo_key: Option<String>,
         allowed_paths: Vec<String>,
         task: TaskContract,
         decision: RoutingDecision,

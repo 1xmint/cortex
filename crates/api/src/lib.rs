@@ -40,6 +40,7 @@ mod ratelimit;
 pub mod replit;
 pub mod routes;
 mod run_payload;
+pub mod run_repo;
 mod run_stream;
 pub mod scheduler;
 #[cfg(feature = "soma")]
@@ -71,6 +72,7 @@ mod user;
 mod validate;
 pub mod vera;
 pub mod worker_key;
+pub mod worker_transport;
 mod ws;
 
 pub use api_error::ApiError;
@@ -584,6 +586,14 @@ pub fn build_cortex_router(state: Arc<AppState>) -> Router {
         .route("/api/stripe/webhook", post(billing::stripe_webhook))
         .route("/api/usage", get(usage_api::get_usage))
         .route("/api/usage/daily", get(usage_api::get_daily_usage))
+        .route(
+            "/api/worker/steps/{step_id}/base.bundle",
+            get(worker_transport::get_base_bundle),
+        )
+        .route(
+            "/api/worker/steps/{step_id}/head.bundle",
+            put(worker_transport::put_head_bundle),
+        )
         .route("/api/ws", get(ws::ws_handler))
         .route("/api/mc", get(mission_control::mc_handler))
         .route("/api/mc/snapshot", get(mission_control::mc_snapshot))

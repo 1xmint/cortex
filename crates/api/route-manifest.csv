@@ -89,6 +89,8 @@ cortex,POST,/api/voice/live/sessions
 cortex,DELETE,/api/voice/live/sessions/{id}
 cortex,GET,/api/voice/live/sessions/{id}/events
 cortex,POST,/api/voice/live/sessions/{id}/prompt-ended
+cortex,GET,/api/worker/steps/{step_id}/base.bundle
+cortex,PUT,/api/worker/steps/{step_id}/head.bundle
 cortex,GET,/api/ws
 cortex,POST,/internal/provider/v1/messages
 duplicate,GET,/api/admin/audit-log
