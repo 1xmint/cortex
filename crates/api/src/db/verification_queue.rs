@@ -12,6 +12,16 @@
 
 use super::*;
 
+/// How many claims a job may burn while the step's ending cannot be recorded
+/// and the step has not moved on, before the job is retired anyway.
+///
+/// Twice `VERIFICATION_MAX_ATTEMPTS`: the first `VERIFICATION_MAX_ATTEMPTS`
+/// are the normal budget, the second is the grace for a transient database
+/// error. Past it the failure is not transient -- a run with no owner makes
+/// `transition_verification` roll back every time -- and looping forever
+/// would just hide it.
+const VERIFICATION_ENDING_GIVE_UP_ATTEMPTS: i64 = VERIFICATION_MAX_ATTEMPTS * 2;
+
 impl Database {
     /// Enqueue a verification job **inside** an existing transaction.
     ///
@@ -156,10 +166,10 @@ impl Database {
         // marking the job dead first could leave a stuck step with no
         // billing decision ever recorded for it if the process died before
         // the second write landed.
-        let dying: Vec<(String, String, String, i64)> = {
+        let dying: Vec<(String, String, String, i64, i64)> = {
             let conn = self.conn();
             let mut stmt = match conn.prepare(
-                "SELECT job_id, step_id, attempt_id, lease_gen
+                "SELECT job_id, step_id, attempt_id, lease_gen, attempt_count
                  FROM verification_jobs
                  WHERE state = 'claimed' AND lease_expires_at <= ?1
                    AND attempt_count >= ?2",
@@ -168,14 +178,14 @@ impl Database {
                 Err(_) => return 0,
             };
             stmt.query_map(params![now, VERIFICATION_MAX_ATTEMPTS], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?))
             })
             .map(|rows| rows.filter_map(|r| r.ok()).collect())
             .unwrap_or_default()
         };
 
         let mut dead = 0;
-        for (job_id, step_id, attempt_id, lease_gen) in &dying {
+        for (job_id, step_id, attempt_id, lease_gen, attempt_count) in &dying {
             let ended = self.record_execution_failure_and_end(
                 step_id,
                 attempt_id,
@@ -202,13 +212,39 @@ impl Database {
                      dead-letter -- likely stale lease_gen"
                 );
                 // Retire the job only if the step has genuinely moved on
-                // (a stale lease_gen: something else already ended it). If
-                // the transition failed on a database error the step is
-                // still `verifying` and its attempt has no ending yet;
-                // burying the job now would strand it with nothing left to
-                // retry the ending. Leave it claimed for the next reclaim.
-                if self.get_step_status(step_id).as_deref() == Some("verifying") {
-                    continue;
+                // (a stale lease_gen: something else already ended it), which
+                // means a status that was READ and is not `verifying`. A
+                // status that could not be read (`None`: a database error, or
+                // no such step) proves nothing, and neither does `verifying`:
+                // the attempt has no ending yet, so burying the job would
+                // strand it with nothing left to retry the ending. Leave it
+                // claimed for the next reclaim -- but not forever: a run with
+                // no owner makes the transition roll back every time, so each
+                // pass counts against a give-up cap.
+                let moved_on = matches!(
+                    self.get_step_status(step_id).as_deref(),
+                    Some(s) if s != "verifying"
+                );
+                if !moved_on {
+                    if *attempt_count < VERIFICATION_ENDING_GIVE_UP_ATTEMPTS {
+                        let _ = self.conn().execute(
+                            "UPDATE verification_jobs
+                             SET attempt_count = attempt_count + 1,
+                                 updated_at = ?1, version = version + 1
+                             WHERE job_id = ?2 AND state = 'claimed'",
+                            params![now, job_id],
+                        );
+                        continue;
+                    }
+                    tracing::error!(
+                        job_id = %job_id,
+                        step_id = %step_id,
+                        attempt_id = %attempt_id,
+                        attempt_count = *attempt_count,
+                        "giving up on recording the ending for a dead-lettered \
+                         verification job; the attempt has NO ending row and must \
+                         be reconciled by hand"
+                    );
                 }
             }
             let updated = self
@@ -256,19 +292,19 @@ impl Database {
         // its ending recorded as `CortexCrash` (absorbed) before the job
         // itself is marked dead, rather than leaving the step stranded in
         // `verifying` with no billing decision ever recorded for it.
-        let dying: Option<(String, String, i64)> = self
+        let dying: Option<(String, String, i64, i64)> = self
             .conn()
             .query_row(
-                "SELECT step_id, attempt_id, lease_gen
+                "SELECT step_id, attempt_id, lease_gen, attempt_count
                  FROM verification_jobs
                  WHERE job_id = ?1 AND state = 'claimed' AND claim_token = ?2
                    AND attempt_count >= ?3",
                 params![job_id, claim_token, VERIFICATION_MAX_ATTEMPTS],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .ok();
 
-        if let Some((step_id, attempt_id, lease_gen)) = &dying {
+        if let Some((step_id, attempt_id, lease_gen, attempt_count)) = &dying {
             let ended = self.record_execution_failure_and_end(
                 step_id,
                 attempt_id,
@@ -279,10 +315,30 @@ impl Database {
             );
             // Bury the job only if the ending was recorded, or the step has
             // genuinely left `verifying` (a stale lease_gen: something else
-            // already ended it). A database error leaves the step
-            // `verifying` with no ending; retiring the job then would strand
-            // the attempt, so fall through and leave it for a later retry.
-            let may_retire = ended || self.get_step_status(step_id).as_deref() != Some("verifying");
+            // already ended it) -- a status that was READ and is not
+            // `verifying`. A database error leaves the step `verifying`, or
+            // its status unreadable (`None`), with no ending; retiring the
+            // job then would strand the attempt, so fall through and leave it
+            // for a later retry. The give-up cap bounds that retry loop: each
+            // retry re-claims the job and bumps `attempt_count`.
+            let moved_on = matches!(
+                self.get_step_status(step_id).as_deref(),
+                Some(s) if s != "verifying"
+            );
+            let give_up =
+                !ended && !moved_on && *attempt_count >= VERIFICATION_ENDING_GIVE_UP_ATTEMPTS;
+            if give_up {
+                tracing::error!(
+                    job_id = %job_id,
+                    step_id = %step_id,
+                    attempt_id = %attempt_id,
+                    attempt_count = *attempt_count,
+                    "giving up on recording the ending for a retry-exhausted \
+                     verification job; the attempt has NO ending row and must be \
+                     reconciled by hand"
+                );
+            }
+            let may_retire = ended || moved_on || give_up;
             if ended {
                 if let Err(e) = self.settle_pending_attempts() {
                     tracing::error!(
@@ -973,6 +1029,110 @@ mod verifier {
             settled_at.is_some(),
             "settle_pending_attempts is called inline and must mark the row settled"
         );
+    }
+
+    /// Break the step's ownership the way a lost row would: with foreign keys
+    /// off, drop either the run (the step is still readable, still
+    /// `verifying`, but `transition_verification` finds no owner and rolls
+    /// back) or the step itself (its status is unreadable, `None`).
+    fn orphan(db: &Database, run_id: &str, step_id: &str, drop_step: bool) {
+        let conn = db.conn();
+        conn.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
+        if drop_step {
+            conn.execute("DELETE FROM steps WHERE id = ?1", params![step_id])
+                .unwrap();
+        } else {
+            conn.execute("DELETE FROM runs WHERE id = ?1", params![run_id])
+                .unwrap();
+        }
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+    }
+
+    /// A job whose ending can never be recorded: exhaust the normal attempts
+    /// through reclaim, then keep sweeping.
+    fn reclaim_orphaned_job_until_dead(drop_step: bool) {
+        let db = test_db();
+        let (run_id, gen) = delivered_step(&db, "step-1");
+        let digest = spec_set_digest(&[spec("c1")]);
+        assert!(db.begin_verifying_step(
+            "step-1",
+            "a1",
+            gen,
+            Some(enqueue(&run_id, "job-1", &digest))
+        ));
+        orphan(&db, &run_id, "step-1", drop_step);
+
+        for _ in 0..VERIFICATION_MAX_ATTEMPTS {
+            db.claim_verification_job("dispatcher-a")
+                .expect("claimable");
+            expire_claim(&db, "job-1");
+            db.reclaim_expired_verification_jobs();
+        }
+        assert_eq!(
+            db.get_verification_job("job-1").unwrap().state,
+            "claimed",
+            "an ending that could not be recorded must not retire the job at the              normal attempt limit: the attempt would be left with no billing decision"
+        );
+        assert!(ending_row(&db, "a1").is_none());
+
+        // The give-up cap: not endless, and not early.
+        let mut sweeps = 0;
+        while db.get_verification_job("job-1").unwrap().state == "claimed" {
+            sweeps += 1;
+            assert!(
+                sweeps <= VERIFICATION_ENDING_GIVE_UP_ATTEMPTS * 2,
+                "a run with no owner must not be swept forever"
+            );
+            db.reclaim_expired_verification_jobs();
+        }
+        let job = db.get_verification_job("job-1").unwrap();
+        assert_eq!(job.state, "dead");
+        assert_eq!(
+            job.attempt_count, VERIFICATION_ENDING_GIVE_UP_ATTEMPTS,
+            "the job is retired exactly at the give-up cap"
+        );
+    }
+
+    #[test]
+    fn reclaim_does_not_retire_a_job_whose_step_has_no_owner_until_the_cap() {
+        reclaim_orphaned_job_until_dead(false);
+    }
+
+    #[test]
+    fn reclaim_does_not_retire_a_job_whose_step_status_is_unreadable_until_the_cap() {
+        // `get_step_status` returning None is a failed read, not proof that
+        // the step moved on.
+        reclaim_orphaned_job_until_dead(true);
+    }
+
+    #[test]
+    fn retry_does_not_retire_a_job_whose_step_status_is_unreadable_until_the_cap() {
+        let db = test_db();
+        let (run_id, gen) = delivered_step(&db, "step-1");
+        let digest = spec_set_digest(&[spec("c1")]);
+        assert!(db.begin_verifying_step(
+            "step-1",
+            "a1",
+            gen,
+            Some(enqueue(&run_id, "job-1", &digest))
+        ));
+        orphan(&db, &run_id, "step-1", true);
+
+        for claims in 1..=VERIFICATION_ENDING_GIVE_UP_ATTEMPTS {
+            db.claim_verification_job("dispatcher-a")
+                .expect("claimable");
+            db.retry_verification_job("job-1", "dispatcher-a", 0);
+            let state = db.get_verification_job("job-1").unwrap().state;
+            if claims < VERIFICATION_ENDING_GIVE_UP_ATTEMPTS {
+                assert_eq!(
+                    state, "retry_wait",
+                    "claim {claims}: an unreadable step status must not retire the job"
+                );
+            } else {
+                assert_eq!(state, "dead", "the give-up cap bounds the retry loop");
+            }
+        }
+        assert!(ending_row(&db, "a1").is_none());
     }
 
     /// Force a claim's lease into the past, standing in for a dispatcher that

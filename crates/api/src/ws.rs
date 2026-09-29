@@ -631,12 +631,13 @@ async fn handle_worker_msg(
                             // difference is who pays:
                             //
                             // - `Missing` (a healthy repository that does
-                            //   not hold the commit): the worker's own
-                            //   delivery is broken -- charged.
-                            // - `CheckFailed` (git would not start, the
-                            //   workspace is not a healthy repository, a
-                            //   lock or permission error): Cortex's own
-                            //   machinery -- absorbed as `CortexCrash`.
+                            //   not hold the commit, or a reported string
+                            //   that is not an object id at all): the
+                            //   worker's own delivery is broken -- charged.
+                            // - `CheckFailed` (git would not start, or the
+                            //   workspace is not a repository git can open):
+                            //   Cortex's own machinery -- absorbed as
+                            //   `CortexCrash`.
                             // - `Resolves`: on to verification.
                             //
                             // Run on the blocking pool: it shells out to git
@@ -884,7 +885,10 @@ async fn handle_worker_msg(
                             // transition the step at all: a plain `fail_step`
                             // would terminate it with no attempt ending, so
                             // the attempt's cost would go unrecorded. Left
-                            // alone, lease expiry records the ending.
+                            // alone. When the run lookup failure is transient
+                            // the lease expiring later records the ending; a run
+                            // that is permanently unresolvable is not recovered
+                            // by that.
                             tracing::error!(
                                 step_id = %step_id,
                                 attempt_id = %attempt_id,
@@ -1222,7 +1226,9 @@ async fn handle_worker_msg(
                         // the step at all: a plain `fail_step` /
                         // `cancel_step` would terminate it with no attempt
                         // ending, so the attempt's cost would go unrecorded.
-                        // Left alone, lease expiry records the ending.
+                        // Left alone. When the run lookup failure is transient,
+                        // lease expiry later records the ending; a run that is
+                        // permanently unresolvable is not recovered by that.
                         tracing::error!(
                             step_id = %step_id,
                             attempt_id = %attempt_id,
@@ -2433,6 +2439,20 @@ mod attempt_end_paths {
         .ok()
     }
 
+    /// The diagnostic the step's lifecycle row was left with, so a test can
+    /// say which branch of the delivery handler actually ran.
+    fn terminal_reason(state: &AppState, step_id: &str, attempt_id: &str) -> String {
+        let db = state.db.as_ref().expect("database");
+        let conn = db.conn();
+        conn.query_row(
+            "SELECT terminal_reason FROM step_verification_state
+             WHERE step_id = ?1 AND attempt_id = ?2",
+            rusqlite::params![step_id, attempt_id],
+            |row| row.get::<_, String>(0),
+        )
+        .expect("the failed delivery leaves a terminal reason")
+    }
+
     fn failure(kind: WorkerFailureKind) -> WorkerFailureReport {
         WorkerFailureReport {
             kind,
@@ -3177,6 +3197,36 @@ mod attempt_end_paths {
         .await;
 
         assert_charged_three_credits(&state, "attempt-head-none");
+        assert!(
+            terminal_reason(&state, &step_id, "attempt-head-none")
+                .contains("delivered with no resolvable run or head commit"),
+            "the head=None branch must be the one that ran"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_head_commit_that_cannot_be_an_object_id_is_charged() {
+        // The worker controls this string. A NUL byte would make git's spawn
+        // fail, which looks exactly like Cortex's own fault; it must not buy a
+        // free attempt.
+        let state = state().await;
+        git_in(&state.workspace_dir, &["init"]);
+        let (worker_id, step_id, lease_gen) =
+            running_step_with_settled_call(&state, "attempt-head-nul");
+
+        deliver(
+            &state,
+            &worker_id,
+            completed_message(&step_id, "attempt-head-nul", lease_gen, Some("0\u{0}")),
+        )
+        .await;
+
+        assert_charged_three_credits(&state, "attempt-head-nul");
+        assert!(
+            terminal_reason(&state, &step_id, "attempt-head-nul")
+                .contains("does not resolve in the workspace repository"),
+            "the unresolvable-head branch must be the one that ran"
+        );
     }
 
     #[tokio::test]
@@ -3244,6 +3294,11 @@ mod attempt_end_paths {
         .await;
 
         assert_absorbed(&state, "attempt-enqueue-fails");
+        assert!(
+            terminal_reason(&state, &step_id, "attempt-enqueue-fails")
+                .contains("could not enqueue delivery for verification"),
+            "the enqueue-failed branch must be the one that ran"
+        );
         assert_eq!(
             state
                 .db
