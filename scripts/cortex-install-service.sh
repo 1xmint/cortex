@@ -11,16 +11,23 @@ CORTEX_PORT="${CORTEX_PORT:-3001}"
 CORTEX_LEDGER="${CORTEX_LEDGER:-/var/lib/cortex/ledger.jsonl}"
 
 CORTEX_ENV="${CORTEX_ENV:-/etc/cortex/cortex.env}"
+CORTEX_WORKSPACE_DIR="${CORTEX_WORKSPACE_DIR:-/home/$CORTEX_USER/claw-net}"
 
 sudo mkdir -p /var/lib/cortex
 sudo chown "$CORTEX_USER:$CORTEX_USER" /var/lib/cortex
 sudo mkdir -p /var/www/cortex
 sudo mkdir -p "$(dirname "$CORTEX_ENV")"
 
+# The server refuses to boot unless its workspace is a git repository
+# (require_workspace_repository). Idempotent: git init on an existing
+# repository only reinitializes it.
+sudo -u "$CORTEX_USER" mkdir -p "$CORTEX_WORKSPACE_DIR"
+sudo -u "$CORTEX_USER" git -C "$CORTEX_WORKSPACE_DIR" init -q
+
 if [ ! -f "$CORTEX_ENV" ]; then
   cat <<ENVEOF | sudo tee "$CORTEX_ENV"
 CORTEX_PORT=$CORTEX_PORT
-CORTEX_WORKSPACE=/home/$CORTEX_USER/claw-net
+CORTEX_WORKSPACE=$CORTEX_WORKSPACE_DIR
 CORTEX_ALLOWED_ORIGINS=https://cortex.heyvera.org
 RUST_LOG=info
 # CORTEX_ENV=production tells the API it is running in production, which is
@@ -54,7 +61,7 @@ Type=simple
 User=$CORTEX_USER
 ExecStart=/usr/local/bin/cortex-server
 EnvironmentFile=$CORTEX_ENV
-WorkingDirectory=/home/$CORTEX_USER/claw-net
+WorkingDirectory=$CORTEX_WORKSPACE_DIR
 Restart=on-failure
 RestartSec=5
 

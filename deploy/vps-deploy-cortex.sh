@@ -58,6 +58,14 @@ rm -rf /opt/cortex/frontend/dist
 cp -r cortex/dist /opt/cortex/frontend/
 chown -R cortex:cortex /opt/cortex/frontend
 
+# The server refuses to boot unless its workspace is a git repository
+# (require_workspace_repository). Idempotent: git init on an existing
+# repository only reinitializes it.
+log_step "🗂️ Ensuring the workspace is a git repository..."
+mkdir -p /opt/cortex/workspace
+chown cortex:cortex /opt/cortex/workspace
+runuser -u cortex -- git -C /opt/cortex/workspace init -q
+
 # Database migrations (if any)
 log_step "🗃️ Running database migrations..."
 # Add DB migration logic here if needed

@@ -186,6 +186,8 @@ async fn main() {
         eprintln!("workspace: {msg}");
         std::process::exit(1);
     }
+    // Best effort: drop verification scratch a killed process left behind.
+    cortex_api::verification_driver::sweep_stale_scratch(&std::env::temp_dir());
 
     let auth_config = match cortex_api::clerk::load_heyvera_auth_config() {
         Ok(config) => config,

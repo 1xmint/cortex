@@ -413,6 +413,17 @@ after migrating.
 
 A few more things worth knowing about this guard before you rely on it:
 
+- **The `cortex-next` workspace is not defined in this repo, and the server
+  refuses to boot without one that is a git repository.** `cortex-api` and
+  `cortex-server` exit at startup unless `$CORTEX_WORKSPACE` (the working
+  directory when unset) contains a `.git` (`require_workspace_repository` in
+  `crates/api/src/state.rs`), because verification reads the delivered commit
+  out of it. `deploy-production.sh`, `vps-deploy-cortex.sh`,
+  `cortex-install-service.sh` and the Docker image create it themselves, but
+  the `cortex-next` user unit and its environment live only on the deploy
+  host, so nothing here does it for that unit. Once, on the deploy host, as
+  the service user: `git -C "$CORTEX_WORKSPACE" init -q` (idempotent), using
+  the path from that unit's environment.
 - **Builds made before `SCHEMA_VERSION` checking landed have no `SCHEMA` file
   at all**, and builds made before this fingerprint check landed have no
   `SCHEMA_FINGERPRINT` / `ROUTING_SCHEMA_FINGERPRINT` files — `deploy-receive.sh`

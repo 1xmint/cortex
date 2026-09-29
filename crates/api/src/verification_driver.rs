@@ -24,7 +24,8 @@
 //! 3. Snapshot the delivered commit into a fresh checkout. Never the worker's
 //!    working directory: the moment a worker can influence its own verdict the
 //!    product claim is void. Git never reads the worker's repository either --
-//!    only its objects, as data, through a Cortex-owned scratch repository.
+//!    only its object files, through a Cortex-owned scratch repository that
+//!    ignores every piece of derived metadata the workspace holds.
 //! 4. Execute, record, compute the verdict, seal it.
 //! 5. Record the attempt's end durably (`attempt_endings`, the single source
 //!    of truth that it ended and why) and settle it: sum its settled observed
@@ -37,6 +38,8 @@
 //! See `cortex/plan/VERIFIER.md` and `cortex/plan/V3-LAUNCH-SPEC.md`.
 
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
 
 use cortex_core::billing_binding::{classify_exam_integrity_failure, AttemptEndCause};
 use cortex_core::check_derivation::EcosystemFacts;
@@ -95,31 +98,35 @@ pub fn runner_image() -> String {
 /// repository.
 ///
 /// Three outcomes, not two, because the difference is who pays. `Missing` is
-/// anything the worker could have caused -- the commit not being there, or the
+/// anything the worker could have caused -- the commit not being there, the
 /// workspace's `.git` being missing, renamed, symlinked, unreadable, corrupt
-/// or of an unsupported format -- and is charged. `CheckFailed` means Cortex
-/// could not find out for a reason the worker cannot have caused: git would not
-/// start, or Cortex could not make its own scratch directory on a filesystem
-/// the worker does not share. That is Cortex's own machinery failing and is
-/// absorbed, never charged.
+/// or of an unsupported format, a scratch directory Cortex could not make (the
+/// worker can fill any disk it can deliver trees to), or git stalling on a
+/// planted object store past its deadline -- and is charged. `CheckFailed`
+/// means Cortex could not find out for a reason the worker cannot have caused:
+/// only that the git binary cannot be spawned. That is Cortex's own machinery
+/// failing and is absorbed, never charged.
 ///
 /// Git never opens the workspace repository. It works in a Cortex-owned
-/// scratch repository and reads the workspace's object store only as data,
-/// through [`ObjectView`], so nothing the worker can write into the workspace
-/// (config, attributes, hooks, the `.git` entry itself) is ever read.
+/// scratch repository and reads the workspace's object files only, through
+/// [`ObjectView`]: the alternate's commit-graph, multi-pack-index and bitmap
+/// metadata are switched off, so nothing the worker can write into the
+/// workspace (config, attributes, hooks, the `.git` entry itself, derived
+/// indexes) is ever read.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum CommitCheck {
     /// The commit exists as a commit object in the workspace's object store.
     Resolves,
     /// The commit is not there as far as Cortex can tell: the object store has
     /// no such commit, cannot be read at all (no `.git`, a renamed or
-    /// symlinked one, a corrupt store), or the reported string is not even a
-    /// well-formed object id. The workspace is worker-writable, so all of
-    /// these are the worker's doing and all are charged.
+    /// symlinked one, a corrupt store, one git stalls on), Cortex's scratch
+    /// directory could not be made, or the reported string is not even a
+    /// well-formed object id. The workspace is worker-writable and so is every
+    /// disk trees are delivered to, so all of these are the worker's doing and
+    /// all are charged.
     Missing,
-    /// Cortex could not determine either way: git would not spawn, or Cortex's
-    /// own scratch directory could not be made on a filesystem the worker does
-    /// not share with the workspace.
+    /// Cortex could not determine either way, and the worker cannot have
+    /// caused it: the git binary would not spawn. Nothing else.
     CheckFailed(String),
 }
 
@@ -138,7 +145,8 @@ enum ViewError {
     /// git could not be started at all.
     Spawn(String),
     /// git started but the scratch repository could not be made: the scratch
-    /// filesystem refused it (full, read-only, unusable).
+    /// filesystem refused it (full, read-only, unusable), or `git init` did
+    /// not finish within its deadline.
     Scratch(String),
 }
 
@@ -150,15 +158,14 @@ impl ViewError {
     }
 
     /// Is this Cortex's fault rather than something the worker could have
-    /// caused? A git that will not spawn always is. A scratch directory that
-    /// cannot be made is only when it lives on a different filesystem than the
-    /// workspace: on the same one, the worker can fill the disk (see
-    /// [`same_filesystem`]).
-    fn blames_cortex(&self, scratch_parent: &Path, workspace_dir: &Path) -> bool {
-        match self {
-            Self::Spawn(_) => true,
-            Self::Scratch(_) => !same_filesystem(scratch_parent, workspace_dir),
-        }
+    /// caused? Only a git that will not spawn is. A scratch directory that
+    /// cannot be made never is, whatever filesystem it lives on: worker-
+    /// delivered trees are written into the temp directory, so the worker can
+    /// fill even a different-device one by delivering concurrently, and "the
+    /// scratch directory is unusable" cannot be told apart from "the worker
+    /// made it unusable". When unsure, charge.
+    fn blames_cortex(&self) -> bool {
+        matches!(self, Self::Spawn(_))
     }
 }
 
@@ -173,9 +180,12 @@ impl ViewError {
 /// Cortex makes a scratch bare repository of its own (empty template: no
 /// hooks, no `info/attributes`, no config beyond git's defaults) and points its
 /// `objects/info/alternates` at `<workspace>/.git/objects`. Git then reads the
-/// worker's objects as data and nothing else: a corrupted, deleted or
-/// missing object is just a commit or tree that is not there, which the callers
-/// charge.
+/// worker's object files and nothing else: the alternate's derived metadata
+/// (commit-graph, multi-pack-index, reachability bitmaps) is as worker-writable
+/// as the objects and is switched off in [`ObjectView::git`]. A corrupted,
+/// deleted or missing object is just a commit or tree that is not there, which
+/// the callers charge, and a store git cannot finish reading is killed at its
+/// deadline (see [`run_git`]) and charged too.
 ///
 /// The scratch directory is removed on drop.
 struct ObjectView {
@@ -184,8 +194,9 @@ struct ObjectView {
 
 impl ObjectView {
     /// Make the scratch repository under `parent` (a fresh uuid-named
-    /// directory) with the workspace's object store as its alternate.
-    fn create(parent: &Path, workspace_dir: &Path) -> Result<Self, ViewError> {
+    /// directory) with the workspace's object store as its alternate. `git
+    /// init` gets `deadline`.
+    fn create(parent: &Path, workspace_dir: &Path, deadline: Duration) -> Result<Self, ViewError> {
         // From here on the directory belongs to the view, so `Drop` cleans up
         // whatever a failed step left behind.
         let view = Self {
@@ -195,9 +206,19 @@ impl ObjectView {
         let mut init = control_git();
         init.args(["init", "--quiet", "--bare", "--template="])
             .arg(&view.git_dir);
-        let out = init.output().map_err(|e| {
-            ViewError::Spawn(format!("could not run git init of the object view: {e}"))
-        })?;
+        let out = match run_git(init, deadline) {
+            Ok(GitRun::Finished(out)) => out,
+            Ok(GitRun::TimedOut) => {
+                return Err(ViewError::Scratch(format!(
+                    "git init of the object view did not finish within {deadline:?}"
+                )));
+            }
+            Err(e) => {
+                return Err(ViewError::Spawn(format!(
+                    "could not run git init of the object view: {e}"
+                )));
+            }
+        };
         if !out.status.success() {
             return Err(ViewError::Scratch(format!(
                 "git init of the object view failed: {}",
@@ -217,9 +238,10 @@ impl ObjectView {
     }
 
     /// A git command that runs in the scratch repository: the environment and
-    /// flags of [`control_git`], plus no lazy fetching, no protocols, and every
-    /// repository-driven side effect switched off. Nothing here names the
-    /// workspace.
+    /// flags of [`control_git`], plus no lazy fetching, no protocols, every
+    /// repository-driven side effect switched off, and none of the derived
+    /// metadata (commit-graph, multi-pack-index, bitmaps) the alternate could
+    /// offer in place of reading objects. Nothing here names the workspace.
     fn git(&self) -> std::process::Command {
         let mut git_dir = std::ffi::OsString::from("--git-dir=");
         git_dir.push(&self.git_dir);
@@ -237,6 +259,12 @@ impl ObjectView {
                 "core.attributesFile=/dev/null",
                 "-c",
                 "safe.directory=*",
+                "-c",
+                "core.commitGraph=false",
+                "-c",
+                "core.multiPackIndex=false",
+                "-c",
+                "pack.useBitmaps=false",
             ])
             .arg(git_dir)
             .env("GIT_NO_LAZY_FETCH", "1");
@@ -252,13 +280,17 @@ impl Drop for ObjectView {
 
 /// Do `scratch_parent` and the workspace live on the same filesystem?
 ///
-/// It decides whether a full scratch disk, or a control failure, can be
-/// Cortex's fault. The worker writes to the workspace filesystem, so when the
-/// scratch directory shares it the worker can fill it, and a failure there is
-/// charged. Only when the scratch directory is on another filesystem is a
-/// failure Cortex's own. The workspace directory itself is compared, not its
-/// `.git`, because `.git` may be gone. When either side cannot be inspected,
-/// or off unix where there is no device id, the answer is `true`: charge.
+/// It decides whether a *refused checkout* ([`TreeCheckout::create_in`]) is
+/// even a candidate for being Cortex's fault. The worker writes to the
+/// workspace filesystem, so when the scratch directory shares it the worker
+/// can fill it, and a refusal there is charged. Only when the scratch
+/// directory is on another filesystem is a control checkout consulted. Making
+/// the scratch repository never consults this at all: worker-delivered trees
+/// are written into the temp directory too, so a scratch directory that cannot
+/// be made is charged everywhere (see [`ViewError::blames_cortex`]). The
+/// workspace directory itself is compared, not its `.git`, because `.git` may
+/// be gone. When either side cannot be inspected, or off unix where there is
+/// no device id, the answer is `true`: charge.
 #[cfg(unix)]
 fn same_filesystem(scratch_parent: &Path, workspace_dir: &Path) -> bool {
     use std::os::unix::fs::MetadataExt as _;
@@ -288,42 +320,49 @@ fn same_filesystem(_scratch_parent: &Path, _workspace_dir: &Path) -> bool {
 /// A commit that is not 40 or 64 hex digits is `Missing` without spawning
 /// anything (see [`is_full_object_id`]).
 ///
-/// `CheckFailed` is returned ONLY when git cannot be spawned, or when Cortex
-/// cannot make its own scratch directory on a filesystem that is not the
-/// workspace's. Everything else is `Missing`, which is charged: the answer
-/// comes from `git cat-file -e {commit}^{commit}` in a Cortex-owned scratch
-/// repository whose only link to the workspace is its object store as an
-/// alternate (see [`ObjectView`]). A workspace whose `.git` is missing,
-/// renamed, symlinked or unreadable, or whose objects are corrupt or gone, has
-/// no such commit as far as git can tell, and the workspace is writable by the
-/// worker: any state of it is something the worker could have put there, so it
-/// must never buy an absorbed attempt.
+/// `CheckFailed` is returned ONLY when git cannot be spawned. Everything else
+/// is `Missing`, which is charged: the answer comes from
+/// `git cat-file -e {commit}^{commit}` in a Cortex-owned scratch repository
+/// whose only link to the workspace is its object store as an alternate (see
+/// [`ObjectView`]). A workspace whose `.git` is missing, renamed, symlinked or
+/// unreadable, or whose objects are corrupt or gone, has no such commit as far
+/// as git can tell, and the workspace is writable by the worker: any state of
+/// it is something the worker could have put there, so it must never buy an
+/// absorbed attempt. The same goes for a scratch directory that cannot be made
+/// (the worker can fill any disk it delivers trees to) and for a git that
+/// outlives its deadline (a planted FIFO where an `alternates` file belongs
+/// blocks git forever): both are `Missing`.
 pub(crate) fn check_commit(workspace_dir: &Path, commit: &str) -> CommitCheck {
-    check_commit_in(&std::env::temp_dir(), workspace_dir, commit)
+    check_commit_in(&std::env::temp_dir(), workspace_dir, commit, GIT_DEADLINES)
 }
 
-/// [`check_commit`] with the scratch directory chosen by the caller.
-fn check_commit_in(parent: &Path, workspace_dir: &Path, commit: &str) -> CommitCheck {
+/// [`check_commit`] with the scratch directory and the deadlines chosen by the
+/// caller.
+fn check_commit_in(
+    parent: &Path,
+    workspace_dir: &Path,
+    commit: &str,
+    deadlines: GitDeadlines,
+) -> CommitCheck {
     if !is_full_object_id(commit) {
         return CommitCheck::Missing;
     }
-    let view = match ObjectView::create(parent, workspace_dir) {
+    let view = match ObjectView::create(parent, workspace_dir, deadlines.quick) {
         Ok(view) => view,
-        Err(e) if e.blames_cortex(parent, workspace_dir) => {
+        Err(e) if e.blames_cortex() => {
             return CommitCheck::CheckFailed(e.message().to_string());
         }
         Err(_) => return CommitCheck::Missing,
     };
-    match view
-        .git()
+    let mut cat_file = view.git();
+    cat_file
         .arg("cat-file")
         .arg("-e")
-        .arg(format!("{commit}^{{commit}}"))
-        .output()
-    {
+        .arg(format!("{commit}^{{commit}}"));
+    match run_git(cat_file, deadlines.quick) {
         Err(e) => CommitCheck::CheckFailed(format!("could not run git cat-file: {e}")),
-        Ok(out) if out.status.success() => CommitCheck::Resolves,
-        Ok(_) => CommitCheck::Missing,
+        Ok(GitRun::Finished(out)) if out.status.success() => CommitCheck::Resolves,
+        Ok(GitRun::Finished(_) | GitRun::TimedOut) => CommitCheck::Missing,
     }
 }
 
@@ -399,6 +438,125 @@ fn has_room(dir: &Path, min_free: u64) -> Result<(), String> {
     }
 }
 
+/// Deadline for the cheap git commands: `init`, `cat-file`, `diff` and the
+/// control's plumbing. Generous on purpose: it bounds a hang, not a slow disk.
+const GIT_QUICK_DEADLINE: Duration = Duration::from_secs(30);
+
+/// Deadline for `git worktree add`, which writes a whole tree.
+const GIT_CHECKOUT_DEADLINE: Duration = Duration::from_secs(300);
+
+/// How long each kind of git child may run before it is killed.
+///
+/// The workspace's object store is worker-writable and git reads it, so a
+/// worker can plant something git blocks on forever (a FIFO where an
+/// `alternates` file belongs) or something enormous. A git that never returns
+/// would hold the blocking pool, and the attempt, hostage. Every git child
+/// therefore runs under a deadline ([`run_git`]), and a child that outlives it
+/// is the worker's doing: charged, never absorbed.
+#[derive(Debug, Clone, Copy)]
+struct GitDeadlines {
+    quick: Duration,
+    checkout: Duration,
+}
+
+const GIT_DEADLINES: GitDeadlines = GitDeadlines {
+    quick: GIT_QUICK_DEADLINE,
+    checkout: GIT_CHECKOUT_DEADLINE,
+};
+
+/// What a git child did under [`run_git`].
+enum GitRun {
+    Finished(std::process::Output),
+    /// Killed at its deadline, or a process it left behind still held its
+    /// output pipes at the deadline.
+    TimedOut,
+}
+
+/// Read one of a child's output pipes to the end on its own thread.
+fn drain_pipe(pipe: Option<impl std::io::Read + Send + 'static>) -> mpsc::Receiver<Vec<u8>> {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        if let Some(mut pipe) = pipe {
+            let _ = pipe.read_to_end(&mut bytes);
+        }
+        let _ = tx.send(bytes);
+    });
+    rx
+}
+
+/// Kill a git child and everything it started (it leads its own process
+/// group, see [`run_git`]), then reap it.
+fn kill_git(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        if let Ok(group) = libc::pid_t::try_from(child.id()) {
+            // SAFETY: `killpg` only sends a signal; it touches no memory of ours.
+            unsafe {
+                libc::killpg(group, libc::SIGKILL);
+            }
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// Run a git command to completion, or kill it at `deadline`.
+///
+/// `Err` only when the process could not be spawned (or waiting on it failed),
+/// which is what "git cannot be run" means. A child that outlives `deadline`
+/// -- or leaves a descendant holding its output pipes past it -- is killed
+/// with its whole process group and reported as [`GitRun::TimedOut`]. The
+/// deadline covers output collection too, so a timed-out run never yields
+/// partial output as if it were complete.
+///
+/// A hand-rolled deadline rather than coreutils `timeout`: with `timeout`, a
+/// missing git binary is an exit status of 127, indistinguishable from git
+/// failing, and a spawn failure is exactly what must stay Cortex's.
+fn run_git(mut command: std::process::Command, deadline: Duration) -> std::io::Result<GitRun> {
+    command
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        command.process_group(0);
+    }
+    let mut child = command.spawn()?;
+    let started = Instant::now();
+    let stdout = drain_pipe(child.stdout.take());
+    let stderr = drain_pipe(child.stderr.take());
+
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if started.elapsed() >= deadline => {
+                kill_git(&mut child);
+                return Ok(GitRun::TimedOut);
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+            Err(e) => {
+                kill_git(&mut child);
+                return Err(e);
+            }
+        }
+    };
+    match (
+        stdout.recv_timeout(deadline.saturating_sub(started.elapsed())),
+        stderr.recv_timeout(deadline.saturating_sub(started.elapsed())),
+    ) {
+        (Ok(stdout), Ok(stderr)) => Ok(GitRun::Finished(std::process::Output {
+            status,
+            stdout,
+            stderr,
+        })),
+        _ => {
+            kill_git(&mut child);
+            Ok(GitRun::TimedOut)
+        }
+    }
+}
+
 /// A `git` command that reads nothing the worker can write: no repository
 /// (callers add one of their own making), hooks, attribute file or fsmonitor,
 /// no system or global configuration, none of the environment variables that
@@ -438,16 +596,44 @@ fn control_git() -> std::process::Command {
     command
 }
 
+/// Why a control git command did not succeed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ControlFailure {
+    /// It did not finish within its deadline: git stalling is not evidence
+    /// that Cortex's machinery is broken, so this is charged.
+    TimedOut(String),
+    /// It could not be run, or ran and failed.
+    Failed(String),
+}
+
+impl ControlFailure {
+    fn message(&self) -> &str {
+        match self {
+            Self::TimedOut(m) | Self::Failed(m) => m,
+        }
+    }
+}
+
 /// Run one control git command; its trimmed stdout, or why it failed.
-fn run_control(mut command: std::process::Command, what: &str) -> Result<String, String> {
-    let out = command
-        .output()
-        .map_err(|e| format!("could not run {what}: {e}"))?;
+fn run_control(
+    command: std::process::Command,
+    what: &str,
+    deadline: Duration,
+) -> Result<String, ControlFailure> {
+    let out = match run_git(command, deadline) {
+        Ok(GitRun::Finished(out)) => out,
+        Ok(GitRun::TimedOut) => {
+            return Err(ControlFailure::TimedOut(format!(
+                "{what} did not finish within {deadline:?}"
+            )));
+        }
+        Err(e) => return Err(ControlFailure::Failed(format!("could not run {what}: {e}"))),
+    };
     if !out.status.success() {
-        return Err(format!(
+        return Err(ControlFailure::Failed(format!(
             "{what} failed: {}",
             String::from_utf8_lossy(&out.stderr).trim()
-        ));
+        )));
     }
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
@@ -464,9 +650,10 @@ fn run_control(mut command: std::process::Command, what: &str) -> Result<String,
 /// asking (the worker can fill that disk, so the control proves nothing).
 ///
 /// `Ok` means git and the checkout filesystem work, so a refusal of the
-/// delivered commit was about the delivered commit. `Err` means they do not,
-/// which is Cortex's own fault.
-fn control_checkout(parent: &Path) -> Result<(), String> {
+/// delivered commit was about the delivered commit. `Err(Failed)` means they
+/// do not, which is Cortex's own fault; `Err(TimedOut)` is charged like any
+/// other stall (see [`GitDeadlines`]).
+fn control_checkout(parent: &Path) -> Result<(), ControlFailure> {
     let scratch = parent.join(format!(
         "cortex-verify-control-repo-{}",
         uuid::Uuid::new_v4()
@@ -479,7 +666,7 @@ fn control_checkout(parent: &Path) -> Result<(), String> {
     result
 }
 
-fn control_checkout_in(scratch: &Path, checkout: &Path) -> Result<(), String> {
+fn control_checkout_in(scratch: &Path, checkout: &Path) -> Result<(), ControlFailure> {
     let in_scratch = || {
         let mut command = control_git();
         command.arg("-C").arg(scratch);
@@ -488,27 +675,27 @@ fn control_checkout_in(scratch: &Path, checkout: &Path) -> Result<(), String> {
 
     let mut init = control_git();
     init.args(["init", "--quiet", "--template="]).arg(scratch);
-    run_control(init, "git init of the control repository")?;
+    run_control(init, "git init of the control repository", GIT_QUICK_DEADLINE)?;
 
     let mut hash = in_scratch();
     hash.args(["hash-object", "-t", "tree", "-w", "--stdin"]);
-    let tree = run_control(hash, "git hash-object")?;
+    let tree = run_control(hash, "git hash-object", GIT_QUICK_DEADLINE)?;
 
     let mut commit = in_scratch();
     commit.args(["commit-tree", &tree, "-m", "cortex control checkout"]);
-    let commit = run_control(commit, "git commit-tree")?;
+    let commit = run_control(commit, "git commit-tree", GIT_QUICK_DEADLINE)?;
 
     // Give the scratch repository a real `HEAD`, so `worktree add` has an
     // ordinary repository to work from.
     let mut head = in_scratch();
     head.args(["update-ref", "HEAD", &commit]);
-    run_control(head, "git update-ref")?;
+    run_control(head, "git update-ref", GIT_QUICK_DEADLINE)?;
 
     let mut add = in_scratch();
     add.args(["worktree", "add", "--detach"])
         .arg(checkout)
         .arg(&commit);
-    run_control(add, "the control git worktree add")?;
+    run_control(add, "the control git worktree add", GIT_CHECKOUT_DEADLINE)?;
     Ok(())
 }
 
@@ -546,7 +733,10 @@ impl TreeCheckout {
     ///
     /// A git that will not spawn is `Cortex` outright. A workspace with no
     /// `.git`, or a broken one, is not a special case: it is a tree git cannot
-    /// read, so it is charged.
+    /// read, so it is charged. So is a commit that is not a full object id
+    /// (it is worker text bound for git's argv), a scratch repository that
+    /// cannot be made on any filesystem, a half-made checkout that cannot be
+    /// removed, and a `git worktree add` that outlives its deadline.
     fn create(workspace_dir: &Path, commit: &str) -> Result<Self, TreeCheckoutError> {
         Self::create_in(
             &std::env::temp_dir(),
@@ -564,36 +754,77 @@ impl TreeCheckout {
         commit: &str,
         min_free: u64,
     ) -> Result<Self, TreeCheckoutError> {
-        let view = ObjectView::create(parent, workspace_dir).map_err(|e| {
-            if e.blames_cortex(parent, workspace_dir) {
+        Self::create_with(parent, workspace_dir, commit, min_free, GIT_DEADLINES)
+    }
+
+    /// [`Self::create_in`] with the git deadlines chosen by the caller.
+    fn create_with(
+        parent: &Path,
+        workspace_dir: &Path,
+        commit: &str,
+        min_free: u64,
+        deadlines: GitDeadlines,
+    ) -> Result<Self, TreeCheckoutError> {
+        if !is_full_object_id(commit) {
+            return Err(TreeCheckoutError::DeliveredTree(
+                "the delivered commit is not a full object id".to_string(),
+            ));
+        }
+        let view = ObjectView::create(parent, workspace_dir, deadlines.quick).map_err(|e| {
+            if e.blames_cortex() {
                 TreeCheckoutError::Cortex(e.message().to_string())
             } else {
                 TreeCheckoutError::DeliveredTree(e.message().to_string())
             }
         })?;
         let path = parent.join(format!("cortex-verify-{}", uuid::Uuid::new_v4()));
-        let out = view
-            .git()
-            .arg("worktree")
+        let mut add = view.git();
+        add.arg("worktree")
             .arg("add")
             .arg("--detach")
             .arg(&path)
-            .arg(commit)
-            .output()
-            .map_err(|e| {
-                TreeCheckoutError::Cortex(format!("could not run git worktree add: {e}"))
-            })?;
-        if !out.status.success() {
-            // Best effort: a refused checkout can leave a half-made directory.
+            .arg(commit);
+        // For the log message only; never classified on.
+        let (timed_out, mut message) = match run_git(add, deadlines.checkout) {
+            Err(e) => {
+                return Err(TreeCheckoutError::Cortex(format!(
+                    "could not run git worktree add: {e}"
+                )));
+            }
+            Ok(GitRun::Finished(out)) if out.status.success() => {
+                return Ok(Self { path, _view: view });
+            }
+            Ok(GitRun::Finished(out)) => (
+                false,
+                format!(
+                    "git worktree add failed: {}",
+                    String::from_utf8_lossy(&out.stderr).trim()
+                ),
+            ),
+            Ok(GitRun::TimedOut) => (
+                true,
+                format!(
+                    "git worktree add did not finish within {:?}",
+                    deadlines.checkout
+                ),
+            ),
+        };
+        {
+            // A refused or killed checkout can leave a half-made directory.
             // Its registration lives in the scratch repository, which goes
-            // with the view.
-            let _ = std::fs::remove_dir_all(&path);
-            // For the log message only; never classified on.
-            let message = format!(
-                "git worktree add failed: {}",
-                String::from_utf8_lossy(&out.stderr).trim()
-            );
-            if same_filesystem(parent, workspace_dir) {
+            // with the view. A leftover that cannot be removed is disk the
+            // worker's tree is holding, so it is the delivered tree's fault,
+            // and no control checkout is run on top of it.
+            if let Err(e) = std::fs::remove_dir_all(&path) {
+                if std::fs::symlink_metadata(&path).is_ok() {
+                    message.push_str(&format!(
+                        "; could not remove the half-made checkout {}: {e}",
+                        path.display()
+                    ));
+                    return Err(TreeCheckoutError::DeliveredTree(message));
+                }
+            }
+            if timed_out || same_filesystem(parent, workspace_dir) {
                 return Err(TreeCheckoutError::DeliveredTree(message));
             }
             if let Err(room) = has_room(parent, min_free) {
@@ -603,12 +834,15 @@ impl TreeCheckout {
             }
             return Err(match control_checkout(parent) {
                 Ok(()) => TreeCheckoutError::DeliveredTree(message),
-                Err(control) => TreeCheckoutError::Cortex(format!(
-                    "{message}; the control checkout failed too: {control}"
+                Err(control @ ControlFailure::TimedOut(_)) => TreeCheckoutError::DeliveredTree(
+                    format!("{message}; the control checkout stalled too: {}", control.message()),
+                ),
+                Err(control @ ControlFailure::Failed(_)) => TreeCheckoutError::Cortex(format!(
+                    "{message}; the control checkout failed too: {}",
+                    control.message()
                 )),
             });
         }
-        Ok(Self { path, _view: view })
     }
 }
 
@@ -618,6 +852,50 @@ impl Drop for TreeCheckout {
         // removes right after this.
         let _ = std::fs::remove_dir_all(&self.path);
     }
+}
+
+/// A scratch directory this old is no attempt's: verification takes seconds
+/// to minutes, so anything a couple of hours old was left by a process that
+/// died mid-verification.
+const STALE_SCRATCH_AGE: Duration = Duration::from_secs(2 * 60 * 60);
+
+/// Best-effort startup sweep of `cortex-verify-*` directories under `parent`
+/// (the temp directory) that a killed process left behind: scratch
+/// repositories, half-made checkouts, control repositories. They hold
+/// worker-delivered trees, so left alone they are disk a worker can consume
+/// across restarts. Only directories older than [`STALE_SCRATCH_AGE`] are
+/// removed, so a second Cortex process sharing the temp directory never loses
+/// a live scratch directory; symlinks are never followed. Returns how many
+/// were removed. Never fails: a sweep that cannot run leaves what it found.
+pub fn sweep_stale_scratch(parent: &Path) -> usize {
+    sweep_stale_scratch_older_than(parent, STALE_SCRATCH_AGE)
+}
+
+fn sweep_stale_scratch_older_than(parent: &Path, age: Duration) -> usize {
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return 0;
+    };
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        if !entry.file_name().to_string_lossy().starts_with("cortex-verify-") {
+            continue;
+        }
+        let Ok(meta) = std::fs::symlink_metadata(entry.path()) else {
+            continue;
+        };
+        if !meta.is_dir() {
+            continue;
+        }
+        let stale = meta
+            .modified()
+            .ok()
+            .and_then(|modified| modified.elapsed().ok())
+            .is_some_and(|elapsed| elapsed >= age);
+        if stale && std::fs::remove_dir_all(entry.path()).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
 }
 
 /// Verify one delivery. Returns the verdict, or `None` if there was nothing to
@@ -1063,14 +1341,20 @@ async fn exam_integrity(db: &Database, facts: &DeliveryFacts) -> ExamIntegrity {
 /// Failure is an explicit unknown-integrity result. It is neither evidence of
 /// tampering nor permission to grade.
 fn changed_paths(workspace_dir: &Path, base: &str, head: &str) -> Result<Vec<String>, String> {
-    let view = ObjectView::create(&std::env::temp_dir(), workspace_dir)
+    let view = ObjectView::create(&std::env::temp_dir(), workspace_dir, GIT_QUICK_DEADLINE)
         .map_err(|e| e.message().to_string())?;
-    let out = view
-        .git()
-        .args(["diff", "--name-only", "--no-renames", "-z", "--no-ext-diff"])
-        .arg(format!("{base}..{head}"))
-        .output()
-        .map_err(|err| format!("could not run git diff: {err}"))?;
+    let mut diff = view.git();
+    diff.args(["diff", "--name-only", "--no-renames", "-z", "--no-ext-diff"])
+        .arg(format!("{base}..{head}"));
+    let out = match run_git(diff, GIT_QUICK_DEADLINE) {
+        Ok(GitRun::Finished(out)) => out,
+        Ok(GitRun::TimedOut) => {
+            return Err(format!(
+                "git diff {base}..{head} did not finish within {GIT_QUICK_DEADLINE:?}"
+            ));
+        }
+        Err(err) => return Err(format!("could not run git diff: {err}")),
+    };
     if !out.status.success() {
         return Err(format!(
             "git diff {base}..{head} failed: {}",
@@ -1087,9 +1371,8 @@ fn changed_paths(workspace_dir: &Path, base: &str, head: &str) -> Result<Vec<Str
 
 /// Is a failed `base..head` diff the delivered tree's doing? True whenever
 /// [`check_commit`] does not say `CheckFailed` for the head -- that is, unless
-/// git would not spawn or Cortex could not make its own scratch directory on a
-/// filesystem the worker does not share, in which case Cortex's own machinery
-/// failed and the attempt is absorbed. A workspace with no `.git`, or a broken
+/// git would not spawn, in which case Cortex's own machinery failed and the
+/// attempt is absorbed. A workspace with no `.git`, or a broken
 /// one, is `Missing` and so charged. Nothing here looks at git's stderr.
 /// Blocking.
 ///
@@ -1098,8 +1381,9 @@ fn changed_paths(workspace_dir: &Path, base: &str, head: &str) -> Result<Vec<Str
 /// Cortex's -- a worker can delete or corrupt any object to make a diff fail,
 /// and an answer that turned on "can the base still be read" could be steered
 /// by exactly that. Git never reads the worker's repository -- only its
-/// objects, as data, through an [`ObjectView`] -- so config, attributes and
-/// hooks cannot steer it either. The cost is that a genuine disk I/O error in
+/// object files, through an [`ObjectView`] that ignores the alternate's
+/// derived metadata -- so config, attributes, hooks and indexes cannot steer
+/// it either. The cost is that a genuine disk I/O error in
 /// the worker-writable store is charged to the customer. The only answer that
 /// cannot be steered is a Cortex-owned copy of the objects, which the
 /// delivery-transport PR provides.
@@ -1969,15 +2253,24 @@ mod tests {
 
     /// A scratch directory on a different filesystem than `workspace`, or
     /// `None` where the machine has no second one to offer (the tests that
-    /// need it then have nothing to check and return early).
+    /// need it then have nothing to check and return early). Under CI there
+    /// must be one: a test that silently checks nothing there would hide a
+    /// regression, so it panics instead.
     #[cfg(unix)]
     fn other_filesystem_scratch(workspace: &Path) -> Option<tempfile::TempDir> {
         use std::os::unix::fs::MetadataExt as _;
 
-        let shm = tempfile::tempdir_in("/dev/shm").ok()?;
-        let scratch_dev = std::fs::metadata(shm.path()).ok()?.dev();
-        let workspace_dev = std::fs::metadata(workspace).ok()?.dev();
-        (scratch_dev != workspace_dev).then_some(shm)
+        let found = tempfile::tempdir_in("/dev/shm").ok().and_then(|shm| {
+            let scratch_dev = std::fs::metadata(shm.path()).ok()?.dev();
+            let workspace_dev = std::fs::metadata(workspace).ok()?.dev();
+            (scratch_dev != workspace_dev).then_some(shm)
+        });
+        assert!(
+            found.is_some() || std::env::var_os("CI").is_none(),
+            "CI must offer a second filesystem at /dev/shm; without it the \
+             other-filesystem tests would silently check nothing"
+        );
+        found
     }
 
     #[test]
@@ -1996,7 +2289,7 @@ mod tests {
             Ok(_) => panic!("git must refuse a tree with a .git entry"),
         }
         assert_eq!(
-            check_commit_in(&file.join("scratch"), &dir, &commit),
+            check_commit_in(&file.join("scratch"), &dir, &commit, GIT_DEADLINES),
             CommitCheck::Missing,
             "an unmakeable scratch directory on the workspace's filesystem is charged"
         );
@@ -2051,7 +2344,10 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn an_unmakeable_scratch_on_another_filesystem_is_cortexs_fault() {
+    fn an_unmakeable_scratch_on_another_filesystem_is_charged() {
+        // Worker-delivered trees are written into the temp directory too, so
+        // even a different-device scratch directory can be filled by the
+        // worker: "unusable" cannot be told apart from "made unusable".
         let (dir, _base, commit) = commit_with_tree_entry(".git");
         let Some(shm) = other_filesystem_scratch(&dir) else {
             return;
@@ -2061,12 +2357,119 @@ mod tests {
         let scratch = file.join("scratch");
         assert!(matches!(
             TreeCheckout::create_in(&scratch, &dir, &commit, CONTROL_MIN_FREE_BYTES),
-            Err(TreeCheckoutError::Cortex(_))
+            Err(TreeCheckoutError::DeliveredTree(_))
         ));
-        assert!(matches!(
-            check_commit_in(&scratch, &dir, &commit),
-            CommitCheck::CheckFailed(_)
-        ));
+        assert_eq!(
+            check_commit_in(&scratch, &dir, &commit, GIT_DEADLINES),
+            CommitCheck::Missing
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_planted_fifo_where_alternates_belong_is_killed_at_the_deadline_and_charged() {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let (dir, commit) = repo_with_one_commit();
+        assert_eq!(check_commit(&dir, &commit), CommitCheck::Resolves);
+
+        // A FIFO with no writer blocks git's open() of the alternates file
+        // for ever. The worker owns the workspace, so it can plant one.
+        let info = dir.join(".git").join("objects").join("info");
+        std::fs::create_dir_all(&info).unwrap();
+        let fifo = info.join("alternates");
+        let _ = std::fs::remove_file(&fifo);
+        let path = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `path` is a valid NUL-terminated string that outlives the call.
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+
+        let deadline = Duration::from_secs(1);
+        let deadlines = GitDeadlines {
+            quick: deadline,
+            checkout: deadline,
+        };
+        let parent = tempfile::tempdir().unwrap();
+
+        let started = Instant::now();
+        assert_eq!(
+            check_commit_in(parent.path(), &dir, &commit, deadlines),
+            CommitCheck::Missing,
+            "a git that stalls on the worker's object store is charged"
+        );
+        let took = started.elapsed();
+        assert!(took >= deadline, "git was not actually stalled: {took:?}");
+        assert!(took < Duration::from_secs(20), "the deadline did not bite: {took:?}");
+
+        let started = Instant::now();
+        match TreeCheckout::create_with(
+            parent.path(),
+            &dir,
+            &commit,
+            CONTROL_MIN_FREE_BYTES,
+            deadlines,
+        ) {
+            Err(TreeCheckoutError::DeliveredTree(message)) => {
+                assert!(message.contains("did not finish"), "{message}");
+            }
+            Err(other) => panic!("expected a delivered-tree fault, got {other:?}"),
+            Ok(_) => panic!("a stalled git cannot produce a checkout"),
+        }
+        let took = started.elapsed();
+        assert!(took >= deadline, "git was not actually stalled: {took:?}");
+        assert!(took < Duration::from_secs(20), "the deadline did not bite: {took:?}");
+        assert_eq!(
+            std::fs::read_dir(parent.path()).unwrap().count(),
+            0,
+            "a killed git leaves nothing behind"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_git_that_will_not_spawn_is_still_cortexs_fault() {
+        // The deadline runner must not turn a missing binary into a timeout.
+        let command = std::process::Command::new("/nonexistent/cortex-test-git");
+        assert!(run_git(command, Duration::from_secs(1)).is_err());
+    }
+
+    #[test]
+    fn a_delivered_commit_that_is_not_an_object_id_is_a_delivered_tree_fault() {
+        let dir = tempfile::tempdir().unwrap().keep();
+        for bad in ["", "HEAD", "abc123", "--upload-pack=x", "main^{tree}"] {
+            match TreeCheckout::create(&dir, bad) {
+                Err(TreeCheckoutError::DeliveredTree(_)) => {}
+                Err(other) => panic!("{bad:?}: expected a delivered-tree fault, got {other:?}"),
+                Ok(_) => panic!("{bad:?} is not something to check out"),
+            }
+        }
+    }
+
+    #[test]
+    fn the_startup_sweep_removes_only_old_cortex_verify_directories() {
+        let parent = tempfile::tempdir().unwrap();
+        let make = |name: &str, age: Duration| {
+            let path = parent.path().join(name);
+            std::fs::create_dir(&path).unwrap();
+            std::fs::write(path.join("tree.txt"), "delivered").unwrap();
+            let old = std::time::SystemTime::now() - age;
+            std::fs::File::open(&path).unwrap().set_modified(old).unwrap();
+            path
+        };
+        let hour = Duration::from_secs(3600);
+        let stale_view = make("cortex-verify-objects-a", 3 * hour);
+        let stale_checkout = make("cortex-verify-b", 3 * hour);
+        let fresh = make("cortex-verify-c", Duration::ZERO);
+        let unrelated = make("something-else", 3 * hour);
+        let file = parent.path().join("cortex-verify-file");
+        std::fs::write(&file, "x").unwrap();
+
+        assert_eq!(sweep_stale_scratch_older_than(parent.path(), 2 * hour), 2);
+        assert!(!stale_view.exists());
+        assert!(!stale_checkout.exists());
+        assert!(fresh.exists(), "a live scratch directory is never swept");
+        assert!(unrelated.exists());
+        assert!(file.exists());
+        assert_eq!(sweep_stale_scratch(&parent.path().join("missing")), 0);
     }
 
     #[test]

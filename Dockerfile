@@ -71,6 +71,12 @@ WORKDIR /home/cortex
 
 ENV CORTEX_PORT=3001
 ENV CORTEX_DB_PATH=/data/cortex.db
+# cortex-server refuses to boot unless its workspace is a git repository
+# (crates/api/src/state.rs: require_workspace_repository); verification reads
+# the delivered commit out of it. Made here, as the runtime user, so it exists
+# and is owned by the user that runs the server.
+ENV CORTEX_WORKSPACE=/home/cortex/workspace
+RUN git init -q "$CORTEX_WORKSPACE"
 EXPOSE 3001
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \

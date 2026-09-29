@@ -632,16 +632,18 @@ async fn handle_worker_msg(
                             //
                             // - `Missing` (the object store does not hold
                             //   the commit, the workspace's `.git` is
-                            //   missing, renamed or broken, or the reported
+                            //   missing, renamed or broken, git stalled on
+                            //   it past its deadline, Cortex's scratch
+                            //   directory could not be made, or the reported
                             //   string is not an object id at all): the
-                            //   workspace is worker-writable, so all of it is
-                            //   the worker's doing -- charged.
-                            // - `CheckFailed` (git would not start, or
-                            //   Cortex could not make its own scratch
-                            //   directory on a filesystem the worker does not
-                            //   share): Cortex's own machinery -- absorbed as
-                            //   `CortexCrash`. Git never reads the worker's
-                            //   repository, only its objects, as data.
+                            //   workspace and every disk trees are delivered
+                            //   to are worker-writable, so all of it is the
+                            //   worker's doing -- charged.
+                            // - `CheckFailed` (git would not start, and
+                            //   nothing else): Cortex's own machinery --
+                            //   absorbed as `CortexCrash`. Git never reads
+                            //   the worker's repository, only its object
+                            //   files; derived metadata is disabled.
                             // - `Resolves`: on to verification.
                             //
                             // Run on the blocking pool: it shells out to git
