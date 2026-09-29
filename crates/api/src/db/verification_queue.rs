@@ -178,7 +178,13 @@ impl Database {
                 Err(_) => return 0,
             };
             stmt.query_map(params![now, VERIFICATION_MAX_ATTEMPTS], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?))
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
             })
             .map(|rows| rows.filter_map(|r| r.ok()).collect())
             .unwrap_or_default()

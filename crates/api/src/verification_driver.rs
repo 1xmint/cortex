@@ -241,7 +241,9 @@ fn mint_control_commit(workspace_dir: &Path) -> Result<String, String> {
             String::from_utf8_lossy(&committed.stderr).trim()
         ));
     }
-    Ok(String::from_utf8_lossy(&committed.stdout).trim().to_string())
+    Ok(String::from_utf8_lossy(&committed.stdout)
+        .trim()
+        .to_string())
 }
 
 /// The control: check out a known-good commit into a fresh directory next to
@@ -335,12 +337,14 @@ impl TreeCheckout {
                 "git worktree add failed: {}",
                 String::from_utf8_lossy(&out.stderr).trim()
             );
-            return Err(match control_checkout(workspace_dir, &parent, base_commit) {
-                Ok(()) => TreeCheckoutError::DeliveredTree(message),
-                Err(control) => TreeCheckoutError::Cortex(format!(
-                    "{message}; the control checkout failed too: {control}"
-                )),
-            });
+            return Err(
+                match control_checkout(workspace_dir, &parent, base_commit) {
+                    Ok(()) => TreeCheckoutError::DeliveredTree(message),
+                    Err(control) => TreeCheckoutError::Cortex(format!(
+                        "{message}; the control checkout failed too: {control}"
+                    )),
+                },
+            );
         }
         Ok(Self {
             workspace_dir: workspace_dir.to_path_buf(),
@@ -1809,10 +1813,7 @@ mod tests {
         .unwrap()
         .trim()
         .to_string();
-        let object = dir
-            .join(".git/objects")
-            .join(&tree[..2])
-            .join(&tree[2..]);
+        let object = dir.join(".git/objects").join(&tree[..2]).join(&tree[2..]);
         assert!(object.exists(), "the head's root tree is a loose object");
         std::fs::remove_file(&object).unwrap();
 
