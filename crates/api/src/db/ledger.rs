@@ -3281,7 +3281,16 @@ mod tests {
         let claims = attempt_capability(&db, "attempt-waiting");
 
         // Reserved but never settled: the supplier hasn't confirmed a cost.
+        // Both calls are reserved before the attempt ends -- F5 refuses to
+        // reserve anything new against an attempt that already has an
+        // `attempt_endings` row (`reserve_provider_request`'s `NOT EXISTS`
+        // guard), so the second call must already be in flight by the time
+        // `end_and_settle_attempt` runs, the same as a real attempt still
+        // waiting on two outstanding provider calls when the customer
+        // cancels.
         db.reserve_provider_request(&claims, "wait-1", "digest", 300_000, ATTEMPT_NOW)
+            .expect("reserve");
+        db.reserve_provider_request(&claims, "wait-2", "digest", 150_000, ATTEMPT_NOW)
             .expect("reserve");
 
         end_and_settle_attempt(
@@ -3307,13 +3316,16 @@ mod tests {
             "an attempt with a reservation still `reserved` must not be marked settled"
         );
 
-        // The supplier confirms the first call, and a second call settles
-        // cleanly too.
+        // The supplier confirms the first call, and the already-reserved
+        // second call settles cleanly too -- both after the attempt ended.
         let settled = db
             .settle_provider_request("wait-1", 300_000, Some("upstream-1"), ATTEMPT_NOW)
             .expect("settle");
         assert_eq!(settled.status, "settled");
-        settle_call(&db, &claims, "wait-2", 150_000);
+        let settled2 = db
+            .settle_provider_request("wait-2", 150_000, Some("upstream-2"), ATTEMPT_NOW)
+            .expect("settle");
+        assert_eq!(settled2.status, "settled");
 
         db.settle_pending_attempts().expect("settle");
         assert_eq!(db.get_credit_balance(user).subscription_remaining, 996);
@@ -3339,8 +3351,30 @@ mod tests {
         let claims = attempt_capability(&db, "attempt-no-price-list");
         settle_call(&db, &claims, "no-price-1", 300_000);
 
+        // Invariant 23 (`price_lists_are_not_deleted`) refuses this DELETE
+        // unconditionally -- a plain `DELETE FROM price_lists` never reaches
+        // this point in production, since every published list is protected
+        // regardless of whether anything references it yet. Simulating the
+        // "no active price list" state this test is actually about (an
+        // operational disaster, e.g. a botched restore that lost the price
+        // catalog) means lifting that guard for one statement and putting it
+        // straight back, rather than disabling the invariant for the rest of
+        // the suite. `PRAGMA foreign_keys = OFF` is likewise scoped to this
+        // one statement, since `price_list_models`/`price_list_task_classes`
+        // still reference the seeded list's id and are left in place --
+        // nothing on the settle path this test exercises reads them.
         db.conn()
-            .execute("DELETE FROM price_lists", [])
+            .execute_batch(
+                "DROP TRIGGER IF EXISTS price_lists_are_not_deleted;
+                 PRAGMA foreign_keys = OFF;
+                 DELETE FROM price_lists;
+                 PRAGMA foreign_keys = ON;
+                 CREATE TRIGGER price_lists_are_not_deleted
+                     BEFORE DELETE ON price_lists
+                     BEGIN SELECT RAISE(ABORT,
+                         'a published price list cannot be deleted — receipts name it');
+                     END;",
+            )
             .expect("remove every price list");
 
         end_and_settle_attempt(
@@ -3409,7 +3443,12 @@ mod tests {
         // allotment, it must read back as exactly that whole-credit amount.
         let db = test_db();
         insert_run_and_step(&db, "run-receipt-sub", "step-receipt-sub");
-        let vid = seal_verification(&db, "run-receipt-sub", "step-receipt-sub", Verdict::Verified);
+        let vid = seal_verification(
+            &db,
+            "run-receipt-sub",
+            "step-receipt-sub",
+            Verdict::Verified,
+        );
 
         let user = subscriber(&db, 1_000);
         let charge_key = ChargeKey::for_verification(&vid);
@@ -3447,9 +3486,30 @@ mod tests {
         db.deduct_credits(user, 4, "verified verdict charge", &charge_key)
             .expect("charge succeeds");
 
-        let (sub_total, pack_total) = db.credit_ledger_totals(user);
-        assert_eq!(sub_total, -2, "the allotment covers only 2 of the 4 credits");
-        assert_eq!(pack_total, -2, "the remaining 2 credits spill into the pack bucket");
+        // `credit_ledger_totals` sums every transaction ever posted for this
+        // user, including the +250 topup grant itself -- it is not scoped to
+        // this one charge. To see what THIS charge moved in each bucket,
+        // read the two rows `deduct_credits` writes under this charge's own
+        // idempotency key, the same pattern the absorbed-cost test above
+        // uses via `ChargeKey::for_attempt`.
+        let sub_amount: i64 = db
+            .conn()
+            .query_row(
+                "SELECT amount FROM credit_transactions WHERE idempotency_key = ?1",
+                params![format!("{}:subscription", charge_key.as_str())],
+                |row| row.get(0),
+            )
+            .expect("subscription-bucket row for this charge");
+        let pack_amount: i64 = db
+            .conn()
+            .query_row(
+                "SELECT amount FROM credit_transactions WHERE idempotency_key = ?1",
+                params![format!("{}:pack", charge_key.as_str())],
+                |row| row.get(0),
+            )
+            .expect("pack-bucket row for this charge");
+        assert_eq!(sub_amount, -2, "the allotment covers only 2 of the 4 credits");
+        assert_eq!(pack_amount, -2, "the remaining 2 credits spill into the pack bucket");
 
         let receipt = db
             .get_receipt("run-receipt-split", "step-receipt-split")

@@ -15329,7 +15329,13 @@ mod tests {
     /// by the H5/H6/H11 money tests below, which need a real settled
     /// `provider_request_reservations` row (not a hand-rolled cost) behind
     /// the attempt they end.
-    fn settle_one_call(db: &Database, user_id: &str, run_id: &str, attempt_id: &str, observed_micro_usd: i64) {
+    fn settle_one_call(
+        db: &Database,
+        user_id: &str,
+        run_id: &str,
+        attempt_id: &str,
+        observed_micro_usd: i64,
+    ) {
         let now = Utc::now().timestamp_millis();
         let price_list_id = db.active_price_list().unwrap().id;
         db.set_supplier_capacity("claude", 10_000_000, now)

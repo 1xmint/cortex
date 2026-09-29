@@ -2727,8 +2727,7 @@ mod attempt_end_paths {
         // Driven with a genuinely settled reservation so the assertion is
         // an exact charge, not just a cause label.
         let state = state().await;
-        let (worker_id, step_id, lease_gen) =
-            lease_fixture_owned(&state, "attempt-timeout", true);
+        let (worker_id, step_id, lease_gen) = lease_fixture_owned(&state, "attempt-timeout", true);
         {
             let db = state.db.as_ref().expect("database");
             db.init_credit_balance(OWNER, 1_000).expect("balance row");
