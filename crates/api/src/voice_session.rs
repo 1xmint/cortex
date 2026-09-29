@@ -53,7 +53,6 @@ use crate::provider_gateway_http::{self, SpendLimits};
 use crate::routes::ErrorResponse;
 use crate::spoken_confirm;
 use crate::state::AppState;
-use crate::voice::ceil_div;
 
 /// The model every live voice session runs. Held in one place so a
 /// capability's model and the config sent to OpenAI can never drift apart.
@@ -142,7 +141,7 @@ impl LiveSessionError {
             ),
             LiveSessionError::NotEnoughCredits => (
                 StatusCode::PAYMENT_REQUIRED,
-                "You don't have enough credits for a live voice session. Go to Settings → Billing to buy more or subscribe.",
+                "You don't have enough credits for a live voice session. Top up to continue: go to Settings → Billing to buy more or subscribe.",
             ),
             LiveSessionError::SupplierFailed => (
                 StatusCode::BAD_GATEWAY,
@@ -603,12 +602,12 @@ async fn start_live_session(
             LiveSessionError::Unavailable
         })?;
 
-    let balance = db
-        .get_credit_balance_row(user_id)
-        .filter(|b| b.subscription_remaining + b.pack_remaining > 0)
-        .ok_or(LiveSessionError::NotEnoughCredits)?;
-    let balance_micro_usd = (balance.subscription_remaining + balance.pack_remaining)
-        .saturating_mul(price_list.micros_per_credit);
+    // What the user can actually pay for right now: whole credits in the
+    // balance, less the sub-credit carry already owed on earlier charges.
+    let balance_micro_usd = payable_micro(db, user_id, price_list.micros_per_credit);
+    if balance_micro_usd <= 0 {
+        return Err(LiveSessionError::NotEnoughCredits);
+    }
     let max_micro_usd = limits.max_micro_usd.min(balance_micro_usd);
 
     let segment_micro = rate.cost_micros(SEGMENT_SECONDS, 0, 0);
@@ -929,15 +928,11 @@ async fn run_billing_loop(
     );
     let mut next_segment_index: i64 = 0;
     let mut reserved_so_far_micro = segment0_micro;
+    // Observed cost already charged for this session. Each settled segment
+    // is charged exactly its own observed micro-USD through
+    // `charge_settled_cost`, which carries the sub-credit remainder per
+    // account, so nothing is ever rounded up here.
     let mut settled_so_far_micro: i64 = 0;
-    // Cumulative credits already deducted across every settle/overrun charge
-    // in this session. Each charge deducts only the delta between
-    // `ceil_div(settled_so_far_micro, micros_per_credit)` and this — so
-    // rounding only ever happens once, on the outstanding remainder, instead
-    // of once per segment (which could overcharge by up to a credit per
-    // segment and, worse, make the final segment's all-or-nothing deduction
-    // fail even though the user had enough for the *session's* real cost).
-    let mut charged_credits_so_far: i64 = 0;
     let segment_micro = rate.cost_micros(SEGMENT_SECONDS, 0, 0);
     let mut warning_deadline: Option<tokio::time::Instant> = None;
     let mut closed_cleanly = false;
@@ -950,6 +945,10 @@ async fn run_billing_loop(
     // settle and charge for everything actually observed instead of
     // treating a mid-flight drop as zero usage since the last renewal.
     let mut last_observed_total_micro: i64 = 0;
+    // Cumulative seconds from the last usage event that carried a readable
+    // `usage.seconds`. An event with that field missing or not an integer
+    // must never read as zero usage: it falls back to this.
+    let mut last_observed_seconds: i64 = 0;
     let now_ms = || chrono::Utc::now().timestamp_millis();
 
     // Delegation state, local to this session's billing task. The task text
@@ -1118,10 +1117,14 @@ async fn run_billing_loop(
                         }
                     }
                     Some("session.usage.updated") => {
+                        // Usage is cumulative: a missing/non-integer field, or a
+                        // value below what was already reported, never lowers it.
                         let seconds = event
                             .pointer("/usage/seconds")
                             .and_then(Value::as_i64)
-                            .unwrap_or(0);
+                            .unwrap_or(last_observed_seconds)
+                            .max(last_observed_seconds);
+                        last_observed_seconds = seconds;
                         let observed_total = rate.cost_micros(seconds, 0, 0);
                         last_observed_total_micro = observed_total;
                         budget_exhausted |= settle_up_to(
@@ -1131,7 +1134,6 @@ async fn run_billing_loop(
                             &local_id,
                             &mut segments.lock().unwrap_or_else(|e| e.into_inner()),
                             &mut settled_so_far_micro,
-                            &mut charged_credits_so_far,
                             observed_total,
                             false,
                             micros_per_credit,
@@ -1156,7 +1158,18 @@ async fn run_billing_loop(
                                     cap_exhausted = true;
                                     break;
                                 }
-                                let next_micro = remaining_cap.min(segment_micro);
+                                // The next reservation must also fit in what the
+                                // user can pay right now, beyond what unsettled
+                                // segments already hold. Otherwise refuse ("top
+                                // up to continue") rather than run up cost
+                                // Cortex would have to absorb.
+                                let fits = payable_micro(db, &user_id, micros_per_credit)
+                                    - (reserved_so_far_micro - settled_so_far_micro);
+                                if fits <= 0 {
+                                    reserve_refused = true;
+                                    break;
+                                }
+                                let next_micro = remaining_cap.min(segment_micro).min(fits);
                                 let candidate_index = next_segment_index + 1;
                                 let key = format!("voice:{local_id}:{candidate_index}");
                                 match db.reserve_provider_request(
@@ -1212,10 +1225,15 @@ async fn run_billing_loop(
                         }
                     }
                     Some("session.closed") => {
+                        // Bill the larger of the closing report and the last
+                        // usage already observed: a close that omits or
+                        // understates `usage.seconds` cannot erase cost that
+                        // was already reported.
                         let seconds = event
                             .pointer("/usage/seconds")
                             .and_then(Value::as_i64)
-                            .unwrap_or(0);
+                            .unwrap_or(last_observed_seconds)
+                            .max(last_observed_seconds);
                         let observed_total = rate.cost_micros(seconds, 0, 0);
                         last_observed_total_micro = observed_total;
                         settle_up_to(
@@ -1225,7 +1243,6 @@ async fn run_billing_loop(
                             &local_id,
                             &mut segments.lock().unwrap_or_else(|e| e.into_inner()),
                             &mut settled_so_far_micro,
-                            &mut charged_credits_so_far,
                             observed_total,
                             true,
                             micros_per_credit,
@@ -1270,41 +1287,39 @@ async fn run_billing_loop(
             &local_id,
             &mut segments.lock().unwrap_or_else(|e| e.into_inner()),
             &mut settled_so_far_micro,
-            &mut charged_credits_so_far,
             last_observed_total_micro,
             false,
             micros_per_credit,
             now_ms(),
         );
 
-        // Usage observed but not yet reflected in charged credits is still
-        // real spend, whether it is a mid-segment drop (usage past what
-        // fully settled but not past every reservation, so the loop above
-        // left it `None`) or the debt from an earlier non-final charge
-        // that failed and was only ever recorded in
-        // `charged_credits_so_far` — with no further `session.usage.updated`
-        // coming, that debt would otherwise never be retried. Charge the
-        // whole outstanding remainder now, capped to balance since this is
-        // the last chance (`is_final = true`).
-        let basis_micro = last_observed_total_micro.max(settled_so_far_micro);
-        let credits_due = ceil_div(basis_micro, micros_per_credit);
-        let delta = credits_due - charged_credits_so_far;
-        if delta > 0 {
-            let drop_key = format!("voice:{local_id}:drop");
-            tracing::error!(
-                user_id = %user_id,
-                session_id = %session_id,
-                delta,
-                "voice: sideband dropped with usage not yet reflected in charged credits; charging the remainder directly"
-            );
-            let _ = charge_incremental(
+        // Usage already reported by `session.usage.updated` is a known call
+        // cost, so it is charged: whatever part of `last_observed_total_micro`
+        // the settles above did not cover is billed under one `:drop` key
+        // (idempotent, carry kept). Only the tail the sideband never got to
+        // report before it dropped cannot be observed; that is not guessed at
+        // and Cortex absorbs it (0 credits), logged below.
+        let unsettled_observed = last_observed_total_micro - settled_so_far_micro;
+        if unsettled_observed > 0 {
+            let _ = charge_observed_cost(
                 db,
                 &user_id,
                 &session_id,
-                &drop_key,
-                "Cortex live voice (dropped session)",
-                delta,
-                true,
+                &format!("voice:{local_id}:drop"),
+                "Cortex live voice (observed before sideband drop)",
+                unsettled_observed,
+                micros_per_credit,
+            );
+            settled_so_far_micro = last_observed_total_micro;
+        }
+        let open_segments = segments.lock().unwrap_or_else(|e| e.into_inner()).len();
+        if open_segments > 0 {
+            tracing::error!(
+                user_id = %user_id,
+                session_id = %session_id,
+                open_segments,
+                observed_micro_usd_charged = settled_so_far_micro,
+                "voice: sideband dropped before session.closed; usage already reported was charged, the unreported tail of the open segment(s) cannot be observed and is absorbed by Cortex"
             );
         }
 
@@ -2121,62 +2136,55 @@ async fn reattach_and_close(ws_base: &str, session_id: &str, supplier_key: &str)
     }
 }
 
-/// Deducts the next `delta_credits` credits owed under `key`, on top of
-/// whatever this session has already charged. `delta_credits` is a
-/// cumulative-rounding delta (see [`settle_up_to`]), never a per-segment
-/// `ceil_div`, so a multi-segment session is never charged more than
-/// `ceil_div(total_micro, micros_per_credit)` in total.
+/// What the user can pay for right now, in micro-USD: whole credits in the
+/// balance less the sub-credit carry already owed. Never negative.
+fn payable_micro(db: &crate::db::Database, user_id: &str, micros_per_credit: i64) -> i64 {
+    let credits = db
+        .get_credit_balance_row(user_id)
+        .map(|balance| (balance.subscription_remaining + balance.pack_remaining).max(0))
+        .unwrap_or(0);
+    let carry = i64::try_from(db.get_credit_carry_micro_usd(user_id)).unwrap_or(i64::MAX);
+    credits
+        .saturating_mul(micros_per_credit)
+        .saturating_sub(carry)
+        .max(0)
+}
+
+/// Charges `cost_micro_usd` of observed supplier cost under `key`, exactly as
+/// the chat path does: `charge_settled_cost` deducts whole credits and keeps
+/// the sub-credit remainder as a per-account carry, so the customer pays what
+/// the call cost and nothing more. It is idempotent on `key`, so a settle
+/// that runs twice (a retry, a reconnect) never charges twice, and it clamps
+/// to the balance, recording any shortfall as absorbed by Cortex.
 ///
-/// On the session's final charge (`is_final`), `deduct_credits`'s
-/// all-or-nothing behavior would otherwise let the very last, smallest
-/// segment fail outright even though the user funded the whole session's
-/// real cost — so the final charge instead reads the live balance and caps
-/// itself to what remains, logging the shortfall rather than leaving that
-/// last segment unresolved for free. Earlier, non-final charges keep the
-/// strict all-or-nothing behavior: a shortfall there is real budget
-/// exhaustion the caller must stop renewing against.
-///
-/// Returns `(credits actually charged, budget exhausted)`.
-fn charge_incremental(
+/// Returns `(credits actually charged, budget exhausted)`, where exhausted
+/// means nothing more can be paid for once this charge has landed.
+fn charge_observed_cost(
     db: &crate::db::Database,
     user_id: &str,
     session_id: &str,
     key: &str,
     description: &str,
-    delta_credits: i64,
-    is_final: bool,
+    cost_micro_usd: i64,
+    micros_per_credit: i64,
 ) -> (i64, bool) {
-    if delta_credits <= 0 {
+    if cost_micro_usd <= 0 {
         return (0, false);
     }
-    let to_charge = if is_final {
-        let available = db
-            .get_credit_balance_row(user_id)
-            .map(|balance| (balance.subscription_remaining + balance.pack_remaining).max(0))
-            .unwrap_or(0);
-        if delta_credits > available {
-            tracing::error!(
-                user_id,
-                session_id,
-                key,
-                requested_credits = delta_credits,
-                available_credits = available,
-                shortfall_credits = delta_credits - available,
-                "voice: final charge exceeds the user's remaining balance; charging what is left"
-            );
-        }
-        delta_credits.min(available)
-    } else {
-        delta_credits
-    };
-    if to_charge <= 0 {
-        return (0, !is_final);
-    }
-    match db.deduct_credits(user_id, to_charge, description, &ChargeKey::per_unit(key)) {
-        Ok(_) => (to_charge, false),
+    match db.charge_settled_cost(
+        user_id,
+        cost_micro_usd as u64,
+        micros_per_credit,
+        description,
+        &ChargeKey::per_unit(key),
+    ) {
+        Ok(settled) => (
+            settled.credits_charged,
+            payable_micro(db, user_id, micros_per_credit) <= 0,
+        ),
         Err(error) => {
-            tracing::error!(user_id, session_id, key, %error, "voice: credit deduction failed");
-            (0, !is_final)
+            tracing::error!(user_id, session_id, key, %error, "voice: settled charge failed");
+            (0, true)
         }
     }
 }
@@ -2189,18 +2197,12 @@ fn charge_incremental(
 /// zero. Usage that still exceeds every reservation once `is_final` is true
 /// is charged directly as an overrun rather than forced through settle.
 ///
-/// Every charge (segment or overrun) is a delta against
-/// `charged_credits_so_far`: `ceil_div(settled_so_far_micro,
-/// micros_per_credit) - charged_credits_so_far`. That means rounding only
-/// ever happens once, against the outstanding remainder, so a multi-segment
-/// session's total charge is always exactly `ceil_div(total_micro,
-/// micros_per_credit)` rather than the sum of several per-segment
-/// `ceil_div`s (which could both overcharge and make the final,
-/// often-partial segment's all-or-nothing deduction fail on its own
-/// rounded-up credit even though the user funded the session's real cost).
+/// Every charge is that segment's own observed micro-USD, run through
+/// [`charge_observed_cost`] under the segment's key: one charge per usage
+/// delta, exact integers, the sub-credit remainder carried on the account.
 ///
-/// Returns whether a non-final credit deduction failed during this call —
-/// budget exhaustion the caller must stop renewing against (item D).
+/// Returns whether a non-final charge left the balance unable to pay for
+/// more — budget exhaustion the caller must stop renewing against (item D).
 #[allow(clippy::too_many_arguments)]
 fn settle_up_to(
     db: &crate::db::Database,
@@ -2209,7 +2211,6 @@ fn settle_up_to(
     local_id: &str,
     segments: &mut std::collections::VecDeque<Segment>,
     settled_so_far_micro: &mut i64,
-    charged_credits_so_far: &mut i64,
     observed_total_micro: i64,
     is_final: bool,
     micros_per_credit: i64,
@@ -2233,19 +2234,16 @@ fn settle_up_to(
         match db.settle_provider_request(&key, amount, None, now_ms) {
             Ok(_) => {
                 *settled_so_far_micro += amount;
-                let credits_due = ceil_div(*settled_so_far_micro, micros_per_credit);
-                let delta = credits_due - *charged_credits_so_far;
-                let (charged, exhausted) = charge_incremental(
+                let (_charged, exhausted) = charge_observed_cost(
                     db,
                     user_id,
                     session_id,
                     &key,
                     "Cortex live voice",
-                    delta,
-                    is_final,
+                    amount,
+                    micros_per_credit,
                 );
-                *charged_credits_so_far += charged;
-                if exhausted {
+                if exhausted && !is_final {
                     budget_exhausted = true;
                 }
             }
@@ -2277,43 +2275,15 @@ fn settle_up_to(
                 "voice: usage exceeded every reservation; charging the excess directly rather than settling it"
             );
             *settled_so_far_micro = observed_total_micro;
-            let credits_due = ceil_div(*settled_so_far_micro, micros_per_credit);
-            let delta = credits_due - *charged_credits_so_far;
-            let (charged, _exhausted) = charge_incremental(
+            let _ = charge_observed_cost(
                 db,
                 user_id,
                 session_id,
                 &key,
                 "Cortex live voice overrun",
-                delta,
-                true,
+                remaining,
+                micros_per_credit,
             );
-            *charged_credits_so_far += charged;
-        }
-
-        // A non-final charge earlier in this session can fail
-        // (`charge_incremental` returns `charged: 0` on a deduction
-        // error) while `settled_so_far_micro` already reflects the
-        // settle that triggered it — the debt then lives only in the gap
-        // between `ceil_div(settled_so_far_micro, micros_per_credit)` and
-        // `charged_credits_so_far`. If nothing above just charged it (the
-        // `remaining > 0` branch did not fire, because observed usage
-        // never grew past what was already settled), this is the last
-        // chance to retry it before the segment goes out of scope.
-        let credits_due = ceil_div(*settled_so_far_micro, micros_per_credit);
-        let delta = credits_due - *charged_credits_so_far;
-        if delta > 0 {
-            let key = format!("voice:{local_id}:final");
-            let (charged, _exhausted) = charge_incremental(
-                db,
-                user_id,
-                session_id,
-                &key,
-                "Cortex live voice",
-                delta,
-                true,
-            );
-            *charged_credits_so_far += charged;
         }
     }
 
@@ -2695,6 +2665,11 @@ mod fake_live {
         /// Counts every `/attach` upgrade this script has completed, so a
         /// test can tell a re-attach after a drop actually happened.
         pub attach_count: Option<StdArc<std::sync::atomic::AtomicUsize>>,
+        /// Send one `session.usage.updated` whose `usage.seconds` is not an
+        /// integer after the scripted events -- a malformed report.
+        pub malformed_usage_after_script: bool,
+        /// Send `session.closed` with no `usage` object at all.
+        pub closed_without_seconds: bool,
     }
 
     impl Default for FakeLiveScript {
@@ -2707,6 +2682,8 @@ mod fake_live {
                 pause_after_first_event: None,
                 hang_attach_for: None,
                 attach_count: None,
+                malformed_usage_after_script: false,
+                closed_without_seconds: false,
             }
         }
     }
@@ -2760,12 +2737,29 @@ mod fake_live {
                 }
             }
         }
-        if script.send_closed_after_script {
+        if script.malformed_usage_after_script {
             let message = serde_json::json!({
-                "type": "session.closed",
-                "usage": {"seconds": last_seconds},
-                "reason": "done",
+                "type": "session.usage.updated",
+                "usage": {"seconds": "not-a-number"},
             });
+            if socket
+                .send(AxumMessage::Text(message.to_string().into()))
+                .await
+                .is_err()
+            {
+                return;
+            }
+        }
+        if script.send_closed_after_script {
+            let message = if script.closed_without_seconds {
+                serde_json::json!({"type": "session.closed", "reason": "done"})
+            } else {
+                serde_json::json!({
+                    "type": "session.closed",
+                    "usage": {"seconds": last_seconds},
+                    "reason": "done",
+                })
+            };
             let _ = socket
                 .send(AxumMessage::Text(message.to_string().into()))
                 .await;
@@ -3008,27 +3002,18 @@ mod tests {
         wait_until_session_gone(&state, &session_id).await;
 
         let db = state.db.as_ref().unwrap();
-        let rate = db
-            .active_price_list()
-            .unwrap()
-            .model("openai", "gpt-live-1")
-            .cloned()
-            .unwrap();
-        let expected_total_micro = rate.cost_micros(650, 0, 0);
+        let mpc = db.active_price_list().unwrap().micros_per_credit;
+        // 650s at 833_333 micro-USD per 1000s, integer-truncated once on the
+        // cumulative total: 541_666 micro-USD = 5 whole credits + 41_666
+        // carried. Pinned literally so a rate or rounding change cannot make
+        // this pass by agreeing with itself.
+        let expected_total_micro = 541_666;
         let balance = db.get_credit_balance_row(USER).unwrap();
         let spent_credits = 1_000_000_000 - balance.subscription_remaining;
-        // Charged on the cumulative-rounding rule (a running
-        // `ceil_div(settled_total, micros_per_credit) - charged_so_far`
-        // delta), so a multi-segment session is charged exactly the
-        // whole-session ceiling — never the sum of three separate
-        // per-segment `ceil_div` rounds, which used to overcharge.
-        let expected_credits = ceil_div(
-            expected_total_micro,
-            db.active_price_list().unwrap().micros_per_credit,
-        );
+        assert_eq!(spent_credits, 5);
         assert_eq!(
-            spent_credits, expected_credits,
-            "spent {spent_credits} credits, expected exactly {expected_credits}"
+            db.get_credit_carry_micro_usd(USER),
+            (expected_total_micro % mpc) as u64
         );
 
         for n in 0..3 {
@@ -3056,11 +3041,11 @@ mod tests {
         .await;
         let db = state.db.as_ref().unwrap();
         let price_list = db.active_price_list().unwrap();
-        let rate = price_list.model("openai", "gpt-live-1").cloned().unwrap();
-        // ~2 minutes of gpt-live-1.
-        let two_minutes_micro = rate.cost_micros(120, 0, 0);
-        let two_minutes_credits = ceil_div(two_minutes_micro, price_list.micros_per_credit);
-        db.init_credit_balance(USER, two_minutes_credits).unwrap();
+        // One credit is 100_000 micro-USD: about two minutes of gpt-live-1
+        // (100_000 micro-USD is 120.0005s at 833_333 per 1000s). That is all
+        // the reservation is allowed to hold.
+        assert_eq!(price_list.micros_per_credit, 100_000);
+        db.init_credit_balance(USER, 1).unwrap();
         let _dir = dir;
 
         let (http_base, ws_base) = spawn(FakeLiveScript {
@@ -3097,27 +3082,31 @@ mod tests {
             .get_provider_reservation(&format!("voice:{local_id}:0"))
             .expect("segment 0 exists");
         assert_eq!(reservation.status, "settled");
-        // segment 0's full reservation (120s) is exactly what it settles
-        // for; usage that arrived after the session was told to close
-        // (up to 200s) is charged as an overrun, not folded into the
-        // segment settle.
-        assert_eq!(
-            reservation.observed_micro_usd.unwrap(),
-            rate.cost_micros(120, 0, 0)
-        );
+        // Segment 0's full reservation (the whole 100_000 micro-USD balance)
+        // is exactly what it settles for; usage that arrived after the
+        // session was told to close (up to 200s) is charged as an overrun,
+        // not folded into the segment settle.
+        assert_eq!(reservation.observed_micro_usd.unwrap(), 100_000);
         assert!(
             db.get_provider_reservation(&format!("voice:{local_id}:1"))
                 .is_none(),
             "the balance could not fund a second segment"
         );
+        // The one credit was collected once, and the balance never goes
+        // negative even though the session ran past what it could pay for
+        // (the overrun beyond the balance is Cortex's, not the customer's).
+        let balance = db.get_credit_balance_row(USER).unwrap();
+        assert_eq!(balance.subscription_remaining + balance.pack_remaining, 0);
     }
 
     #[tokio::test]
-    async fn a_dropped_sideband_charges_the_observed_remainder() {
-        // Neither scripted event (50s, 100s) ever crosses the 80% renewal
-        // threshold or the segment boundary, so segment 0 never settles —
-        // it is only the drop-cleanup path's direct `:drop` charge that
-        // must bill for the 100s actually observed.
+    async fn a_dropped_sideband_charges_the_usage_it_reported() {
+        // Neither scripted event (50s, 100s) crosses the 80% renewal
+        // threshold or the segment boundary, so segment 0 never settles and
+        // no `session.closed` confirms the cost. The last report (100s =
+        // 83_333 micro-USD) was still observed, so it is charged under
+        // `:drop` with carry (0 whole credits, 83_333 carried); only usage
+        // that was never reported would be absorbed.
         let (_dir, state) = test_state().await;
         let (http_base, ws_base) = spawn(FakeLiveScript {
             usage_events: vec![50, 100],
@@ -3147,8 +3136,6 @@ mod tests {
         wait_until_session_gone(&state, &session_id).await;
 
         let db = state.db.as_ref().unwrap();
-        let price_list = db.active_price_list().unwrap();
-        let rate = price_list.model("openai", "gpt-live-1").cloned().unwrap();
         let reservation = db
             .get_provider_reservation(&format!("voice:{local_id}:0"))
             .expect("segment 0 exists");
@@ -3158,40 +3145,30 @@ mod tests {
             0
         );
 
-        let expected_credits = ceil_div(rate.cost_micros(100, 0, 0), price_list.micros_per_credit);
-        // 100s = 83_333 micro-USD at this test's rate, ceil-divided by
-        // 100_000 micros/credit = 1 credit; pinned literally so a change to
-        // `rate` or `ceil_div` that silently zeroed the delta cannot make
-        // this test pass by agreeing with itself.
-        assert_eq!(expected_credits, 1);
         let balance = db.get_credit_balance_row(USER).unwrap();
-        let spent_credits = 1_000_000_000 - balance.subscription_remaining;
-        assert_eq!(spent_credits, expected_credits);
-
-        let drop_key_prefix = format!("voice:{local_id}:drop%");
-        let ledger_rows: i64 = db
-            .conn()
-            .query_row(
-                "SELECT COUNT(*) FROM credit_transactions WHERE idempotency_key LIKE ?1",
-                [&drop_key_prefix],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert!(
-            ledger_rows >= 1,
-            "the observed remainder must be charged directly on drop"
+        assert_eq!(
+            1_000_000_000 - balance.subscription_remaining,
+            0,
+            "83_333 micro-USD is under one credit, so nothing whole is debited yet"
+        );
+        assert_eq!(db.get_credit_carry_micro_usd(USER), 83_333);
+        assert_eq!(
+            voice_ledger_rows(db, &local_id),
+            vec![(format!("voice:{local_id}:drop"), 0, Some(83_333))],
+            "the reported usage is charged once, under the :drop key"
         );
     }
 
     #[tokio::test]
-    async fn a_dropped_sideband_after_850_seconds_settles_two_segments_and_charges_the_rest() {
+    async fn a_dropped_sideband_after_850_seconds_charges_settled_segments_and_reported_tail() {
         // Crosses the 80% renewal threshold enough times to reserve four
         // 300s segments, but only ever reports usage through 850s: segments
-        // 0 (0-300s) and 1 (300-600s) are fully consumed and settle inline;
-        // segment 2 (600-900s) is only partially observed (250s of its
-        // 300s) so it never settles, and segment 3 (900-1200s) is reserved
-        // with no usage at all. The drop then charges the remainder beyond
-        // what settled and leaves both open segments unresolved.
+        // 0 (0-300s) and 1 (300-600s) are fully consumed and settle inline
+        // (each charged exactly its observed cost); segment 2 (600-900s) is
+        // only partially observed (250s of its 300s) so it never settles,
+        // and segment 3 (900-1200s) is reserved with no usage at all. The
+        // drop leaves both open segments unresolved, but the 850s that were
+        // reported are charged: the unsettled 250s tail goes through `:drop`.
         let (_dir, state) = test_state().await;
         let (http_base, ws_base) = spawn(FakeLiveScript {
             usage_events: vec![240, 480, 720, 850],
@@ -3221,8 +3198,6 @@ mod tests {
         wait_until_session_gone(&state, &session_id).await;
 
         let db = state.db.as_ref().unwrap();
-        let price_list = db.active_price_list().unwrap();
-        let rate = price_list.model("openai", "gpt-live-1").cloned().unwrap();
 
         for n in 0..2 {
             let reservation = db
@@ -3240,41 +3215,75 @@ mod tests {
             );
         }
 
-        let expected_credits = ceil_div(rate.cost_micros(850, 0, 0), price_list.micros_per_credit);
-        // 850s = 708_333 micro-USD at this test's rate, ceil-divided by
-        // 100_000 micros/credit = 8 credits; pinned literally so a change to
-        // `rate` or `ceil_div` that silently under-charges cannot make this
-        // test pass by agreeing with itself.
-        assert_eq!(expected_credits, 8);
+        // Two settled 300s segments at 249_999 micro-USD each = 499_998
+        // micro-USD = 4 whole credits + 99_998 carried. The reported 850s
+        // total is 708_333, so the drop charges the remaining 208_335 with
+        // that carry: 308_333 = 3 credits + 8_333 carried. Total 7 credits.
         let balance = db.get_credit_balance_row(USER).unwrap();
-        let spent_credits = 1_000_000_000 - balance.subscription_remaining;
-        assert_eq!(spent_credits, expected_credits);
+        assert_eq!(1_000_000_000 - balance.subscription_remaining, 7);
+        assert_eq!(db.get_credit_carry_micro_usd(USER), 8_333);
 
-        let drop_key_prefix = format!("voice:{local_id}:drop%");
-        let ledger_rows: i64 = db
-            .conn()
-            .query_row(
-                "SELECT COUNT(*) FROM credit_transactions WHERE idempotency_key LIKE ?1",
-                [&drop_key_prefix],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert!(
-            ledger_rows >= 1,
-            "the observed remainder beyond the settled segments must be charged on drop"
+        assert_eq!(
+            voice_ledger_rows(db, &local_id),
+            vec![
+                (format!("voice:{local_id}:0"), -2, Some(249_999)),
+                (format!("voice:{local_id}:1"), -2, Some(249_999)),
+                (format!("voice:{local_id}:drop"), -3, Some(208_335)),
+            ],
         );
     }
 
     #[tokio::test]
-    async fn cumulative_rounding_charges_exactly_the_ceiling_and_settles_the_last_segment() {
-        // Same scripted session as the 650s multi-segment test, but the
-        // balance is funded for *exactly* the session's real cost instead
-        // of an ample amount. Under the old per-segment `ceil_div` rounding
-        // each of the three segments could round up independently, so the
-        // final (often partial) segment's all-or-nothing deduction failed
-        // even though the user funded the whole session's real cost. The
-        // cumulative-delta rule must charge exactly the ceiling and settle
-        // every segment, including the last one.
+    async fn missing_or_malformed_usage_seconds_never_bill_less_than_the_last_report() {
+        // One real report (200s), then a usage event whose `seconds` is not
+        // an integer, then a `session.closed` with no usage at all. Neither
+        // may reset the count to 0: the session is billed its last observed
+        // 200s = 166_666 micro-USD = 1 credit + 66_666 carried.
+        let (_dir, state) = test_state().await;
+        let (http_base, ws_base) = spawn(FakeLiveScript {
+            usage_events: vec![200],
+            send_closed_after_script: true,
+            malformed_usage_after_script: true,
+            closed_without_seconds: true,
+            ..Default::default()
+        })
+        .await;
+
+        let (session_id, _sdp, local_id) = start_session(
+            &state,
+            LiveVoiceMode::Live("sk-test-supplier-0123456789".into()),
+            &http_base,
+            &ws_base,
+            SIGNING_KEY,
+            ample_limits(),
+            USER,
+            "offer-sdp",
+            0,
+            None,
+        )
+        .await
+        .expect("live start must succeed");
+
+        wait_until_session_gone(&state, &session_id).await;
+
+        let db = state.db.as_ref().unwrap();
+        assert_eq!(
+            voice_ledger_rows(db, &local_id),
+            vec![(format!("voice:{local_id}:0"), -1, Some(166_666))],
+        );
+        let balance = db.get_credit_balance_row(USER).unwrap();
+        assert_eq!(1_000_000_000 - balance.subscription_remaining, 1);
+        assert_eq!(db.get_credit_carry_micro_usd(USER), 66_666);
+    }
+
+    #[tokio::test]
+    async fn a_tightly_funded_session_is_charged_exactly_its_cost_and_settles_every_segment() {
+        // Same scripted session as the 650s multi-segment test, but funded
+        // with just enough whole credits for the upper bound of what the
+        // session can hold: 541_666 micro-USD of real cost needs 6 credits
+        // (600_000 micro-USD) to fit its reservations. Every segment must
+        // settle, and the customer pays exactly the observed cost: 5 whole
+        // credits, with 41_666 micro-USD carried rather than rounded up.
         let dir = tempfile::tempdir().unwrap();
         let state = AppState::new(
             dir.path().join(".cortex/ledger.jsonl"),
@@ -3283,11 +3292,7 @@ mod tests {
         )
         .await;
         let db = state.db.as_ref().unwrap();
-        let price_list = db.active_price_list().unwrap();
-        let rate = price_list.model("openai", "gpt-live-1").cloned().unwrap();
-        let expected_total_micro = rate.cost_micros(650, 0, 0);
-        let expected_credits = ceil_div(expected_total_micro, price_list.micros_per_credit);
-        db.init_credit_balance(USER, expected_credits).unwrap();
+        db.init_credit_balance(USER, 6).unwrap();
         let _dir = dir;
 
         let (http_base, ws_base) = spawn(FakeLiveScript {
@@ -3318,11 +3323,12 @@ mod tests {
         wait_until_session_gone(&state, &session_id).await;
 
         let balance = db.get_credit_balance_row(USER).unwrap();
-        let spent_credits = expected_credits - balance.subscription_remaining;
         assert_eq!(
-            spent_credits, expected_credits,
-            "must charge exactly the ceiling of the whole session's cost, not a per-segment overcharge"
+            6 - (balance.subscription_remaining + balance.pack_remaining),
+            5,
+            "must charge exactly the observed cost's whole credits, not round up"
         );
+        assert_eq!(db.get_credit_carry_micro_usd(USER), 41_666);
 
         for n in 0..3 {
             let key = format!("voice:{local_id}:{n}");
@@ -3331,9 +3337,7 @@ mod tests {
                 .expect("reservation exists");
             assert_eq!(
                 reservation.status, "settled",
-                "segment {n} must be settled, including the last one — it must not be skipped \
-                 or left unresolved because an earlier segment's per-segment rounding ate the \
-                 whole tightly-funded balance"
+                "segment {n} must be settled, including the last one"
             );
         }
     }
@@ -3527,16 +3531,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_dropped_sideband_with_usage_past_every_reservation_charges_the_overrun_and_reattaches_to_close(
+    async fn a_dropped_sideband_with_usage_past_every_reservation_charges_the_reported_excess_and_reattaches_to_close(
     ) {
         // A tight max_micro_usd budget of exactly one segment: the second
         // scripted event lands on the cap and gets no further renewal, and
         // the third event reports usage past every reservation this session
         // ever made, then the fake drops the connection without a
-        // `session.closed`. The drop-cleanup path must charge that excess
-        // directly as an overrun and attempt one re-attach to send
-        // `session.close` rather than leaving the upstream session running
-        // unmetered.
+        // `session.closed`. The excess was reported, so it is charged under
+        // `:drop` (nothing is guessed beyond the last report), and the
+        // drop-cleanup path
+        // attempts one re-attach to send `session.close` rather than
+        // leaving the upstream session running unmetered.
         let (_dir, state) = test_state().await;
         let db = state.db.as_ref().unwrap();
         let price_list = db.active_price_list().unwrap();
@@ -3549,9 +3554,6 @@ mod tests {
 
         let attach_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let (http_base, ws_base) = spawn(FakeLiveScript {
-            // 450s = 375_000 micro-USD at this test's rate = 4 credits, so
-            // the drop-cleanup charge is provably nonzero (300s and 330s
-            // both round up to 3 credits and would make the delta 0).
             usage_events: vec![80, SEGMENT_SECONDS, SEGMENT_SECONDS + 150],
             send_closed_after_script: false,
             respond_to_client_close: false,
@@ -3580,44 +3582,25 @@ mod tests {
         wait_until_session_gone_with_timeout(&state, &session_id, StdDuration::from_secs(30)).await;
 
         // Segment 0 (the only reservation this cap could ever fund) settles
-        // for its full reserved amount; the extra 150s reported on top of it
-        // is charged directly as an overrun.
+        // for its full reserved amount and is charged exactly: 249_999
+        // micro-USD = 2 whole credits + 49_999 carried. The extra 150s
+        // reported on top of it (450s total = 374_999) is charged as the
+        // 125_000 remainder: 174_999 with carry = 1 credit + 74_999 carried.
         let reservation = db
             .get_provider_reservation(&format!("voice:{local_id}:0"))
             .expect("segment 0 exists");
         assert_eq!(reservation.status, "settled");
 
-        // The overrun charge goes straight through `deduct_credits` — it
-        // never creates a `provider_request_reservations` row, so
-        // `provider_spend_row_count` (which joins on that table) can only
-        // ever read 0 for it. Count the ledger rows it actually writes
-        // instead: `deduct_credits` fans one idempotency key out into a
-        // `:subscription`/`:pack` suffixed row per bucket it draws from,
-        // so match on the prefix.
-        let drop_key_prefix = format!("voice:{local_id}:drop%");
-        let ledger_rows: i64 = db
-            .conn()
-            .query_row(
-                "SELECT COUNT(*) FROM credit_transactions WHERE idempotency_key LIKE ?1",
-                [&drop_key_prefix],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert!(
-            ledger_rows >= 1,
-            "usage past every reservation must be charged directly on drop"
+        assert_eq!(
+            voice_ledger_rows(db, &local_id),
+            vec![
+                (format!("voice:{local_id}:0"), -2, Some(249_999)),
+                (format!("voice:{local_id}:drop"), -1, Some(125_000)),
+            ],
         );
-
-        let expected_total_micro = rate.cost_micros(SEGMENT_SECONDS + 150, 0, 0);
-        let expected_credits = ceil_div(expected_total_micro, price_list.micros_per_credit);
-        // 450s = 375_000 micro-USD at this test's price = 4 credits;
-        // pinned literally so a change to `rate` or `ceil_div` that
-        // silently zeroed the delta cannot make this test pass by
-        // agreeing with itself.
-        assert_eq!(expected_credits, 4);
         let balance = db.get_credit_balance_row(USER).unwrap();
-        let spent_credits = 1_000_000_000 - balance.subscription_remaining;
-        assert_eq!(spent_credits, expected_credits);
+        assert_eq!(1_000_000_000 - balance.subscription_remaining, 3);
+        assert_eq!(db.get_credit_carry_micro_usd(USER), 74_999);
 
         // The drop-cleanup path must have tried a re-attach to send
         // `session.close` on top of the original attach.
@@ -3783,25 +3766,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_settle_that_cannot_charge_credits_closes_the_session() {
-        // Look up the segment cost against a throwaway state first, since
-        // the real state's balance must be initialized to exactly that
-        // amount in one `init_credit_balance` call — it only ever inserts,
-        // so a second call for the same user is a no-op.
-        let price_probe = test_state().await.1;
-        let price_list = price_probe
-            .db
-            .as_ref()
-            .unwrap()
-            .active_price_list()
-            .unwrap();
-        let rate = price_list.model("openai", "gpt-live-1").cloned().unwrap();
-        let segment_micro = rate.cost_micros(SEGMENT_SECONDS, 0, 0);
-        let segment_credits = ceil_div(segment_micro, price_list.micros_per_credit);
-
-        // Exactly enough to fund (and later settle) segment 0 — until the
-        // test drains it mid-script.
-        let (_dir, state) = test_state_with_balance(segment_credits).await;
+    async fn a_settle_against_a_drained_balance_is_absorbed_and_closes_the_session() {
+        // Funded with 3 credits (300_000 micro-USD), enough for segment 0's
+        // 249_999 micro-USD reservation, until the test drains the balance
+        // mid-script (standing in for a concurrent charge shrinking it).
+        let (_dir, state) = test_state_with_balance(3).await;
         let db = state.db.as_ref().unwrap();
 
         // A harmless first event (below the 80% renewal threshold), a real
@@ -3830,7 +3799,7 @@ mod tests {
             None,
         )
         .await
-        .expect("live start must succeed with exactly enough balance for segment 0");
+        .expect("live start must succeed with enough balance for segment 0");
 
         // Give the fake time to send the first event, then drain the
         // balance to zero before it sends the segment-crossing one.
@@ -3845,48 +3814,214 @@ mod tests {
         )
         .expect("draining the balance directly must succeed");
 
-        // Give the segment-crossing event time to arrive and the settle it
-        // triggers time to fail against the drained balance (entering the
-        // warning-grace/goodbye path), then top the balance back up — still
-        // well inside the 20s `WARNING_GRACE` window — the same way the
-        // ledger's own tests fund a balance (`add_pack_credits`). This
-        // proves the goodbye path's `session.closed` retry (the `:final`
-        // charge in `settle_up_to`) actually recovers a settle that failed
-        // only because credits were briefly unavailable, not because the
-        // session was over budget.
-        tokio::time::sleep(StdDuration::from_millis(500)).await;
-        db.add_pack_credits(USER, segment_credits)
-            .expect("topping the balance back up must succeed");
-
-        // The failed deduction stops renewal and heads for the goodbye
-        // path, which needs the full warning grace before it closes.
+        // The settle now has nothing to collect from: the balance is
+        // clamped (never negative), the shortfall is recorded as absorbed
+        // by Cortex, and the exhausted budget heads the session for the
+        // goodbye path, which needs the full warning grace before it closes.
         wait_until_session_gone_with_timeout(&state, &session_id, StdDuration::from_secs(40)).await;
 
-        let final_key_prefix = format!("voice:{local_id}:final%");
-        let final_rows: i64 = db
+        let balance = db.get_credit_balance_row(USER).unwrap();
+        assert_eq!(
+            balance.subscription_remaining + balance.pack_remaining,
+            0,
+            "the balance is clamped at zero, never negative"
+        );
+        let description: String = db
             .conn()
             .query_row(
-                "SELECT COUNT(*) FROM credit_transactions WHERE idempotency_key LIKE ?1",
-                [&final_key_prefix],
+                "SELECT description FROM credit_transactions WHERE idempotency_key = ?1",
+                [format!("voice:{local_id}:0")],
                 |row| row.get(0),
             )
-            .unwrap();
+            .expect("the settle still records its cost");
         assert!(
-            final_rows >= 1,
-            "the retried settle must charge under the :final key once credits are available again"
+            description.contains("absorbed by Cortex"),
+            "the uncollectable shortfall must be recorded: {description}"
         );
+        let rows = voice_ledger_rows(db, &local_id);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].2, Some(249_999), "the full true cost is recorded");
+    }
 
-        // Total spent, excluding the test's own direct drain, must be
-        // exactly the one segment's cost — the retried settle must not
-        // double-charge on top of what `charged_credits_so_far` already
-        // tracked as owed.
+    /// `(idempotency_key, credits debited, cost_micro_usd)` for every ledger
+    /// row a live session wrote, ordered by key.
+    fn voice_ledger_rows(
+        db: &crate::db::Database,
+        local_id: &str,
+    ) -> Vec<(String, i64, Option<i64>)> {
+        let pattern = format!("voice:{local_id}:%");
+        let conn = db.conn();
+        let mut stmt = conn
+            .prepare(
+                "SELECT idempotency_key, amount, cost_micro_usd FROM credit_transactions \
+                 WHERE idempotency_key LIKE ?1 ORDER BY idempotency_key",
+            )
+            .unwrap();
+        let rows: Vec<(String, i64, Option<i64>)> = stmt
+            .query_map([&pattern], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect();
+        rows
+    }
+
+    #[tokio::test]
+    async fn a_137_second_session_costs_exactly_137_seconds_of_rate_with_carry() {
+        let (_dir, state) = test_state().await;
+        let (http_base, ws_base) = spawn(FakeLiveScript {
+            usage_events: vec![60, 137],
+            send_closed_after_script: true,
+            respond_to_client_close: true,
+            refuse_attach: false,
+            pause_after_first_event: None,
+            ..Default::default()
+        })
+        .await;
+
+        let (session_id, _sdp, local_id) = start_session(
+            &state,
+            LiveVoiceMode::Live("sk-test-supplier-0123456789".into()),
+            &http_base,
+            &ws_base,
+            SIGNING_KEY,
+            ample_limits(),
+            USER,
+            "offer-sdp",
+            0,
+            None,
+        )
+        .await
+        .expect("live start must succeed");
+
+        wait_until_session_gone(&state, &session_id).await;
+
+        let db = state.db.as_ref().unwrap();
+        let price_list = db.active_price_list().unwrap();
+        let rate = price_list.model("openai", "gpt-live-1").cloned().unwrap();
+        // gpt-live-1 is $0.05/min = 833.333 micro-USD/s, stored as 833_333
+        // per 1000s: 137s = 137 * 833_333 / 1000 = 114_166 micro-USD, which
+        // is 1 whole credit (100_000) with 14_166 carried, not 2 credits.
+        assert_eq!(rate.cost_micros(137, 0, 0), 114_166);
         let balance = db.get_credit_balance_row(USER).unwrap();
-        let remaining = balance.subscription_remaining + balance.pack_remaining;
-        // Funded in total: `segment_credits` at `test_state_with_balance`,
-        // plus `segment_credits` from the top-up above.
-        let funded = segment_credits + segment_credits;
-        let spent_excluding_drain = funded - remaining - drainable;
-        assert_eq!(spent_excluding_drain, segment_credits);
+        assert_eq!(1_000_000_000 - balance.subscription_remaining, 1);
+        assert_eq!(db.get_credit_carry_micro_usd(USER), 14_166);
+
+        let rows = voice_ledger_rows(db, &local_id);
+        assert_eq!(
+            rows,
+            vec![(format!("voice:{local_id}:0"), -1, Some(114_166))],
+            "one charge for the one segment delta, at its exact observed cost"
+        );
+    }
+
+    #[tokio::test]
+    async fn each_segment_delta_is_charged_once_and_a_replay_charges_nothing() {
+        let (_dir, state) = test_state().await;
+        let (http_base, ws_base) = spawn(FakeLiveScript {
+            usage_events: vec![100, 240, 300, 480, 600, 650],
+            send_closed_after_script: true,
+            respond_to_client_close: true,
+            refuse_attach: false,
+            pause_after_first_event: None,
+            ..Default::default()
+        })
+        .await;
+
+        let (session_id, _sdp, local_id) = start_session(
+            &state,
+            LiveVoiceMode::Live("sk-test-supplier-0123456789".into()),
+            &http_base,
+            &ws_base,
+            SIGNING_KEY,
+            ample_limits(),
+            USER,
+            "offer-sdp",
+            chrono::Utc::now().timestamp_millis(),
+            None,
+        )
+        .await
+        .expect("live start must succeed");
+
+        wait_until_session_gone(&state, &session_id).await;
+
+        let db = state.db.as_ref().unwrap();
+        // Three segment deltas (249_999 + 249_999 + 41_668 = 541_666
+        // micro-USD), each charged once under its own key, carrying the
+        // sub-credit remainder from one to the next: 2 + 2 + 1 credits.
+        let expected = vec![
+            (format!("voice:{local_id}:0"), -2, Some(249_999)),
+            (format!("voice:{local_id}:1"), -2, Some(249_999)),
+            (format!("voice:{local_id}:2"), -1, Some(41_668)),
+        ];
+        assert_eq!(voice_ledger_rows(db, &local_id), expected);
+
+        // A reconnect or retry that settles the same segment again re-derives
+        // the same key and is a no-op: no second row, no second charge.
+        let before = db.get_credit_balance_row(USER).unwrap();
+        let carry_before = db.get_credit_carry_micro_usd(USER);
+        let mpc = db.active_price_list().unwrap().micros_per_credit;
+        let replay = db
+            .charge_settled_cost(
+                USER,
+                249_999,
+                mpc,
+                "replay",
+                &cortex_core::billing_binding::ChargeKey::per_unit(format!("voice:{local_id}:0")),
+            )
+            .unwrap();
+        assert_eq!(replay.credits_charged, 0);
+        assert_eq!(db.get_credit_balance_row(USER).unwrap(), before);
+        assert_eq!(db.get_credit_carry_micro_usd(USER), carry_before);
+        assert_eq!(voice_ledger_rows(db, &local_id), expected);
+    }
+
+    #[tokio::test]
+    async fn the_carry_already_owed_shrinks_what_a_new_session_may_reserve() {
+        // One credit on the balance with 50_000 micro-USD of carry already
+        // owed leaves only 50_000 micro-USD payable; a session may never
+        // reserve more than that.
+        let (_dir, state) = test_state_with_balance(1).await;
+        let db = state.db.as_ref().unwrap();
+        let mpc = db.active_price_list().unwrap().micros_per_credit;
+        db.charge_settled_cost(
+            USER,
+            50_000,
+            mpc,
+            "test carry",
+            &cortex_core::billing_binding::ChargeKey::per_unit("test:carry"),
+        )
+        .unwrap();
+        assert_eq!(payable_micro(db, USER, mpc), 50_000);
+
+        let (http_base, ws_base) = spawn(FakeLiveScript {
+            usage_events: vec![],
+            send_closed_after_script: false,
+            respond_to_client_close: true,
+            ..Default::default()
+        })
+        .await;
+        let (session_id, _sdp, local_id) = start_session(
+            &state,
+            LiveVoiceMode::Live("sk-test-supplier-0123456789".into()),
+            &http_base,
+            &ws_base,
+            SIGNING_KEY,
+            ample_limits(),
+            USER,
+            "offer-sdp",
+            0,
+            None,
+        )
+        .await
+        .expect("live start must succeed");
+        let reserved = db
+            .get_provider_reservation(&format!("voice:{local_id}:0"))
+            .expect("segment 0 reservation")
+            .reserved_micro_usd;
+        assert_eq!(reserved, 50_000);
+        close_session(&state, USER, &session_id).await.unwrap();
     }
 
     #[test]

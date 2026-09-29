@@ -1250,4 +1250,31 @@ describe('ChatComposer voice controls', () => {
 
     expect(await screen.findByRole('alert')).toHaveTextContent(/not enough credits for dictation/i);
   });
+
+  it('a 503 on the dictation token disables the mic with the server message, no alert and no retry', async () => {
+    const { fakeTrack } = installFakeMediaDevices();
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
+      const url = String(input);
+      if (url.includes('/api/voice/dictation/token')) {
+        return jsonResponse({ error: 'Dictation is not available yet' }, 503);
+      }
+      return jsonResponse({}, 404);
+    });
+
+    render(<ChatComposer draft="" onDraftChange={noop} onSend={noop} />);
+    await act(async () => {
+      fireEvent.click(screen.getByLabelText('Dictation'));
+    });
+
+    expect(await screen.findByRole('status')).toHaveTextContent('Dictation is not available yet');
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+    const mic = screen.getByLabelText('Dictation');
+    expect(mic).toBeDisabled();
+    expect(mic).toHaveAttribute('title', 'Dictation is not available yet');
+    // The mic that was opened to ask is released, and the token is asked for once.
+    expect(fakeTrack.stop).toHaveBeenCalled();
+    fireEvent.click(mic);
+    const tokenCalls = fetchSpy.mock.calls.filter(([input]) => String(input).includes('/api/voice/dictation/token'));
+    expect(tokenCalls).toHaveLength(1);
+  });
 });

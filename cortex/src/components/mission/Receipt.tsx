@@ -1,5 +1,6 @@
 import { useState } from 'react';
 import { AlertCircle, CheckCircle2, Copy, HelpCircle, MinusCircle } from 'lucide-react';
+import { formatDollars } from '../../lib/formatDollars';
 
 /**
  * The receipt: what Cortex ran, what happened, and why a charge is defensible.
@@ -214,9 +215,16 @@ export function ReceiptCard({ receipt }: { receipt: Receipt }) {
         <span className="t-micro t-mono opacity-90">
           {receipt.gate.required_passed}/{receipt.gate.required_total} required checks passed
         </span>
-        {typeof receipt.charged_credits === 'number' && (
-          <span className="t-micro t-mono opacity-90">{receipt.charged_credits} credits</span>
-        )}
+        {typeof receipt.charged_credits === 'number' && receipt.charged_credits > 0 ? (
+          <span className="t-micro t-mono opacity-90">{formatDollars(receipt.charged_credits)}</span>
+        ) : receipt.gate.verdict === 'inconclusive' ? (
+          // An inconclusive step is Cortex's fault (a required check could not
+          // run), so it is never billed. The receipt carries no per-attempt
+          // cost field; this is read off the verdict, not invented.
+          <span className="t-micro t-mono opacity-90">not charged (Cortex issue)</span>
+        ) : typeof receipt.charged_credits === 'number' ? (
+          <span className="t-micro t-mono opacity-90">{formatDollars(receipt.charged_credits)}</span>
+        ) : null}
         <span className="ml-auto">
           <CopyEvidenceButton payload={receipt} />
         </span>
