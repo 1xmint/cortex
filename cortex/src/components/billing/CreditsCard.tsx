@@ -66,7 +66,7 @@ export default function CreditsCard() {
             className="flex items-center justify-center gap-1.5 rounded-lg border border-white/10 bg-white/6 px-3 py-2 text-xs text-white transition hover:bg-white/10 active:scale-95 disabled:opacity-50"
           >
             {pending === amountUsd ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : null}
-            Pay {formatMoney(amountUsd * 100)} · get {formatCreditGrant(creditsForDollars(amountUsd))}
+            Pay {formatDollars(creditsForDollars(amountUsd))} · get {formatCreditGrant(creditsForDollars(amountUsd))}
           </button>
         ))}
       </div>
