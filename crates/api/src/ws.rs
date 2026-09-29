@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
@@ -620,52 +621,160 @@ async fn handle_worker_msg(
                         // an unavailable container runtime, or a panic and the
                         // verification simply never happened — and the code
                         // said so in a log line nobody was watching.
+                        let owned = db.worker_owned_by_cortex(worker_id);
                         if let (Some(run_id), Some(head)) =
                             (resolved_run_id.clone(), head_commit.clone())
                         {
-                            // The exam, frozen at dispatch. Digested now so the
-                            // dispatcher can refuse a job whose specs changed
-                            // between enqueue and claim rather than grading
-                            // against a different exam than the one promised.
-                            let specs = db.load_check_specs(&run_id, &step_id);
-                            let digest = crate::db::spec_set_digest(&specs);
-                            let job_id = uuid::Uuid::new_v4().to_string();
-
-                            let enqueued = db.begin_verifying_step(
-                                &step_id,
-                                &attempt_id,
-                                lease_gen,
-                                Some(crate::db::VerificationEnqueue {
-                                    job_id: &job_id,
-                                    run_id: &run_id,
-                                    delivered_commit: &head,
-                                    spec_set_digest: &digest,
-                                    runner_policy_ver:
-                                        crate::verification_driver::RUNNER_POLICY_VERSION,
-                                }),
-                            );
-                            if enqueued {
-                                tracing::info!(
-                                    step_id = %step_id,
-                                    job_id = %job_id,
-                                    "delivery enqueued for independent verification"
-                                );
-                            } else {
+                            // F2 of the money-review fix pass: verify the
+                            // worker's claimed head commit actually resolves
+                            // in the workspace repo *before* handing it to
+                            // verification. If it does not resolve, that is
+                            // the worker's own delivery being broken, not a
+                            // Cortex fault -- charged, not absorbed. This
+                            // check happens here, upstream of
+                            // `TreeCheckout::create` in
+                            // verification_driver.rs: once we get there, a
+                            // checkout failure really is Cortex's own
+                            // tooling breaking on a commit that does exist,
+                            // and that stays absorbed.
+                            if !commit_resolves(&state.workspace_dir, &head) {
                                 tracing::warn!(
                                     step_id = %step_id,
-                                    "could not move the delivery to verifying; \
-                                     it stays delivered and reconciliation will see it"
+                                    attempt_id = %attempt_id,
+                                    head_commit = %head,
+                                    "worker-reported head commit does not resolve in the \
+                                     workspace repository; failing the delivery"
                                 );
+                                if db.record_execution_failure_and_end(
+                                    &step_id,
+                                    &attempt_id,
+                                    lease_gen,
+                                    &format!(
+                                        "worker-reported head commit {head} does not resolve \
+                                         in the workspace repository"
+                                    ),
+                                    AttemptEndCause::Failed,
+                                    owned,
+                                ) {
+                                    if let Err(e) = db.settle_pending_attempts() {
+                                        tracing::error!(
+                                            step_id = %step_id,
+                                            attempt_id = %attempt_id,
+                                            error = %e,
+                                            "settle_pending_attempts failed after an \
+                                             unresolvable head commit; the scheduler's next \
+                                             tick will retry"
+                                        );
+                                    }
+                                } else {
+                                    tracing::warn!(
+                                        step_id = %step_id,
+                                        "record_execution_failure_and_end returned false for \
+                                         an unresolvable head commit — likely stale lease_gen"
+                                    );
+                                }
+                            } else {
+                                // The exam, frozen at dispatch. Digested now so the
+                                // dispatcher can refuse a job whose specs changed
+                                // between enqueue and claim rather than grading
+                                // against a different exam than the one promised.
+                                let specs = db.load_check_specs(&run_id, &step_id);
+                                let digest = crate::db::spec_set_digest(&specs);
+                                let job_id = uuid::Uuid::new_v4().to_string();
+
+                                let enqueued = db.begin_verifying_step(
+                                    &step_id,
+                                    &attempt_id,
+                                    lease_gen,
+                                    Some(crate::db::VerificationEnqueue {
+                                        job_id: &job_id,
+                                        run_id: &run_id,
+                                        delivered_commit: &head,
+                                        spec_set_digest: &digest,
+                                        runner_policy_ver:
+                                            crate::verification_driver::RUNNER_POLICY_VERSION,
+                                    }),
+                                );
+                                if enqueued {
+                                    tracing::info!(
+                                        step_id = %step_id,
+                                        job_id = %job_id,
+                                        "delivery enqueued for independent verification"
+                                    );
+                                } else {
+                                    // F3 of the money-review fix pass: a delivery
+                                    // that cannot be enqueued must not be left
+                                    // `delivered` forever with no ending -- fail
+                                    // the step and record why atomically instead.
+                                    tracing::warn!(
+                                        step_id = %step_id,
+                                        "could not move the delivery to verifying; failing \
+                                         the step instead of leaving it stranded"
+                                    );
+                                    if db.record_execution_failure_and_end(
+                                        &step_id,
+                                        &attempt_id,
+                                        lease_gen,
+                                        "could not enqueue delivery for verification",
+                                        AttemptEndCause::Failed,
+                                        owned,
+                                    ) {
+                                        if let Err(e) = db.settle_pending_attempts() {
+                                            tracing::error!(
+                                                step_id = %step_id,
+                                                attempt_id = %attempt_id,
+                                                error = %e,
+                                                "settle_pending_attempts failed after an \
+                                                 unenqueueable delivery; the scheduler's next \
+                                                 tick will retry"
+                                            );
+                                        }
+                                    } else {
+                                        tracing::warn!(
+                                            step_id = %step_id,
+                                            "record_execution_failure_and_end returned false \
+                                             for an unenqueueable delivery — likely \
+                                             stale lease_gen"
+                                        );
+                                    }
+                                }
                             }
                         } else {
                             // No run or no commit means there is nothing to
-                            // grade against. The step stays `delivered` rather
-                            // than being promoted, which is the honest state.
+                            // grade against. F3 of the money-review fix pass:
+                            // this must not leave the step `delivered`
+                            // forever with no ending either.
                             tracing::warn!(
                                 step_id = %step_id,
-                                "delivered with no resolvable run or head commit; \
-                                 nothing to verify against, step stays delivered"
+                                "delivered with no resolvable run or head commit; failing \
+                                 the step instead of leaving it stranded"
                             );
+                            if db.record_execution_failure_and_end(
+                                &step_id,
+                                &attempt_id,
+                                lease_gen,
+                                "delivered with no resolvable run or head commit",
+                                AttemptEndCause::Failed,
+                                owned,
+                            ) {
+                                if let Err(e) = db.settle_pending_attempts() {
+                                    tracing::error!(
+                                        step_id = %step_id,
+                                        attempt_id = %attempt_id,
+                                        error = %e,
+                                        "settle_pending_attempts failed after a delivery with \
+                                         no run or head commit; the scheduler's next tick \
+                                         will retry"
+                                    );
+                                }
+                            } else {
+                                tracing::warn!(
+                                    step_id = %step_id,
+                                    "record_execution_failure_and_end returned false for a \
+                                     delivery with no run or head commit — likely \
+                                     stale lease_gen"
+                                );
+                            }
                         }
                     }
                 } else {
@@ -681,12 +790,55 @@ async fn handle_worker_msg(
                         base_commit.as_deref(),
                         head_commit.as_deref(),
                     );
-                    step_transitioned = db.fail_step(
-                        &step_id,
-                        lease_gen,
-                        &verifier_failure,
-                        Some("VerifierRejected"),
-                    );
+                    // F6 of the money-review fix pass: fail the step and
+                    // record why the attempt ended in the same transaction,
+                    // via `fail_step_and_end`, instead of a separate
+                    // `record_attempt_ended` call after the fact. The
+                    // verifier itself rejected the worker's claimed
+                    // completion as implausible -- an agent/task-level
+                    // outcome, not Cortex's fault, so it is always charged
+                    // (`AttemptEndCause::Failed`) regardless of worker
+                    // ownership.
+                    let step_transition_result = match resolved_run_id.as_deref() {
+                        Some(run_id) => db.fail_step_and_end(
+                            &step_id,
+                            run_id,
+                            lease_gen,
+                            &verifier_failure,
+                            &attempt_id,
+                            AttemptEndCause::Failed,
+                            false,
+                        ),
+                        None => {
+                            tracing::warn!(
+                                step_id = %step_id,
+                                attempt_id = %attempt_id,
+                                "no resolvable run for verifier-rejected step; transitioning \
+                                 without an attempt-ended record"
+                            );
+                            Ok(db.fail_step(
+                                &step_id,
+                                lease_gen,
+                                &verifier_failure,
+                                Some("VerifierRejected"),
+                            ))
+                        }
+                    };
+
+                    step_transitioned = match step_transition_result {
+                        Ok(transitioned) => transitioned,
+                        Err(e) => {
+                            tracing::error!(
+                                step_id = %step_id,
+                                attempt_id = %attempt_id,
+                                error = %e,
+                                "failed to atomically fail verifier-rejected step and record \
+                                 attempt ending; rolled back rather than losing the charge"
+                            );
+                            false
+                        }
+                    };
+
                     if step_transitioned {
                         db.fail_attempt(
                             &step_id,
@@ -695,52 +847,18 @@ async fn handle_worker_msg(
                             Some(&verifier_failure),
                         );
 
-                        // The verifier itself rejected the worker's claimed
-                        // completion as implausible -- an agent/task-level
-                        // outcome, not Cortex's fault, so it is charged like
-                        // any other `Failed` end cause. Item B: every end path
-                        // records a durable `attempt_endings` row; the shared
-                        // settler (also driven by the scheduler's tick and
-                        // startup passes, so a crash right here still gets
-                        // settled later) is run immediately so the ledger
-                        // reflects it by the time this returns.
-                        if let Some(user_id) = resolved_run_id
-                            .as_deref()
-                            .and_then(|run_id| db.get_run_user_id(run_id))
-                        {
-                            if let Err(e) = db.record_attempt_ended(
-                                &attempt_id,
-                                &user_id,
-                                &step_id,
-                                AttemptEndCause::Failed,
-                                false,
-                            ) {
-                                tracing::error!(
-                                    step_id = %step_id,
-                                    attempt_id = %attempt_id,
-                                    error = %e,
-                                    "failed to record attempt ending for verifier-rejected step"
-                                );
-                            } else if let Err(e) = db.settle_pending_attempts() {
-                                tracing::error!(
-                                    step_id = %step_id,
-                                    attempt_id = %attempt_id,
-                                    error = %e,
-                                    "settle_pending_attempts failed after verifier rejection; \
-                                     the scheduler's next tick will retry"
-                                );
-                            }
-                        } else {
-                            tracing::warn!(
+                        if let Err(e) = db.settle_pending_attempts() {
+                            tracing::error!(
                                 step_id = %step_id,
                                 attempt_id = %attempt_id,
-                                "no resolvable owner for verifier-rejected step; skipping \
-                                 attempt-ended record"
+                                error = %e,
+                                "settle_pending_attempts failed after verifier rejection; \
+                                 the scheduler's next tick will retry"
                             );
                         }
                     } else {
                         tracing::warn!(
-                            "fail_step returned false for verifier-rejected step {step_id} lease_gen={lease_gen} — \
+                            "fail_step returned false for verifier-rejected step {step_id} lease_gen={lease_gen} \u{2014} \
                              likely stale lease_gen (step may have been re-leased or already completed)"
                         );
                         completion_error =
@@ -975,14 +1093,81 @@ async fn handle_worker_msg(
             );
 
             if let Some(db) = &state.db {
-                let step_transitioned = if is_cancelled {
-                    db.cancel_step(&step_id, lease_gen, error_msg)
-                } else {
-                    db.fail_step(&step_id, lease_gen, error_msg, Some(&kind_str))
+                // F6 of the money-review fix pass: the step's terminal
+                // UPDATE, its lease release, its operations event, and the
+                // attempt's durable ending all land in one transaction via
+                // `fail_step_and_end` / `cancel_step_and_end`, so a crash or
+                // error in between cannot lose the charge the way a separate
+                // `record_attempt_ended` call after the fact could.
+                // `classify_worker_failure` already distinguishes a customer
+                // cancellation, a plain task/agent failure, and
+                // infrastructure trouble that is only Cortex's fault when the
+                // worker itself is Cortex-owned -- it covers both the cancel
+                // and fail_step branches uniformly, so there is no need to
+                // special-case `is_cancelled` again here.
+                let worker_owned_by_cortex = db.worker_owned_by_cortex(worker_id);
+                let end_cause = classify_worker_failure(failure.kind, worker_owned_by_cortex);
+                let resolved_run_id = resolve_run_id(step_run_cache, state, &step_id);
+
+                let step_transitioned = match resolved_run_id.as_deref() {
+                    Some(run_id) => {
+                        let result = if is_cancelled {
+                            db.cancel_step_and_end(
+                                &step_id,
+                                run_id,
+                                lease_gen,
+                                error_msg,
+                                &attempt_id,
+                                end_cause,
+                                worker_owned_by_cortex,
+                            )
+                        } else {
+                            db.fail_step_and_end(
+                                &step_id,
+                                run_id,
+                                lease_gen,
+                                error_msg,
+                                &attempt_id,
+                                end_cause,
+                                worker_owned_by_cortex,
+                            )
+                        };
+                        match result {
+                            Ok(transitioned) => transitioned,
+                            Err(e) => {
+                                tracing::error!(
+                                    step_id = %step_id,
+                                    attempt_id = %attempt_id,
+                                    error = %e,
+                                    "failed to atomically fail step and record attempt ending; \
+                                     rolled back rather than losing the charge"
+                                );
+                                false
+                            }
+                        }
+                    }
+                    None => {
+                        // No resolvable run means there is no owner to bill;
+                        // fall back to the plain (non-billing) transition so
+                        // the step still terminates, and skip the ledger
+                        // write entirely rather than guessing an owner.
+                        tracing::warn!(
+                            step_id = %step_id,
+                            attempt_id = %attempt_id,
+                            "no resolvable run for failed step; transitioning without an \
+                             attempt-ended record"
+                        );
+                        if is_cancelled {
+                            db.cancel_step(&step_id, lease_gen, error_msg)
+                        } else {
+                            db.fail_step(&step_id, lease_gen, error_msg, Some(&kind_str))
+                        }
+                    }
                 };
+
                 if !step_transitioned {
                     tracing::warn!(
-                        "terminal failure transition returned false for step {step_id} lease_gen={lease_gen} — \
+                        "terminal failure transition returned false for step {step_id} lease_gen={lease_gen} \u{2014} \
                          likely stale lease_gen (step may have been re-leased or already completed)"
                     );
                     if let Some(tx) = state.get_step_sender(&step_id).await {
@@ -998,48 +1183,13 @@ async fn handle_worker_msg(
                 }
                 db.fail_attempt(&step_id, lease_gen, Some(&kind_str), Some(error_msg));
 
-                // Item B: every worker-failure end path records a durable
-                // `attempt_endings` row. `classify_worker_failure` already
-                // distinguishes a customer cancellation, a plain task/agent
-                // failure, and infrastructure trouble that is only Cortex's
-                // fault when the worker itself is Cortex-owned -- it covers
-                // both the cancel and fail_step branches above uniformly, so
-                // there is no need to special-case `is_cancelled` again here.
-                // The shared settler runs immediately after, matching
-                // `finish_and_bill`'s pattern; the scheduler's tick and
-                // startup passes retry it if this in-request call fails.
-                let worker_owned_by_cortex = db.worker_owned_by_cortex(worker_id);
-                let end_cause = classify_worker_failure(failure.kind, worker_owned_by_cortex);
-                if let Some(user_id) = resolve_run_id(step_run_cache, state, &step_id)
-                    .and_then(|run_id| db.get_run_user_id(&run_id))
-                {
-                    if let Err(e) = db.record_attempt_ended(
-                        &attempt_id,
-                        &user_id,
-                        &step_id,
-                        end_cause,
-                        worker_owned_by_cortex,
-                    ) {
-                        tracing::error!(
-                            step_id = %step_id,
-                            attempt_id = %attempt_id,
-                            error = %e,
-                            "failed to record attempt ending for failed step"
-                        );
-                    } else if let Err(e) = db.settle_pending_attempts() {
-                        tracing::error!(
-                            step_id = %step_id,
-                            attempt_id = %attempt_id,
-                            error = %e,
-                            "settle_pending_attempts failed after step failure; the \
-                             scheduler's next tick will retry"
-                        );
-                    }
-                } else {
-                    tracing::warn!(
+                if let Err(e) = db.settle_pending_attempts() {
+                    tracing::error!(
                         step_id = %step_id,
                         attempt_id = %attempt_id,
-                        "no resolvable owner for failed step; skipping attempt-ended record"
+                        error = %e,
+                        "settle_pending_attempts failed after step failure; the \
+                         scheduler's next tick will retry"
                     );
                 }
 
@@ -1053,7 +1203,7 @@ async fn handle_worker_msg(
                     None,
                 );
 
-                if let Some(run_id) = resolve_run_id(step_run_cache, state, &step_id) {
+                if let Some(run_id) = resolved_run_id {
                     state
                         .emit_scheduler_event(SchedulerEvent::StepFailed {
                             run_id: run_id.clone(),
@@ -1150,11 +1300,15 @@ async fn handle_worker_msg(
                 }
             }
 
-            // The worker refused to execute because it could not establish the
-            // isolation the job required. That is our infrastructure failing,
-            // not the customer's step, so it is recorded as `execution_failed`
-            // and never as `failed`. Nothing is charged, and no bandit learns
-            // that a provider did badly — it never ran.
+            // The worker refused to execute because it could not establish
+            // the isolation the job required. Whether that is charged to the
+            // customer or absorbed by Cortex depends on who owned the worker
+            // (see the ownership snapshot just below): a Cortex-owned worker
+            // failing is our infrastructure fault (absorbed); a
+            // customer-owned worker refusing is the customer's own
+            // infrastructure (charged). Recorded as `execution_failed`, never
+            // as `failed`, either way — and no bandit learns that a
+            // provider did badly, since it never ran.
             tracing::error!(
                 step_id = %step_id,
                 reason = %blocked.reason.as_str(),
@@ -1164,8 +1318,31 @@ async fn handle_worker_msg(
 
             if let Some(db) = &state.db {
                 let reason = blocked.to_string();
-                let transitioned =
-                    db.record_execution_failure(&step_id, &attempt_id, lease_gen, &reason);
+                // F1 of the money-review fix pass: recording every
+                // StepBlocked as CortexCrash unconditionally let a
+                // customer-owned worker make any attempt free simply by
+                // refusing to execute. The ownership snapshot now decides
+                // both the cause and the charge: a Cortex-owned worker
+                // failing to establish its own sandbox is our fault
+                // (`WorkerInfraDown`, absorbed); a customer-owned worker
+                // refusing is the customer's own infrastructure (`Failed`,
+                // charged) -- Cortex never eats a customer's broken sandbox.
+                // `record_execution_failure_and_end` records the ending in
+                // the same transaction as the step's own transition (F6).
+                let owned = db.worker_owned_by_cortex(worker_id);
+                let end_cause = if owned {
+                    AttemptEndCause::WorkerInfraDown
+                } else {
+                    AttemptEndCause::Failed
+                };
+                let transitioned = db.record_execution_failure_and_end(
+                    &step_id,
+                    &attempt_id,
+                    lease_gen,
+                    &reason,
+                    end_cause,
+                    owned,
+                );
                 if !transitioned {
                     tracing::warn!(
                         "execution failure did not apply to step {step_id} lease_gen={lease_gen} — \
@@ -1180,43 +1357,13 @@ async fn handle_worker_msg(
                 );
 
                 if transitioned {
-                    // Item B: the worker refused to execute because Cortex's own
-                    // isolation setup failed -- never the customer's fault, so
-                    // this always absorbs (`AttemptEndCause::CortexCrash`,
-                    // unconditionally `Absorb` in `settle_attempt`'s table),
-                    // matching the "nothing is charged" comment above. The
-                    // shared settler runs immediately; the scheduler's tick and
-                    // startup passes retry it if this in-request call fails.
-                    if let Some(user_id) = resolve_run_id(step_run_cache, state, &step_id)
-                        .and_then(|run_id| db.get_run_user_id(&run_id))
-                    {
-                        if let Err(e) = db.record_attempt_ended(
-                            &attempt_id,
-                            &user_id,
-                            &step_id,
-                            AttemptEndCause::CortexCrash,
-                            false,
-                        ) {
-                            tracing::error!(
-                                step_id = %step_id,
-                                attempt_id = %attempt_id,
-                                error = %e,
-                                "failed to record attempt ending for blocked step"
-                            );
-                        } else if let Err(e) = db.settle_pending_attempts() {
-                            tracing::error!(
-                                step_id = %step_id,
-                                attempt_id = %attempt_id,
-                                error = %e,
-                                "settle_pending_attempts failed after step blocked; the \
-                                 scheduler's next tick will retry"
-                            );
-                        }
-                    } else {
-                        tracing::warn!(
+                    if let Err(e) = db.settle_pending_attempts() {
+                        tracing::error!(
                             step_id = %step_id,
                             attempt_id = %attempt_id,
-                            "no resolvable owner for blocked step; skipping attempt-ended record"
+                            error = %e,
+                            "settle_pending_attempts failed after step blocked; the \
+                             scheduler's next tick will retry"
                         );
                     }
 
@@ -1615,6 +1762,28 @@ fn verifier_verdict(verdict: VerifierVerdict) -> &'static str {
         VerifierVerdict::Blocked => "blocked",
     }
 }
+
+/// F2 of the money-review fix pass: does `commit` actually resolve as a
+/// commit object in the workspace repository? A worker can report any
+/// string as its delivered `head_commit`; checking this *before* handing it
+/// to verification means an unresolvable commit is recognized as the
+/// worker's own delivery being broken (charged, `AttemptEndCause::Failed`)
+/// rather than surfacing later as a `TreeCheckout::create` failure in
+/// verification_driver.rs, which is reserved for a checkout failing on a
+/// commit that really does exist -- Cortex's own tooling breaking, and
+/// still absorbed there.
+fn commit_resolves(workspace_dir: &Path, commit: &str) -> bool {
+    std::process::Command::new("git")
+        .arg("-C")
+        .arg(workspace_dir)
+        .arg("cat-file")
+        .arg("-e")
+        .arg(format!("{commit}^{{commit}}"))
+        .output()
+        .map(|out| out.status.success())
+        .unwrap_or(false)
+}
+
 
 /// Resolve step_id to run_id using a per-connection cache to avoid repeated DB lookups.
 /// A step producing 100 output lines would otherwise trigger 100 DB queries with Mutex locks.
@@ -2179,6 +2348,32 @@ mod attempt_end_paths {
         (worker_id, step_id, lease_gen)
     }
 
+    /// Same as [`lease_fixture`] but with an explicit ownership flag. F1 of
+    /// the money-review fix pass distinguishes a Cortex-owned worker's own
+    /// infrastructure failing (absorbed) from a customer-owned worker's own
+    /// infrastructure failing (charged) -- these tests need to construct
+    /// both.
+    fn lease_fixture_owned(
+        state: &AppState,
+        attempt_id: &str,
+        owned_by_cortex: bool,
+    ) -> (String, String, i64) {
+        let db = state.db.as_ref().expect("database");
+        let worker_id = format!("w-{}", &uuid::Uuid::new_v4().to_string()[..8]);
+        db.register_worker(&worker_id, OWNER, owned_by_cortex);
+        let run_id = db.create_run(OWNER, "goal", "default", &[]);
+        let step_id = db.create_step(&run_id, "execute", "strong", "low", "do the thing");
+        let lease_gen = db
+            .lease_step(
+                &step_id,
+                &worker_id,
+                chrono::Utc::now().timestamp_millis() + 60_000,
+                attempt_id,
+            )
+            .expect("lease_step must succeed against a freshly created, pending step");
+        (worker_id, step_id, lease_gen)
+    }
+
     /// Reads back an `attempt_endings` row exactly as the schema stores it:
     /// the snake_case cause string and whether the settler has run.
     fn ending_row(state: &AppState, attempt_id: &str) -> Option<(String, Option<i64>)> {
@@ -2199,6 +2394,62 @@ mod attempt_end_paths {
             stderr_excerpt: Some("boom".into()),
             tool: None,
         }
+    }
+
+    // A funded spend authorization plus a genuinely SETTLED reservation --
+    // the same two-call path a real gateway `forward()` drives
+    // (`reserve_provider_request` then `settle_provider_request`) -- so
+    // F1's tests assert on exact ledger rows a real settlement produced,
+    // not a hand-rolled substitute.
+    const ATTEMPT_NOW: i64 = 1_800_000_000_000;
+
+    fn attempt_capability(
+        db: &crate::db::Database,
+        user_id: &str,
+        attempt_id: &str,
+    ) -> crate::provider_gateway::GatewayCapability {
+        let price_list_id = db.active_price_list().unwrap().id;
+        db.set_supplier_capacity("claude", 10_000_000, ATTEMPT_NOW)
+            .unwrap();
+        let authorization = crate::db::SpendAuthorization {
+            id: format!("auth-{attempt_id}"),
+            user_id: user_id.into(),
+            run_id: format!("run-for-{attempt_id}"),
+            attempt_id: attempt_id.into(),
+            provider: "claude".into(),
+            model: "claude-sonnet-5".into(),
+            price_list_id,
+            max_micro_usd: 10_000_000,
+            expires_at_ms: ATTEMPT_NOW + 60_000,
+        };
+        db.create_spend_authorization(&authorization, ATTEMPT_NOW)
+            .unwrap();
+        crate::provider_gateway::GatewayCapability::new(
+            authorization.id,
+            authorization.user_id,
+            authorization.run_id,
+            authorization.attempt_id,
+            authorization.provider,
+            authorization.model,
+            authorization.expires_at_ms,
+        )
+    }
+
+    /// Reserve and settle one provider call for `claims.attempt_id`, exactly
+    /// as a real gateway `forward()` would once the supplier confirms a
+    /// cost.
+    fn settle_call(
+        db: &crate::db::Database,
+        claims: &crate::provider_gateway::GatewayCapability,
+        request_key: &str,
+        observed: i64,
+    ) {
+        db.reserve_provider_request(claims, request_key, "digest", observed, ATTEMPT_NOW)
+            .expect("reserve");
+        let settled = db
+            .settle_provider_request(request_key, observed, Some("upstream-1"), ATTEMPT_NOW)
+            .expect("settle");
+        assert_eq!(settled.status, "settled");
     }
 
     #[tokio::test]
@@ -2330,9 +2581,21 @@ mod attempt_end_paths {
     }
 
     #[tokio::test]
-    async fn a_matching_stepblocked_always_absorbs_and_settles() {
+    async fn a_stepblocked_from_a_cortex_owned_worker_absorbs_as_zero_amount() {
+        // F1 of the money-review fix pass: a Cortex-owned worker refusing to
+        // execute is Cortex's own infrastructure failing, never the
+        // customer's -- absorbed, recorded as a zero-amount ledger row, not
+        // a refund of any kind.
         let state = state().await;
-        let (worker_id, step_id, lease_gen) = lease_fixture(&state, "real-attempt");
+        let (worker_id, step_id, lease_gen) =
+            lease_fixture_owned(&state, "attempt-blocked-owned", true);
+        {
+            let db = state.db.as_ref().expect("database");
+            db.init_credit_balance(OWNER, 1_000).expect("balance row");
+            let claims = attempt_capability(db, OWNER, "attempt-blocked-owned");
+            settle_call(db, &claims, "call-blocked-owned", 300_000);
+        }
+
         let (brain_tx, _brain_rx) = mpsc::channel(8);
         let mut registered = true;
         let mut authed_user_id = Some(OWNER.to_string());
@@ -2346,9 +2609,9 @@ mod attempt_end_paths {
             &mut authed_user_id,
             &brain_tx,
             WorkerMessage::StepBlocked {
-                message_id: "m4".into(),
+                message_id: "m-owned".into(),
                 step_id: step_id.clone(),
-                attempt_id: "real-attempt".into(),
+                attempt_id: "attempt-blocked-owned".into(),
                 lease_gen,
                 blocked: Blocked::new(BlockedReason::SandboxUnavailable, "no sandbox"),
             },
@@ -2356,17 +2619,101 @@ mod attempt_end_paths {
         )
         .await;
 
-        let (cause, settled_at) = ending_row(&state, "real-attempt")
+        let (cause, settled_at) = ending_row(&state, "attempt-blocked-owned")
             .expect("a matching attempt id must record an attempt_endings row");
         assert_eq!(
-            cause, "cortex_crash",
-            "a worker's own refusal to execute is Cortex's infrastructure fault, \
-             never the customer's, so it must always absorb"
+            cause, "worker_infra_down",
+            "a Cortex-owned worker's own sandbox failure is Cortex's \
+             infrastructure fault and must absorb, never charge"
         );
         assert!(
             settled_at.is_some(),
             "the settler runs inline in the same request and must mark the row settled"
         );
+
+        let db = state.db.as_ref().expect("database");
+        assert_eq!(
+            db.get_credit_balance(OWNER).subscription_remaining,
+            1_000,
+            "an absorbed attempt must never touch the customer's balance"
+        );
+        assert_eq!(db.get_credit_carry_micro_usd(OWNER), 0);
+
+        let key = cortex_core::billing_binding::ChargeKey::for_attempt("attempt-blocked-owned");
+        let (amount, reason): (i64, String) = db
+            .conn()
+            .query_row(
+                "SELECT amount, reason FROM credit_transactions WHERE idempotency_key = ?1",
+                rusqlite::params![key.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("absorbed-cost row");
+        assert_eq!(amount, 0, "an absorbed cost is a zero-amount row, never a refund");
+        assert_eq!(reason, "absorbed");
+    }
+
+    #[tokio::test]
+    async fn a_stepblocked_from_a_customer_owned_worker_charges_the_exact_settled_cost() {
+        // F1 of the money-review fix pass -- this is the exact bug. Before
+        // the fix, every StepBlocked recorded `CortexCrash` unconditionally,
+        // so a customer-owned worker could refuse to execute and make the
+        // attempt free. A customer-owned worker's own infrastructure
+        // failing is the customer's own fault and must be charged exactly
+        // like any other `Failed` end cause -- the exact settled cost of
+        // the call their own worker made, no more, no less.
+        let state = state().await;
+        let (worker_id, step_id, lease_gen) =
+            lease_fixture_owned(&state, "attempt-blocked-customer", false);
+        {
+            let db = state.db.as_ref().expect("database");
+            db.init_credit_balance(OWNER, 1_000).expect("balance row");
+            let claims = attempt_capability(db, OWNER, "attempt-blocked-customer");
+            settle_call(db, &claims, "call-blocked-customer", 300_000);
+        }
+
+        let (brain_tx, _brain_rx) = mpsc::channel(8);
+        let mut registered = true;
+        let mut authed_user_id = Some(OWNER.to_string());
+        let mut step_run_cache = HashMap::new();
+
+        handle_worker_msg(
+            &state,
+            &worker_id,
+            "session-1",
+            &mut registered,
+            &mut authed_user_id,
+            &brain_tx,
+            WorkerMessage::StepBlocked {
+                message_id: "m-customer".into(),
+                step_id: step_id.clone(),
+                attempt_id: "attempt-blocked-customer".into(),
+                lease_gen,
+                blocked: Blocked::new(BlockedReason::SandboxUnavailable, "no sandbox"),
+            },
+            &mut step_run_cache,
+        )
+        .await;
+
+        let (cause, settled_at) = ending_row(&state, "attempt-blocked-customer")
+            .expect("a matching attempt id must record an attempt_endings row");
+        assert_eq!(
+            cause, "failed",
+            "a customer-owned worker's own sandbox failure is the customer's \
+             own infrastructure fault and must be charged, not absorbed for free"
+        );
+        assert!(
+            settled_at.is_some(),
+            "the settler runs inline in the same request and must mark the row settled"
+        );
+
+        let db = state.db.as_ref().expect("database");
+        assert_eq!(
+            db.get_credit_balance(OWNER).subscription_remaining,
+            997,
+            "300_000 micro-USD at the seeded 100_000-micro-USD credit is \
+             exactly 3 whole credits -- pass-through billing, no rounding"
+        );
+        assert_eq!(db.get_credit_carry_micro_usd(OWNER), 0);
     }
 }
 

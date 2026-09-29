@@ -752,10 +752,16 @@ impl Database {
     /// settler's transaction and must see a real error rather than a
     /// swallowed `0` if the read fails — a silent `0` here would read as "no
     /// cost" and skip billing entirely, instead of retrying next tick.
+    ///
+    /// Returns `Ok(None)` — not an `Err` — when a reservation is still
+    /// `reserved`/`unresolved`/`mismatch`: this is an ordinary "not ready
+    /// yet" outcome the settler retries next tick, not a failure worth
+    /// logging as one every tick until the gateway reconciles (F7 of the
+    /// money-review fix pass). `Err` is reserved for a genuine read failure.
     fn attempt_settled_cost_micro_usd_in_tx(
         conn: &Connection,
         attempt_id: &str,
-    ) -> Result<u64, String> {
+    ) -> Result<Option<u64>, String> {
         let blocking: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM provider_request_reservations
@@ -767,9 +773,7 @@ impl Database {
                 format!("failed to check reservation readiness for attempt {attempt_id}: {e}")
             })?;
         if blocking > 0 {
-            return Err(format!(
-                "attempt {attempt_id} has {blocking} reservation(s) still reserved/unresolved/mismatched; not ready to settle"
-            ));
+            return Ok(None);
         }
 
         let settled: i64 = conn
@@ -781,7 +785,7 @@ impl Database {
                 |row| row.get(0),
             )
             .map_err(|e| format!("failed to sum settled cost for attempt {attempt_id}: {e}"))?;
-        Ok(settled.max(0) as u64)
+        Ok(Some(settled.max(0) as u64))
     }
 
     /// Mirrors [`Self::active_price_list`]'s `ORDER BY version DESC LIMIT 1`
@@ -814,7 +818,16 @@ impl Database {
     /// `Ok(())` without settling, so the next tick retries once the gateway
     /// finishes reconciling; (3) the charge or the zero-amount absorb
     /// insert, or neither at all when the settled cost is exactly zero; (4)
-    /// stamp `settled_at`.
+    /// stamp `settled_at` and clear `last_error`.
+    ///
+    /// `Ok(())` covers two distinct outcomes on purpose (F7 of the
+    /// money-review fix pass): the attempt settled just now, or it is still
+    /// waiting on a reservation and will be retried next tick — neither is a
+    /// failure, so neither should spam an error log every tick. Only a
+    /// genuine problem (a DB error, an unreadable row, a missing price list)
+    /// is an `Err`, and only an `Err` here is persisted to
+    /// `attempt_endings.last_error` (by the caller, after the rollback below,
+    /// as a separate write outside this now-rolled-back transaction).
     fn settle_one_pending_attempt(&self, attempt_id: &str) -> Result<(), String> {
         let conn = self.conn();
 
@@ -831,6 +844,21 @@ impl Database {
             }
             Err(e) => {
                 conn.execute("ROLLBACK", []).ok();
+                // A separate write, deliberately outside the transaction that
+                // just rolled back: the failure itself must survive on the
+                // row so it's visible (and so a human or a test can see why
+                // an attempt is stuck) even though nothing else about this
+                // attempt could be committed.
+                if let Err(update_err) = conn.execute(
+                    "UPDATE attempt_endings SET last_error = ?1 WHERE attempt_id = ?2",
+                    params![e.clone(), attempt_id],
+                ) {
+                    tracing::error!(
+                        attempt_id,
+                        error = %update_err,
+                        "failed to persist last_error after a settlement failure"
+                    );
+                }
                 Err(e)
             }
         }
@@ -869,7 +897,14 @@ impl Database {
         })?;
 
         let now = Utc::now().timestamp_millis();
-        let cost_micro_usd = Self::attempt_settled_cost_micro_usd_in_tx(conn, attempt_id)?;
+        let Some(cost_micro_usd) = Self::attempt_settled_cost_micro_usd_in_tx(conn, attempt_id)?
+        else {
+            // Still waiting on a reservation to reconcile — not an error (see
+            // this function's doc comment), just not ready yet. Leave
+            // `settled_at` and `last_error` untouched and let the next tick
+            // try again.
+            return Ok(());
+        };
 
         if cost_micro_usd > 0 {
             let key = billing_binding::ChargeKey::for_attempt(attempt_id);
@@ -907,7 +942,7 @@ impl Database {
         }
 
         conn.execute(
-            "UPDATE attempt_endings SET settled_at = ?1 WHERE attempt_id = ?2",
+            "UPDATE attempt_endings SET settled_at = ?1, last_error = NULL WHERE attempt_id = ?2",
             params![now, attempt_id],
         )
         .map_err(|e| format!("failed to stamp settled_at for attempt {attempt_id}: {e}"))?;
@@ -924,9 +959,13 @@ impl Database {
     /// `Database::record_attempt_ended`); this is what reads it back and
     /// charges or absorbs.
     ///
-    /// One attempt's failure (a stuck reservation, a missing price list) is
-    /// logged and skipped, not propagated — it stays unsettled and is
-    /// retried next call, without blocking every other attempt's tick.
+    /// A stuck reservation is not a failure — `settle_one_pending_attempt`
+    /// returns `Ok(())` for it and simply leaves the row unsettled for the
+    /// next tick to retry. What genuinely fails here (a missing price list,
+    /// a DB error) is logged and skipped, not propagated, so one bad attempt
+    /// can't block every other attempt's tick; it is also written to that
+    /// row's own `last_error` for visibility (F7 of the money-review fix
+    /// pass), rather than existing only in the log.
     pub fn settle_pending_attempts(&self) -> Result<(), String> {
         let pending: Vec<String> = {
             let conn = self.conn();
@@ -936,7 +975,22 @@ impl Database {
             let rows = stmt
                 .query_map([], |row| row.get::<_, String>(0))
                 .map_err(|e| format!("failed to list pending attempt endings: {e}"))?;
-            rows.filter_map(|r| r.ok()).collect()
+            // Every row is a real attempt id this same query just produced --
+            // a read failure here (a corrupt row, a type mismatch) is a
+            // genuine problem, not something to drop silently the way
+            // `filter_map(|r| r.ok())` used to (F7): it would have hidden an
+            // attempt from settlement with no trace of why.
+            let mut ids = Vec::new();
+            for row in rows {
+                match row {
+                    Ok(id) => ids.push(id),
+                    Err(e) => tracing::error!(
+                        error = %e,
+                        "failed to read a pending attempt id; skipping it this tick"
+                    ),
+                }
+            }
+            ids
         };
 
         for attempt_id in pending {
@@ -1660,6 +1714,58 @@ impl Database {
             ],
         )
         .map_err(|e| format!("failed to finish verification: {e}"))?;
+        Ok(())
+    }
+
+    /// Atomic sibling of [`Self::finish_verification`] that also records why
+    /// the attempt ended, in the same transaction as sealing the verdict (F6
+    /// of the money-review fix pass). `verification_driver.rs`'s
+    /// `finish_and_bill` calls this instead of `finish_verification` followed
+    /// by a separate `record_attempt_ended`, so a crash between sealing the
+    /// verdict and recording why the attempt ended can no longer happen —
+    /// either both land, or neither does and the caller (whose worker message
+    /// or verification job is still outstanding) can be retried.
+    #[allow(clippy::too_many_arguments)]
+    pub fn finish_verification_and_end(
+        &self,
+        verification_id: &str,
+        verdict: Verdict,
+        run_id: &str,
+        step_id: &str,
+        attempt_id: &str,
+        cause: cortex_core::billing_binding::AttemptEndCause,
+        worker_owned_by_cortex: bool,
+    ) -> Result<(), String> {
+        let mut conn = self.conn();
+        let tx = conn
+            .transaction()
+            .map_err(|e| format!("failed to begin transaction: {e}"))?;
+
+        tx.execute(
+            "UPDATE verification_runs SET verdict = ?1, finished_at = ?2 WHERE id = ?3",
+            params![
+                verdict_str(verdict),
+                Utc::now().timestamp(),
+                verification_id
+            ],
+        )
+        .map_err(|e| format!("failed to finish verification: {e}"))?;
+
+        let user_id = Database::run_user_id_in_tx(&tx, run_id)?;
+        let now = Utc::now().timestamp_millis();
+        Database::insert_attempt_ending_in_tx(
+            &tx,
+            attempt_id,
+            &user_id,
+            step_id,
+            cause,
+            worker_owned_by_cortex,
+            now,
+        )
+        .map_err(|e| format!("failed to record attempt ending: {e}"))?;
+
+        tx.commit()
+            .map_err(|e| format!("failed to commit transaction: {e}"))?;
         Ok(())
     }
 

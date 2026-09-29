@@ -115,6 +115,26 @@ impl Database {
         Ok(())
     }
 
+    /// A run's owning user, read inside a caller-held transaction, as an
+    /// `Err` rather than a `None` -- for the atomic "fail/cancel/finish a
+    /// step *and* record why its attempt ended" wrappers below (F6 of the
+    /// money-review fix pass). Those wrappers end exactly one attempt per
+    /// call, so a missing owner cannot be a warn-and-skip the way it is in
+    /// `expire_stale_leases`'s and `orphan_step`'s per-row batch loops --
+    /// there is no "other rows" for the charge to ride along with, so
+    /// swallowing this would lose the attempt's ending (and therefore its
+    /// charge or absorb) for good. Returning `Err` here rolls back the
+    /// caller's whole transaction, including the state change that was
+    /// about to be recorded alongside it.
+    fn run_user_id_in_tx(conn: &Connection, run_id: &str) -> Result<String, String> {
+        conn.query_row(
+            "SELECT user_id FROM runs WHERE id = ?1",
+            params![run_id],
+            |row| row.get(0),
+        )
+        .map_err(|e| format!("no owner for run {run_id}: {e}"))
+    }
+
     /// Standalone wrapper around [`Self::insert_attempt_ending_in_tx`] for a
     /// caller that has no transaction of its own already open — a step's end
     /// path that is not otherwise writing to the database in the same breath
@@ -9116,13 +9136,22 @@ impl Database {
         let conn = self.conn();
         let now = Utc::now().timestamp_millis();
         conn.execute(
+            // `owned_by_cortex` is intentionally absent from the UPDATE SET
+            // list (O3 of the money-review fix pass): it is a snapshot taken
+            // once, the first time a worker id is ever registered, so a
+            // later reconnect -- or a colliding worker id presenting a
+            // different key -- can never rewrite an existing row's
+            // ownership flag. Only the operator's own provisioning path sets
+            // it, by inserting the row in the first place; everything after
+            // that is a fresh INSERT for a genuinely new id (`owned_by_cortex`
+            // takes its bound value) or a reconnect of an existing one
+            // (the column keeps whatever it already was).
             "INSERT INTO workers (id, user_id, status, created_at, last_seen, owned_by_cortex)
              VALUES (?1, ?2, 'connected', ?3, ?3, ?4)
              ON CONFLICT(id) DO UPDATE SET
                 user_id = excluded.user_id,
                 status = 'connected',
-                last_seen = excluded.last_seen,
-                owned_by_cortex = excluded.owned_by_cortex",
+                last_seen = excluded.last_seen",
             params![worker_id, user_id, now, owned_by_cortex],
         )
         .map_err(|e| {
@@ -10408,6 +10437,7 @@ impl Database {
             &["delivered"],
             "step.verifying",
             job,
+            None,
         )
     }
 
@@ -10441,6 +10471,7 @@ impl Database {
             &["verifying"],
             "step.verdict",
             None,
+            None,
         )
     }
 
@@ -10469,6 +10500,40 @@ impl Database {
             &["leased", "running", "delivered", "verifying"],
             "step.execution_failed",
             None,
+            None,
+        )
+    }
+
+    /// Atomic sibling of [`Self::record_execution_failure`] that also records
+    /// why the attempt ended, in the same transaction as the transition
+    /// (F1, F2, F3, F6 of the money-review fix pass). Used by ws.rs's
+    /// `StepCompleted` (an unresolvable `head_commit`, or a delivery that
+    /// could not be enqueued for verification) and `StepBlocked` (the worker
+    /// could not establish the sandbox at all) production paths, each of
+    /// which has already classified `cause` and snapshotted
+    /// `worker_owned_by_cortex` before calling this. The plain
+    /// `record_execution_failure` above is untouched and keeps its existing
+    /// callers (tests, `verification_queue.rs`'s dead-letter path).
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_execution_failure_and_end(
+        &self,
+        step_id: &str,
+        attempt_id: &str,
+        lease_gen: i64,
+        reason: &str,
+        cause: cortex_core::billing_binding::AttemptEndCause,
+        worker_owned_by_cortex: bool,
+    ) -> bool {
+        self.transition_verification(
+            step_id,
+            attempt_id,
+            lease_gen,
+            "execution_failed",
+            Some(reason),
+            &["leased", "running", "delivered", "verifying"],
+            "step.execution_failed",
+            None,
+            Some((cause, worker_owned_by_cortex)),
         )
     }
 
@@ -10515,6 +10580,7 @@ impl Database {
             &["delivered", "verifying", "failed", "inconclusive"],
             "step.manual_override",
             None,
+            None,
         )
     }
 
@@ -10525,6 +10591,15 @@ impl Database {
     /// guards. `lease_gen` says *which attempt* this is about, and `from`
     /// restricts *which state* it may leave, so a duplicate or out-of-order
     /// message is a no-op rather than a state machine running backwards.
+    ///
+    /// `ending`, when given, is `(cause, worker_owned_by_cortex)` for the
+    /// attempt this transition ends (F6): recorded via
+    /// [`Self::insert_attempt_ending_in_tx`] inside this same transaction,
+    /// after the transition applies but before anything is committed. A
+    /// missing owner for the step's run rolls back the whole transition
+    /// (returns `false` without committing) rather than applying the state
+    /// change with no ending recorded for it -- there is no other path left
+    /// to record it once this one gives up.
     #[allow(clippy::too_many_arguments)]
     fn transition_verification(
         &self,
@@ -10536,6 +10611,7 @@ impl Database {
         from: &[&str],
         event_kind: &str,
         enqueue: Option<VerificationEnqueue<'_>>,
+        ending: Option<(cortex_core::billing_binding::AttemptEndCause, bool)>,
     ) -> bool {
         let mut conn = self.conn();
         let now = Utc::now().timestamp_millis();
@@ -10600,6 +10676,32 @@ impl Database {
             return false;
         }
 
+        let context = step_event_context(&tx, step_id);
+
+        if let Some((cause, worker_owned_by_cortex)) = ending {
+            let Some(user_id) = context.as_ref().map(|context| context.user_id.as_str()) else {
+                tracing::error!(
+                    step_id,
+                    to_state,
+                    "no owner for step's run; rolling back the transition rather than \
+                     applying it with no attempt ending recorded"
+                );
+                return false;
+            };
+            if let Err(err) = Self::insert_attempt_ending_in_tx(
+                &tx,
+                attempt_id,
+                user_id,
+                step_id,
+                cause,
+                worker_owned_by_cortex,
+                now,
+            ) {
+                tracing::error!(step_id, to_state, error = %err, "could not record the attempt's ending");
+                return false;
+            }
+        }
+
         // The durable job, in the same transaction as the transition that
         // justifies it. This is the whole point of threading it through here
         // rather than exposing an enqueue anyone could call.
@@ -10621,7 +10723,6 @@ impl Database {
             }
         }
 
-        let context = step_event_context(&tx, step_id);
         insert_operations_event(
             &tx,
             context.as_ref().map(|context| context.user_id.as_str()),
@@ -10816,6 +10917,161 @@ impl Database {
             );
         }
         rows > 0
+    }
+
+    /// Atomic sibling of [`Self::fail_step`] for ws.rs's `StepFailed`
+    /// (agent-kind failure) and `VerifierRejected` production paths (F6):
+    /// the step's own UPDATE, its lease release, its operations event, and
+    /// the attempt's durable ending all land in one transaction, so a crash
+    /// or error in between cannot lose the charge the way a separate
+    /// `record_attempt_ended` call after the fact could. `run_id` and
+    /// `attempt_id` are the caller's own (ws.rs already resolves both to
+    /// validate the message before it gets here); a missing run owner rolls
+    /// back the whole call rather than failing the step with no ending
+    /// recorded for it. Existing callers of the plain `fail_step` (tests,
+    /// other call sites not named in the money-review fix pass) are left
+    /// untouched.
+    #[allow(clippy::too_many_arguments)]
+    pub fn fail_step_and_end(
+        &self,
+        step_id: &str,
+        run_id: &str,
+        lease_gen: i64,
+        error: &str,
+        attempt_id: &str,
+        cause: cortex_core::billing_binding::AttemptEndCause,
+        worker_owned_by_cortex: bool,
+    ) -> Result<bool, String> {
+        let mut conn = self.conn();
+        let now = Utc::now().timestamp_millis();
+        let tx = conn
+            .transaction()
+            .map_err(|e| format!("failed to begin transaction: {e}"))?;
+
+        let rows = tx
+            .execute(
+                "UPDATE steps SET status = 'failed', last_error = ?1, updated_at = ?2, version = version + 1
+                 WHERE id = ?3 AND lease_gen = ?4 AND status IN ('leased', 'running')",
+                params![error, now, step_id, lease_gen],
+            )
+            .map_err(|e| format!("failed to fail step {step_id}: {e}"))?;
+
+        if rows > 0 {
+            release_step_leases(&tx, step_id, now);
+            let context = step_event_context(&tx, step_id);
+            insert_operations_event(
+                &tx,
+                context.as_ref().map(|context| context.user_id.as_str()),
+                context
+                    .as_ref()
+                    .and_then(|context| context.group_id.as_deref()),
+                None,
+                context
+                    .as_ref()
+                    .and_then(|context| context.task_id.as_deref()),
+                context.as_ref().map(|context| context.run_id.as_str()),
+                Some(step_id),
+                None,
+                "step.failed",
+                "step",
+                step_id,
+                &serde_json::json!({
+                    "status": "failed",
+                    "lease_gen": lease_gen,
+                    "error": error,
+                }),
+            );
+
+            let user_id = Self::run_user_id_in_tx(&tx, run_id)?;
+            Self::insert_attempt_ending_in_tx(
+                &tx,
+                attempt_id,
+                &user_id,
+                step_id,
+                cause,
+                worker_owned_by_cortex,
+                now,
+            )
+            .map_err(|e| format!("failed to record attempt ending: {e}"))?;
+        }
+
+        tx.commit()
+            .map_err(|e| format!("failed to commit transaction: {e}"))?;
+        Ok(rows > 0)
+    }
+
+    /// Atomic sibling of [`Self::cancel_step`] for ws.rs's `StepFailed`
+    /// cancelled-kind path (F6) -- same reasoning as
+    /// [`Self::fail_step_and_end`], for the `Cancelled` worker-failure kind
+    /// instead of a plain failure.
+    #[allow(clippy::too_many_arguments)]
+    pub fn cancel_step_and_end(
+        &self,
+        step_id: &str,
+        run_id: &str,
+        lease_gen: i64,
+        reason: &str,
+        attempt_id: &str,
+        cause: cortex_core::billing_binding::AttemptEndCause,
+        worker_owned_by_cortex: bool,
+    ) -> Result<bool, String> {
+        let mut conn = self.conn();
+        let now = Utc::now().timestamp_millis();
+        let tx = conn
+            .transaction()
+            .map_err(|e| format!("failed to begin transaction: {e}"))?;
+
+        let rows = tx
+            .execute(
+                "UPDATE steps SET status = 'cancelled', last_error = ?1, assigned_worker = NULL,
+                 lease_deadline = NULL, updated_at = ?2, version = version + 1
+                 WHERE id = ?3 AND lease_gen = ?4 AND status IN ('leased', 'running')",
+                params![reason, now, step_id, lease_gen],
+            )
+            .map_err(|e| format!("failed to cancel step {step_id}: {e}"))?;
+
+        if rows > 0 {
+            release_step_leases(&tx, step_id, now);
+            let context = step_event_context(&tx, step_id);
+            insert_operations_event(
+                &tx,
+                context.as_ref().map(|context| context.user_id.as_str()),
+                context
+                    .as_ref()
+                    .and_then(|context| context.group_id.as_deref()),
+                None,
+                context
+                    .as_ref()
+                    .and_then(|context| context.task_id.as_deref()),
+                context.as_ref().map(|context| context.run_id.as_str()),
+                Some(step_id),
+                None,
+                "step.cancelled",
+                "step",
+                step_id,
+                &serde_json::json!({
+                    "status": "cancelled",
+                    "lease_gen": lease_gen,
+                    "reason": reason,
+                }),
+            );
+
+            let user_id = Self::run_user_id_in_tx(&tx, run_id)?;
+            Self::insert_attempt_ending_in_tx(
+                &tx,
+                attempt_id,
+                &user_id,
+                step_id,
+                cause,
+                worker_owned_by_cortex,
+                now,
+            )
+            .map_err(|e| format!("failed to record attempt ending: {e}"))?;
+        }
+
+        tx.commit()
+            .map_err(|e| format!("failed to commit transaction: {e}"))?;
+        Ok(rows > 0)
     }
 
     pub fn cancel_assigned_step(&self, step_id: &str, reason: &str) -> bool {
@@ -12973,25 +13229,93 @@ impl Database {
         rows > 0
     }
 
+    /// Orphan a step whose worker's grace period expired without a
+    /// reconnect. A worker that never comes back after its grace period is
+    /// functionally identical to one whose lease expired outright, so this
+    /// records the same ending `expire_stale_leases` would (F4 of the
+    /// money-review fix pass): the worker-ownership snapshot and the
+    /// scheduler-minted `server_attempt_id` are read *before* the UPDATE
+    /// below clears `assigned_worker`, and the ending is inserted in the same
+    /// transaction as the UPDATE, so a later re-lease can never overwrite
+    /// `server_attempt_id` out from under an unsettled attempt. This is a
+    /// per-step call from `expire_grace_periods`'s own per-worker loop, so a
+    /// missing run owner is a warn-and-skip here, not a rollback -- the same
+    /// convention `expire_stale_leases` uses for its batch loop.
     pub fn orphan_step(&self, step_id: &str) {
-        let conn = self.conn();
+        let mut conn = self.conn();
         let now = Utc::now().timestamp_millis();
-        let rows = conn.execute(
-            "UPDATE steps SET status = 'orphaned', assigned_worker = NULL, lease_deadline = NULL,
-                 updated_at = ?1, version = version + 1
-             WHERE id = ?2 AND status IN ('leased', 'running')",
-            params![now, step_id],
-        )
-        .unwrap_or(0);
+        let tx = match conn.transaction() {
+            Ok(tx) => tx,
+            Err(err) => {
+                tracing::error!(step_id, error = %err, "orphan_step: could not begin transaction");
+                return;
+            }
+        };
+
+        let snapshot: Option<(String, Option<String>, bool)> = tx
+            .query_row(
+                "SELECT steps.run_id, steps.server_attempt_id,
+                        COALESCE(workers.owned_by_cortex, 0)
+                 FROM steps
+                 LEFT JOIN workers ON workers.id = steps.assigned_worker
+                 WHERE steps.id = ?1 AND steps.status IN ('leased', 'running')",
+                params![step_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, bool>(2)?,
+                    ))
+                },
+            )
+            .ok();
+
+        let rows = tx
+            .execute(
+                "UPDATE steps SET status = 'orphaned', assigned_worker = NULL, lease_deadline = NULL,
+                     updated_at = ?1, version = version + 1
+                 WHERE id = ?2 AND status IN ('leased', 'running')",
+                params![now, step_id],
+            )
+            .unwrap_or(0);
+
         if rows > 0 {
             insert_step_operations_event(
-                &conn,
+                &tx,
                 step_id,
                 "step.orphaned",
                 &serde_json::json!({
                     "status": "orphaned",
                 }),
             );
+
+            if let Some((run_id, Some(attempt_id), worker_owned_by_cortex)) = snapshot {
+                match Self::run_user_id_in_tx(&tx, &run_id) {
+                    Ok(user_id) => {
+                        let cause = cortex_core::billing_binding::classify_lease_expiry(
+                            worker_owned_by_cortex,
+                        );
+                        if let Err(err) = Self::insert_attempt_ending_in_tx(
+                            &tx,
+                            &attempt_id,
+                            &user_id,
+                            step_id,
+                            cause,
+                            worker_owned_by_cortex,
+                            now,
+                        ) {
+                            tracing::error!(step_id, error = %err, "orphan_step: could not record attempt ending");
+                        }
+                    }
+                    Err(err) => {
+                        tracing::warn!(step_id, run_id = %run_id, error = %err, "orphan_step: no owner for run; skipping ledger write for orphaned step");
+                    }
+                }
+            }
+        }
+
+        if let Err(err) = tx.commit() {
+            tracing::error!(step_id, error = %err, "orphan_step: failed to commit");
         }
     }
 

@@ -140,22 +140,83 @@ impl Database {
     /// job that kills every dispatcher that touches it and takes the queue with
     /// it.
     pub fn reclaim_expired_verification_jobs(&self) -> usize {
-        let conn = self.conn();
         let now = Utc::now().timestamp_millis();
 
-        let dead = conn
-            .execute(
-                "UPDATE verification_jobs
-                 SET state = 'dead', claim_token = NULL,
-                     terminal_reason = 'claim expired after exhausting attempts',
-                     updated_at = ?1, version = version + 1
+        // Candidates that have exhausted their attempts, read up front so
+        // each one's step can be failed and its attempt's ending recorded
+        // before the job itself is marked dead (O1 of the money-review fix
+        // pass). A claim that dies here, on every dispatcher that picks it
+        // up, is Cortex's own infrastructure failing -- never the
+        // customer's work -- so every one of these absorbs as
+        // `CortexCrash`, never charges. The step-and-ending write happens
+        // first and the job's own terminal write second: a crash between
+        // the two just gets retried next sweep (`record_execution_failure_and_end`
+        // is guarded on the step's own state and `insert_attempt_ending_in_tx`
+        // is `INSERT OR IGNORE`, so redoing it is a safe no-op), whereas
+        // marking the job dead first could leave a stuck step with no
+        // billing decision ever recorded for it if the process died before
+        // the second write landed.
+        let dying: Vec<(String, String, String, i64)> = {
+            let conn = self.conn();
+            let mut stmt = match conn.prepare(
+                "SELECT job_id, step_id, attempt_id, lease_gen
+                 FROM verification_jobs
                  WHERE state = 'claimed' AND lease_expires_at <= ?1
                    AND attempt_count >= ?2",
-                params![now, VERIFICATION_MAX_ATTEMPTS],
-            )
-            .unwrap_or(0);
+            ) {
+                Ok(stmt) => stmt,
+                Err(_) => return 0,
+            };
+            stmt.query_map(params![now, VERIFICATION_MAX_ATTEMPTS], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })
+            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            .unwrap_or_default()
+        };
 
-        let requeued = conn
+        let mut dead = 0;
+        for (job_id, step_id, attempt_id, lease_gen) in &dying {
+            if self.record_execution_failure_and_end(
+                step_id,
+                attempt_id,
+                *lease_gen,
+                "verification claim expired after exhausting attempts",
+                cortex_core::billing_binding::AttemptEndCause::CortexCrash,
+                false,
+            ) {
+                if let Err(e) = self.settle_pending_attempts() {
+                    tracing::error!(
+                        job_id = %job_id,
+                        step_id = %step_id,
+                        error = %e,
+                        "settle_pending_attempts failed after a reclaim dead-letter; \
+                         the scheduler's next tick will retry"
+                    );
+                }
+            } else {
+                tracing::warn!(
+                    job_id = %job_id,
+                    step_id = %step_id,
+                    "record_execution_failure_and_end returned false for a reclaim \
+                     dead-letter -- likely stale lease_gen"
+                );
+            }
+            let updated = self
+                .conn()
+                .execute(
+                    "UPDATE verification_jobs
+                     SET state = 'dead', claim_token = NULL,
+                         terminal_reason = 'claim expired after exhausting attempts',
+                         updated_at = ?1, version = version + 1
+                     WHERE job_id = ?2 AND state = 'claimed'",
+                    params![now, job_id],
+                )
+                .unwrap_or(0);
+            dead += updated;
+        }
+
+        let requeued = self
+            .conn()
             .execute(
                 "UPDATE verification_jobs
                  SET state = 'retry_wait', claim_token = NULL, next_run_at = ?1,
@@ -175,25 +236,72 @@ impl Database {
     /// `retry_wait` with a time, rather than a log line and a stranded
     /// delivery.
     pub fn retry_verification_job(&self, job_id: &str, claim_token: &str, delay_ms: i64) -> bool {
-        let conn = self.conn();
         let now = Utc::now().timestamp_millis();
 
-        // Out of attempts. Retrying forever is how a queue stops being a queue.
-        let retired = conn
-            .execute(
-                "UPDATE verification_jobs
-                 SET state = 'dead', claim_token = NULL,
-                     terminal_reason = 'retries exhausted without a verdict',
-                     updated_at = ?1, version = version + 1
-                 WHERE job_id = ?2 AND state = 'claimed' AND claim_token = ?3
-                   AND attempt_count >= ?4",
-                params![now, job_id, claim_token, VERIFICATION_MAX_ATTEMPTS],
+        // Out of attempts. Retrying forever is how a queue stops being a
+        // queue. Look up the step this job belongs to before giving up on
+        // it -- same O1 reasoning as reclaim_expired_verification_jobs's
+        // dead-letter path: our own runner repeatedly failing to come back
+        // is Cortex's infrastructure fault, so the attempt is failed and
+        // its ending recorded as `CortexCrash` (absorbed) before the job
+        // itself is marked dead, rather than leaving the step stranded in
+        // `verifying` with no billing decision ever recorded for it.
+        let dying: Option<(String, String, i64)> = self
+            .conn()
+            .query_row(
+                "SELECT step_id, attempt_id, lease_gen
+                 FROM verification_jobs
+                 WHERE job_id = ?1 AND state = 'claimed' AND claim_token = ?2
+                   AND attempt_count >= ?3",
+                params![job_id, claim_token, VERIFICATION_MAX_ATTEMPTS],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
-            .unwrap_or(0);
-        if retired > 0 {
-            return true;
+            .ok();
+
+        if let Some((step_id, attempt_id, lease_gen)) = &dying {
+            if self.record_execution_failure_and_end(
+                step_id,
+                attempt_id,
+                *lease_gen,
+                "retries exhausted without a verdict",
+                cortex_core::billing_binding::AttemptEndCause::CortexCrash,
+                false,
+            ) {
+                if let Err(e) = self.settle_pending_attempts() {
+                    tracing::error!(
+                        job_id = %job_id,
+                        step_id = %step_id,
+                        error = %e,
+                        "settle_pending_attempts failed after a retry-exhausted \
+                         dead-letter; the scheduler's next tick will retry"
+                    );
+                }
+            } else {
+                tracing::warn!(
+                    job_id = %job_id,
+                    step_id = %step_id,
+                    "record_execution_failure_and_end returned false for a \
+                     retry-exhausted dead-letter -- likely stale lease_gen"
+                );
+            }
+            let retired = self
+                .conn()
+                .execute(
+                    "UPDATE verification_jobs
+                     SET state = 'dead', claim_token = NULL,
+                         terminal_reason = 'retries exhausted without a verdict',
+                         updated_at = ?1, version = version + 1
+                     WHERE job_id = ?2 AND state = 'claimed' AND claim_token = ?3
+                       AND attempt_count >= ?4",
+                    params![now, job_id, claim_token, VERIFICATION_MAX_ATTEMPTS],
+                )
+                .unwrap_or(0);
+            if retired > 0 {
+                return true;
+            }
         }
 
+        let conn = self.conn();
         conn.execute(
             "UPDATE verification_jobs
              SET state = 'retry_wait', claim_token = NULL, next_run_at = ?1,
@@ -743,6 +851,111 @@ mod verifier {
         let depth = db.verification_queue_depth();
         assert_eq!(depth, vec![("queued".to_string(), 1)]);
     }
+
+    /// Reads back an `attempt_endings` row exactly as the schema stores it:
+    /// the snake_case cause string and whether the settler has run.
+    fn ending_row(db: &Database, attempt_id: &str) -> Option<(String, Option<i64>)> {
+        db.conn()
+            .query_row(
+                "SELECT cause, settled_at FROM attempt_endings WHERE attempt_id = ?1",
+                params![attempt_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<i64>>(1)?)),
+            )
+            .ok()
+    }
+
+    #[test]
+    fn reclaim_dead_letter_fails_the_step_and_absorbs_as_cortex_crash() {
+        // O1 of the money-review fix pass: before this fix, a claim that
+        // burned every attempt only marked the *job* dead -- the step
+        // stayed stuck in `verifying` forever with no attempt_endings row,
+        // so the attempt was never billed one way or the other. A claim
+        // that kills every dispatcher that touches it is Cortex's own
+        // infrastructure failing, never the customer's work, so it must now
+        // fail the step and absorb the ending as `cortex_crash`.
+        let db = test_db();
+        let (run_id, gen) = delivered_step(&db, "step-1");
+        let digest = spec_set_digest(&[spec("c1")]);
+        assert!(db.begin_verifying_step(
+            "step-1",
+            "a1",
+            gen,
+            Some(enqueue(&run_id, "job-1", &digest))
+        ));
+
+        for _ in 0..VERIFICATION_MAX_ATTEMPTS {
+            db.claim_verification_job("dispatcher-a")
+                .expect("claimable");
+            expire_claim(&db, "job-1");
+            db.reclaim_expired_verification_jobs();
+        }
+
+        assert_eq!(
+            db.get_step_status("step-1").as_deref(),
+            Some("execution_failed"),
+            "a claim that exhausts every attempt must fail the step, not leave it \
+             stuck in verifying forever"
+        );
+
+        let (cause, settled_at) =
+            ending_row(&db, "a1").expect("the dead-lettered attempt must record an ending");
+        assert_eq!(
+            cause, "cortex_crash",
+            "a claim that kills every dispatcher is Cortex's own infrastructure \
+             failing and must absorb, not charge"
+        );
+        assert!(
+            settled_at.is_some(),
+            "settle_pending_attempts is called inline and must mark the row settled"
+        );
+    }
+
+    #[test]
+    fn retry_exhausted_dead_letter_fails_the_step_and_absorbs_as_cortex_crash() {
+        // Same O1 gap, the other dead-letter path: a dispatcher that keeps
+        // calling retry_verification_job (rather than letting the claim
+        // expire and reconciliation reclaim it) until attempts are
+        // exhausted must get the identical billing outcome.
+        let db = test_db();
+        let (run_id, gen) = delivered_step(&db, "step-1");
+        let digest = spec_set_digest(&[spec("c1")]);
+        assert!(db.begin_verifying_step(
+            "step-1",
+            "a1",
+            gen,
+            Some(enqueue(&run_id, "job-1", &digest))
+        ));
+
+        for _ in 0..VERIFICATION_MAX_ATTEMPTS {
+            db.claim_verification_job("dispatcher-a")
+                .expect("claimable");
+            db.retry_verification_job("job-1", "dispatcher-a", 0);
+        }
+
+        let job = db.get_verification_job("job-1").unwrap();
+        assert_eq!(
+            job.state, "dead",
+            "retries exhausted through retry_verification_job must also retire the job"
+        );
+        assert_eq!(
+            db.get_step_status("step-1").as_deref(),
+            Some("execution_failed"),
+            "and must fail the step rather than leave it stuck in verifying forever"
+        );
+
+        let (cause, settled_at) =
+            ending_row(&db, "a1").expect("the dead-lettered attempt must record an ending");
+        assert_eq!(
+            cause, "cortex_crash",
+            "a runner that never comes back is Cortex's own infrastructure fault \
+             and must absorb, not charge"
+        );
+        assert!(
+            settled_at.is_some(),
+            "settle_pending_attempts is called inline and must mark the row settled"
+        );
+    }
+
 
     /// Force a claim's lease into the past, standing in for a dispatcher that
     /// died without releasing it.

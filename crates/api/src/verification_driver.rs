@@ -37,7 +37,7 @@
 
 use std::path::{Path, PathBuf};
 
-use cortex_core::billing_binding::AttemptEndCause;
+use cortex_core::billing_binding::{classify_exam_integrity_failure, AttemptEndCause};
 use cortex_core::check_derivation::EcosystemFacts;
 use cortex_core::diff_surface::{self, ClassOutcome, VerdictClass};
 use cortex_core::verification::{
@@ -205,12 +205,13 @@ pub async fn verify_delivery<R: CheckRunner>(
             .await;
             return Some(Verdict::Inconclusive);
         }
-        ExamIntegrity::Unknown { reason } => {
+        ExamIntegrity::Unknown { reason, delivered_tree_caused } => {
             let detail = format!("exam integrity unknown: {reason}");
             tracing::error!(
                 run_id = %facts.run_id,
                 step_id = %facts.step_id,
                 reason = %reason,
+                delivered_tree_caused,
                 "could not establish frozen exam integrity; grading refused"
             );
             finish_inconclusive_without_grading(
@@ -218,7 +219,7 @@ pub async fn verify_delivery<R: CheckRunner>(
                 &verification_id,
                 facts,
                 &detail,
-                AttemptEndCause::CortexCrash,
+                classify_exam_integrity_failure(delivered_tree_caused),
             )
             .await;
             return Some(Verdict::Inconclusive);
@@ -409,26 +410,23 @@ async fn finish_and_bill(
     end_cause: AttemptEndCause,
     facts: &DeliveryFacts,
 ) {
-    if let Err(e) = db.finish_verification(verification_id, verdict) {
-        tracing::error!(verification_id, error = %e, "failed to seal verdict");
-        return;
-    }
-
-    let Some(user_id) = db.get_run_user_id(&facts.run_id) else {
-        tracing::warn!(run_id = %facts.run_id, "no owner for run; skipping attempt-ended record");
-        return;
-    };
-
     // `worker_owned_by_cortex` only matters to `classify_lease_expiry` and
     // `classify_worker_failure`, neither of which produces the causes this
     // module ever passes here (Verified/Unverified/Failed/ExamTampered/
     // CortexCrash/RunnerDown) -- `settle_attempt` maps those directly with no
     // dependence on worker ownership. `false` is the schema's own default for
     // a record where the field is not meaningful.
-    if let Err(e) = db.record_attempt_ended(
-        &facts.attempt_id,
-        &user_id,
+    //
+    // Sealing the verdict and recording why the attempt ended happen in one
+    // transaction (F6 of the money-review fix pass): a crash between them
+    // used to be able to leave a sealed verdict with no durable ending for
+    // the settler to find.
+    if let Err(e) = db.finish_verification_and_end(
+        verification_id,
+        verdict,
+        &facts.run_id,
         &facts.step_id,
+        &facts.attempt_id,
         end_cause,
         false,
     ) {
@@ -436,8 +434,9 @@ async fn finish_and_bill(
             run_id = %facts.run_id,
             step_id = %facts.step_id,
             attempt_id = %facts.attempt_id,
+            verification_id,
             error = %e,
-            "failed to record attempt ending"
+            "failed to seal verdict and record attempt ending"
         );
         return;
     }
@@ -448,8 +447,7 @@ async fn finish_and_bill(
             verification_id,
             attempt_id = %facts.attempt_id,
             error = %e,
-            "settle_pending_attempts failed after recording attempt ending; \
-             the scheduler's next tick will retry"
+            "settle_pending_attempts failed after recording attempt ending;              the scheduler's next tick will retry"
         );
     }
 }
@@ -460,7 +458,15 @@ enum ExamIntegrity {
     Intact,
     PermittedAuthoredWork,
     ModifiedExam { paths: Vec<String> },
-    Unknown { reason: String },
+    /// `delivered_tree_caused` distinguishes a failure caused by what the
+    /// worker actually delivered (its head commit does not resolve, its
+    /// diff against the frozen base cannot be computed) from a failure in
+    /// Cortex's own machinery (a missing or unreadable work contract, a
+    /// base commit Cortex itself should have recorded at dispatch). Fed to
+    /// `classify_exam_integrity_failure` (F2 of the money-review fix pass)
+    /// so an unknown result is charged when it stems from delivered content
+    /// and absorbed only when it is genuinely ours.
+    Unknown { reason: String, delivered_tree_caused: bool },
 }
 
 fn exam_integrity(db: &Database, facts: &DeliveryFacts) -> ExamIntegrity {
@@ -469,11 +475,13 @@ fn exam_integrity(db: &Database, facts: &DeliveryFacts) -> ExamIntegrity {
         Ok(None) => {
             return ExamIntegrity::Unknown {
                 reason: "missing work contract".to_string(),
+                delivered_tree_caused: false,
             };
         }
         Err(err) => {
             return ExamIntegrity::Unknown {
                 reason: format!("unreadable work contract: {err}"),
+                delivered_tree_caused: false,
             };
         }
     };
@@ -487,6 +495,7 @@ fn exam_integrity(db: &Database, facts: &DeliveryFacts) -> ExamIntegrity {
     let Some(base) = contract.expected_base_commit.as_deref() else {
         return ExamIntegrity::Unknown {
             reason: "strong contract is missing its required base commit".to_string(),
+            delivered_tree_caused: false,
         };
     };
     let changed = match changed_paths(&facts.workspace_dir, base, &facts.head_commit) {
@@ -494,6 +503,11 @@ fn exam_integrity(db: &Database, facts: &DeliveryFacts) -> ExamIntegrity {
         Err(err) => {
             return ExamIntegrity::Unknown {
                 reason: format!("diff inspection failed: {err}"),
+                // The base and head are both from the frozen contract and
+                // the delivery itself; a git failure resolving either -- most
+                // often a head commit the worker never actually delivered --
+                // is charged by default rather than assumed to be ours (F2).
+                delivered_tree_caused: true,
             };
         }
     };
@@ -1101,7 +1115,8 @@ mod tests {
         assert_eq!(
             exam_integrity(&db, &facts(&dir, &head)),
             ExamIntegrity::Unknown {
-                reason: "missing work contract".to_string()
+                reason: "missing work contract".to_string(),
+                delivered_tree_caused: false,
             }
         );
     }
