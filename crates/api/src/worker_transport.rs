@@ -563,7 +563,6 @@ mod tests {
     async fn base_bundle_carries_the_base_commit() {
         let f = fixture().await;
         let leased = authorize_user(&f.state, OWNER, &f.step_id, &headers(&f.worker_id))
-            .ok()
             .expect("leased");
         let response = serve_base(&f.state, &leased, Some(&f.base)).await;
         assert_eq!(response.status(), StatusCode::OK);
@@ -635,7 +634,6 @@ mod tests {
     async fn head_bundle_lands_under_the_step_ref() {
         let f = fixture().await;
         let leased = authorize_user(&f.state, OWNER, &f.step_id, &headers(&f.worker_id))
-            .ok()
             .expect("leased");
         let (bytes, head) = worker_bundle(&f);
         let response = ingest_head(
@@ -662,7 +660,6 @@ mod tests {
     async fn oversized_and_corrupt_bundles_are_the_workers_fault() {
         let f = fixture().await;
         let leased = authorize_user(&f.state, OWNER, &f.step_id, &headers(&f.worker_id))
-            .ok()
             .expect("leased");
         let (bytes, _) = worker_bundle(&f);
 
