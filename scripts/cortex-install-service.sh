@@ -19,7 +19,7 @@ sudo mkdir -p /var/www/cortex
 sudo mkdir -p "$(dirname "$CORTEX_ENV")"
 
 # The server refuses to boot unless its workspace is a git repository
-# (require_workspace_repository). Idempotent: git init on an existing
+# (ensure_workspace_repository). Idempotent: git init on an existing
 # repository only reinitializes it.
 sudo -u "$CORTEX_USER" mkdir -p "$CORTEX_WORKSPACE_DIR"
 sudo -u "$CORTEX_USER" git -C "$CORTEX_WORKSPACE_DIR" init -q

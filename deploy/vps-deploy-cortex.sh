@@ -59,7 +59,7 @@ cp -r cortex/dist /opt/cortex/frontend/
 chown -R cortex:cortex /opt/cortex/frontend
 
 # The server refuses to boot unless its workspace is a git repository
-# (require_workspace_repository). Idempotent: git init on an existing
+# (ensure_workspace_repository). Idempotent: git init on an existing
 # repository only reinitializes it.
 log_step "🗂️ Ensuring the workspace is a git repository..."
 mkdir -p /opt/cortex/workspace

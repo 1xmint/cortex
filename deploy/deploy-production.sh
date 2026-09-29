@@ -51,7 +51,7 @@ log_info "Creating directory structure..."
 mkdir -p "$CORTEX_HOME" "$WORKSPACE_DIR" "$DATA_DIR" "$BIN_DIR" "$FRONTEND_DIR"
 
 # The server refuses to boot unless its workspace is a git repository
-# (require_workspace_repository). Idempotent: git init on an existing
+# (ensure_workspace_repository). Idempotent: git init on an existing
 # repository only reinitializes it. Run as the service user so the
 # repository is owned by the user that runs the server.
 log_info "Ensuring the workspace is a git repository..."

@@ -83,21 +83,48 @@ pub fn cortex_db_path(workspace_dir: &std::path::Path) -> PathBuf {
 /// The server's workspace must be a git repository: verification reads the
 /// worker's delivered commits from `<workspace>/.git/objects`, and a
 /// workspace without one would make every delivery unverifiable. Checked once
-/// at startup, so a misconfigured deploy fails to boot instead of billing
-/// customers for deliveries it can never look at. The workspace is
+/// at startup. Rather than make the owner run `git init` by hand on the
+/// server, a workspace with no `.git` directory gets one here (the workspace
+/// directory is created first if needed). Boot is refused only if that
+/// initialisation fails, so a misconfigured deploy still fails to boot instead
+/// of billing customers for deliveries it can never look at. The workspace is
 /// worker-writable, so this is deliberately NOT re-asserted per delivery: a
 /// `.git` that goes missing later is the worker's doing and is charged.
 ///
 /// Test constructors of [`AppState`] do not call this.
-pub fn require_workspace_repository(workspace_dir: &std::path::Path) -> Result<(), String> {
+pub fn ensure_workspace_repository(workspace_dir: &std::path::Path) -> Result<(), String> {
     if workspace_dir.join(".git").is_dir() {
-        Ok(())
-    } else {
-        Err(format!(
-            "CORTEX_WORKSPACE ({}) is not a git repository: it has no .git directory. Point CORTEX_WORKSPACE at the repository checkout workers deliver into.",
-            workspace_dir.display()
-        ))
+        return Ok(());
     }
+    std::fs::create_dir_all(workspace_dir).map_err(|e| {
+        format!(
+            "CORTEX_WORKSPACE ({}) could not be created: {e}",
+            workspace_dir.display()
+        )
+    })?;
+    let output = std::process::Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(workspace_dir)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(|e| {
+            format!(
+                "CORTEX_WORKSPACE ({}) has no .git and `git init` could not run: {e}",
+                workspace_dir.display()
+            )
+        })?;
+    if !output.status.success() || !workspace_dir.join(".git").is_dir() {
+        return Err(format!(
+            "CORTEX_WORKSPACE ({}) has no .git and `git init` failed ({}): {}",
+            workspace_dir.display(),
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    tracing::info!("workspace: initialized a git repository in {}", workspace_dir.display());
+    Ok(())
 }
 
 pub struct AppState {
