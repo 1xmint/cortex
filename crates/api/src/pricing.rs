@@ -579,12 +579,12 @@ pub fn seed_models() -> Vec<ModelPrice> {
         // token-shaped row avoids a schema change, and input is the one field
         // the gateway already reserves against. `context_window` is the
         // longest session Cortex allows, in seconds.
-        // gpt-live-1: $0.05/min billed per second = 833.33 micros/s, rounded
-        // up so a minute never costs less than the supplier charges us. This
-        // one row keeps its round-up: voice_session.rs's per-second billing
-        // (a forbidden file for this PR) is pinned to this exact rate, and
-        // its own round-up policy is the voice PR's to change, not this one's.
-        m("openai", "gpt-live-1", 833_334, 0, 0, 7_200, "voice"),
+        // gpt-live-1: $0.05/min billed per second = 833.333... micros/s, so
+        // 833_333 micros per 1000 seconds, truncated like every other row.
+        // Live voice is pass-through: each segment is charged its observed
+        // cost through `charge_settled_cost`, whose sub-credit carry keeps
+        // the remainder exact per account (no round-up anywhere).
+        m("openai", "gpt-live-1", 833_333, 0, 0, 7_200, "voice"),
         // gpt-4o-mini-transcribe: $0.003/min = 50 micros/s.
         m(
             "openai",
@@ -1137,13 +1137,11 @@ mod tests {
                 .find(|m| m.provider == "openai" && m.model_id == id)
                 .unwrap()
         };
-        // One minute of gpt-live-1 is $0.05 = 50_000 micros. The per-second
-        // rate is rounded up ($0.05/60s = 833.33 micros/s -> 833_334) so a
-        // minute never costs Cortex less than the supplier charges; this
-        // matches the pinned expectation in voice_session.rs, a forbidden
-        // file for this PR.
-        let minute = rate("gpt-live-1").cost_micros(60, 0, 0);
-        assert!((50_000..=50_001).contains(&minute), "got {minute}");
+        // One minute of gpt-live-1 is $0.05 = 50_000 micros: 833_333 per
+        // 1000 seconds truncates to 49_999 for 60 seconds, and 137 seconds is
+        // exactly 137 * 833_333 / 1000 = 114_166.
+        assert_eq!(rate("gpt-live-1").cost_micros(60, 0, 0), 49_999);
+        assert_eq!(rate("gpt-live-1").cost_micros(137, 0, 0), 114_166);
         assert_eq!(rate("gpt-4o-mini-transcribe").cost_micros(60, 0, 0), 3_000);
     }
 
