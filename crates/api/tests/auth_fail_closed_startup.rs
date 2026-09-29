@@ -89,7 +89,6 @@ fn production_without_clerk_trust_anchors_exits_nonzero_and_says_why() {
     );
 }
 
-
 #[test]
 fn a_workspace_that_is_not_a_git_repository_stops_the_server_from_booting() {
     let bin = env!("CARGO_BIN_EXE_cortex-server");
