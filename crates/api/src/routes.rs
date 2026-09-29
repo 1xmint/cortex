@@ -578,28 +578,19 @@ pub async fn create_run(
         .and_then(|value| value.as_str())
         .map(String::from);
 
-    let scheduler_tx = state.scheduler_tx.read().await;
-    let tx = scheduler_tx.as_ref().ok_or_else(|| {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(ErrorResponse {
-                error: "scheduler not ready".into(),
-            }),
-        )
-    })?;
-
-    let user_id = &user.user_id;
-
     // The run's repo_key is the only repository it may touch: fetch it into
-    // the run's own repository before the run exists. Production requires a
-    // real GitHub repo_key; a keyless (or `local:`) run is a dev/test path.
+    // the run's own repository before the run exists. This is a network fetch,
+    // so it happens BEFORE the scheduler_tx read guard is taken: holding that
+    // guard across it would stall whoever needs the write side meanwhile.
+    // Production requires a real GitHub repo_key; a keyless (or `local:`) run
+    // is a dev/test path.
     let production = crate::is_production_env();
     let staged = match req.repo_key.as_deref() {
         Some(key) if !key.is_empty() => Some(
             crate::run_repo::stage(
                 &state.workspace_dir,
                 state.clerk_secret_key.as_deref(),
-                user_id,
+                &user.user_id,
                 key,
                 production,
             )
@@ -629,6 +620,18 @@ pub async fn create_run(
         }
         _ => None,
     };
+
+    let scheduler_tx = state.scheduler_tx.read().await;
+    let tx = scheduler_tx.as_ref().ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse {
+                error: "scheduler not ready".into(),
+            }),
+        )
+    })?;
+
+    let user_id = &user.user_id;
 
     let run_id = scheduler::create_run_from_goal(
         &state,
@@ -1241,7 +1244,7 @@ pub(crate) fn validate_run_for_pr(
     Ok((goal, branch))
 }
 
-const RECONNECT_GITHUB: &str = "GitHub did not accept Cortex's access. Reconnect GitHub in your      Cortex settings (the connection may have expired or may not include private      repositories), then try again.";
+const RECONNECT_GITHUB: &str = "GitHub did not accept Cortex's access. Reconnect GitHub in your Cortex settings (the connection may have expired or may not include private repositories), then try again.";
 
 fn pr_error(status: StatusCode, msg: &str) -> (StatusCode, Json<ErrorResponse>) {
     (

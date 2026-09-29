@@ -80,8 +80,14 @@ struct Leased {
     repo: PathBuf,
 }
 
+/// Every refusal is `{"error": "..."}`, so a worker can tell the brain's own
+/// verdict from a proxy's error page.
 fn reply(status: StatusCode, message: impl Into<String>) -> Response {
-    (status, message.into()).into_response()
+    (
+        status,
+        axum::Json(serde_json::json!({ "error": message.into() })),
+    )
+        .into_response()
 }
 
 fn bearer(headers: &HeaderMap) -> Option<String> {

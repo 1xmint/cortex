@@ -12,7 +12,9 @@ use uuid::Uuid;
 
 use cortex_core::billing_binding::{classify_worker_failure, AttemptEndCause};
 use cortex_core::failure::WorkerFailureKind;
-use cortex_core::protocol::{BrainMessage, StepOutput, WorkerMessage, PROTOCOL_VERSION};
+use cortex_core::protocol::{
+    BrainMessage, StepOutput, WorkerMessage, MIN_STEP_PROTOCOL_VERSION, PROTOCOL_VERSION,
+};
 use cortex_core::routing::RiskLevel;
 use cortex_core::task::TaskContract;
 use cortex_engine::captain::SchedulerEvent;
@@ -289,9 +291,27 @@ async fn handle_worker_msg(
                     worker_id.to_string(),
                     user_id.clone(),
                     provider_ids,
+                    protocol_version,
                     brain_tx.clone(),
                 )
                 .await;
+
+            if protocol_version < MIN_STEP_PROTOCOL_VERSION {
+                tracing::warn!(
+                    "worker {worker_id} speaks protocol v{protocol_version}, older than \
+                     v{MIN_STEP_PROTOCOL_VERSION}: it will not be given steps"
+                );
+                let _ = brain_tx
+                    .send(BrainMessage::CancelStep {
+                        step_id: "protocol".into(),
+                        reason: format!(
+                            "update your Cortex worker: it speaks protocol v{protocol_version} and \
+                             this brain needs v{MIN_STEP_PROTOCOL_VERSION} or newer, so it will \
+                             not be given any steps"
+                        ),
+                    })
+                    .await;
+            }
 
             state
                 .emit_scheduler_event(SchedulerEvent::WorkerConnected {

@@ -535,11 +535,16 @@ impl Executor {
             // the brain refuses is a bad delivery (the step fails); a brain
             // or network that could not take it says nothing about the work
             // (the step is blocked).
+            //
+            // A step that left the tree alone (search, think, a no-op) has
+            // head == base, and the base is already in the run repository, so
+            // there is nothing to upload (and `git bundle` refuses to create an
+            // empty bundle).
             if let (Some(repo), Some(guard), Some(base), Some(head)) = (
                 step.repo.as_ref(),
                 worktree_guard.as_ref(),
                 base_commit.as_deref(),
-                head_commit.as_deref(),
+                head_commit.as_deref().filter(|head| Some(*head) != base_commit.as_deref()),
             ) {
                 if let Err(e) =
                     repo_transport::upload_head(repo, &step.step_id, guard.repo_root(), base, head)

@@ -16,7 +16,17 @@ use crate::task::TaskContract;
 // it behaves exactly as it does today, and a new worker talking to an old brain
 // gets the same. Bumping would break every running worker's handshake to
 // announce a change whose failure mode is already closed.
-pub const PROTOCOL_VERSION: u32 = 3;
+//
+// Bumped to 4 for the repository transport: a step now ends with the worker
+// uploading its commits to the brain (`head.bundle`) BEFORE it reports the step
+// complete, and the brain verifies from its own repository. A v3 worker never
+// uploads, so its every step would fail verification and be charged to the
+// customer for a change they did not make. The brain therefore never leases a
+// step to a worker below [`MIN_STEP_PROTOCOL_VERSION`].
+pub const PROTOCOL_VERSION: u32 = 4;
+
+/// The oldest worker protocol a step may be leased to. See [`PROTOCOL_VERSION`].
+pub const MIN_STEP_PROTOCOL_VERSION: u32 = 4;
 
 /// HTTP header naming the worker on the git-bundle transport routes
 /// (`/api/worker/steps/{step_id}/base.bundle` and `head.bundle`). It is

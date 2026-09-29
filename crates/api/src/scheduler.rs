@@ -3129,6 +3129,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_v3_worker_is_never_leased_a_step() {
+        // A worker that predates the repository transport never uploads its
+        // commits, so any step it ran would fail verification and be charged
+        // to the customer. It must not be found at all: no lease, no attempt.
+        let temporary = tempfile::tempdir().expect("temporary workspace");
+        let workspace = temporary.path().to_path_buf();
+        std::fs::create_dir_all(workspace.join(".cortex")).expect("workspace metadata");
+        let state = AppState::new(workspace.join(".cortex/ledger.jsonl"), workspace, None).await;
+
+        let (tx, _rx) = mpsc::channel(8);
+        state
+            .register_worker("old".to_string(), "user-v3".to_string(), Vec::new(), 3, tx)
+            .await;
+        assert!(state.find_worker_for_user("user-v3").await.is_none());
+
+        let (tx, _rx) = mpsc::channel(8);
+        state
+            .register_worker(
+                "new".to_string(),
+                "user-v3".to_string(),
+                Vec::new(),
+                cortex_core::protocol::PROTOCOL_VERSION,
+                tx,
+            )
+            .await;
+        let found = state.find_worker_for_user("user-v3").await;
+        assert_eq!(found.map(|(id, _)| id).as_deref(), Some("new"));
+    }
+
+    #[tokio::test]
     async fn a_cancelled_ready_step_queued_behind_the_cap_is_dropped_not_requeued() {
         // Regression for the bounce found in PR #60 review: `dispatch_step`
         // used to return `RetryLater` for a step that turned out to be
@@ -3162,6 +3192,7 @@ mod tests {
                 user_id: user_id.to_string(),
                 available_providers: Vec::new(),
                 disabled_providers: HashSet::new(),
+                protocol_version: cortex_core::protocol::PROTOCOL_VERSION,
                 tx,
             },
         );

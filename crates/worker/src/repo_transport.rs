@@ -132,8 +132,26 @@ fn is_plain_id(s: &str) -> bool {
 }
 
 fn git(dir: &Path) -> Command {
+    // The cache repository holds what a brain sent and what a model wrote, so
+    // git runs with hooks and every configuration file switched off, the same
+    // as the brain's own `control_git`.
     let mut c = Command::new("git");
-    c.arg("-C").arg(dir).env("GIT_TERMINAL_PROMPT", "0");
+    c.args([
+        "-c",
+        "core.hooksPath=/dev/null",
+        "-c",
+        "core.fsmonitor=false",
+        "-c",
+        "core.attributesFile=/dev/null",
+    ])
+    .arg("-C")
+    .arg(dir)
+    .env("GIT_TERMINAL_PROMPT", "0")
+    .env("GIT_CONFIG_NOSYSTEM", "1")
+    .env("GIT_CONFIG_GLOBAL", "/dev/null")
+    .env_remove("GIT_DIR")
+    .env_remove("GIT_WORK_TREE")
+    .env_remove("GIT_INDEX_FILE");
     c
 }
 
@@ -392,11 +410,23 @@ pub async fn upload_head(
         "the brain did not accept the head bundle (HTTP {status}): {}",
         excerpt(&body)
     );
-    if status.is_client_error() {
+    if is_brain_rejection(status, &body) {
         Err(UploadError::Rejected(msg))
     } else {
         Err(UploadError::Unavailable(msg))
     }
+}
+
+/// True only for a refusal that is the brain's own verdict on the bundle: 413
+/// (over the cap) or 422 (not a usable bundle), with the brain's JSON error as
+/// the body. Everything else says nothing about the work and is the platform's
+/// problem: other 4xx, 401 (the auth provider being down), an HTML page from a
+/// proxy, 5xx.
+fn is_brain_rejection(status: reqwest::StatusCode, body: &str) -> bool {
+    matches!(status.as_u16(), 413 | 422)
+        && serde_json::from_str::<serde_json::Value>(body)
+            .ok()
+            .is_some_and(|v| v.get("error").is_some_and(serde_json::Value::is_string))
 }
 
 fn excerpt(body: &str) -> String {
@@ -456,6 +486,23 @@ mod tests {
         );
         run(src, &["update-ref", "-d", "refs/cortex/dispatch/x"]);
         out
+    }
+
+    #[test]
+    fn only_the_brains_json_413_or_422_blames_the_worker() {
+        use reqwest::StatusCode as S;
+        let json = r#"{"error":"the bundle is empty"}"#;
+        assert!(is_brain_rejection(S::UNPROCESSABLE_ENTITY, json));
+        assert!(is_brain_rejection(S::PAYLOAD_TOO_LARGE, json));
+        // A proxy's HTML page, whatever the status.
+        assert!(!is_brain_rejection(S::PAYLOAD_TOO_LARGE, "<html>413</html>"));
+        assert!(!is_brain_rejection(S::UNPROCESSABLE_ENTITY, "the bundle is empty"));
+        // Other codes are never the worker's fault, JSON or not.
+        assert!(!is_brain_rejection(S::UNAUTHORIZED, json));
+        assert!(!is_brain_rejection(S::BAD_REQUEST, json));
+        assert!(!is_brain_rejection(S::NOT_FOUND, json));
+        assert!(!is_brain_rejection(S::BAD_GATEWAY, json));
+        assert!(!is_brain_rejection(S::UNPROCESSABLE_ENTITY, "{}"));
     }
 
     #[test]

@@ -53,6 +53,9 @@ pub struct ConnectedWorker {
     pub user_id: String,
     pub available_providers: Vec<ProviderId>,
     pub disabled_providers: HashSet<ProviderId>,
+    /// What the worker announced at registration. A worker below
+    /// `MIN_STEP_PROTOCOL_VERSION` is never leased a step.
+    pub protocol_version: u32,
     pub tx: mpsc::Sender<BrainMessage>,
 }
 
@@ -508,6 +511,7 @@ impl AppState {
         worker_id: String,
         user_id: String,
         available_providers: Vec<ProviderId>,
+        protocol_version: u32,
         tx: mpsc::Sender<BrainMessage>,
     ) {
         tracing::info!("registering worker {worker_id} for user {user_id}");
@@ -519,6 +523,7 @@ impl AppState {
                 user_id,
                 available_providers,
                 disabled_providers: HashSet::new(),
+                protocol_version,
                 tx,
             },
         );
@@ -539,6 +544,11 @@ impl AppState {
         workers
             .iter()
             .find(|(_, w)| {
+                // An old worker is never leased a step: no lease, no attempt, no
+                // charge. See `PROTOCOL_VERSION`.
+                if w.protocol_version < cortex_core::protocol::MIN_STEP_PROTOCOL_VERSION {
+                    return false;
+                }
                 w.user_id == user_id && {
                     let has_usable = w
                         .available_providers

@@ -475,16 +475,33 @@ fn snapshot_manifests(repo: &Path, dest: &Path) -> Result<(), PrepareError> {
     std::fs::create_dir_all(dest)
         .map_err(|e| PrepareError::Ours(format!("could not create the manifests dir: {e}")))?;
     for name in MANIFEST_FILES {
+        // Ask for the size first: a blob is read only once it is known to be
+        // small, so a huge file at a manifest's path is never pulled into memory.
+        let spec = format!("{BASE_REF}:{name}");
+        let mut size = git_in(repo);
+        size.args(["cat-file", "-s", &spec]);
+        match run(size, QUICK_DEADLINE) {
+            Ran::Ok(bytes) => {
+                let len = String::from_utf8_lossy(&bytes).trim().parse::<usize>();
+                if !len.is_ok_and(|len| len <= MANIFEST_MAX_BYTES) {
+                    continue;
+                }
+            }
+            // Missing at the base: the ecosystem simply is not declared.
+            Ran::Failed(_) => continue,
+            Ran::Spawn(e) => return Err(PrepareError::Ours(format!("could not run git: {e}"))),
+            Ran::TimedOut => {
+                return Err(PrepareError::Ours("git cat-file did not finish".into()));
+            }
+        }
         let mut show = git_in(repo);
-        show.args(["cat-file", "blob", &format!("{BASE_REF}:{name}")]);
+        show.args(["cat-file", "blob", &spec]);
         match run(show, QUICK_DEADLINE) {
             Ran::Ok(bytes) if bytes.len() <= MANIFEST_MAX_BYTES => {
                 std::fs::write(dest.join(name), bytes).map_err(|e| {
                     PrepareError::Ours(format!("could not write the manifests snapshot: {e}"))
                 })?;
             }
-            // Missing at the base (or oversized): the ecosystem simply is not
-            // declared.
             Ran::Ok(_) | Ran::Failed(_) => {}
             Ran::Spawn(e) => return Err(PrepareError::Ours(format!("could not run git: {e}"))),
             Ran::TimedOut => {
@@ -1096,5 +1113,34 @@ mod tests {
             "fresh staging is live"
         );
         assert!(root.path().join("other").exists());
+    }
+
+    #[test]
+    fn a_pr_targets_the_repo_key_and_nothing_else() {
+        // `create_pr_core` derives the owner/repo and the push URL from the
+        // run's `repo_key` alone.
+        let (owner, repo) = github_owner_repo("acme/widgets").expect("valid key");
+        assert_eq!((owner.as_str(), repo.as_str()), ("acme", "widgets"));
+        assert_eq!(
+            RepoSource::github_url(&owner, &repo),
+            "https://github.com/acme/widgets.git"
+        );
+        // Surrounding whitespace is tolerated, as `parse` trims.
+        assert_eq!(
+            github_owner_repo("  acme/widgets "),
+            Some(("acme".to_string(), "widgets".to_string()))
+        );
+        // Nothing that is not a plain GitHub owner/repo yields a target.
+        for key in [
+            "",
+            "widgets",
+            "local:/srv/repo",
+            "acme/widgets/extra",
+            "acme/wid gets",
+            "../etc/passwd",
+            "https://evil.example/acme/widgets",
+        ] {
+            assert_eq!(github_owner_repo(key), None, "{key:?}");
+        }
     }
 }
