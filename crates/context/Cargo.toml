@@ -11,6 +11,7 @@ rusqlite.workspace = true
 serde.workspace = true
 sha2.workspace = true
 hex.workspace = true
+ignore = "0.4"
 streaming-iterator = "0.1.9"
 tracing.workspace = true
 tree-sitter = "0.27.0"
