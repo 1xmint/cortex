@@ -642,7 +642,10 @@ async fn a_webhook_top_up_resumes_a_paused_run() {
         vec![paused.run_id.clone()],
         "the grant resumes the paused run"
     );
-    assert_eq!(db.get_run_status(&paused.run_id).as_deref(), Some("running"));
+    assert_eq!(
+        db.get_run_status(&paused.run_id).as_deref(),
+        Some("running")
+    );
 
     // The webhook handler passes each resumed run to the scheduler.
     for run_id in resumed {

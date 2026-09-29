@@ -1461,9 +1461,9 @@ pub async fn stripe_webhook(
                 })?;
                 for run_id in resumed {
                     state
-                        .emit_scheduler_event(
-                            cortex_engine::captain::SchedulerEvent::RunResumed { run_id },
-                        )
+                        .emit_scheduler_event(cortex_engine::captain::SchedulerEvent::RunResumed {
+                            run_id,
+                        })
                         .await;
                 }
             }
