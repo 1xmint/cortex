@@ -3082,10 +3082,7 @@ mod attempt_end_paths {
 
     /// A customer-owned worker's step that has started, on a funded account,
     /// with one genuinely settled 300_000 micro-USD call.
-    fn running_step_with_settled_call(
-        state: &AppState,
-        attempt_id: &str,
-    ) -> (String, String, i64) {
+    fn running_step_with_settled_call(state: &AppState, attempt_id: &str) -> (String, String, i64) {
         let (worker_id, step_id, lease_gen) = lease_fixture_owned(state, attempt_id, false);
         let db = state.db.as_ref().expect("database");
         assert!(db.start_step(&step_id, lease_gen));
