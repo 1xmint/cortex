@@ -205,7 +205,8 @@ impl OpenAiTranscriber {
         let text = response.text().await.map_err(|error| {
             ProviderFailure::Unavailable(format!("transcription response was cut off: {error}"))
         })?;
-        if status.is_server_error() || status.as_u16() == 429 {
+        // 401/403 mean Cortex's own key is bad, not the customer's recording.
+        if status.is_server_error() || matches!(status.as_u16(), 401 | 403 | 429) {
             return Err(ProviderFailure::Unavailable(format!(
                 "openai returned {status}"
             )));
@@ -405,6 +406,15 @@ pub(crate) async fn dictation_with(
     }
 
     let charge_label = format!("dictation:{request_id}");
+    // Claim first, then read the ledger: a concurrent request with the same
+    // id releases its claim only after its charge commits, so this read
+    // sees that charge and the replay is refused instead of served free.
+    let Some(claim) = InFlight::claim(&charge_label) else {
+        return Err(reject(
+            StatusCode::CONFLICT,
+            "That recording was already transcribed.",
+        ));
+    };
     let already_charged: i64 = db
         .conn()
         .query_row(
@@ -413,8 +423,7 @@ pub(crate) async fn dictation_with(
             |row| row.get(0),
         )
         .unwrap_or(0);
-    let claim = InFlight::claim(&charge_label);
-    if already_charged > 0 || claim.is_none() {
+    if already_charged > 0 {
         return Err(reject(
             StatusCode::CONFLICT,
             "That recording was already transcribed.",
