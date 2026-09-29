@@ -3508,8 +3508,14 @@ mod tests {
                 |row| row.get(0),
             )
             .expect("pack-bucket row for this charge");
-        assert_eq!(sub_amount, -2, "the allotment covers only 2 of the 4 credits");
-        assert_eq!(pack_amount, -2, "the remaining 2 credits spill into the pack bucket");
+        assert_eq!(
+            sub_amount, -2,
+            "the allotment covers only 2 of the 4 credits"
+        );
+        assert_eq!(
+            pack_amount, -2,
+            "the remaining 2 credits spill into the pack bucket"
+        );
 
         let receipt = db
             .get_receipt("run-receipt-split", "step-receipt-split")
