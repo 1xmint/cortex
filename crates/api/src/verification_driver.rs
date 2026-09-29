@@ -675,7 +675,11 @@ fn control_checkout_in(scratch: &Path, checkout: &Path) -> Result<(), ControlFai
 
     let mut init = control_git();
     init.args(["init", "--quiet", "--template="]).arg(scratch);
-    run_control(init, "git init of the control repository", GIT_QUICK_DEADLINE)?;
+    run_control(
+        init,
+        "git init of the control repository",
+        GIT_QUICK_DEADLINE,
+    )?;
 
     let mut hash = in_scratch();
     hash.args(["hash-object", "-t", "tree", "-w", "--stdin"]);
@@ -832,16 +836,19 @@ impl TreeCheckout {
                     "{message}; not enough scratch space for a control checkout: {room}"
                 )));
             }
-            return Err(match control_checkout(parent) {
+            Err(match control_checkout(parent) {
                 Ok(()) => TreeCheckoutError::DeliveredTree(message),
-                Err(control @ ControlFailure::TimedOut(_)) => TreeCheckoutError::DeliveredTree(
-                    format!("{message}; the control checkout stalled too: {}", control.message()),
-                ),
+                Err(control @ ControlFailure::TimedOut(_)) => {
+                    TreeCheckoutError::DeliveredTree(format!(
+                        "{message}; the control checkout stalled too: {}",
+                        control.message()
+                    ))
+                }
                 Err(control @ ControlFailure::Failed(_)) => TreeCheckoutError::Cortex(format!(
                     "{message}; the control checkout failed too: {}",
                     control.message()
                 )),
-            });
+            })
         }
     }
 }
@@ -877,7 +884,11 @@ fn sweep_stale_scratch_older_than(parent: &Path, age: Duration) -> usize {
     };
     let mut removed = 0;
     for entry in entries.flatten() {
-        if !entry.file_name().to_string_lossy().starts_with("cortex-verify-") {
+        if !entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with("cortex-verify-")
+        {
             continue;
         }
         let Ok(meta) = std::fs::symlink_metadata(entry.path()) else {
@@ -2398,7 +2409,10 @@ mod tests {
         );
         let took = started.elapsed();
         assert!(took >= deadline, "git was not actually stalled: {took:?}");
-        assert!(took < Duration::from_secs(20), "the deadline did not bite: {took:?}");
+        assert!(
+            took < Duration::from_secs(20),
+            "the deadline did not bite: {took:?}"
+        );
 
         let started = Instant::now();
         match TreeCheckout::create_with(
@@ -2416,7 +2430,10 @@ mod tests {
         }
         let took = started.elapsed();
         assert!(took >= deadline, "git was not actually stalled: {took:?}");
-        assert!(took < Duration::from_secs(20), "the deadline did not bite: {took:?}");
+        assert!(
+            took < Duration::from_secs(20),
+            "the deadline did not bite: {took:?}"
+        );
         assert_eq!(
             std::fs::read_dir(parent.path()).unwrap().count(),
             0,
@@ -2452,7 +2469,10 @@ mod tests {
             std::fs::create_dir(&path).unwrap();
             std::fs::write(path.join("tree.txt"), "delivered").unwrap();
             let old = std::time::SystemTime::now() - age;
-            std::fs::File::open(&path).unwrap().set_modified(old).unwrap();
+            std::fs::File::open(&path)
+                .unwrap()
+                .set_modified(old)
+                .unwrap();
             path
         };
         let hour = Duration::from_secs(3600);
