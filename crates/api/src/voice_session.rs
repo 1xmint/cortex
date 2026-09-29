@@ -1234,7 +1234,6 @@ async fn run_billing_loop(
                             .and_then(Value::as_i64)
                             .unwrap_or(last_observed_seconds)
                             .max(last_observed_seconds);
-                        last_observed_seconds = seconds;
                         let observed_total = rate.cost_micros(seconds, 0, 0);
                         last_observed_total_micro = observed_total;
                         settle_up_to(
