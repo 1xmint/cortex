@@ -3755,7 +3755,9 @@ mod tests {
             )
             .unwrap();
         let rows: Vec<(String, i64, Option<i64>)> = stmt
-            .query_map([&pattern], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .query_map([&pattern], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
             .unwrap()
             .map(|row| row.unwrap())
             .collect();
