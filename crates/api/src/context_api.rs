@@ -9,7 +9,10 @@ use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Json};
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::path::{Path as FsPath, PathBuf};
+use std::sync::{Arc, LazyLock, Mutex};
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Serialize)]
 pub struct ArtifactResponse {
@@ -319,6 +322,55 @@ pub struct ImpactResponse {
     pub files_indexed: usize,
 }
 
+/// How long a repo's index is trusted before an impact request re-syncs it.
+///
+/// A sync walks and hashes the whole tree, so doing it on every request turns
+/// a burst of lease checks into a burst of full scans. Thirty seconds is short
+/// enough that an edit is picked up before anyone plans against it, and long
+/// enough to collapse a burst into one scan.
+const RESYNC_WINDOW: Duration = Duration::from_secs(30);
+
+/// What the last sync of one repo left behind.
+#[derive(Clone, Copy)]
+struct SyncRecord {
+    at: Instant,
+    /// Indexed-file total from that sync, so a skipped sync can still report
+    /// index freshness.
+    files_indexed: usize,
+    /// Syncs actually run for this repo since the process started.
+    syncs: usize,
+}
+
+/// Per-repo record of the last sync, keyed by workspace directory.
+static LAST_SYNC: LazyLock<Mutex<HashMap<PathBuf, SyncRecord>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn last_sync() -> std::sync::MutexGuard<'static, HashMap<PathBuf, SyncRecord>> {
+    // The map holds plain `Copy` values, so a panic elsewhere cannot leave it
+    // half-updated; recover the guard rather than failing every later request.
+    LAST_SYNC.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// The indexed-file total from `repo`'s last sync, if that sync is still
+/// within the window and so does not need repeating.
+fn fresh_sync(repo: &FsPath, now: Instant) -> Option<usize> {
+    let record = *last_sync().get(repo)?;
+    (now.saturating_duration_since(record.at) < RESYNC_WINDOW).then_some(record.files_indexed)
+}
+
+fn record_sync(repo: &FsPath, now: Instant, files_indexed: usize) {
+    let mut map = last_sync();
+    let syncs = map.get(repo).map_or(0, |record| record.syncs) + 1;
+    map.insert(
+        repo.to_path_buf(),
+        SyncRecord {
+            at: now,
+            files_indexed,
+            syncs,
+        },
+    );
+}
+
 /// GET /api/context/impact?files=a.rs,b.rs&depth=1
 ///
 /// The impact set for an edit surface: the bounded dependency closure a lease
@@ -373,15 +425,24 @@ pub async fn get_impact_set(
 
     // Sync before answering. An impact set computed from a stale index is a
     // lease over the wrong files, which is worse than no lease at all: it
-    // blocks work that is fine and permits work that collides.
-    let stats = match index.sync(&state.workspace_dir) {
-        Ok(stats) => stats,
-        Err(error) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "error": error })),
-            );
-        }
+    // blocks work that is fine and permits work that collides. But a sync
+    // scans the whole tree, so one that already ran within `RESYNC_WINDOW` is
+    // reused rather than repeated on every request.
+    let files_indexed = match fresh_sync(&state.workspace_dir, Instant::now()) {
+        Some(files_indexed) => files_indexed,
+        None => match index.sync(&state.workspace_dir) {
+            Ok(stats) => {
+                let files_indexed = stats.files_indexed + stats.files_unchanged;
+                record_sync(&state.workspace_dir, Instant::now(), files_indexed);
+                files_indexed
+            }
+            Err(error) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({ "error": error })),
+                );
+            }
+        },
     };
 
     match index.impact_set(&seed_files, depth) {
@@ -399,7 +460,7 @@ pub async fn get_impact_set(
                     })
                     .collect(),
                 truncated: set.truncated,
-                files_indexed: stats.files_indexed + stats.files_unchanged,
+                files_indexed,
             };
             (StatusCode::OK, Json(serde_json::json!(response)))
         }
@@ -575,5 +636,44 @@ mod ownership_tests {
         let (status, _) =
             status_and_body(get_context_stats(State(state), user("user-a")).await).await;
         assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    /// Two impact requests inside the window share one sync, and both still
+    /// report how many files the index holds.
+    #[tokio::test]
+    async fn impact_requests_within_the_window_sync_once() {
+        let (dir, state) = test_state().await;
+        std::fs::write(dir.path().join("a.rs"), "pub fn a() {}
+").unwrap();
+        let request = || ImpactQuery {
+            files: "a.rs".to_string(),
+            depth: None,
+        };
+
+        let (status, first) = status_and_body(
+            get_impact_set(State(state.clone()), Query(request()), user("user-a")).await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, second) = status_and_body(
+            get_impact_set(State(state.clone()), Query(request()), user("user-a")).await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        assert_eq!(last_sync().get(&state.workspace_dir).unwrap().syncs, 1);
+        assert_eq!(first["files_indexed"], 1);
+        assert_eq!(second["files_indexed"], 1);
+    }
+
+    #[test]
+    fn a_sync_older_than_the_window_is_repeated() {
+        let repo = PathBuf::from("/repo/that/never/exists/window-test");
+        let then = Instant::now();
+        assert_eq!(fresh_sync(&repo, then), None);
+
+        record_sync(&repo, then, 7);
+        assert_eq!(fresh_sync(&repo, then + Duration::from_secs(1)), Some(7));
+        assert_eq!(fresh_sync(&repo, then + RESYNC_WINDOW), None);
     }
 }

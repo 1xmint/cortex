@@ -13,6 +13,7 @@
 
 use std::path::{Path, PathBuf};
 
+use ignore::WalkBuilder;
 use streaming_iterator::StreamingIterator;
 use tree_sitter::{Language, Parser, Query, QueryCursor};
 
@@ -93,7 +94,7 @@ fn grammar_for(path: &Path) -> Option<GrammarSpec> {
 /// a sync are unchanged and must not be reparsed.
 pub fn source_files(root: &Path) -> Vec<(PathBuf, String)> {
     let mut files = Vec::new();
-    collect_files(root, root, &mut files);
+    collect_files(root, &mut files);
     // Sorted so a sync visits files in the same order every time, which makes
     // the reference-promotion path deterministic and its tests meaningful.
     files.sort_by(|a, b| a.1.cmp(&b.1));
@@ -183,35 +184,49 @@ pub fn extract_file(path: &Path, relative: &str, source: &str, extraction: &mut 
     }
 }
 
-fn collect_files(root: &Path, dir: &Path, out: &mut Vec<(PathBuf, String)>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let Ok(file_type) = entry.file_type() else {
-            continue;
-        };
+/// Walk `root` the way git does, so build output that a repo ignores is never
+/// even visited: `.gitignore`, `.git/info/exclude` and hidden entries are all
+/// honoured, and [`SKIP_DIRS`] still applies on top for the directories a repo
+/// might forget to ignore.
+///
+/// The hand-rolled walk this replaced descended into every directory it did
+/// not have a hard-coded name for, so a gitignored `target-shared/` with
+/// hundreds of thousands of files stalled the caller for minutes.
+///
+/// Returns how many files the walker visited (before the grammar and size
+/// filters), which is what a test needs to prove an ignored tree costs nothing.
+fn collect_files(root: &Path, out: &mut Vec<(PathBuf, String)>) -> usize {
+    let mut visited = 0;
+    let walker = WalkBuilder::new(root)
+        // A workspace is not always a git checkout (a container copy, an
+        // unpacked archive), and its `.gitignore` still says what it means.
+        .require_git(false)
+        .filter_entry(|entry| {
+            if entry.depth() == 0 || !entry.file_type().is_some_and(|t| t.is_dir()) {
+                return true;
+            }
+            let name = entry.file_name().to_string_lossy();
+            !SKIP_DIRS.contains(&&*name)
+        })
+        .build();
 
-        if file_type.is_dir() {
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            if name.starts_with('.') || SKIP_DIRS.contains(&name.as_ref()) {
-                continue;
-            }
-            collect_files(root, &path, out);
-        } else if file_type.is_file() {
-            if grammar_for(&path).is_none() {
-                continue;
-            }
-            if entry.metadata().map(|m| m.len()).unwrap_or(0) > MAX_FILE_BYTES {
-                continue;
-            }
-            if let Some(relative) = relative_path(root, &path) {
-                out.push((path, relative));
-            }
+    for entry in walker.flatten() {
+        if !entry.file_type().is_some_and(|t| t.is_file()) {
+            continue;
+        }
+        visited += 1;
+        let path = entry.path();
+        if grammar_for(path).is_none() {
+            continue;
+        }
+        if entry.metadata().map(|m| m.len()).unwrap_or(0) > MAX_FILE_BYTES {
+            continue;
+        }
+        if let Some(relative) = relative_path(root, path) {
+            out.push((path.to_path_buf(), relative));
         }
     }
+    visited
 }
 
 /// Repo-relative and forward-slashed, so a map built on Windows reads exactly
@@ -307,5 +322,73 @@ fn helper(raw: &str) -> bool { !raw.is_empty() }
             relative_path(root, &nested).as_deref(),
             Some("crates/api/src.rs")
         );
+    }
+
+    /// A scratch repo under the OS temp dir, removed on drop.
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new(tag: &str) -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "cortex-extract-{tag}-{}-{:?}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(&root).expect("create scratch repo");
+            Self(root)
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.0).ok();
+        }
+    }
+
+    #[test]
+    fn a_gitignored_build_tree_is_not_visited() {
+        let scratch = Scratch::new("ignored");
+        let root = &scratch.0;
+        std::fs::write(root.join(".gitignore"), "target-shared/
+").unwrap();
+        std::fs::write(root.join("lib.rs"), "pub fn kept() {}
+").unwrap();
+        let build = root.join("target-shared").join("debug");
+        std::fs::create_dir_all(&build).unwrap();
+        for i in 0..5_000 {
+            std::fs::write(build.join(format!("gen_{i}.rs")), "fn generated() {}
+").unwrap();
+        }
+
+        let mut files = Vec::new();
+        let visited = collect_files(root, &mut files);
+
+        let relative: Vec<&str> = files.iter().map(|(_, rel)| rel.as_str()).collect();
+        assert_eq!(relative, vec!["lib.rs"]);
+        // Only `lib.rs` is visited: none of the 5,000 ignored files (and not
+        // the hidden `.gitignore` itself) reach the walker's output.
+        assert_eq!(visited, 1, "walker descended into the gitignored tree");
+    }
+
+    #[test]
+    fn skip_dirs_still_apply_without_a_gitignore() {
+        let scratch = Scratch::new("skipdirs");
+        let root = &scratch.0;
+        std::fs::write(root.join("main.rs"), "fn main() {}
+").unwrap();
+        for dir in ["node_modules", "target", "vendor"] {
+            std::fs::create_dir_all(root.join(dir)).unwrap();
+            std::fs::write(root.join(dir).join("dep.rs"), "fn dep() {}
+").unwrap();
+        }
+
+        let mut files = Vec::new();
+        collect_files(root, &mut files);
+
+        let relative: Vec<&str> = files.iter().map(|(_, rel)| rel.as_str()).collect();
+        assert_eq!(relative, vec!["main.rs"]);
     }
 }
