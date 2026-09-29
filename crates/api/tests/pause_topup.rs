@@ -2,11 +2,15 @@
 //!
 //! There are no holds anywhere in this flow. Credits are charged as each
 //! attempt settles, at exact cost. What is under test is the one moment that
-//! matters: the provider gateway's per-call reservation no longer fits in the
-//! owner's balance. The attempt ends (the calls it already made are charged as
-//! settled), the step is not failed and not retried, the run waits in
-//! `awaiting_top_up`, and nothing is dispatched for it until the owner tops up
-//! and `POST /api/runs/{id}/resume` lets the scheduler pick the step up again.
+//! matters: the provider gateway's per-call reservation is checked, live and
+//! inside its own transaction, against what the owner can still pay for (their
+//! credits less the uncharged exposure of their run attempts). When it does not
+//! fit, the call is refused with "insufficient credits", the attempt ends (the
+//! calls it already made are charged as settled), the step is not failed and
+//! not retried, the run waits in `awaiting_top_up`, and nothing is dispatched
+//! for it until the owner tops up and `POST /api/runs/{id}/resume` (or the
+//! top-up webhook) lets the scheduler pick the step up again. Any other refusal
+//! -- the operator's authorization cap included -- does not pause.
 //!
 //! Everything runs against the real router, scheduler and gateway (stub
 //! transport: nothing leaves the machine and no money moves). A worker takes
@@ -25,6 +29,7 @@ use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tower::ServiceExt;
 
+use cortex_api::provider_gateway::GatewayCapability;
 use cortex_api::scheduler;
 use cortex_api::state::AppState;
 use cortex_core::protocol::{
@@ -350,27 +355,6 @@ async fn wait_for_run_status(state: &AppState, run_id: &str, want: &str) {
     );
 }
 
-/// The credits one maximum per-call reservation needs, worked out here from
-/// the published price list rather than by calling the code under test: the
-/// dearest model's whole context window at its dearer rate, plus the carry the
-/// user already owes, rounded up to whole credits.
-fn expected_need_credits(state: &AppState) -> i64 {
-    let db = state.db.as_ref().unwrap();
-    let list = db.active_price_list().expect("a price list is published");
-    let max_reservation = list
-        .models
-        .iter()
-        .filter(|m| m.provider == "claude" || m.provider == "openai")
-        .map(|m| {
-            let rate = m.input_micros_per_1k.max(m.output_micros_per_1k);
-            (m.context_window * rate + 999) / 1_000 + 1
-        })
-        .max()
-        .expect("the price list has a model");
-    let carry = db.get_credit_carry_micro_usd(USER) as i64;
-    (max_reservation + carry + list.micros_per_credit - 1) / list.micros_per_credit
-}
-
 fn raw_count(workspace: &std::path::Path, sql: &str) -> i64 {
     let path = cortex_api::state::cortex_db_path(workspace);
     let conn = rusqlite::Connection::open(path).expect("open the test database");
@@ -425,8 +409,39 @@ async fn paused_run() -> Paused {
     }
 }
 
+/// The capability an `ExecuteStep` frame carries, as the claims the database
+/// checks a reservation against.
+fn claims_of(access: &ProviderGatewayAccess) -> GatewayCapability {
+    GatewayCapability::new(
+        access.authorization_id.clone(),
+        USER,
+        access.run_id.clone(),
+        access.attempt_id.clone(),
+        access.provider.clone(),
+        access.model.clone(),
+        access.expires_at_ms,
+    )
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64
+}
+
+/// Take the user's balance to exactly zero credits (they had `credits`).
+fn drain_credits(state: &AppState, credits: i64) {
+    state
+        .db
+        .as_ref()
+        .unwrap()
+        .add_pack_credits(USER, -credits)
+        .expect("drain credits");
+}
+
 #[tokio::test(flavor = "multi_thread")]
-async fn balance_below_one_reservation_pauses_the_run_and_dispatches_nothing_more() {
+async fn insufficient_credits_pauses_the_run_and_dispatches_nothing_more() {
     let mut paused = paused_run().await;
     let db = paused.state.db.as_ref().unwrap();
 
@@ -470,18 +485,101 @@ async fn balance_below_one_reservation_pauses_the_run_and_dispatches_nothing_mor
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn resume_without_enough_credits_is_402_with_the_exact_shortfall() {
-    let paused = paused_run().await;
-    let need = expected_need_credits(&paused.state);
+async fn two_parallel_reservations_cannot_both_spend_the_same_credits() {
+    let repo = real_repository();
+    let (app, state) = test_app(repo.path()).await;
+    let base_url = serve_app(app.clone()).await;
+    // 5 credits = 500_000 micro-USD payable.
+    state
+        .db
+        .as_ref()
+        .unwrap()
+        .add_pack_credits(USER, 5)
+        .expect("seed five credits");
+
+    let (_sink, mut stream) = connect_worker(&base_url, issue_worker_key(&state)).await;
+    let run_id = create_run(&app, "make the arithmetic in src/lib.rs correct").await;
+    let (_step_id, access) = first_execute_step(&mut stream).await;
+    let claims = claims_of(&access);
+
+    // Two calls of 400_000 each, at the same instant. Each fits alone; both
+    // together do not. The check and the reservation share one transaction,
+    // so exactly one wins.
+    let db = state.db.as_ref().unwrap();
+    let barrier = std::sync::Barrier::new(2);
+    let (left, right) = std::thread::scope(|scope| {
+        let left = scope.spawn(|| {
+            barrier.wait();
+            db.reserve_provider_request(&claims, "parallel-left", "sha256:left", 400_000, now_ms())
+        });
+        let right = scope.spawn(|| {
+            barrier.wait();
+            db.reserve_provider_request(
+                &claims,
+                "parallel-right",
+                "sha256:right",
+                400_000,
+                now_ms(),
+            )
+        });
+        (left.join().unwrap(), right.join().unwrap())
+    });
+    let refused: Vec<String> = [left, right]
+        .into_iter()
+        .filter_map(|result| result.err())
+        .collect();
+    assert_eq!(refused.len(), 1, "exactly one must be refused: {refused:?}");
     assert!(
-        need > 1,
-        "the test needs a price list where 1 credit is short"
+        refused[0].starts_with("insufficient credits:"),
+        "refused for the distinct reason: {}",
+        refused[0]
     );
+
+    // The next call through the gateway does not fit in the 100_000 left, so
+    // the run pauses.
+    let (status, body) = gateway_call(&app, &access, "call-after").await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(body.to_string().contains("insufficient credits"), "{body}");
+    wait_for_run_status(&state, &run_id, "awaiting_top_up").await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_top_up_mid_step_means_no_pause() {
+    let repo = real_repository();
+    let (app, state) = test_app(repo.path()).await;
+    let base_url = serve_app(app.clone()).await;
+    let db = state.db.as_ref().unwrap();
+    db.add_pack_credits(USER, 1).expect("seed one credit");
+
+    let (_sink, mut stream) = connect_worker(&base_url, issue_worker_key(&state)).await;
+    let run_id = create_run(&app, "make the arithmetic in src/lib.rs correct").await;
+    let (_step_id, access) = first_execute_step(&mut stream).await;
+
+    // The owner tops up while the step is running, before its call is
+    // refused. Nothing was decided at dispatch, so nothing is stranded.
+    db.add_pack_credits(USER, 100_000_000).expect("top up");
+
+    let (status, body) = gateway_call(&app, &access, "call-1").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(db.get_run_status(&run_id).as_deref(), Some("running"));
+    assert_eq!(
+        raw_count(
+            repo.path(),
+            "SELECT COUNT(*) FROM attempt_endings WHERE cause = 'out_of_credits'"
+        ),
+        0
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn resume_with_no_credits_is_402_need_one_credit() {
+    let paused = paused_run().await;
+    drain_credits(&paused.state, 1);
 
     let (status, body) = resume(&paused.app, &paused.run_id).await;
     assert_eq!(status, StatusCode::PAYMENT_REQUIRED, "{body}");
-    assert_eq!(body["need_credits"], need);
-    assert_eq!(body["available_credits"], 1);
+    assert_eq!(body["need_credits"], 1);
+    assert_eq!(body["available_credits"], 0);
 
     // Still paused, still nothing charged.
     assert_eq!(
@@ -497,19 +595,10 @@ async fn resume_without_enough_credits_is_402_with_the_exact_shortfall() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn credit_added_then_resume_dispatches_the_paused_step_exactly_once() {
+async fn resume_with_one_credit_is_200_and_dispatches_the_paused_step_exactly_once() {
     let mut paused = paused_run().await;
-    let need = expected_need_credits(&paused.state);
 
-    // Top up to exactly what one maximum reservation needs.
-    paused
-        .state
-        .db
-        .as_ref()
-        .unwrap()
-        .add_pack_credits(USER, need - 1)
-        .expect("top up");
-
+    // One credit is enough to resume; the next refusal, if any, pauses again.
     let (status, body) = resume(&paused.app, &paused.run_id).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["status"], "running");
@@ -530,6 +619,35 @@ async fn credit_added_then_resume_dispatches_the_paused_step_exactly_once() {
             .as_deref(),
         Some("running")
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_webhook_top_up_resumes_a_paused_run() {
+    let mut paused = paused_run().await;
+    drain_credits(&paused.state, 1);
+    let db = paused.state.db.as_ref().unwrap();
+
+    // A paid $10 checkout: 100 credits.
+    let session = serde_json::json!({
+        "id": "cs_test_topup_1",
+        "metadata": {"clerk_user_id": USER},
+        "payment_status": "paid",
+        "currency": "usd",
+        "amount_subtotal": 1000,
+    });
+    cortex_api::billing::grant_credit_topup(db, &session, "evt_topup_1").expect("grant");
+
+    assert_eq!(
+        db.get_run_status(&paused.run_id).as_deref(),
+        Some("running"),
+        "the grant resumes the paused run"
+    );
+    paused
+        .state
+        .emit_scheduler_event(cortex_engine::captain::SchedulerEvent::Reconcile)
+        .await;
+    let dispatched = execute_steps_within(&mut paused.stream, Duration::from_secs(20)).await;
+    assert_eq!(dispatched, vec![paused.step_id.clone()]);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -602,6 +720,51 @@ async fn cancelling_a_paused_run_charges_nothing_more() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn an_operator_cap_refusal_does_not_pause() {
+    let repo = real_repository();
+    let (app, state) = test_app(repo.path()).await;
+    let base_url = serve_app(app.clone()).await;
+    let db = state.db.as_ref().unwrap();
+    // Far more credit than any reservation: the balance is never the problem.
+    db.add_pack_credits(USER, 100_000_000).expect("seed credits");
+
+    let (_sink, mut stream) = connect_worker(&base_url, issue_worker_key(&state)).await;
+    let run_id = create_run(&app, "make the arithmetic in src/lib.rs correct").await;
+    let (_step_id, access) = first_execute_step(&mut stream).await;
+
+    // Use up the operator's authorization cap, leaving less than one call.
+    let cap: i64 = OPERATOR_MAX_MICRO_USD.parse().unwrap();
+    db.reserve_provider_request(
+        &claims_of(&access),
+        "use-up-the-cap",
+        "sha256:cap",
+        cap - 1,
+        now_ms(),
+    )
+    .expect("the reservation that nearly exhausts the cap");
+
+    let (status, body) = gateway_call(&app, &access, "call-1").await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(body.to_string().contains("authorization exhausted"), "{body}");
+    assert!(!body.to_string().contains("insufficient credits"), "{body}");
+
+    // Give the pause path every chance to (wrongly) run.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(
+        db.get_run_status(&run_id).as_deref(),
+        Some("running"),
+        "the operator's cap is not the owner's balance; it must not pause"
+    );
+    assert_eq!(
+        raw_count(
+            repo.path(),
+            "SELECT COUNT(*) FROM attempt_endings WHERE cause = 'out_of_credits'"
+        ),
+        0
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_refusal_that_is_not_about_the_balance_does_not_pause() {
     let repo = real_repository();
     let (app, state) = test_app(repo.path()).await;
@@ -623,11 +786,12 @@ async fn a_refusal_that_is_not_about_the_balance_does_not_pause() {
     assert_eq!(status, StatusCode::OK, "{body}");
 
     // The same request key again is refused as a replay: a reservation error,
-    // but not "authorization exhausted".
+    // but neither "authorization exhausted" nor "insufficient credits".
     let (status, body) = gateway_call(&app, &access, "call-1").await;
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
     assert!(
-        !body.to_string().contains("authorization exhausted"),
+        !body.to_string().contains("authorization exhausted")
+            && !body.to_string().contains("insufficient credits"),
         "the replay must be refused for its own reason: {body}"
     );
 

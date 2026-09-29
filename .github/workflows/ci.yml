@@ -163,6 +163,10 @@ jobs:
       # and the RunsPane pull request block for engine statuses `succeeded` and
       # `recovered` (3), and dictation disabling itself on a 503 from the token
       # route with no alert (1, in `ChatComposer.voice.test.tsx`).
+      #
+      # 60 -> 64 with four for the run-paused-for-credits banner in RunsPane:
+      # the banner and top-up link, Resume reloading the run, a 402 reading
+      # "Top up first", and no banner for a run that is not paused.
       - name: Test Cortex
         run: |
           set -euo pipefail
@@ -172,8 +176,8 @@ jobs:
           echo "$output"
           passed=$(echo "$output" | grep -oE "Tests +[0-9]+ passed" | grep -oE "[0-9]+" | tail -1)
           echo "cortex tests passed: ${passed:-0}"
-          if [ "${passed:-0}" -lt 60 ]; then
-            echo "::error::expected at least 60 Cortex tests to run, saw ${passed:-0}"
+          if [ "${passed:-0}" -lt 64 ]; then
+            echo "::error::expected at least 64 Cortex tests to run, saw ${passed:-0}"
             exit 1
           fi
 

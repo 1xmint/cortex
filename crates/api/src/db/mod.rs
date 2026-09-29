@@ -30,7 +30,16 @@ pub use run_pause::{PausedAttempt, ResumeOutcome};
 
 pub struct Database {
     conn: Mutex<Connection>,
+    /// Whether provider reservations are checked against the owner's live
+    /// credit balance. Set once at startup from `billing_enforced`; off for a
+    /// bare `Database` so unit tests that reserve without credits are unaffected.
+    credit_gate: std::sync::atomic::AtomicBool,
 }
+
+/// Prefix of the reservation refusal that means the owner's credits cannot
+/// cover the call. Distinct from "authorization exhausted" (the operator's
+/// cap), because only this one pauses a run.
+pub const INSUFFICIENT_CREDITS_PREFIX: &str = "insufficient credits:";
 
 /// The stable, storage-level spelling of an [`AttemptEndCause`]
 /// (`cortex_core::billing_binding`) — the `attempt_endings.cause` column and
@@ -5886,6 +5895,12 @@ impl Database {
         self.conn.lock_recovering()
     }
 
+    /// Turn on the live credit check in `reserve_provider_request`.
+    pub fn set_credit_gate(&self, enforced: bool) {
+        self.credit_gate
+            .store(enforced, std::sync::atomic::Ordering::Relaxed);
+    }
+
     pub fn open(path: &Path) -> Self {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).ok();
@@ -5906,6 +5921,7 @@ impl Database {
 
         let db = Self {
             conn: Mutex::new(conn),
+            credit_gate: std::sync::atomic::AtomicBool::new(false),
         };
         db.seed_price_list_if_absent();
         db.publish_gateway_model_revision_if_needed();

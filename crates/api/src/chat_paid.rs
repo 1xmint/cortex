@@ -349,7 +349,10 @@ async fn send_one_turn<T: ProviderTransport + Clone>(
             // user did nothing to cause, and telling them they're out of
             // credits would be false; those get the same outage message as a
             // gateway that's off or has no price row for this model.
-            GatewayError::Reservation(detail) if detail.starts_with("authorization exhausted") => {
+            GatewayError::Reservation(detail)
+                if detail.starts_with("authorization exhausted")
+                    || detail.starts_with(crate::db::INSUFFICIENT_CREDITS_PREFIX) =>
+            {
                 tracing::info!(user_id, %detail, turn, "chat: spend reservation refused");
                 PaidReplyError::NotEnoughCredits
             }

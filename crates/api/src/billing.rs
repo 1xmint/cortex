@@ -1575,7 +1575,7 @@ pub async fn stripe_webhook(
 /// database error), so the caller can turn that into a 5xx and let Stripe's
 /// webhook retry logic take another pass instead of the customer's paid
 /// credits silently vanishing.
-fn grant_credit_topup(
+pub fn grant_credit_topup(
     db: &Database,
     obj: &serde_json::Value,
     event_id: &str,

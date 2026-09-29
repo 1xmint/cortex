@@ -2069,6 +2069,18 @@ export async function cancelRun(runId: string, reason?: string): Promise<CancelR
   });
 }
 
+/**
+ * Resume a run parked as `awaiting_top_up`. A 402 means the balance is still
+ * empty: it throws a `CortexApiError` with status 402, which the caller shows
+ * as "Top up first".
+ */
+export async function resumeRun(runId: string): Promise<{ status: string }> {
+  return requestJson<{ status: string }>(`/api/runs/${runId}/resume`, {
+    method: 'POST',
+    body: JSON.stringify({}),
+  });
+}
+
 export function streamRun(
   runId: string,
   onEvent: (event: RunStreamEvent) => void,

@@ -32,7 +32,7 @@ pub enum ResumeOutcome {
     /// The run is running again; the caller should let the scheduler
     /// re-dispatch its paused steps.
     Resumed,
-    /// The balance still does not cover one maximum per-call reservation.
+    /// The user cannot pay for anything yet (payable balance is not positive).
     Insufficient {
         need_credits: i64,
         available_credits: i64,
@@ -57,55 +57,17 @@ impl Database {
         )
     }
 
-    /// The largest reservation one provider call can ask for on the active
-    /// price list: a call whose input plus output fills the model's whole
-    /// context window at the dearer of its two rates. The gateway refuses a
-    /// call whose input bound plus `max_tokens` exceeds the window, so no call
-    /// can reserve more than this.
-    pub fn max_call_reservation_micros(&self) -> Option<i64> {
-        let price_list = self.active_price_list()?;
-        price_list
-            .models
-            .iter()
-            .filter(|m| m.provider == "claude" || m.provider == "openai")
-            .filter_map(|m| {
-                let rate = m.input_micros_per_1k.max(m.output_micros_per_1k);
-                m.context_window
-                    .checked_mul(rate)?
-                    .checked_add(999)
-                    // The gateway rounds input and output up separately, so
-                    // one micro of headroom covers the two roundings.
-                    .map(|v| v / 1_000 + 1)
-            })
-            .max()
-    }
-
-    /// `(need_credits, available_credits)` for resuming a paused run: the
-    /// credits that cover one maximum per-call reservation plus the carry
-    /// already owed, against the credits the user has now. `None` when no
-    /// price list is published.
-    pub fn top_up_requirement(&self, user_id: &str) -> Option<(i64, i64)> {
-        let price_list = self.active_price_list()?;
-        let max_reservation = self.max_call_reservation_micros()?;
-        let carry = self.get_credit_carry_micro_usd(user_id) as i64;
-        let available = self
-            .get_credit_balance_row(user_id)
+    /// Credits the user has now (subscription plus pack). `0` with no balance row.
+    pub fn available_credits(&self, user_id: &str) -> i64 {
+        self.get_credit_balance_row(user_id)
             .map(|b| b.subscription_remaining + b.pack_remaining)
-            .unwrap_or(0);
-        let per_credit = price_list.micros_per_credit.max(1);
-        let need = max_reservation
-            .saturating_add(carry)
-            .saturating_add(per_credit - 1)
-            / per_credit;
-        Some((need, available))
+            .unwrap_or(0)
     }
 
-    /// End the attempt that just hit its balance-capped authorization and
-    /// park its run.
-    ///
-    /// Only an authorization whose cap sits below the operator's own cap
-    /// (`env_max_micro_usd`) was capped by the balance; an attempt that hit
-    /// the operator's cap did not run out of credits and is left alone.
+    /// End the attempt whose reservation was just refused for want of credits
+    /// ("insufficient credits", see `reserve_provider_request`) and park its
+    /// run. The caller only gets here on that one refusal; an operator-cap
+    /// refusal never does.
     ///
     /// In one transaction: the step goes to `orphaned` (dispatchable again,
     /// not failed, no retry counted), its path leases are released, an
@@ -116,25 +78,11 @@ impl Database {
         &self,
         run_id: &str,
         attempt_id: &str,
-        authorization_id: &str,
-        env_max_micro_usd: i64,
     ) -> Option<PausedAttempt> {
         let paused = {
             let mut conn = self.conn();
             let now = chrono::Utc::now().timestamp_millis();
             let tx = conn.transaction().ok()?;
-
-            let authorized_max: i64 = tx
-                .query_row(
-                    "SELECT max_micro_usd FROM provider_spend_authorizations
-                     WHERE id = ?1 AND run_id = ?2 AND attempt_id = ?3",
-                    params![authorization_id, run_id, attempt_id],
-                    |row| row.get(0),
-                )
-                .ok()?;
-            if authorized_max >= env_max_micro_usd {
-                return None;
-            }
 
             let run_status: String = tx
                 .query_row(
@@ -217,9 +165,9 @@ impl Database {
         Some(paused)
     }
 
-    /// Put a paused run back to `running` if the balance now covers one
-    /// maximum per-call reservation. The caller emits the scheduler event
-    /// that re-dispatches the paused steps.
+    /// Put a paused run back to `running` if the user can pay for anything
+    /// (payable balance above zero). The caller emits the scheduler event that
+    /// re-dispatches the paused steps.
     pub fn resume_run_after_top_up(
         &self,
         run_id: &str,
@@ -228,13 +176,13 @@ impl Database {
         if self.get_run_status(run_id).as_deref() != Some("awaiting_top_up") {
             return Ok(ResumeOutcome::NotPaused);
         }
-        let (need_credits, available_credits) = self
-            .top_up_requirement(user_id)
-            .ok_or_else(|| "no price list is published".to_string())?;
-        if available_credits < need_credits {
+        // Resume as soon as the user can pay for anything at all. If the next
+        // call still does not fit, its refusal simply pauses the run again.
+        // A user with no balance row is unmetered and is never short.
+        if matches!(self.payable_micro_usd(user_id), Some(payable) if payable <= 0) {
             return Ok(ResumeOutcome::Insufficient {
-                need_credits,
-                available_credits,
+                need_credits: 1,
+                available_credits: self.available_credits(user_id),
             });
         }
 

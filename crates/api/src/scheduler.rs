@@ -906,14 +906,6 @@ async fn dispatch_step(state: &AppState, step: &StepRef) -> DispatchOutcome {
         &decision.model_id,
         deadline,
         chrono::Utc::now().timestamp_millis(),
-        // Pass-through billing: when credits are enforced, the balance now is
-        // the most this attempt's calls may reserve against. A call that no
-        // longer fits pauses the run instead of failing it.
-        if state.billing_enforced {
-            db.payable_micro_usd(&step.user_id)
-        } else {
-            None
-        },
     );
     if provider_egress.is_deny() {
         // Every `ProviderId` has an endpoint, so this is unreachable today. It

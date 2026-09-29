@@ -433,6 +433,63 @@ impl Database {
             ));
         }
 
+        // Pass-through billing: a metered user's new reservation must fit in
+        // what they can still pay for -- their credits (less the fractional
+        // carry already owed) minus the uncharged exposure of their run
+        // attempts (reservations not released, on attempts not yet settled
+        // into the ledger). Checked here, inside the reservation transaction,
+        // so two concurrent calls cannot both spend the same credits. Nothing
+        // is held: this reads the balance and the exposure and writes nothing.
+        if self.credit_gate.load(std::sync::atomic::Ordering::Relaxed) {
+            let balance: Option<(i64, i64)> = tx
+                .query_row(
+                    "SELECT subscription_remaining + pack_remaining, carry_micro_usd
+                     FROM credit_balances WHERE clerk_user_id = ?1",
+                    params![authorization.user_id],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+                )
+                .ok();
+            let micros_per_credit: Option<i64> = tx
+                .query_row(
+                    "SELECT micros_per_credit FROM price_lists ORDER BY version DESC LIMIT 1",
+                    [],
+                    |row| row.get(0),
+                )
+                .ok();
+            if let (Some((credits, carry)), Some(per_credit)) = (balance, micros_per_credit) {
+                let payable = credits
+                    .saturating_mul(per_credit)
+                    .saturating_sub(carry.max(0));
+                let exposure: i64 = tx
+                    .query_row(
+                        "SELECT COALESCE(SUM(
+                            CASE WHEN r.observed_micro_usd > r.reserved_micro_usd THEN r.observed_micro_usd
+                                 WHEN r.status = 'settled' THEN r.observed_micro_usd
+                                 ELSE r.reserved_micro_usd END
+                         ), 0)
+                         FROM provider_request_reservations r
+                         WHERE r.user_id = ?1 AND r.status != 'released'
+                           AND (EXISTS (SELECT 1 FROM steps s WHERE s.server_attempt_id = r.attempt_id)
+                                OR EXISTS (SELECT 1 FROM attempt_endings e WHERE e.attempt_id = r.attempt_id))
+                           AND NOT EXISTS (
+                               SELECT 1 FROM attempt_endings e
+                               WHERE e.attempt_id = r.attempt_id AND e.settled_at IS NOT NULL
+                           )",
+                        params![authorization.user_id],
+                        |row| row.get(0),
+                    )
+                    .map_err(|e| format!("failed to read credit exposure: {e}"))?;
+                let available = payable.saturating_sub(exposure);
+                if reserved_micro_usd > available {
+                    return Err(format!(
+                        "{} need {reserved_micro_usd}, available {}",
+                        INSUFFICIENT_CREDITS_PREFIX,
+                        available.max(0)
+                    ));
+                }
+            }
+        }
+
         let funded: i64 = tx
             .query_row(
                 "SELECT funded_micro_usd FROM supplier_capacities WHERE provider = ?1",
