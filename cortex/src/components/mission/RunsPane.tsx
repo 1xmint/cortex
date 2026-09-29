@@ -53,6 +53,10 @@ import { hasFailedStep, hasFailedVerificationStep, hasPendingVerification } from
 // Delivered and verifying are absent on purpose: work handed over but not
 // checked has not finished, and a row that renders it as terminal makes the
 // claim the truth model exists to stop.
+//
+// `succeeded` and `recovered` are what the engine actually sends for a
+// finished run (crates/api/src/db/mod.rs `update_run_status_tx`); the step-level
+// `verified`/`manual_override` names never appear on a run row.
 const TERMINAL = new Set([
   'verified',
   'manual_override',
@@ -60,13 +64,15 @@ const TERMINAL = new Set([
   'execution_failed',
   'cancelled',
   'completed',
+  'succeeded',
+  'recovered',
 ]);
 
 // A run that finished without failing is the only kind worth offering a pull
 // request for. The backend decides for real -- it answers 422 "run has no
 // branch" when the run changed nothing -- but there is no reason to show a
 // button for a run that was cancelled or that crashed.
-const SHIPPABLE = new Set(['verified', 'manual_override', 'completed']);
+const SHIPPABLE = new Set(['verified', 'manual_override', 'completed', 'succeeded', 'recovered']);
 
 // A run is only worth offering a Cancel button while it can still spend
 // money or do work: once it is planning, running, or merely queued, there is

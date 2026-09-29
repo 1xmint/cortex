@@ -722,6 +722,24 @@ export async function getBillingHistory(): Promise<BillingHistoryEntry[]> {
   return requestBillingJson<BillingHistoryEntry[]>('/api/billing/history');
 }
 
+/**
+ * Credit balance from `GET /api/billing/usage`. The backend counts in whole
+ * credits (1 credit = $0.10) and sends `null` when no ledger row exists
+ * (unmetered). The UI converts to dollars at display time only.
+ */
+export async function getCreditsBalance(): Promise<number | null> {
+  const usage = await requestBillingJson<{ creditsBalance?: number | null }>('/api/billing/usage');
+  return typeof usage.creditsBalance === 'number' ? usage.creditsBalance : null;
+}
+
+/** One-time credit purchase (`POST /api/billing/topup`): $10, $25, $50 or $100. */
+export async function createTopupCheckout(amountUsd: number): Promise<CheckoutResponse> {
+  return requestBillingJson<CheckoutResponse>('/api/billing/topup', {
+    method: 'POST',
+    body: JSON.stringify({ amount_usd: amountUsd }),
+  });
+}
+
 export interface GitHubStatus {
   linked: boolean;
   username: string | null;

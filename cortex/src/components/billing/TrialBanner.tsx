@@ -3,6 +3,15 @@ import { useState } from 'react';
 import type { BillingStatus } from '../../lib/cortexApi';
 import { formatMoney } from './format';
 
+// The name of the plan the user is on, or 'Preview mode' when there is none.
+// An unknown or empty plan type must fall back rather than leave a hole in the
+// sentence ("You're in .").
+function planName(billing: BillingStatus | null): string {
+  const type = billing?.plan?.plan_type;
+  const label = type === 'annual' ? 'Cortex Pro Annual' : type === 'monthly' ? 'Cortex Pro Monthly' : '';
+  return label.trim() || 'Preview mode';
+}
+
 interface TrialBannerProps {
   billing: BillingStatus | null;
   onOpenBilling: () => void;
@@ -72,7 +81,7 @@ export default function TrialBanner({ billing, onOpenBilling }: TrialBannerProps
         <div className="mx-auto flex max-w-3xl items-center gap-3">
           <Sparkles className="h-4 w-4 shrink-0 text-[var(--accent)]" />
           <p className="min-w-0 flex-1 text-xs text-[var(--muted-strong)]">
-            You're in <span className="font-medium text-white">Preview mode</span>. Subscribe to unlock full AI agent capabilities.
+            You're in <span className="font-medium text-white">{planName(billing)}</span>. Subscribe to unlock full AI agent capabilities.
           </p>
           <button
             type="button"
