@@ -15324,6 +15324,321 @@ mod tests {
         );
     }
 
+    /// Reserve and settle one real provider call for `attempt_id`, exactly as
+    /// a gateway `forward()` would once the supplier confirms a cost. Shared
+    /// by the H5/H6/H11 money tests below, which need a real settled
+    /// `provider_request_reservations` row (not a hand-rolled cost) behind
+    /// the attempt they end.
+    fn settle_one_call(db: &Database, user_id: &str, run_id: &str, attempt_id: &str, observed_micro_usd: i64) {
+        let now = Utc::now().timestamp_millis();
+        let price_list_id = db.active_price_list().unwrap().id;
+        db.set_supplier_capacity("claude", 10_000_000, now)
+            .expect("fund supplier capacity");
+        let authorization = crate::db::provider_gateway::SpendAuthorization {
+            id: format!("auth-{attempt_id}"),
+            user_id: user_id.to_string(),
+            run_id: run_id.to_string(),
+            attempt_id: attempt_id.to_string(),
+            provider: "claude".to_string(),
+            model: "claude-sonnet-5".to_string(),
+            price_list_id,
+            max_micro_usd: 10_000_000,
+            expires_at_ms: now + 60_000,
+        };
+        db.create_spend_authorization(&authorization, now)
+            .expect("create spend authorization");
+        let claims = crate::provider_gateway::GatewayCapability::new(
+            authorization.id.clone(),
+            authorization.user_id.clone(),
+            authorization.run_id.clone(),
+            authorization.attempt_id.clone(),
+            authorization.provider.clone(),
+            authorization.model.clone(),
+            authorization.expires_at_ms,
+        );
+        let request_key = format!("call-{attempt_id}");
+        db.reserve_provider_request(&claims, &request_key, "digest", observed_micro_usd, now)
+            .expect("reserve");
+        db.settle_provider_request(&request_key, observed_micro_usd, Some("upstream-1"), now)
+            .expect("settle");
+    }
+
+    // --- H5: expire_stale_leases / orphan_step are ownership-aware ---
+
+    #[test]
+    fn expire_stale_leases_charges_the_customer_when_their_own_worker_holds_the_lease() {
+        let db = test_db();
+        db.init_credit_balance("user-1", 1_000).expect("balance");
+        let run_id = db.create_run_with_steps(
+            "user-1",
+            "ship it",
+            "auto",
+            &[],
+            None,
+            None,
+            None,
+            &[(
+                "step-customer-expire".to_string(),
+                "execute".to_string(),
+                "ship".to_string(),
+                None,
+                "execute".to_string(),
+                "medium".to_string(),
+                "Do the work".to_string(),
+                Utc::now().timestamp_millis(),
+            )],
+            &[],
+        );
+        db.update_run_status(&run_id, "running", None);
+        db.register_worker("worker-customer-expire", "user-1", false);
+        let lease_gen = db
+            .lease_step(
+                "step-customer-expire",
+                "worker-customer-expire",
+                Utc::now().timestamp_millis() + 600_000,
+                "attempt-customer-expire",
+            )
+            .expect("lease step");
+        assert!(db.start_step("step-customer-expire", lease_gen));
+        settle_one_call(&db, "user-1", &run_id, "attempt-customer-expire", 300_000);
+
+        db.conn()
+            .execute(
+                "UPDATE steps SET lease_deadline = 1 WHERE id = ?1",
+                params!["step-customer-expire"],
+            )
+            .expect("force the lease stale");
+
+        let expired = db.expire_stale_leases();
+        assert_eq!(expired, vec!["step-customer-expire".to_string()]);
+
+        db.settle_pending_attempts().expect("settle");
+        assert_eq!(
+            db.get_credit_balance("user-1").subscription_remaining,
+            997,
+            "a customer-owned worker's dropped lease is charged, not absorbed"
+        );
+    }
+
+    #[test]
+    fn expire_stale_leases_absorbs_the_cost_when_a_cortex_owned_worker_holds_the_lease() {
+        let db = test_db();
+        db.init_credit_balance("user-1", 1_000).expect("balance");
+        let run_id = db.create_run_with_steps(
+            "user-1",
+            "ship it",
+            "auto",
+            &[],
+            None,
+            None,
+            None,
+            &[(
+                "step-cortex-expire".to_string(),
+                "execute".to_string(),
+                "ship".to_string(),
+                None,
+                "execute".to_string(),
+                "medium".to_string(),
+                "Do the work".to_string(),
+                Utc::now().timestamp_millis(),
+            )],
+            &[],
+        );
+        db.update_run_status(&run_id, "running", None);
+        db.register_worker("worker-cortex-expire", "user-1", true);
+        let lease_gen = db
+            .lease_step(
+                "step-cortex-expire",
+                "worker-cortex-expire",
+                Utc::now().timestamp_millis() + 600_000,
+                "attempt-cortex-expire",
+            )
+            .expect("lease step");
+        assert!(db.start_step("step-cortex-expire", lease_gen));
+        settle_one_call(&db, "user-1", &run_id, "attempt-cortex-expire", 300_000);
+
+        db.conn()
+            .execute(
+                "UPDATE steps SET lease_deadline = 1 WHERE id = ?1",
+                params!["step-cortex-expire"],
+            )
+            .expect("force the lease stale");
+
+        db.expire_stale_leases();
+        db.settle_pending_attempts().expect("settle");
+
+        assert_eq!(
+            db.get_credit_balance("user-1").subscription_remaining,
+            1_000,
+            "a Cortex-owned worker's dropped lease must not touch the customer's balance"
+        );
+        let key = cortex_core::billing_binding::ChargeKey::for_attempt("attempt-cortex-expire");
+        let (amount, reason): (i64, String) = db
+            .conn()
+            .query_row(
+                "SELECT amount, reason FROM credit_transactions WHERE idempotency_key = ?1",
+                params![key.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("absorbed-cost row");
+        assert_eq!(amount, 0);
+        assert_eq!(reason, "absorbed");
+    }
+
+    #[test]
+    fn orphan_step_charges_the_customer_when_their_own_worker_holds_the_lease() {
+        let db = test_db();
+        db.init_credit_balance("user-1", 1_000).expect("balance");
+        let (run_id, lease_gen) = leased_step(&db, "step-customer-orphan");
+        let _ = lease_gen;
+        settle_one_call(&db, "user-1", &run_id, "attempt-1", 300_000);
+
+        db.orphan_step("step-customer-orphan");
+        db.settle_pending_attempts().expect("settle");
+
+        assert_eq!(
+            db.get_credit_balance("user-1").subscription_remaining,
+            997,
+            "orphaning a step leased to the customer's own worker is charged"
+        );
+    }
+
+    #[test]
+    fn orphan_step_absorbs_the_cost_when_a_cortex_owned_worker_holds_the_lease() {
+        let db = test_db();
+        db.init_credit_balance("user-1", 1_000).expect("balance");
+        let run_id = db.create_run_with_steps(
+            "user-1",
+            "ship it",
+            "auto",
+            &[],
+            None,
+            None,
+            None,
+            &[(
+                "step-cortex-orphan".to_string(),
+                "execute".to_string(),
+                "ship".to_string(),
+                None,
+                "execute".to_string(),
+                "medium".to_string(),
+                "Do the work".to_string(),
+                Utc::now().timestamp_millis(),
+            )],
+            &[],
+        );
+        db.update_run_status(&run_id, "running", None);
+        db.register_worker("worker-cortex-orphan", "user-1", true);
+        let lease_gen = db
+            .lease_step(
+                "step-cortex-orphan",
+                "worker-cortex-orphan",
+                Utc::now().timestamp_millis() + 600_000,
+                "attempt-cortex-orphan",
+            )
+            .expect("lease step");
+        assert!(db.start_step("step-cortex-orphan", lease_gen));
+        settle_one_call(&db, "user-1", &run_id, "attempt-cortex-orphan", 300_000);
+
+        db.orphan_step("step-cortex-orphan");
+        db.settle_pending_attempts().expect("settle");
+
+        assert_eq!(
+            db.get_credit_balance("user-1").subscription_remaining,
+            1_000,
+            "orphaning a step leased to a Cortex-owned worker must not touch the customer's balance"
+        );
+        let key = cortex_core::billing_binding::ChargeKey::for_attempt("attempt-cortex-orphan");
+        let (amount, reason): (i64, String) = db
+            .conn()
+            .query_row(
+                "SELECT amount, reason FROM credit_transactions WHERE idempotency_key = ?1",
+                params![key.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("absorbed-cost row");
+        assert_eq!(amount, 0);
+        assert_eq!(reason, "absorbed");
+    }
+
+    // --- H6: cancel_run charges the exact settled cost ---
+
+    #[test]
+    fn cancel_run_charges_the_customer_for_the_exact_settled_cost_of_the_cancelled_attempt() {
+        let db = test_db();
+        db.init_credit_balance("user-1", 1_000).expect("balance");
+        let (run_id, _lease_gen) = leased_step(&db, "step-cancel-charge");
+        settle_one_call(&db, "user-1", &run_id, "attempt-1", 300_000);
+
+        db.cancel_run(&run_id, "user-1", "stop spending")
+            .expect("owner can cancel");
+        db.settle_pending_attempts().expect("settle");
+
+        assert_eq!(
+            db.get_credit_balance("user-1").subscription_remaining,
+            997,
+            "a customer cancel with a settled reservation is charged, not absorbed"
+        );
+    }
+
+    // --- H11: a late ending for an already-ended attempt is a no-op ---
+
+    #[test]
+    fn cancel_run_then_a_late_ending_for_the_same_attempt_writes_only_one_ledger_outcome() {
+        // A cancel and a race with a late-arriving verdict/StepFailed for the
+        // same attempt must not double-settle it. `insert_attempt_ending_in_tx`
+        // is `INSERT OR IGNORE` on `attempt_id`, so the first ending recorded
+        // here (the cancel's `CustomerCancel`) wins, and whatever the late
+        // path tries to record afterward for the same attempt is a no-op:
+        // exactly one `attempt_endings` row, exactly one ledger outcome.
+        let db = test_db();
+        db.init_credit_balance("user-1", 1_000).expect("balance");
+        let (run_id, _lease_gen) = leased_step(&db, "step-cancel-then-late");
+        settle_one_call(&db, "user-1", &run_id, "attempt-1", 300_000);
+
+        db.cancel_run(&run_id, "user-1", "stop spending")
+            .expect("owner can cancel");
+
+        {
+            let mut conn = db.conn();
+            let tx = conn.transaction().expect("begin");
+            Database::insert_attempt_ending_in_tx(
+                &tx,
+                "attempt-1",
+                "user-1",
+                "step-cancel-then-late",
+                cortex_core::billing_binding::AttemptEndCause::Failed,
+                false,
+                Utc::now().timestamp_millis(),
+            )
+            .expect("insert ending (must be ignored: already ended)");
+            tx.commit().expect("commit");
+        }
+
+        let ending_rows: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM attempt_endings WHERE attempt_id = 'attempt-1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(ending_rows, 1, "the late ending must not add a second row");
+
+        db.settle_pending_attempts().expect("settle");
+        assert_eq!(db.get_credit_balance("user-1").subscription_remaining, 997);
+
+        let charge_rows: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM credit_transactions WHERE clerk_user_id = 'user-1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(charge_rows, 1, "exactly one ledger outcome for the attempt");
+    }
+
     #[test]
     fn scheduler_mutations_record_operations_events() {
         let db = test_db();

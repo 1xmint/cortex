@@ -6,9 +6,10 @@
 //! moves through `deduct_credits`/`refund_credits`, the same calls
 //! `verification_driver::finish_and_bill` makes.
 
-use cortex_api::db::Database;
+use cortex_api::db::{Database, SpendAuthorization};
 use cortex_api::pricing::{self, PriceStatus, StepQuote};
-use cortex_core::billing_binding::{ChargeKey, RefundKey};
+use cortex_api::provider_gateway::GatewayCapability;
+use cortex_core::billing_binding::{AttemptEndCause, ChargeKey, RefundKey};
 use cortex_core::diff_surface::VerdictClass;
 use cortex_core::routing::RiskLevel;
 use cortex_core::task::WorkKind;
@@ -65,6 +66,52 @@ fn freeze(
     };
     db.freeze_step_quote(&quote).expect("freeze quote");
     credits
+}
+
+/// A funded spend authorization scoped to one attempt, ready for
+/// `reserve_provider_request` -- the same shape
+/// `ledger.rs`'s internal `attempt_capability` test helper builds, using
+/// the crate's public re-exports (`cortex_api::db::SpendAuthorization`,
+/// `cortex_api::provider_gateway::GatewayCapability`) since this is an
+/// external integration-test crate.
+fn attempt_capability(db: &Database, user_id: &str, attempt_id: &str) -> GatewayCapability {
+    let now = 0;
+    let price_list_id = db.active_price_list().expect("seed list publishes").id;
+    db.set_supplier_capacity("claude", 10_000_000, now)
+        .expect("fund supplier capacity");
+    let authorization = SpendAuthorization {
+        id: format!("auth-{attempt_id}"),
+        user_id: user_id.to_string(),
+        run_id: "run-verdict-class".to_string(),
+        attempt_id: attempt_id.to_string(),
+        provider: "claude".to_string(),
+        model: "claude-sonnet-5".to_string(),
+        price_list_id,
+        max_micro_usd: 10_000_000,
+        expires_at_ms: now + 60_000,
+    };
+    db.create_spend_authorization(&authorization, now)
+        .expect("create spend authorization");
+    GatewayCapability::new(
+        authorization.id,
+        authorization.user_id,
+        authorization.run_id,
+        authorization.attempt_id,
+        authorization.provider,
+        authorization.model,
+        authorization.expires_at_ms,
+    )
+}
+
+/// Reserve and settle one provider call for `claims.attempt_id`, exactly
+/// as a real gateway `forward()` would once the supplier confirms a cost.
+fn settle_call(db: &Database, claims: &GatewayCapability, request_key: &str, observed: i64) {
+    db.reserve_provider_request(claims, request_key, "digest", observed, 0)
+        .expect("reserve");
+    let settled = db
+        .settle_provider_request(request_key, observed, Some("upstream-1"), 0)
+        .expect("settle");
+    assert_eq!(settled.status, "settled");
 }
 
 #[test]
@@ -211,6 +258,62 @@ fn a_failed_attempt_that_never_spent_anything_has_no_billing_effect_strong() {
 
     let (sub_total, pack_total) = db.credit_ledger_totals(user);
     assert_eq!(sub_total + pack_total, 0);
+}
+
+// A `Failed` attempt is not special-cased: if it actually spent provider
+// money before it failed, that settled cost is charged just like any other
+// end cause -- billing is pass-through on real spend, not on the verdict.
+// The two tests above prove the zero-spend side of that rule at this same
+// entry point (`record_attempt_ended` then `settle_pending_attempts`); this
+// proves the non-zero side, which nothing else at this entry point covers
+// (`ledger.rs`'s equivalent, `settle_pending_attempts_charges_the_exact_settled_sum_for_a_chargeable_cause`,
+// only exercises `AttemptEndCause::CustomerCancel`).
+#[test]
+fn a_failed_attempt_that_spent_money_is_charged_the_exact_settled_cost() {
+    let (_dir, db) = db();
+    let (list, class) = billable_list(&db);
+
+    let user = "user_failed_charged";
+    db.init_credit_balance(user, 10_000).expect("init balance");
+
+    let attempt_id = "attempt-failed-charged";
+    let _quoted = freeze(
+        &db,
+        "run-failed-charged",
+        "step-failed-charged",
+        &list,
+        &class,
+        VerdictClass::Authored,
+    );
+
+    // 450_000 micro-USD at the seeded 100_000-micro-USD credit is exactly
+    // 4 whole credits with a 50_000 remainder -- pass-through billing, no
+    // rounding up, same as `ledger.rs`'s settled-sum test.
+    let claims = attempt_capability(&db, user, attempt_id);
+    settle_call(&db, &claims, "call-failed-charged", 450_000);
+
+    db.record_attempt_ended(
+        attempt_id,
+        user,
+        "step-failed-charged",
+        AttemptEndCause::Failed,
+        false,
+    )
+    .expect("record attempt ended");
+    db.settle_pending_attempts()
+        .expect("settle pending attempts");
+
+    let (sub_total, pack_total) = db.credit_ledger_totals(user);
+    assert_eq!(
+        sub_total + pack_total,
+        -4,
+        "a Failed attempt that spent money must be charged for exactly what it spent"
+    );
+    assert_eq!(
+        db.get_credit_carry_micro_usd(user),
+        50_000,
+        "the sub-credit remainder must be carried, not dropped or rounded up"
+    );
 }
 
 #[test]

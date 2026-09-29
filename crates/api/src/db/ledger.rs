@@ -3267,6 +3267,200 @@ mod tests {
         assert_eq!(reason, "absorbed");
     }
 
+    #[test]
+    fn settle_pending_attempts_waits_while_a_reservation_is_still_reserved_then_settles_exactly() {
+        // H2: while any reservation for the attempt is still `reserved` (the
+        // gateway hasn't heard back from the supplier yet), the settler must
+        // not guess -- it leaves the ending unsettled and writes nothing.
+        // Once every reservation resolves, the very next tick charges the
+        // exact sum, floored to whole credits with the remainder carried
+        // (same 300_000 + 150_000 -> 4 credits, 50_000 carry arithmetic as
+        // `settle_pending_attempts_charges_the_exact_settled_sum_for_a_chargeable_cause`).
+        let db = test_db();
+        let user = subscriber(&db, 1_000);
+        let claims = attempt_capability(&db, "attempt-waiting");
+
+        // Reserved but never settled: the supplier hasn't confirmed a cost.
+        db.reserve_provider_request(&claims, "wait-1", "digest", 300_000, ATTEMPT_NOW)
+            .expect("reserve");
+
+        end_and_settle_attempt(
+            &db,
+            user,
+            "attempt-waiting",
+            "step-waiting",
+            AttemptEndCause::CustomerCancel,
+        );
+
+        assert_eq!(db.get_credit_balance(user).subscription_remaining, 1_000);
+        assert_eq!(db.credit_ledger_totals(user), (0, 0));
+        let settled_at: Option<i64> = db
+            .conn()
+            .query_row(
+                "SELECT settled_at FROM attempt_endings WHERE attempt_id = ?1",
+                params!["attempt-waiting"],
+                |row| row.get(0),
+            )
+            .expect("ending row exists");
+        assert!(
+            settled_at.is_none(),
+            "an attempt with a reservation still `reserved` must not be marked settled"
+        );
+
+        // The supplier confirms the first call, and a second call settles
+        // cleanly too.
+        let settled = db
+            .settle_provider_request("wait-1", 300_000, Some("upstream-1"), ATTEMPT_NOW)
+            .expect("settle");
+        assert_eq!(settled.status, "settled");
+        settle_call(&db, &claims, "wait-2", 150_000);
+
+        db.settle_pending_attempts().expect("settle");
+        assert_eq!(db.get_credit_balance(user).subscription_remaining, 996);
+        assert_eq!(db.get_credit_carry_micro_usd(user), 50_000);
+
+        // A second settle pass, now that the row is already settled, changes
+        // nothing further.
+        db.settle_pending_attempts().expect("settle");
+        assert_eq!(db.get_credit_balance(user).subscription_remaining, 996);
+        assert_eq!(db.get_credit_carry_micro_usd(user), 50_000);
+    }
+
+    #[test]
+    fn settle_pending_attempts_with_no_price_list_records_the_error_then_recovers() {
+        // H3: with no active price list there is no rate to convert a
+        // settled micro-USD cost into credits. The settler must not guess --
+        // it leaves the ending unsettled, records the failure on the row's
+        // own `last_error` (F7 of the money-review fix pass), and writes no
+        // ledger row. Once a price list exists again, the next pass charges
+        // the exact sum and clears the error.
+        let db = test_db();
+        let user = subscriber(&db, 1_000);
+        let claims = attempt_capability(&db, "attempt-no-price-list");
+        settle_call(&db, &claims, "no-price-1", 300_000);
+
+        db.conn()
+            .execute("DELETE FROM price_lists", [])
+            .expect("remove every price list");
+
+        end_and_settle_attempt(
+            &db,
+            user,
+            "attempt-no-price-list",
+            "step-no-price-list",
+            AttemptEndCause::CustomerCancel,
+        );
+
+        assert_eq!(db.get_credit_balance(user).subscription_remaining, 1_000);
+        assert_eq!(db.credit_ledger_totals(user), (0, 0));
+
+        let (settled_at, last_error): (Option<i64>, Option<String>) = db
+            .conn()
+            .query_row(
+                "SELECT settled_at, last_error FROM attempt_endings WHERE attempt_id = ?1",
+                params!["attempt-no-price-list"],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("ending row exists");
+        assert!(
+            settled_at.is_none(),
+            "a settlement failure must not be marked settled"
+        );
+        assert!(
+            last_error.is_some(),
+            "a missing price list must record why the settle failed"
+        );
+
+        // Publish a price list again and retry: the exact same tick that
+        // previously failed now succeeds and clears the error.
+        db.publish_price_list(&crate::pricing::seed_provisional(
+            2,
+            "test:recovered",
+            0,
+            crate::pricing::seed_models(),
+        ))
+        .expect("publish recovered price list");
+
+        db.settle_pending_attempts().expect("settle");
+        assert_eq!(db.get_credit_balance(user).subscription_remaining, 997);
+        assert_eq!(db.get_credit_carry_micro_usd(user), 0);
+
+        let (settled_at, last_error): (Option<i64>, Option<String>) = db
+            .conn()
+            .query_row(
+                "SELECT settled_at, last_error FROM attempt_endings WHERE attempt_id = ?1",
+                params!["attempt-no-price-list"],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("ending row exists");
+        assert!(settled_at.is_some(), "the retried settle must succeed");
+        assert!(
+            last_error.is_none(),
+            "a successful retry must clear the prior error"
+        );
+    }
+
+    // --- get_receipt: charged_credits ---
+
+    #[test]
+    fn get_receipt_reports_the_exact_charge_when_paid_from_subscription_alone() {
+        // H8: `charged_credits` is what the ledger actually moved for this
+        // verification, not the quote. Paid entirely out of the monthly
+        // allotment, it must read back as exactly that whole-credit amount.
+        let db = test_db();
+        insert_run_and_step(&db, "run-receipt-sub", "step-receipt-sub");
+        let vid = seal_verification(&db, "run-receipt-sub", "step-receipt-sub", Verdict::Verified);
+
+        let user = subscriber(&db, 1_000);
+        let charge_key = ChargeKey::for_verification(&vid);
+        db.deduct_credits(user, 4, "verified verdict charge", &charge_key)
+            .expect("charge succeeds");
+
+        let receipt = db
+            .get_receipt("run-receipt-sub", "step-receipt-sub")
+            .expect("sealed verification has a receipt");
+        assert_eq!(receipt.charged_credits, Some(4));
+    }
+
+    #[test]
+    fn get_receipt_reports_the_exact_total_when_the_charge_splits_across_subscription_and_pack() {
+        // H8: a charge larger than the remaining monthly allotment spills
+        // into the purchased-pack bucket, writing two `credit_transactions`
+        // rows under the same verification key. The receipt must still show
+        // one exact total, not just the subscription-bucket half of it.
+        let db = test_db();
+        insert_run_and_step(&db, "run-receipt-split", "step-receipt-split");
+        let vid = seal_verification(
+            &db,
+            "run-receipt-split",
+            "step-receipt-split",
+            Verdict::Verified,
+        );
+
+        let user = subscriber(&db, 2);
+        let granted = db
+            .grant_topup_credits(user, "cs_receipt_split", 250, "Top-up $25")
+            .expect("grant");
+        assert!(granted);
+
+        let charge_key = ChargeKey::for_verification(&vid);
+        db.deduct_credits(user, 4, "verified verdict charge", &charge_key)
+            .expect("charge succeeds");
+
+        let (sub_total, pack_total) = db.credit_ledger_totals(user);
+        assert_eq!(sub_total, -2, "the allotment covers only 2 of the 4 credits");
+        assert_eq!(pack_total, -2, "the remaining 2 credits spill into the pack bucket");
+
+        let receipt = db
+            .get_receipt("run-receipt-split", "step-receipt-split")
+            .expect("sealed verification has a receipt");
+        assert_eq!(
+            receipt.charged_credits,
+            Some(4),
+            "the receipt must show the full split charge as one exact total"
+        );
+    }
+
     // --- grant_topup_credits ---
 
     #[test]

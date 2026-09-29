@@ -2717,6 +2717,252 @@ mod attempt_end_paths {
         );
         assert_eq!(db.get_credit_carry_micro_usd(OWNER), 0);
     }
+
+    #[tokio::test]
+    async fn a_stepfailed_agent_caused_kind_charges_the_exact_settled_cost_regardless_of_ownership()
+    {
+        // H4: an agent-caused failure kind (ProcessTimeout) is always the
+        // customer's own attempt failing -- classify_worker_failure charges
+        // it unconditionally, whether the worker is Cortex-owned or not.
+        // Driven with a genuinely settled reservation so the assertion is
+        // an exact charge, not just a cause label.
+        let state = state().await;
+        let (worker_id, step_id, lease_gen) =
+            lease_fixture_owned(&state, "attempt-timeout", true);
+        {
+            let db = state.db.as_ref().expect("database");
+            db.init_credit_balance(OWNER, 1_000).expect("balance row");
+            let claims = attempt_capability(db, OWNER, "attempt-timeout");
+            settle_call(db, &claims, "call-timeout", 300_000);
+        }
+
+        let (brain_tx, _brain_rx) = mpsc::channel(8);
+        let mut registered = true;
+        let mut authed_user_id = Some(OWNER.to_string());
+        let mut step_run_cache = HashMap::new();
+
+        handle_worker_msg(
+            &state,
+            &worker_id,
+            "session-1",
+            &mut registered,
+            &mut authed_user_id,
+            &brain_tx,
+            WorkerMessage::StepFailed {
+                message_id: "m-timeout".into(),
+                step_id: step_id.clone(),
+                attempt_id: "attempt-timeout".into(),
+                lease_gen,
+                failure: failure(WorkerFailureKind::ProcessTimeout),
+            },
+            &mut step_run_cache,
+        )
+        .await;
+
+        let (cause, settled_at) = ending_row(&state, "attempt-timeout")
+            .expect("a matching attempt id must record an attempt_endings row");
+        assert_eq!(
+            cause, "failed",
+            "ProcessTimeout is classify_worker_failure's unconditional Failed case"
+        );
+        assert!(settled_at.is_some());
+
+        let db = state.db.as_ref().expect("database");
+        assert_eq!(
+            db.get_credit_balance(OWNER).subscription_remaining,
+            997,
+            "300_000 micro-USD at the seeded 100_000-micro-USD credit is exactly 3 \
+             whole credits"
+        );
+        assert_eq!(db.get_credit_carry_micro_usd(OWNER), 0);
+    }
+
+    #[tokio::test]
+    async fn a_stepfailed_infra_kind_on_a_cortex_owned_worker_absorbs_as_zero_amount() {
+        // H4: a CLI/network-caused failure kind on a Cortex-owned worker is
+        // Cortex's own infrastructure fault -- absorbed as a zero-amount
+        // row, never charged, even though a real settled call was made.
+        let state = state().await;
+        let (worker_id, step_id, lease_gen) =
+            lease_fixture_owned(&state, "attempt-cli-owned", true);
+        {
+            let db = state.db.as_ref().expect("database");
+            db.init_credit_balance(OWNER, 1_000).expect("balance row");
+            let claims = attempt_capability(db, OWNER, "attempt-cli-owned");
+            settle_call(db, &claims, "call-cli-owned", 300_000);
+        }
+
+        let (brain_tx, _brain_rx) = mpsc::channel(8);
+        let mut registered = true;
+        let mut authed_user_id = Some(OWNER.to_string());
+        let mut step_run_cache = HashMap::new();
+
+        handle_worker_msg(
+            &state,
+            &worker_id,
+            "session-1",
+            &mut registered,
+            &mut authed_user_id,
+            &brain_tx,
+            WorkerMessage::StepFailed {
+                message_id: "m-cli-owned".into(),
+                step_id: step_id.clone(),
+                attempt_id: "attempt-cli-owned".into(),
+                lease_gen,
+                failure: failure(WorkerFailureKind::CliCrashed),
+            },
+            &mut step_run_cache,
+        )
+        .await;
+
+        let (cause, settled_at) = ending_row(&state, "attempt-cli-owned")
+            .expect("a matching attempt id must record an attempt_endings row");
+        assert_eq!(
+            cause, "worker_infra_down",
+            "CliCrashed on a Cortex-owned worker is Cortex's own infrastructure fault"
+        );
+        assert!(settled_at.is_some());
+
+        let db = state.db.as_ref().expect("database");
+        assert_eq!(
+            db.get_credit_balance(OWNER).subscription_remaining,
+            1_000,
+            "an absorbed attempt must never touch the customer's balance"
+        );
+        assert_eq!(db.get_credit_carry_micro_usd(OWNER), 0);
+
+        let key = cortex_core::billing_binding::ChargeKey::for_attempt("attempt-cli-owned");
+        let (amount, reason): (i64, String) = db
+            .conn()
+            .query_row(
+                "SELECT amount, reason FROM credit_transactions WHERE idempotency_key = ?1",
+                rusqlite::params![key.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("absorbed-cost row");
+        assert_eq!(
+            amount, 0,
+            "an absorbed cost is a zero-amount row, never a refund"
+        );
+        assert_eq!(reason, "absorbed");
+    }
+
+    #[tokio::test]
+    async fn a_stepfailed_infra_kind_on_a_customer_owned_worker_charges_the_exact_settled_cost() {
+        // H4: the same CLI/network-caused failure kind on a customer-owned
+        // worker is the customer's own infrastructure fault -- charged
+        // exactly like any other Failed cause, not absorbed for free.
+        let state = state().await;
+        let (worker_id, step_id, lease_gen) =
+            lease_fixture_owned(&state, "attempt-cli-customer", false);
+        {
+            let db = state.db.as_ref().expect("database");
+            db.init_credit_balance(OWNER, 1_000).expect("balance row");
+            let claims = attempt_capability(db, OWNER, "attempt-cli-customer");
+            settle_call(db, &claims, "call-cli-customer", 300_000);
+        }
+
+        let (brain_tx, _brain_rx) = mpsc::channel(8);
+        let mut registered = true;
+        let mut authed_user_id = Some(OWNER.to_string());
+        let mut step_run_cache = HashMap::new();
+
+        handle_worker_msg(
+            &state,
+            &worker_id,
+            "session-1",
+            &mut registered,
+            &mut authed_user_id,
+            &brain_tx,
+            WorkerMessage::StepFailed {
+                message_id: "m-cli-customer".into(),
+                step_id: step_id.clone(),
+                attempt_id: "attempt-cli-customer".into(),
+                lease_gen,
+                failure: failure(WorkerFailureKind::CliCrashed),
+            },
+            &mut step_run_cache,
+        )
+        .await;
+
+        let (cause, settled_at) = ending_row(&state, "attempt-cli-customer")
+            .expect("a matching attempt id must record an attempt_endings row");
+        assert_eq!(
+            cause, "failed",
+            "CliCrashed on a customer-owned worker is the customer's own infrastructure fault"
+        );
+        assert!(settled_at.is_some());
+
+        let db = state.db.as_ref().expect("database");
+        assert_eq!(
+            db.get_credit_balance(OWNER).subscription_remaining,
+            997,
+            "300_000 micro-USD at the seeded 100_000-micro-USD credit is exactly 3 \
+             whole credits"
+        );
+        assert_eq!(db.get_credit_carry_micro_usd(OWNER), 0);
+    }
+
+    #[tokio::test]
+    async fn a_stepcompleted_attempt_id_mismatch_is_dropped_without_recording_anything() {
+        // H7: StepCompleted must be guarded by the scheduler-minted attempt
+        // id exactly like StepFailed and StepBlocked -- a worker-reported id
+        // that disagrees must be dropped before it can touch step state or
+        // billing.
+        let state = state().await;
+        let (worker_id, step_id, lease_gen) = lease_fixture(&state, "real-attempt-completed");
+        let (brain_tx, _brain_rx) = mpsc::channel(8);
+        let mut registered = true;
+        let mut authed_user_id = Some(OWNER.to_string());
+        let mut step_run_cache = HashMap::new();
+
+        handle_worker_msg(
+            &state,
+            &worker_id,
+            "session-1",
+            &mut registered,
+            &mut authed_user_id,
+            &brain_tx,
+            WorkerMessage::StepCompleted {
+                message_id: "m-completed-mismatch".into(),
+                step_id: step_id.clone(),
+                attempt_id: "wrong-attempt".into(),
+                lease_gen,
+                exit_code: 0,
+                base_commit: Some("base-sha".into()),
+                head_commit: Some("head-sha".into()),
+                branch: Some("worker-branch".into()),
+                output: StepOutput {
+                    summary: "done".into(),
+                    files_found: Vec::new(),
+                    files_changed: Vec::new(),
+                    evidence: None,
+                    tokens_in: None,
+                    tokens_out: None,
+                    cost_estimate: None,
+                    structured: serde_json::Value::Null,
+                },
+            },
+            &mut step_run_cache,
+        )
+        .await;
+
+        assert!(
+            ending_row(&state, "wrong-attempt").is_none(),
+            "a worker-reported attempt id that disagrees with the scheduler-minted one \
+             must never produce an attempt_endings row"
+        );
+        assert_eq!(
+            state
+                .db
+                .as_ref()
+                .unwrap()
+                .get_step_status(&step_id)
+                .as_deref(),
+            Some("leased"),
+            "the step must be untouched when the reported attempt id is rejected"
+        );
+    }
 }
 
 #[cfg(test)]

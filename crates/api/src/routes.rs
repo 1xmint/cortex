@@ -1690,6 +1690,71 @@ mod validate_run_for_pr_tests {
         (dir, state)
     }
 
+    /// Guards a whole test body while HEYVERA_ENV=production is set, and
+    /// always clears it afterward (even on panic) -- this is the only test
+    /// in this binary that depends on `is_production_env`, so the window is
+    /// scoped as tightly as possible around the single call under test.
+    struct ProductionEnvGuard;
+
+    impl ProductionEnvGuard {
+        fn set() -> Self {
+            std::env::set_var("HEYVERA_ENV", "production");
+            ProductionEnvGuard
+        }
+    }
+
+    impl Drop for ProductionEnvGuard {
+        fn drop(&mut self) {
+            std::env::remove_var("HEYVERA_ENV");
+        }
+    }
+
+    /// Item F of the M-D-0024 settlement redesign: in production, with no
+    /// usable provider gateway, `create_run` must refuse before a run row
+    /// even exists -- a customer must never be told a run is under way when
+    /// nothing behind it can make a priced call. Calls the handler directly
+    /// (no HTTP, no Clerk) since `PremiumUser` is a plain constructible
+    /// struct outside of axum's extractor machinery.
+    #[tokio::test]
+    async fn create_run_in_production_without_a_gateway_returns_service_unavailable() {
+        let (_dir, state) = test_state().await;
+        let _guard = ProductionEnvGuard::set();
+        assert!(
+            crate::is_production_env(),
+            "test setup: HEYVERA_ENV=production must be visible to is_production_env"
+        );
+        assert!(
+            !crate::provider_gateway_http::is_gateway_on(),
+            "test setup: no supplier keys are configured, so the gateway must be off"
+        );
+
+        let user = PremiumUser {
+            user_id: "user-1".to_string(),
+        };
+        let req = CreateRunRequest {
+            goal: "ship it".to_string(),
+            profile: "auto".to_string(),
+            file_paths: vec![],
+            repo_key: None,
+            task_id: None,
+            group_id: None,
+            conversation_id: None,
+            authority_scope_id: None,
+            authority_handoff_id: None,
+            authority_reason: None,
+        };
+
+        let result = create_run(State(state), user, Json(req)).await;
+        let Err((status, body)) = result else {
+            panic!("a production run with no gateway must be refused, not accepted");
+        };
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            body.0.error,
+            cortex_core::billing_binding::GATEWAY_DOWN_MESSAGE
+        );
+    }
+
     fn write_lease(path: &str) -> ResourceLeaseRequest {
         ResourceLeaseRequest {
             resource_type: "path".to_string(),
