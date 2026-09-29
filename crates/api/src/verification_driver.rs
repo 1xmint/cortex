@@ -3,8 +3,16 @@
 //!
 //! This is the money path. Everything here exists to make two guarantees hold
 //! at once: a verdict is produced by *us* executing checks rather than by a
-//! worker reporting on itself, and the charge or refund that follows fires
-//! exactly once no matter how many times this runs.
+//! worker reporting on itself, and the settlement that follows — a charge or
+//! an absorption of the attempt's own observed cost — fires exactly once no
+//! matter how many times this runs.
+//!
+//! **No verdict here ever produces a refund.** The owner's settled billing
+//! rule (`cortex_core::billing_binding`) is pass-through: a customer pays
+//! exactly what the model calls an attempt made, nothing more, and a failed
+//! attempt is still charged for calls it made. The only question this module
+//! answers per attempt-end is *charge the customer, or have Cortex absorb it*
+//! — see [`billing_binding::AttemptEndCause`] and [`billing_binding::settle_attempt`].
 //!
 //! The sequence, and why it is in this order:
 //!
@@ -15,16 +23,25 @@
 //!    to stop, not to retry.
 //! 3. Snapshot the delivered commit into a fresh checkout. Never the worker's
 //!    working directory: the moment a worker can influence its own verdict the
-//!    product claim is void.
+//!    product claim is void. Git never reads the worker's repository either --
+//!    only its object files, through a Cortex-owned scratch repository that
+//!    ignores every piece of derived metadata the workspace holds.
 //! 4. Execute, record, compute the verdict, seal it.
-//! 5. Bind to the ledger, with the billing state derived from the ledger
-//!    itself rather than from a column that could drift from the money.
+//! 5. Record the attempt's end durably (`attempt_endings`, the single source
+//!    of truth that it ended and why) and settle it: sum its settled observed
+//!    provider cost and either charge it (via `ChargeKey::for_attempt`, so a
+//!    replay of the same attempt writes no second row) or absorb it against
+//!    Cortex. The record and the settlement are two separate, idempotent
+//!    steps — see [`crate::db::Database::settle_pending_attempts`] — so a
+//!    crash between them still leaves a trail the scheduler finishes later.
 //!
 //! See `cortex/plan/VERIFIER.md` and `cortex/plan/V3-LAUNCH-SPEC.md`.
 
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
 
-use cortex_core::billing_binding::{self, BillingEffect, BillingState};
+use cortex_core::billing_binding::{classify_exam_integrity_failure, AttemptEndCause};
 use cortex_core::check_derivation::EcosystemFacts;
 use cortex_core::diff_surface::{self, ClassOutcome, VerdictClass};
 use cortex_core::verification::{
@@ -52,9 +69,12 @@ pub struct DeliveryFacts {
     pub workspace_dir: PathBuf,
     /// The commit the worker delivered. This is what gets graded.
     pub head_commit: String,
-    /// Credits quoted for this step. `None` means no quote was reachable, in
-    /// which case the verdict is still recorded and the ledger is left alone.
-    /// Inventing a price is never correct — pricing is a product decision.
+    /// Credits quoted for this step at dispatch time, kept for display only.
+    /// **Not what the customer is charged** — `finish_and_bill` records the
+    /// attempt's end and `settle_pending_attempts` settles it from the
+    /// attempt's actual settled observed provider cost, never this quote.
+    /// `None` means no quote was reachable; that has no effect on billing
+    /// either way.
     pub quoted_credits: Option<i64>,
 }
 
@@ -74,52 +94,819 @@ pub fn runner_image() -> String {
     std::env::var("CORTEX_RUNNER_IMAGE").unwrap_or_else(|_| "cortex/runner:phase-a".to_string())
 }
 
+/// Whether a commit the worker reported resolves in the server's workspace
+/// repository.
+///
+/// Three outcomes, not two, because the difference is who pays. `Missing` is
+/// anything the worker could have caused -- the commit not being there, the
+/// workspace's `.git` being missing, renamed, symlinked, unreadable, corrupt
+/// or of an unsupported format, a scratch directory Cortex could not make (the
+/// worker can fill any disk it can deliver trees to), or git stalling on a
+/// planted object store past its deadline -- and is charged. `CheckFailed`
+/// means Cortex could not find out for a reason the worker cannot have caused:
+/// only that the git binary cannot be spawned. That is Cortex's own machinery
+/// failing and is absorbed, never charged.
+///
+/// Git never opens the workspace repository. It works in a Cortex-owned
+/// scratch repository and reads the workspace's object files only, through
+/// [`ObjectView`]: the alternate's commit-graph, multi-pack-index and bitmap
+/// metadata are switched off, so nothing the worker can write into the
+/// workspace (config, attributes, hooks, the `.git` entry itself, derived
+/// indexes) is ever read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CommitCheck {
+    /// The commit exists as a commit object in the workspace's object store.
+    Resolves,
+    /// The commit is not there as far as Cortex can tell: the object store has
+    /// no such commit, cannot be read at all (no `.git`, a renamed or
+    /// symlinked one, a corrupt store, one git stalls on), Cortex's scratch
+    /// directory could not be made, or the reported string is not even a
+    /// well-formed object id. The workspace is worker-writable and so is every
+    /// disk trees are delivered to, so all of these are the worker's doing and
+    /// all are charged.
+    Missing,
+    /// Cortex could not determine either way, and the worker cannot have
+    /// caused it: the git binary would not spawn. Nothing else.
+    CheckFailed(String),
+}
+
+/// Is `commit` shaped like a full object id (SHA-1 or SHA-256 hex)?
+///
+/// The delivered commit is worker-controlled text that ends up in git's argv.
+/// Anything else -- a NUL byte, a string too long to spawn with -- would make
+/// the *spawn* fail, and a failed spawn looks exactly like Cortex's own fault.
+fn is_full_object_id(commit: &str) -> bool {
+    matches!(commit.len(), 40 | 64) && commit.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Why an [`ObjectView`] could not be made.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ViewError {
+    /// git could not be started at all.
+    Spawn(String),
+    /// git started but the scratch repository could not be made: the scratch
+    /// filesystem refused it (full, read-only, unusable), or `git init` did
+    /// not finish within its deadline.
+    Scratch(String),
+}
+
+impl ViewError {
+    fn message(&self) -> &str {
+        match self {
+            Self::Spawn(m) | Self::Scratch(m) => m,
+        }
+    }
+
+    /// Is this Cortex's fault rather than something the worker could have
+    /// caused? Only a git that will not spawn is. A scratch directory that
+    /// cannot be made never is, whatever filesystem it lives on: worker-
+    /// delivered trees are written into the temp directory, so the worker can
+    /// fill even a different-device one by delivering concurrently, and "the
+    /// scratch directory is unusable" cannot be told apart from "the worker
+    /// made it unusable". When unsure, charge.
+    fn blames_cortex(&self) -> bool {
+        matches!(self, Self::Spawn(_))
+    }
+}
+
+/// A read-only view of the workspace's object store, and the only way any
+/// verification code runs git.
+///
+/// The workspace repository is writable by the worker: `.git/config`,
+/// `.git/info/attributes`, hooks, the object store and the `.git` entry
+/// itself. Git *reads* most of that -- config keys name filters, fsmonitors,
+/// hooks and promisor remotes, attribute files name filters to run -- so git
+/// is never run with the workspace repository as its repository. Instead
+/// Cortex makes a scratch bare repository of its own (empty template: no
+/// hooks, no `info/attributes`, no config beyond git's defaults) and points its
+/// `objects/info/alternates` at `<workspace>/.git/objects`. Git then reads the
+/// worker's object files and nothing else: the alternate's derived metadata
+/// (commit-graph, multi-pack-index, reachability bitmaps) is as worker-writable
+/// as the objects and is switched off in [`ObjectView::git`]. A corrupted,
+/// deleted or missing object is just a commit or tree that is not there, which
+/// the callers charge, and a store git cannot finish reading is killed at its
+/// deadline (see [`run_git`]) and charged too.
+///
+/// The scratch directory is removed on drop.
+struct ObjectView {
+    git_dir: PathBuf,
+}
+
+impl ObjectView {
+    /// Make the scratch repository under `parent` (a fresh uuid-named
+    /// directory) with the workspace's object store as its alternate. `git
+    /// init` gets `deadline`.
+    fn create(parent: &Path, workspace_dir: &Path, deadline: Duration) -> Result<Self, ViewError> {
+        // From here on the directory belongs to the view, so `Drop` cleans up
+        // whatever a failed step left behind.
+        let view = Self {
+            git_dir: parent.join(format!("cortex-verify-objects-{}", uuid::Uuid::new_v4())),
+        };
+
+        let mut init = control_git();
+        init.args(["init", "--quiet", "--bare", "--template="])
+            .arg(&view.git_dir);
+        let out = match run_git(init, deadline) {
+            Ok(GitRun::Finished(out)) => out,
+            Ok(GitRun::TimedOut) => {
+                return Err(ViewError::Scratch(format!(
+                    "git init of the object view did not finish within {deadline:?}"
+                )));
+            }
+            Err(e) => {
+                return Err(ViewError::Spawn(format!(
+                    "could not run git init of the object view: {e}"
+                )));
+            }
+        };
+        if !out.status.success() {
+            return Err(ViewError::Scratch(format!(
+                "git init of the object view failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            )));
+        }
+
+        let workspace =
+            std::path::absolute(workspace_dir).unwrap_or_else(|_| workspace_dir.to_path_buf());
+        let mut alternate = workspace.join(".git").join("objects").into_os_string();
+        alternate.push("\n");
+        let info = view.git_dir.join("objects").join("info");
+        std::fs::create_dir_all(&info)
+            .and_then(|()| std::fs::write(info.join("alternates"), alternate.into_encoded_bytes()))
+            .map_err(|e| ViewError::Scratch(format!("could not write the alternates file: {e}")))?;
+        Ok(view)
+    }
+
+    /// A git command that runs in the scratch repository: the environment and
+    /// flags of [`control_git`], plus no lazy fetching, no protocols, every
+    /// repository-driven side effect switched off, and none of the derived
+    /// metadata (commit-graph, multi-pack-index, bitmaps) the alternate could
+    /// offer in place of reading objects. Nothing here names the workspace.
+    fn git(&self) -> std::process::Command {
+        let mut git_dir = std::ffi::OsString::from("--git-dir=");
+        git_dir.push(&self.git_dir);
+
+        let mut command = control_git();
+        command
+            .args([
+                "-c",
+                "protocol.allow=never",
+                "-c",
+                "core.fsmonitor=false",
+                "-c",
+                "core.hooksPath=/dev/null",
+                "-c",
+                "core.attributesFile=/dev/null",
+                "-c",
+                "safe.directory=*",
+                "-c",
+                "core.commitGraph=false",
+                "-c",
+                "core.multiPackIndex=false",
+                "-c",
+                "pack.useBitmaps=false",
+            ])
+            .arg(git_dir)
+            .env("GIT_NO_LAZY_FETCH", "1");
+        command
+    }
+}
+
+impl Drop for ObjectView {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.git_dir);
+    }
+}
+
+/// Do `scratch_parent` and the workspace live on the same filesystem?
+///
+/// It decides whether a *refused checkout* ([`TreeCheckout::create_in`]) is
+/// even a candidate for being Cortex's fault. The worker writes to the
+/// workspace filesystem, so when the scratch directory shares it the worker
+/// can fill it, and a refusal there is charged. Only when the scratch
+/// directory is on another filesystem is a control checkout consulted. Making
+/// the scratch repository never consults this at all: worker-delivered trees
+/// are written into the temp directory too, so a scratch directory that cannot
+/// be made is charged everywhere (see [`ViewError::blames_cortex`]). The
+/// workspace directory itself is compared, not its `.git`, because `.git` may
+/// be gone. When either side cannot be inspected, or off unix where there is
+/// no device id, the answer is `true`: charge.
+#[cfg(unix)]
+fn same_filesystem(scratch_parent: &Path, workspace_dir: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let Ok(workspace) = std::fs::metadata(workspace_dir) else {
+        return true;
+    };
+    // The scratch directory may not exist yet: compare its nearest existing
+    // ancestor, which is the filesystem it would be created on.
+    let Some(scratch) = scratch_parent
+        .ancestors()
+        .find_map(|dir| std::fs::metadata(dir).ok())
+    else {
+        return true;
+    };
+    scratch.dev() == workspace.dev()
+}
+
+#[cfg(not(unix))]
+fn same_filesystem(_scratch_parent: &Path, _workspace_dir: &Path) -> bool {
+    true
+}
+
+/// Blocking: shells out to git. Async callers must run it through
+/// `tokio::task::spawn_blocking`.
+///
+/// A commit that is not 40 or 64 hex digits is `Missing` without spawning
+/// anything (see [`is_full_object_id`]).
+///
+/// `CheckFailed` is returned ONLY when git cannot be spawned. Everything else
+/// is `Missing`, which is charged: the answer comes from
+/// `git cat-file -e {commit}^{commit}` in a Cortex-owned scratch repository
+/// whose only link to the workspace is its object store as an alternate (see
+/// [`ObjectView`]). A workspace whose `.git` is missing, renamed, symlinked or
+/// unreadable, or whose objects are corrupt or gone, has no such commit as far
+/// as git can tell, and the workspace is writable by the worker: any state of
+/// it is something the worker could have put there, so it must never buy an
+/// absorbed attempt. The same goes for a scratch directory that cannot be made
+/// (the worker can fill any disk it delivers trees to) and for a git that
+/// outlives its deadline (a planted FIFO where an `alternates` file belongs
+/// blocks git forever): both are `Missing`.
+pub(crate) fn check_commit(workspace_dir: &Path, commit: &str) -> CommitCheck {
+    check_commit_in(&std::env::temp_dir(), workspace_dir, commit, GIT_DEADLINES)
+}
+
+/// [`check_commit`] with the scratch directory and the deadlines chosen by the
+/// caller.
+fn check_commit_in(
+    parent: &Path,
+    workspace_dir: &Path,
+    commit: &str,
+    deadlines: GitDeadlines,
+) -> CommitCheck {
+    if !is_full_object_id(commit) {
+        return CommitCheck::Missing;
+    }
+    let view = match ObjectView::create(parent, workspace_dir, deadlines.quick) {
+        Ok(view) => view,
+        Err(e) if e.blames_cortex() => {
+            return CommitCheck::CheckFailed(e.message().to_string());
+        }
+        Err(_) => return CommitCheck::Missing,
+    };
+    let mut cat_file = view.git();
+    cat_file
+        .arg("cat-file")
+        .arg("-e")
+        .arg(format!("{commit}^{{commit}}"));
+    match run_git(cat_file, deadlines.quick) {
+        Err(e) => CommitCheck::CheckFailed(format!("could not run git cat-file: {e}")),
+        Ok(GitRun::Finished(out)) if out.status.success() => CommitCheck::Resolves,
+        Ok(GitRun::Finished(_) | GitRun::TimedOut) => CommitCheck::Missing,
+    }
+}
+
+/// Why a delivered tree could not be checked out. The split decides who pays.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TreeCheckoutError {
+    /// git ran and refused the delivered commit, or the scratch filesystem the
+    /// worker shares with the workspace refused Cortex's scratch repository, or
+    /// (on another filesystem) a control checkout through the very same git in
+    /// a repository Cortex made itself succeeded -- so the refusal is about the
+    /// delivered tree or the workspace (an entry named `.git`, `..`, a name too
+    /// long or unsafe for the checkout filesystem, an unreadable or missing
+    /// object, a full disk the worker filled). A worker can build every one of
+    /// those, so it is charged.
+    DeliveredTree(String),
+    /// Anything else: git would not spawn, or -- on a filesystem the worker
+    /// does not share -- the scratch disk is nearly full, the scratch
+    /// repository could not be made, or the control checkout failed too.
+    /// Cortex's own machinery, absorbed.
+    Cortex(String),
+}
+
+impl TreeCheckoutError {
+    fn message(&self) -> &str {
+        match self {
+            Self::DeliveredTree(m) | Self::Cortex(m) => m,
+        }
+    }
+}
+
+/// Free space on the scratch filesystem below which a refused checkout is
+/// blamed on Cortex (when that filesystem is not the workspace's): git may well
+/// have been refused by a full disk, and a control checkout on a full disk
+/// would only repeat the failure.
+const CONTROL_MIN_FREE_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Bytes available to an unprivileged writer on the filesystem holding `dir`,
+/// or `None` when that cannot be found out.
+#[cfg(unix)]
+#[allow(clippy::unnecessary_cast)]
+fn free_bytes(dir: &Path) -> Option<u64> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let path = std::ffi::CString::new(dir.as_os_str().as_bytes()).ok()?;
+    let mut stats = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+    // SAFETY: `path` is a valid NUL-terminated string that outlives the call,
+    // and `stats` is a valid out-pointer that `statvfs` fully initialises when
+    // it returns 0, which is the only case in which it is read.
+    let ok = unsafe { libc::statvfs(path.as_ptr(), stats.as_mut_ptr()) } == 0;
+    if !ok {
+        return None;
+    }
+    // SAFETY: initialised by the successful `statvfs` call above.
+    let stats = unsafe { stats.assume_init() };
+    Some((stats.f_bavail as u64).saturating_mul(stats.f_frsize as u64))
+}
+
+/// Without `statvfs` there is no check; the control checkout still runs.
+#[cfg(not(unix))]
+fn free_bytes(_dir: &Path) -> Option<u64> {
+    None
+}
+
+/// `Err` when `dir`'s filesystem is known to have less than `min_free` bytes
+/// free. An unknown amount is not an error.
+fn has_room(dir: &Path, min_free: u64) -> Result<(), String> {
+    match free_bytes(dir) {
+        Some(free) if free < min_free => Err(format!(
+            "only {free} bytes are free under {}",
+            dir.display()
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// Deadline for the cheap git commands: `init`, `cat-file`, `diff` and the
+/// control's plumbing. Generous on purpose: it bounds a hang, not a slow disk.
+const GIT_QUICK_DEADLINE: Duration = Duration::from_secs(30);
+
+/// Deadline for `git worktree add`, which writes a whole tree.
+const GIT_CHECKOUT_DEADLINE: Duration = Duration::from_secs(300);
+
+/// How long each kind of git child may run before it is killed.
+///
+/// The workspace's object store is worker-writable and git reads it, so a
+/// worker can plant something git blocks on forever (a FIFO where an
+/// `alternates` file belongs) or something enormous. A git that never returns
+/// would hold the blocking pool, and the attempt, hostage. Every git child
+/// therefore runs under a deadline ([`run_git`]), and a child that outlives it
+/// is the worker's doing: charged, never absorbed.
+#[derive(Debug, Clone, Copy)]
+struct GitDeadlines {
+    quick: Duration,
+    checkout: Duration,
+}
+
+const GIT_DEADLINES: GitDeadlines = GitDeadlines {
+    quick: GIT_QUICK_DEADLINE,
+    checkout: GIT_CHECKOUT_DEADLINE,
+};
+
+/// What a git child did under [`run_git`].
+enum GitRun {
+    Finished(std::process::Output),
+    /// Killed at its deadline, or a process it left behind still held its
+    /// output pipes at the deadline.
+    TimedOut,
+}
+
+/// Read one of a child's output pipes to the end on its own thread.
+fn drain_pipe(pipe: Option<impl std::io::Read + Send + 'static>) -> mpsc::Receiver<Vec<u8>> {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        if let Some(mut pipe) = pipe {
+            let _ = pipe.read_to_end(&mut bytes);
+        }
+        let _ = tx.send(bytes);
+    });
+    rx
+}
+
+/// Kill a git child and everything it started (it leads its own process
+/// group, see [`run_git`]), then reap it.
+fn kill_git(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        if let Ok(group) = libc::pid_t::try_from(child.id()) {
+            // SAFETY: `killpg` only sends a signal; it touches no memory of ours.
+            unsafe {
+                libc::killpg(group, libc::SIGKILL);
+            }
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// Run a git command to completion, or kill it at `deadline`.
+///
+/// `Err` only when the process could not be spawned (or waiting on it failed),
+/// which is what "git cannot be run" means. A child that outlives `deadline`
+/// -- or leaves a descendant holding its output pipes past it -- is killed
+/// with its whole process group and reported as [`GitRun::TimedOut`]. The
+/// deadline covers output collection too, so a timed-out run never yields
+/// partial output as if it were complete.
+///
+/// A hand-rolled deadline rather than coreutils `timeout`: with `timeout`, a
+/// missing git binary is an exit status of 127, indistinguishable from git
+/// failing, and a spawn failure is exactly what must stay Cortex's.
+fn run_git(mut command: std::process::Command, deadline: Duration) -> std::io::Result<GitRun> {
+    command
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        command.process_group(0);
+    }
+    let mut child = command.spawn()?;
+    let started = Instant::now();
+    let stdout = drain_pipe(child.stdout.take());
+    let stderr = drain_pipe(child.stderr.take());
+
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if started.elapsed() >= deadline => {
+                kill_git(&mut child);
+                return Ok(GitRun::TimedOut);
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+            Err(e) => {
+                kill_git(&mut child);
+                return Err(e);
+            }
+        }
+    };
+    match (
+        stdout.recv_timeout(deadline.saturating_sub(started.elapsed())),
+        stderr.recv_timeout(deadline.saturating_sub(started.elapsed())),
+    ) {
+        (Ok(stdout), Ok(stderr)) => Ok(GitRun::Finished(std::process::Output {
+            status,
+            stdout,
+            stderr,
+        })),
+        _ => {
+            kill_git(&mut child);
+            Ok(GitRun::TimedOut)
+        }
+    }
+}
+
+/// A `git` command that reads nothing the worker can write: no repository
+/// (callers add one of their own making), hooks, attribute file or fsmonitor,
+/// no system or global configuration, none of the environment variables that
+/// name a repository, object store or extra config, and a fixed author and
+/// committer, so nothing about it depends on the machine's git setup or on
+/// anything the worker can write.
+fn control_git() -> std::process::Command {
+    let mut command = std::process::Command::new("git");
+    command
+        .args([
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "core.attributesFile=/dev/null",
+            "-c",
+            "init.defaultBranch=main",
+        ])
+        .env("LC_ALL", "C")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_AUTHOR_NAME", "cortex")
+        .env("GIT_AUTHOR_EMAIL", "cortex@localhost")
+        .env("GIT_COMMITTER_NAME", "cortex")
+        .env("GIT_COMMITTER_EMAIL", "cortex@localhost")
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .env_remove("GIT_COMMON_DIR")
+        .env_remove("GIT_OBJECT_DIRECTORY")
+        .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
+        .env_remove("GIT_CONFIG_PARAMETERS")
+        .env_remove("GIT_CONFIG_COUNT")
+        .env_remove("GIT_NAMESPACE")
+        .stdin(std::process::Stdio::null());
+    command
+}
+
+/// Why a control git command did not succeed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ControlFailure {
+    /// It did not finish within its deadline: git stalling is not evidence
+    /// that Cortex's machinery is broken, so this is charged.
+    TimedOut(String),
+    /// It could not be run, or ran and failed.
+    Failed(String),
+}
+
+impl ControlFailure {
+    fn message(&self) -> &str {
+        match self {
+            Self::TimedOut(m) | Self::Failed(m) => m,
+        }
+    }
+}
+
+/// Run one control git command; its trimmed stdout, or why it failed.
+fn run_control(
+    command: std::process::Command,
+    what: &str,
+    deadline: Duration,
+) -> Result<String, ControlFailure> {
+    let out = match run_git(command, deadline) {
+        Ok(GitRun::Finished(out)) => out,
+        Ok(GitRun::TimedOut) => {
+            return Err(ControlFailure::TimedOut(format!(
+                "{what} did not finish within {deadline:?}"
+            )));
+        }
+        Err(e) => return Err(ControlFailure::Failed(format!("could not run {what}: {e}"))),
+    };
+    if !out.status.success() {
+        return Err(ControlFailure::Failed(format!(
+            "{what} failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// The control: a checkout that involves nothing the worker can touch. A
+/// fresh repository Cortex makes itself under `parent` gets a parentless
+/// empty-tree commit, which is checked out with `git worktree add --detach`
+/// into another fresh directory under `parent` -- the same operation, through
+/// the same git and onto the same filesystem, as the delivered checkout. Both
+/// directories are removed afterwards.
+///
+/// Only consulted when `parent` is on a different filesystem than the
+/// workspace; on the workspace's own filesystem a failure is charged without
+/// asking (the worker can fill that disk, so the control proves nothing).
+///
+/// `Ok` means git and the checkout filesystem work, so a refusal of the
+/// delivered commit was about the delivered commit. `Err(Failed)` means they
+/// do not, which is Cortex's own fault; `Err(TimedOut)` is charged like any
+/// other stall (see [`GitDeadlines`]).
+fn control_checkout(parent: &Path) -> Result<(), ControlFailure> {
+    let scratch = parent.join(format!(
+        "cortex-verify-control-repo-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let checkout = parent.join(format!("cortex-verify-control-{}", uuid::Uuid::new_v4()));
+    let result = control_checkout_in(&scratch, &checkout);
+    // Whatever happened, leave nothing behind.
+    let _ = std::fs::remove_dir_all(&checkout);
+    let _ = std::fs::remove_dir_all(&scratch);
+    result
+}
+
+fn control_checkout_in(scratch: &Path, checkout: &Path) -> Result<(), ControlFailure> {
+    let in_scratch = || {
+        let mut command = control_git();
+        command.arg("-C").arg(scratch);
+        command
+    };
+
+    let mut init = control_git();
+    init.args(["init", "--quiet", "--template="]).arg(scratch);
+    run_control(
+        init,
+        "git init of the control repository",
+        GIT_QUICK_DEADLINE,
+    )?;
+
+    let mut hash = in_scratch();
+    hash.args(["hash-object", "-t", "tree", "-w", "--stdin"]);
+    let tree = run_control(hash, "git hash-object", GIT_QUICK_DEADLINE)?;
+
+    let mut commit = in_scratch();
+    commit.args(["commit-tree", &tree, "-m", "cortex control checkout"]);
+    let commit = run_control(commit, "git commit-tree", GIT_QUICK_DEADLINE)?;
+
+    // Give the scratch repository a real `HEAD`, so `worktree add` has an
+    // ordinary repository to work from.
+    let mut head = in_scratch();
+    head.args(["update-ref", "HEAD", &commit]);
+    run_control(head, "git update-ref", GIT_QUICK_DEADLINE)?;
+
+    let mut add = in_scratch();
+    add.args(["worktree", "add", "--detach"])
+        .arg(checkout)
+        .arg(&commit);
+    run_control(add, "the control git worktree add", GIT_CHECKOUT_DEADLINE)?;
+    Ok(())
+}
+
 /// A detached checkout of the delivered commit, removed on drop.
 struct TreeCheckout {
-    workspace_dir: PathBuf,
     path: PathBuf,
+    /// The checkout's `.git` file points into the view's scratch repository,
+    /// so the view lives exactly as long as the checkout. Dropped after
+    /// [`Drop for TreeCheckout`] has removed the checkout itself.
+    _view: ObjectView,
 }
 
 impl TreeCheckout {
-    /// `git worktree add --detach` at the delivered commit. Cheap (it shares
-    /// the object store) and, unlike a copy, guaranteed to be exactly the
-    /// delivered tree with nothing the worker left lying around.
-    fn create(workspace_dir: &Path, commit: &str) -> Result<Self, String> {
-        let path = std::env::temp_dir().join(format!("cortex-verify-{}", uuid::Uuid::new_v4()));
-        let out = std::process::Command::new("git")
-            .arg("-C")
-            .arg(workspace_dir)
-            .arg("worktree")
+    /// `git worktree add --detach` at the delivered commit, run from a
+    /// Cortex-owned scratch repository whose only link to the workspace is its
+    /// object store, read as data ([`ObjectView`]). Cheap (it shares the
+    /// object store) and, unlike a copy, guaranteed to be exactly the delivered
+    /// tree with nothing the worker left lying around. Git never reads the
+    /// workspace's config, attributes or hooks, so none of them can make the
+    /// checkout fail, run a filter, or run a hook.
+    ///
+    /// When git spawns but refuses, that alone does not say whose fault it is:
+    /// git's stderr echoes worker-chosen file names and depends on the locale,
+    /// so it is never classified on. The decision is made from what the worker
+    /// can and cannot reach:
+    ///
+    /// - The scratch directory is on the workspace's filesystem (or that
+    ///   cannot be told): the worker can fill that disk, so every refusal is
+    ///   the delivered tree's ([`TreeCheckoutError::DeliveredTree`], charged).
+    /// - It is on a different filesystem: low free space is Cortex's, and
+    ///   otherwise a control checkout is run in a repository Cortex creates
+    ///   itself ([`control_checkout`]). If the control works, what git refused
+    ///   is the delivered tree (charged); if it fails too, Cortex's machinery
+    ///   is what failed ([`TreeCheckoutError::Cortex`], absorbed).
+    ///
+    /// A git that will not spawn is `Cortex` outright. A workspace with no
+    /// `.git`, or a broken one, is not a special case: it is a tree git cannot
+    /// read, so it is charged. So is a commit that is not a full object id
+    /// (it is worker text bound for git's argv), a scratch repository that
+    /// cannot be made on any filesystem, a half-made checkout that cannot be
+    /// removed, and a `git worktree add` that outlives its deadline.
+    fn create(workspace_dir: &Path, commit: &str) -> Result<Self, TreeCheckoutError> {
+        Self::create_in(
+            &std::env::temp_dir(),
+            workspace_dir,
+            commit,
+            CONTROL_MIN_FREE_BYTES,
+        )
+    }
+
+    /// [`Self::create`] with the scratch directory and the free-space floor
+    /// chosen by the caller.
+    fn create_in(
+        parent: &Path,
+        workspace_dir: &Path,
+        commit: &str,
+        min_free: u64,
+    ) -> Result<Self, TreeCheckoutError> {
+        Self::create_with(parent, workspace_dir, commit, min_free, GIT_DEADLINES)
+    }
+
+    /// [`Self::create_in`] with the git deadlines chosen by the caller.
+    fn create_with(
+        parent: &Path,
+        workspace_dir: &Path,
+        commit: &str,
+        min_free: u64,
+        deadlines: GitDeadlines,
+    ) -> Result<Self, TreeCheckoutError> {
+        if !is_full_object_id(commit) {
+            return Err(TreeCheckoutError::DeliveredTree(
+                "the delivered commit is not a full object id".to_string(),
+            ));
+        }
+        let view = ObjectView::create(parent, workspace_dir, deadlines.quick).map_err(|e| {
+            if e.blames_cortex() {
+                TreeCheckoutError::Cortex(e.message().to_string())
+            } else {
+                TreeCheckoutError::DeliveredTree(e.message().to_string())
+            }
+        })?;
+        let path = parent.join(format!("cortex-verify-{}", uuid::Uuid::new_v4()));
+        let mut add = view.git();
+        add.arg("worktree")
             .arg("add")
             .arg("--detach")
             .arg(&path)
-            .arg(commit)
-            .output()
-            .map_err(|e| format!("could not run git worktree add: {e}"))?;
-        if !out.status.success() {
-            return Err(format!(
-                "git worktree add failed: {}",
-                String::from_utf8_lossy(&out.stderr).trim()
-            ));
+            .arg(commit);
+        // For the log message only; never classified on.
+        let (timed_out, mut message) = match run_git(add, deadlines.checkout) {
+            Err(e) => {
+                return Err(TreeCheckoutError::Cortex(format!(
+                    "could not run git worktree add: {e}"
+                )));
+            }
+            Ok(GitRun::Finished(out)) if out.status.success() => {
+                return Ok(Self { path, _view: view });
+            }
+            Ok(GitRun::Finished(out)) => (
+                false,
+                format!(
+                    "git worktree add failed: {}",
+                    String::from_utf8_lossy(&out.stderr).trim()
+                ),
+            ),
+            Ok(GitRun::TimedOut) => (
+                true,
+                format!(
+                    "git worktree add did not finish within {:?}",
+                    deadlines.checkout
+                ),
+            ),
+        };
+        {
+            // A refused or killed checkout can leave a half-made directory.
+            // Its registration lives in the scratch repository, which goes
+            // with the view. A leftover that cannot be removed is disk the
+            // worker's tree is holding, so it is the delivered tree's fault,
+            // and no control checkout is run on top of it.
+            if let Err(e) = std::fs::remove_dir_all(&path) {
+                if std::fs::symlink_metadata(&path).is_ok() {
+                    message.push_str(&format!(
+                        "; could not remove the half-made checkout {}: {e}",
+                        path.display()
+                    ));
+                    return Err(TreeCheckoutError::DeliveredTree(message));
+                }
+            }
+            if timed_out || same_filesystem(parent, workspace_dir) {
+                return Err(TreeCheckoutError::DeliveredTree(message));
+            }
+            if let Err(room) = has_room(parent, min_free) {
+                return Err(TreeCheckoutError::Cortex(format!(
+                    "{message}; not enough scratch space for a control checkout: {room}"
+                )));
+            }
+            Err(match control_checkout(parent) {
+                Ok(()) => TreeCheckoutError::DeliveredTree(message),
+                Err(control @ ControlFailure::TimedOut(_)) => {
+                    TreeCheckoutError::DeliveredTree(format!(
+                        "{message}; the control checkout stalled too: {}",
+                        control.message()
+                    ))
+                }
+                Err(control @ ControlFailure::Failed(_)) => TreeCheckoutError::Cortex(format!(
+                    "{message}; the control checkout failed too: {}",
+                    control.message()
+                )),
+            })
         }
-        Ok(Self {
-            workspace_dir: workspace_dir.to_path_buf(),
-            path,
-        })
     }
 }
 
 impl Drop for TreeCheckout {
     fn drop(&mut self) {
-        let _ = std::process::Command::new("git")
-            .arg("-C")
-            .arg(&self.workspace_dir)
-            .arg("worktree")
-            .arg("remove")
-            .arg("--force")
-            .arg(&self.path)
-            .output();
+        // The registration is in the scratch repository, which the view
+        // removes right after this.
+        let _ = std::fs::remove_dir_all(&self.path);
     }
+}
+
+/// A scratch directory this old is no attempt's: verification takes seconds
+/// to minutes, so anything a couple of hours old was left by a process that
+/// died mid-verification.
+const STALE_SCRATCH_AGE: Duration = Duration::from_secs(2 * 60 * 60);
+
+/// Best-effort startup sweep of `cortex-verify-*` directories under `parent`
+/// (the temp directory) that a killed process left behind: scratch
+/// repositories, half-made checkouts, control repositories. They hold
+/// worker-delivered trees, so left alone they are disk a worker can consume
+/// across restarts. Only directories older than [`STALE_SCRATCH_AGE`] are
+/// removed, so a second Cortex process sharing the temp directory never loses
+/// a live scratch directory; symlinks are never followed. Returns how many
+/// were removed. Never fails: a sweep that cannot run leaves what it found.
+pub fn sweep_stale_scratch(parent: &Path) -> usize {
+    sweep_stale_scratch_older_than(parent, STALE_SCRATCH_AGE)
+}
+
+fn sweep_stale_scratch_older_than(parent: &Path, age: Duration) -> usize {
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return 0;
+    };
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        if !entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with("cortex-verify-")
+        {
+            continue;
+        }
+        let Ok(meta) = std::fs::symlink_metadata(entry.path()) else {
+            continue;
+        };
+        if !meta.is_dir() {
+            continue;
+        }
+        let stale = meta
+            .modified()
+            .ok()
+            .and_then(|modified| modified.elapsed().ok())
+            .is_some_and(|elapsed| elapsed >= age);
+        if stale && std::fs::remove_dir_all(entry.path()).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
 }
 
 /// Verify one delivery. Returns the verdict, or `None` if there was nothing to
@@ -166,7 +953,7 @@ pub async fn verify_delivery<R: CheckRunner>(
     // `strong` and then edited the exam has contradicted its own contract.
     // That is not a verdict, and the run does not get to choose the weaker
     // class after the fact.
-    match exam_integrity(db, facts) {
+    match exam_integrity(db, facts).await {
         ExamIntegrity::Intact | ExamIntegrity::PermittedAuthoredWork => {}
         ExamIntegrity::ModifiedExam { paths } => {
             let detail = format!(
@@ -179,36 +966,82 @@ pub async fn verify_delivery<R: CheckRunner>(
                 exam_paths = ?paths,
                 "declared verdict_class=strong and then edited the exam; inconclusive"
             );
-            finish_inconclusive_without_grading(db, &verification_id, facts, &detail);
+            finish_inconclusive_without_grading(
+                db,
+                &verification_id,
+                facts,
+                &detail,
+                AttemptEndCause::ExamTampered,
+            )
+            .await;
             return Some(Verdict::Inconclusive);
         }
-        ExamIntegrity::Unknown { reason } => {
+        ExamIntegrity::Unknown {
+            reason,
+            delivered_tree_caused,
+        } => {
             let detail = format!("exam integrity unknown: {reason}");
             tracing::error!(
                 run_id = %facts.run_id,
                 step_id = %facts.step_id,
                 reason = %reason,
+                delivered_tree_caused,
                 "could not establish frozen exam integrity; grading refused"
             );
-            finish_inconclusive_without_grading(db, &verification_id, facts, &detail);
+            finish_inconclusive_without_grading(
+                db,
+                &verification_id,
+                facts,
+                &detail,
+                classify_exam_integrity_failure(delivered_tree_caused),
+            )
+            .await;
             return Some(Verdict::Inconclusive);
         }
     }
 
-    let checkout = match TreeCheckout::create(&facts.workspace_dir, &facts.head_commit) {
+    // Blocking git and filesystem work, so off the async thread.
+    let checkout = {
+        let (workspace, head) = (facts.workspace_dir.clone(), facts.head_commit.clone());
+        tokio::task::spawn_blocking(move || TreeCheckout::create(&workspace, &head))
+            .await
+            .unwrap_or_else(|e| {
+                Err(TreeCheckoutError::Cortex(format!(
+                    "checkout task did not complete: {e}"
+                )))
+            })
+    };
+    let checkout = match checkout {
         Ok(c) => c,
         Err(e) => {
-            // We could not produce a tree to grade. That is our failure, so it
-            // is Inconclusive: no charge, no refund, and an operator hears
-            // about it. Leaving the row 'pending' would strand the attempt.
+            // We could not produce a tree to grade, so it is Inconclusive and
+            // an operator still hears about it. Leaving the row 'pending'
+            // would strand the attempt. Who pays depends on why:
+            //
+            // - git ran and refused the delivered tree while a control checkout
+            //   in a repository Cortex made itself worked (an entry named
+            //   `.git`, `..`, a name too long or unsafe -- a worker can build
+            //   such a commit with `git mktree`): that is what the worker
+            //   delivered, so it is charged, not free work.
+            // - anything else (git would not spawn, IO, low scratch space, or
+            //   the control failed too: disk, lock) is Cortex's own machinery:
+            //   absorbed.
+            let delivered_tree_caused = matches!(e, TreeCheckoutError::DeliveredTree(_));
             tracing::error!(
                 run_id = %facts.run_id,
                 step_id = %facts.step_id,
-                error = %e,
+                error = %e.message(),
+                delivered_tree_caused,
                 "could not snapshot the delivered tree; verification is inconclusive"
             );
-            let _ = db.finish_verification(&verification_id, Verdict::Inconclusive);
-            project_verdict(db, facts, Verdict::Inconclusive, Some(&e));
+            finish_inconclusive_without_grading(
+                db,
+                &verification_id,
+                facts,
+                e.message(),
+                classify_exam_integrity_failure(delivered_tree_caused),
+            )
+            .await;
             return Some(Verdict::Inconclusive);
         }
     };
@@ -242,19 +1075,32 @@ pub async fn verify_delivery<R: CheckRunner>(
         "verification complete"
     );
 
-    finish_and_bill(db, &verification_id, report.verdict, facts).await;
+    // A real verdict maps straight to its matching end cause. `Inconclusive`
+    // reaching here can only mean `run_with_retries` exhausted its retries --
+    // our runner, not the customer's work, failed to produce a result -- so
+    // it absorbs rather than charges.
+    let end_cause = match report.verdict {
+        Verdict::Verified => AttemptEndCause::Verified,
+        Verdict::Unverified => AttemptEndCause::Unverified,
+        Verdict::Failed => AttemptEndCause::Failed,
+        Verdict::Inconclusive => AttemptEndCause::RunnerDown,
+    };
+    finish_and_bill(db, &verification_id, report.verdict, end_cause, facts).await;
     project_verdict(db, facts, report.verdict, None);
     Some(report.verdict)
 }
 
-/// Seal an integrity refusal without reaching either the runner or billing.
-fn finish_inconclusive_without_grading(
+/// Seal an integrity refusal without reaching the runner, then settle the
+/// attempt for the given cause (see
+/// [`cortex_core::billing_binding::settle_attempt`]).
+async fn finish_inconclusive_without_grading(
     db: &Database,
     verification_id: &str,
     facts: &DeliveryFacts,
     detail: &str,
+    cause: AttemptEndCause,
 ) {
-    let _ = db.finish_verification(verification_id, Verdict::Inconclusive);
+    finish_and_bill(db, verification_id, Verdict::Inconclusive, cause, facts).await;
     project_verdict(db, facts, Verdict::Inconclusive, Some(detail));
 }
 
@@ -338,94 +1184,66 @@ async fn run_with_retries<R: CheckRunner>(
     }
 }
 
-/// Seal the verdict, then move money if the verdict says to.
+/// Seal the verdict, then record the attempt's end durably and settle it:
+/// charge its settled observed cost to the customer, or have Cortex absorb
+/// it. Never a refund — see the module doc comment and
+/// [`cortex_core::billing_binding::settle_attempt`].
+///
+/// This no longer computes the settled cost or writes the ledger row itself.
+/// It writes one `attempt_endings` row (the durable, single source of truth
+/// that this attempt ended and why) and then runs the shared settler,
+/// [`Database::settle_pending_attempts`], immediately — so the ledger still
+/// reflects the outcome by the time this returns, matching every existing
+/// caller's and test's expectations. Splitting the record from the charge
+/// this way means a crash between the two still leaves a durable trail: the
+/// scheduler's tick and startup passes call the same settler and will finish
+/// the job even if this in-request call never returns.
 async fn finish_and_bill(
     db: &Database,
     verification_id: &str,
     verdict: Verdict,
+    end_cause: AttemptEndCause,
     facts: &DeliveryFacts,
 ) {
-    if let Err(e) = db.finish_verification(verification_id, verdict) {
-        tracing::error!(verification_id, error = %e, "failed to seal verdict");
-        return;
-    }
-
-    if !verdict.has_billing_effect() {
-        // Inconclusive. Our problem, so it costs us time and not the
-        // customer's money — but somebody should look at it.
+    // `worker_owned_by_cortex` only matters to `classify_lease_expiry` and
+    // `classify_worker_failure`, neither of which produces the causes this
+    // module ever passes here (Verified/Unverified/Failed/ExamTampered/
+    // CortexCrash/RunnerDown) -- `settle_attempt` maps those directly with no
+    // dependence on worker ownership. `false` is the schema's own default for
+    // a record where the field is not meaningful.
+    //
+    // Sealing the verdict and recording why the attempt ended happen in one
+    // transaction (F6 of the money-review fix pass): a crash between them
+    // used to be able to leave a sealed verdict with no durable ending for
+    // the settler to find.
+    if let Err(e) = db.finish_verification_and_end(
+        verification_id,
+        verdict,
+        &facts.run_id,
+        &facts.step_id,
+        &facts.attempt_id,
+        end_cause,
+        false,
+    ) {
         tracing::error!(
             run_id = %facts.run_id,
             step_id = %facts.step_id,
-            "verification inconclusive; no ledger write, operator attention needed"
+            attempt_id = %facts.attempt_id,
+            verification_id,
+            error = %e,
+            "failed to seal verdict and record attempt ending"
         );
         return;
     }
 
-    let Some(user_id) = db.get_run_user_id(&facts.run_id) else {
-        tracing::warn!(run_id = %facts.run_id, "no owner for run; skipping ledger write");
-        return;
-    };
-
-    let charge_key = billing_binding::ChargeKey::for_verification(verification_id);
-    let refund_key = billing_binding::RefundKey::for_verification(verification_id);
-
-    // Derive the billing state from the ledger, not from a status column. The
-    // ledger is where the money actually is, so it cannot disagree with itself.
-    let state = if db.ledger_has_key(refund_key.as_str()) {
-        BillingState::Refunded
-    } else if db.ledger_has_key(charge_key.as_str()) {
-        BillingState::Charged
-    } else {
-        BillingState::Unbilled
-    };
-
-    let reason = billing_binding::ledger_reason(verdict).unwrap_or("verdict");
-
-    match billing_binding::billing_effect(verdict, state, verification_id) {
-        BillingEffect::Charge { idempotency_key } => {
-            let Some(amount) = facts.quoted_credits else {
-                // Never invent a price. The verdict still stands; the charge
-                // simply does not happen, and that is visible.
-                tracing::warn!(
-                    run_id = %facts.run_id,
-                    step_id = %facts.step_id,
-                    "verdict is billable but no quoted price was reachable; no charge written"
-                );
-                return;
-            };
-            match db.deduct_credits(&user_id, amount, reason, &idempotency_key) {
-                Ok(_) => tracing::info!(
-                    run_id = %facts.run_id,
-                    verification_id,
-                    amount,
-                    "charged for a verified outcome"
-                ),
-                Err(e) => tracing::error!(
-                    run_id = %facts.run_id,
-                    verification_id,
-                    error = %e,
-                    "charge failed"
-                ),
-            }
-        }
-        BillingEffect::Refund { idempotency_key } => {
-            match db.refund_credits(&user_id, &charge_key, &idempotency_key, reason) {
-                Ok(_) => tracing::info!(
-                    run_id = %facts.run_id,
-                    verification_id,
-                    "refunded a failed outcome"
-                ),
-                Err(e) => tracing::error!(
-                    run_id = %facts.run_id,
-                    verification_id,
-                    error = %e,
-                    "refund failed"
-                ),
-            }
-        }
-        BillingEffect::None => {
-            tracing::debug!(verification_id, ?verdict, ?state, "no ledger effect");
-        }
+    if let Err(e) = db.settle_pending_attempts() {
+        tracing::error!(
+            run_id = %facts.run_id,
+            verification_id,
+            attempt_id = %facts.attempt_id,
+            error = %e,
+            "settle_pending_attempts failed after recording attempt ending; the scheduler's next tick will retry"
+        );
     }
 }
 
@@ -434,21 +1252,36 @@ async fn finish_and_bill(
 enum ExamIntegrity {
     Intact,
     PermittedAuthoredWork,
-    ModifiedExam { paths: Vec<String> },
-    Unknown { reason: String },
+    ModifiedExam {
+        paths: Vec<String>,
+    },
+    /// `delivered_tree_caused` distinguishes a failure caused by what the
+    /// worker actually delivered (its head commit is missing from a healthy
+    /// workspace repository) from a failure in Cortex's own machinery (a
+    /// missing or unreadable work contract, a base commit Cortex itself
+    /// should have recorded at dispatch, git or the disk failing). Fed to
+    /// `classify_exam_integrity_failure` (F2 of the money-review fix pass)
+    /// so an unknown result is charged when it stems from delivered content
+    /// and absorbed only when it is genuinely ours.
+    Unknown {
+        reason: String,
+        delivered_tree_caused: bool,
+    },
 }
 
-fn exam_integrity(db: &Database, facts: &DeliveryFacts) -> ExamIntegrity {
+async fn exam_integrity(db: &Database, facts: &DeliveryFacts) -> ExamIntegrity {
     let contract = match db.read_step_work_contract(&facts.step_id, facts.attempt) {
         Ok(Some(contract)) => contract,
         Ok(None) => {
             return ExamIntegrity::Unknown {
                 reason: "missing work contract".to_string(),
+                delivered_tree_caused: false,
             };
         }
         Err(err) => {
             return ExamIntegrity::Unknown {
                 reason: format!("unreadable work contract: {err}"),
+                delivered_tree_caused: false,
             };
         }
     };
@@ -462,13 +1295,36 @@ fn exam_integrity(db: &Database, facts: &DeliveryFacts) -> ExamIntegrity {
     let Some(base) = contract.expected_base_commit.as_deref() else {
         return ExamIntegrity::Unknown {
             reason: "strong contract is missing its required base commit".to_string(),
+            delivered_tree_caused: false,
         };
     };
-    let changed = match changed_paths(&facts.workspace_dir, base, &facts.head_commit) {
+    // Blocking git, so off the async thread.
+    let changed = {
+        let (workspace, base, head) = (
+            facts.workspace_dir.clone(),
+            base.to_string(),
+            facts.head_commit.clone(),
+        );
+        tokio::task::spawn_blocking(move || changed_paths(&workspace, &base, &head))
+            .await
+            .unwrap_or_else(|e| Err(format!("diff inspection task did not complete: {e}")))
+    };
+    let changed = match changed {
         Ok(changed) => changed,
         Err(err) => {
+            let (workspace, head) = (facts.workspace_dir.clone(), facts.head_commit.clone());
+            // `StepCompleted` already rejects a head that does not resolve
+            // in the workspace (charged there), so a head that reaches this
+            // point resolved when it was delivered. See
+            // `diff_failure_is_delivered_tree` for who pays for a failure here.
+            let delivered_tree_caused = tokio::task::spawn_blocking(move || {
+                diff_failure_is_delivered_tree(&workspace, &head)
+            })
+            .await
+            .unwrap_or(false);
             return ExamIntegrity::Unknown {
                 reason: format!("diff inspection failed: {err}"),
+                delivered_tree_caused,
             };
         }
     };
@@ -482,30 +1338,71 @@ fn exam_integrity(db: &Database, facts: &DeliveryFacts) -> ExamIntegrity {
     }
 }
 
-/// `git diff --name-only base..head`, against the workspace.
+/// `git diff --name-only --no-renames -z base..head`, read through an
+/// [`ObjectView`] of the workspace's object store (git never opens the
+/// worker's repository).
+///
+/// `--no-renames` reports a rename as a deletion of the old path plus an
+/// addition of the new one, so moving a protected exam file out of its
+/// protected path shows up as a change to that path instead of as a rename
+/// whose old side is hidden. `-z` gives NUL-separated, unquoted, untrimmed
+/// paths, so a path with a newline, quote or leading space is compared exactly
+/// as git has it.
 ///
 /// Failure is an explicit unknown-integrity result. It is neither evidence of
 /// tampering nor permission to grade.
 fn changed_paths(workspace_dir: &Path, base: &str, head: &str) -> Result<Vec<String>, String> {
-    let out = std::process::Command::new("git")
-        .arg("-C")
-        .arg(workspace_dir)
-        .arg("diff")
-        .arg("--name-only")
-        .arg(format!("{base}..{head}"))
-        .output()
-        .map_err(|err| format!("could not run git diff: {err}"))?;
+    let view = ObjectView::create(&std::env::temp_dir(), workspace_dir, GIT_QUICK_DEADLINE)
+        .map_err(|e| e.message().to_string())?;
+    let mut diff = view.git();
+    diff.args(["diff", "--name-only", "--no-renames", "-z", "--no-ext-diff"])
+        .arg(format!("{base}..{head}"));
+    let out = match run_git(diff, GIT_QUICK_DEADLINE) {
+        Ok(GitRun::Finished(out)) => out,
+        Ok(GitRun::TimedOut) => {
+            return Err(format!(
+                "git diff {base}..{head} did not finish within {GIT_QUICK_DEADLINE:?}"
+            ));
+        }
+        Err(err) => return Err(format!("could not run git diff: {err}")),
+    };
     if !out.status.success() {
         return Err(format!(
             "git diff {base}..{head} failed: {}",
             String::from_utf8_lossy(&out.stderr).trim()
         ));
     }
-    Ok(String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .map(|l| l.trim().to_string())
-        .filter(|l| !l.is_empty())
+    Ok(out
+        .stdout
+        .split(|b| *b == 0)
+        .filter(|path| !path.is_empty())
+        .map(|path| String::from_utf8_lossy(path).into_owned())
         .collect())
+}
+
+/// Is a failed `base..head` diff the delivered tree's doing? True whenever
+/// [`check_commit`] does not say `CheckFailed` for the head -- that is, unless
+/// git would not spawn, in which case Cortex's own machinery failed and the
+/// attempt is absorbed. A workspace with no `.git`, or a broken
+/// one, is `Missing` and so charged. Nothing here looks at git's stderr.
+/// Blocking.
+///
+/// Tradeoff, on purpose: the workspace repository, including its object store,
+/// is writable by the worker, so nothing read from it can prove the fault is
+/// Cortex's -- a worker can delete or corrupt any object to make a diff fail,
+/// and an answer that turned on "can the base still be read" could be steered
+/// by exactly that. Git never reads the worker's repository -- only its
+/// object files, through an [`ObjectView`] that ignores the alternate's
+/// derived metadata -- so config, attributes, hooks and indexes cannot steer
+/// it either. The cost is that a genuine disk I/O error in
+/// the worker-writable store is charged to the customer. The only answer that
+/// cannot be steered is a Cortex-owned copy of the objects, which the
+/// delivery-transport PR provides.
+fn diff_failure_is_delivered_tree(workspace_dir: &Path, head: &str) -> bool {
+    !matches!(
+        check_commit(workspace_dir, head),
+        CommitCheck::CheckFailed(_)
+    )
 }
 
 /// What ecosystems the workspace root declares, for path classification.
@@ -743,8 +1640,8 @@ mod tests {
         );
         assert_eq!(
             receipt.charged_credits, None,
-            "facts_for this test carries no quoted_credits, so finish_and_bill \
-             never charges and no ledger row exists to read back"
+            "this attempt made no settled provider calls, so finish_and_bill's \
+             attempt_settled_cost_micro_usd is 0 and no ledger row exists to read back"
         );
     }
 
@@ -944,9 +1841,9 @@ mod tests {
     fn seed_verifying_step(db: &Database, step_id: &str, head: &str) -> (String, i64) {
         let run_id = seed_run_and_step(db, step_id);
         db.update_run_status(&run_id, "running", None);
-        db.register_worker("worker-1", "user-1");
+        db.register_worker("worker-1", "user-1", false);
         let lease_gen = db
-            .lease_step(step_id, "worker-1", i64::MAX)
+            .lease_step(step_id, "worker-1", i64::MAX, "attempt-1")
             .expect("step leases");
         assert!(db.start_step(step_id, lease_gen));
         assert!(db.deliver_step(
@@ -984,8 +1881,8 @@ mod tests {
         c
     }
 
-    #[test]
-    fn a_strong_declaration_that_edits_the_exam_is_a_contract_violation() {
+    #[tokio::test]
+    async fn a_strong_declaration_that_edits_the_exam_is_a_contract_violation() {
         // The case Phase 27.2 exists for. Dispatch promised the battery would
         // be the customer's own; delivery rewrote it. Downgrading to
         // `authored` here would make `strong` mean "strong unless it was
@@ -1001,7 +1898,7 @@ mod tests {
         ));
 
         assert_eq!(
-            exam_integrity(&db, &facts_for(&dir, &head, &run_id, "step-1")),
+            exam_integrity(&db, &facts_for(&dir, &head, &run_id, "step-1")).await,
             ExamIntegrity::ModifiedExam {
                 paths: vec!["tests/e2e.rs".to_string()]
             },
@@ -1009,8 +1906,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_strong_declaration_that_leaves_the_exam_alone_is_graded() {
+    #[tokio::test]
+    async fn a_strong_declaration_that_leaves_the_exam_alone_is_graded() {
         let db = test_db();
         let (dir, base, head) = repo_with_base_and_delivery(&["src/lib.rs"]);
         let run_id = seed_run_and_step(&db, "step-1");
@@ -1022,14 +1919,14 @@ mod tests {
         ));
 
         assert_eq!(
-            exam_integrity(&db, &facts_for(&dir, &head, &run_id, "step-1")),
+            exam_integrity(&db, &facts_for(&dir, &head, &run_id, "step-1")).await,
             ExamIntegrity::Intact,
             "subject-only work under a strong declaration is what strong means"
         );
     }
 
-    #[test]
-    fn authored_work_may_edit_the_exam() {
+    #[tokio::test]
+    async fn authored_work_may_edit_the_exam() {
         // Characterization testing and TDD both write the exam. If this ever
         // fires, Phase 24.2's brownfield on-ramp is broken.
         let db = test_db();
@@ -1043,14 +1940,14 @@ mod tests {
         ));
 
         assert_eq!(
-            exam_integrity(&db, &facts_for(&dir, &head, &run_id, "step-1")),
+            exam_integrity(&db, &facts_for(&dir, &head, &run_id, "step-1")).await,
             ExamIntegrity::PermittedAuthoredWork,
             "an authored verdict is allowed to have written the exam"
         );
     }
 
-    #[test]
-    fn an_undeclared_verdict_class_is_graded_as_authored() {
+    #[tokio::test]
+    async fn an_undeclared_verdict_class_is_graded_as_authored() {
         // `verdict_class: None` is a pre-PR contract, or one written by a path
         // that never set the field. It must be treated exactly like
         // `Authored` -- today's behaviour on `main` -- rather than tripping
@@ -1063,20 +1960,21 @@ mod tests {
         assert!(db.record_step_work_contract("step-1", &run_id, 1, &contract,));
 
         assert_eq!(
-            exam_integrity(&db, &facts_for(&dir, &head, &run_id, "step-1")),
+            exam_integrity(&db, &facts_for(&dir, &head, &run_id, "step-1")).await,
             ExamIntegrity::PermittedAuthoredWork,
             "undeclared reads back as authored, not as a broken strong contract"
         );
     }
 
-    #[test]
-    fn a_missing_contract_is_explicitly_unknown() {
+    #[tokio::test]
+    async fn a_missing_contract_is_explicitly_unknown() {
         let db = test_db();
         let (dir, _base, head) = repo_with_base_and_delivery(&["tests/e2e.rs"]);
         assert_eq!(
-            exam_integrity(&db, &facts(&dir, &head)),
+            exam_integrity(&db, &facts(&dir, &head)).await,
             ExamIntegrity::Unknown {
-                reason: "missing work contract".to_string()
+                reason: "missing work contract".to_string(),
+                delivered_tree_caused: false,
             }
         );
     }
@@ -1195,8 +2093,63 @@ mod tests {
             .contains("strong contract is missing its required base commit"));
     }
 
+    const ATTEMPT_NOW: i64 = 1_800_000_000_000;
+
+    /// One genuinely settled provider call for `attempt_id` -- the same
+    /// reserve-then-settle path a real gateway `forward()` drives -- so a
+    /// test can assert on an exact charge or absorption, not just a label.
+    fn settle_call_for(db: &Database, user_id: &str, attempt_id: &str, observed: i64) {
+        let price_list_id = db.active_price_list().unwrap().id;
+        db.set_supplier_capacity("claude", 10_000_000, ATTEMPT_NOW)
+            .unwrap();
+        let authorization = crate::db::SpendAuthorization {
+            id: format!("auth-{attempt_id}"),
+            user_id: user_id.into(),
+            run_id: format!("run-for-{attempt_id}"),
+            attempt_id: attempt_id.into(),
+            provider: "claude".into(),
+            model: "claude-sonnet-5".into(),
+            price_list_id,
+            max_micro_usd: 10_000_000,
+            expires_at_ms: ATTEMPT_NOW + 60_000,
+        };
+        db.create_spend_authorization(&authorization, ATTEMPT_NOW)
+            .unwrap();
+        let claims = crate::provider_gateway::GatewayCapability::new(
+            authorization.id,
+            authorization.user_id,
+            authorization.run_id,
+            authorization.attempt_id,
+            authorization.provider,
+            authorization.model,
+            authorization.expires_at_ms,
+        );
+        let request_key = format!("call-{attempt_id}");
+        db.reserve_provider_request(&claims, &request_key, "digest", observed, ATTEMPT_NOW)
+            .expect("reserve");
+        let settled = db
+            .settle_provider_request(&request_key, observed, Some("upstream-1"), ATTEMPT_NOW)
+            .expect("settle");
+        assert_eq!(settled.status, "settled");
+    }
+
+    fn ending_cause(db: &Database, attempt_id: &str) -> Option<String> {
+        db.conn()
+            .query_row(
+                "SELECT cause FROM attempt_endings WHERE attempt_id = ?1",
+                rusqlite::params![attempt_id],
+                |row| row.get::<_, String>(0),
+            )
+            .ok()
+    }
+
     #[tokio::test]
-    async fn a_failed_diff_inspection_is_inconclusive_with_its_own_diagnostic() {
+    async fn a_failed_diff_inspection_on_a_resolving_head_is_charged_with_its_own_diagnostic() {
+        // The base is not a commit but the head is valid and resolves. The
+        // workspace repository is worker-writable, so a diff that fails
+        // against a head that resolves cannot be shown to be Cortex's fault:
+        // it is charged. The attempt made a real settled call, so an exact
+        // balance is meaningful.
         let db = test_db();
         let (dir, _base, head) = repo_with_base_and_delivery(&["src/lib.rs"]);
         let (run_id, lease_gen) = seed_verifying_step(&db, "step-1", &head);
@@ -1208,6 +2161,8 @@ mod tests {
             lease_gen,
             &contract_declaring(VerdictClass::Strong, "not-a-commit"),
         ));
+        db.init_credit_balance("user-1", 1_000).expect("balance");
+        settle_call_for(&db, "user-1", "attempt-1", 300_000);
         let runner = ScriptedRunner::new(vec![Ok(CheckOutcome::Passed)]);
 
         assert_eq!(
@@ -1216,5 +2171,839 @@ mod tests {
         );
         assert_eq!(runner.calls(), 0);
         assert!(verification_reason(&db, "step-1", lease_gen).contains("diff inspection failed"));
+        assert_eq!(
+            ending_cause(&db, "attempt-1").as_deref(),
+            Some("exam_tampered"),
+            "a diff that fails on a head that resolves is charged, not absorbed"
+        );
+        assert_eq!(
+            db.get_credit_balance("user-1").subscription_remaining,
+            997,
+            "300_000 micro-USD is exactly 3 whole credits at the seeded price"
+        );
+    }
+
+    /// A commit that exists but that git refuses to check out: its tree has a
+    /// single entry called `entry_name`. Built with `git mktree` and
+    /// `git commit-tree`, which is all a worker needs to do. Returns the
+    /// repository, a known-good base commit in it, and the crafted commit.
+    fn commit_with_tree_entry(entry_name: &str) -> (std::path::PathBuf, String, String) {
+        use std::io::Write as _;
+        use std::process::Stdio;
+
+        let (dir, base) = repo_with_one_commit();
+        let run = |args: &[&str], stdin: Option<&str>| -> String {
+            let mut child = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&dir)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("git runs");
+            if let Some(input) = stdin {
+                child
+                    .stdin
+                    .as_mut()
+                    .expect("piped stdin")
+                    .write_all(input.as_bytes())
+                    .expect("write stdin");
+            }
+            drop(child.stdin.take());
+            let out = child.wait_with_output().expect("git finishes");
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        let blob = run(&["hash-object", "-w", "file.txt"], None);
+        let tree = run(
+            &["mktree"],
+            Some(&format!("100644 blob {blob}\t{entry_name}\n")),
+        );
+        let commit = run(&["commit-tree", &tree, "-m", "crafted"], None);
+        (dir, base, commit)
+    }
+
+    #[test]
+    fn a_tree_git_refuses_to_check_out_is_a_delivered_tree_fault() {
+        let (dir, _base, commit) = commit_with_tree_entry(".git");
+
+        // The commit exists, so the upstream resolve check passes it ...
+        assert_eq!(check_commit(&dir, &commit), CommitCheck::Resolves);
+
+        // ... and the refusal at checkout is typed as the worker's own doing:
+        // the control checkout, in a repository Cortex made itself, works
+        // through the same machinery.
+        match TreeCheckout::create(&dir, &commit) {
+            Err(TreeCheckoutError::DeliveredTree(message)) => {
+                assert!(message.contains("git worktree add failed"), "{message}");
+            }
+            Err(other) => panic!("expected a delivered-tree fault, got {other:?}"),
+            Ok(_) => panic!("git must refuse a tree with a .git entry"),
+        }
+    }
+
+    #[test]
+    fn a_tree_entry_name_over_the_filesystem_limit_is_a_delivered_tree_fault() {
+        // 300 bytes is over NAME_MAX (255), so the checkout fails with
+        // "File name too long" -- which says nothing about Cortex. Classifying
+        // on that text is what once let this be absorbed as free work.
+        let long_name = "a".repeat(300);
+        let (dir, _base, commit) = commit_with_tree_entry(&long_name);
+        assert_eq!(check_commit(&dir, &commit), CommitCheck::Resolves);
+
+        match TreeCheckout::create(&dir, &commit) {
+            Err(TreeCheckoutError::DeliveredTree(_)) => {}
+            Err(other) => panic!("expected a delivered-tree fault, got {other:?}"),
+            Ok(_) => panic!("a 300-byte entry name cannot be checked out"),
+        }
+    }
+
+    /// A scratch directory on a different filesystem than `workspace`, or
+    /// `None` where the machine has no second one to offer (the tests that
+    /// need it then have nothing to check and return early). Under CI there
+    /// must be one: a test that silently checks nothing there would hide a
+    /// regression, so it panics instead.
+    #[cfg(unix)]
+    fn other_filesystem_scratch(workspace: &Path) -> Option<tempfile::TempDir> {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let found = tempfile::tempdir_in("/dev/shm").ok().and_then(|shm| {
+            let scratch_dev = std::fs::metadata(shm.path()).ok()?.dev();
+            let workspace_dev = std::fs::metadata(workspace).ok()?.dev();
+            (scratch_dev != workspace_dev).then_some(shm)
+        });
+        assert!(
+            found.is_some() || std::env::var_os("CI").is_none(),
+            "CI must offer a second filesystem at /dev/shm; without it the \
+             other-filesystem tests would silently check nothing"
+        );
+        found
+    }
+
+    #[test]
+    fn a_failing_control_on_the_workspaces_filesystem_is_charged() {
+        // The delivered tree is refused and the scratch directory cannot be
+        // made (its parent is a regular file). Scratch and workspace share a
+        // filesystem, and the worker can fill or break that, so the refusal
+        // is the delivered tree's: charged.
+        let (dir, _base, commit) = commit_with_tree_entry(".git");
+        let file = tempfile::tempdir().unwrap().keep().join("not-a-directory");
+        std::fs::write(&file, "x").unwrap();
+        match TreeCheckout::create_in(&file.join("scratch"), &dir, &commit, CONTROL_MIN_FREE_BYTES)
+        {
+            Err(TreeCheckoutError::DeliveredTree(_)) => {}
+            Err(other) => panic!("expected a delivered-tree fault, got {other:?}"),
+            Ok(_) => panic!("git must refuse a tree with a .git entry"),
+        }
+        assert_eq!(
+            check_commit_in(&file.join("scratch"), &dir, &commit, GIT_DEADLINES),
+            CommitCheck::Missing,
+            "an unmakeable scratch directory on the workspace's filesystem is charged"
+        );
+    }
+
+    #[test]
+    fn low_free_space_on_the_workspaces_filesystem_is_charged() {
+        // A floor nothing can meet, on the workspace's own filesystem: the
+        // worker can fill that disk, so this must not be absorbed.
+        let (dir, _base, commit) = commit_with_tree_entry(".git");
+        let parent = tempfile::tempdir().unwrap();
+        match TreeCheckout::create_in(parent.path(), &dir, &commit, u64::MAX) {
+            Err(TreeCheckoutError::DeliveredTree(_)) => {}
+            Err(other) => panic!("expected a delivered-tree fault, got {other:?}"),
+            Ok(_) => panic!("git must refuse a tree with a .git entry"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn low_free_space_on_another_filesystem_is_cortexs_fault() {
+        let (dir, _base, commit) = commit_with_tree_entry(".git");
+        let Some(shm) = other_filesystem_scratch(&dir) else {
+            return;
+        };
+        match TreeCheckout::create_in(shm.path(), &dir, &commit, u64::MAX) {
+            Err(TreeCheckoutError::Cortex(message)) => {
+                assert!(
+                    message.contains("not enough scratch space for a control checkout"),
+                    "{message}"
+                );
+            }
+            Err(other) => panic!("expected a Cortex-side fault, got {other:?}"),
+            Ok(_) => panic!("git must refuse a tree with a .git entry"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_tree_refused_on_another_filesystem_is_charged_when_the_control_works() {
+        let (dir, _base, commit) = commit_with_tree_entry(".git");
+        let Some(shm) = other_filesystem_scratch(&dir) else {
+            return;
+        };
+        match TreeCheckout::create_in(shm.path(), &dir, &commit, 0) {
+            Err(TreeCheckoutError::DeliveredTree(_)) => {}
+            Err(other) => panic!("expected a delivered-tree fault, got {other:?}"),
+            Ok(_) => panic!("git must refuse a tree with a .git entry"),
+        }
+        assert_eq!(std::fs::read_dir(shm.path()).unwrap().count(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unmakeable_scratch_on_another_filesystem_is_charged() {
+        // Worker-delivered trees are written into the temp directory too, so
+        // even a different-device scratch directory can be filled by the
+        // worker: "unusable" cannot be told apart from "made unusable".
+        let (dir, _base, commit) = commit_with_tree_entry(".git");
+        let Some(shm) = other_filesystem_scratch(&dir) else {
+            return;
+        };
+        let file = shm.path().join("not-a-directory");
+        std::fs::write(&file, "x").unwrap();
+        let scratch = file.join("scratch");
+        assert!(matches!(
+            TreeCheckout::create_in(&scratch, &dir, &commit, CONTROL_MIN_FREE_BYTES),
+            Err(TreeCheckoutError::DeliveredTree(_))
+        ));
+        assert_eq!(
+            check_commit_in(&scratch, &dir, &commit, GIT_DEADLINES),
+            CommitCheck::Missing
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_planted_fifo_where_alternates_belong_is_killed_at_the_deadline_and_charged() {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let (dir, commit) = repo_with_one_commit();
+        assert_eq!(check_commit(&dir, &commit), CommitCheck::Resolves);
+
+        // A FIFO with no writer blocks git's open() of the alternates file
+        // for ever. The worker owns the workspace, so it can plant one.
+        let info = dir.join(".git").join("objects").join("info");
+        std::fs::create_dir_all(&info).unwrap();
+        let fifo = info.join("alternates");
+        let _ = std::fs::remove_file(&fifo);
+        let path = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `path` is a valid NUL-terminated string that outlives the call.
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+
+        let deadline = Duration::from_secs(1);
+        let deadlines = GitDeadlines {
+            quick: deadline,
+            checkout: deadline,
+        };
+        let parent = tempfile::tempdir().unwrap();
+
+        let started = Instant::now();
+        assert_eq!(
+            check_commit_in(parent.path(), &dir, &commit, deadlines),
+            CommitCheck::Missing,
+            "a git that stalls on the worker's object store is charged"
+        );
+        let took = started.elapsed();
+        assert!(took >= deadline, "git was not actually stalled: {took:?}");
+        assert!(
+            took < Duration::from_secs(20),
+            "the deadline did not bite: {took:?}"
+        );
+
+        let started = Instant::now();
+        match TreeCheckout::create_with(
+            parent.path(),
+            &dir,
+            &commit,
+            CONTROL_MIN_FREE_BYTES,
+            deadlines,
+        ) {
+            Err(TreeCheckoutError::DeliveredTree(message)) => {
+                assert!(message.contains("did not finish"), "{message}");
+            }
+            Err(other) => panic!("expected a delivered-tree fault, got {other:?}"),
+            Ok(_) => panic!("a stalled git cannot produce a checkout"),
+        }
+        let took = started.elapsed();
+        assert!(took >= deadline, "git was not actually stalled: {took:?}");
+        assert!(
+            took < Duration::from_secs(20),
+            "the deadline did not bite: {took:?}"
+        );
+        assert_eq!(
+            std::fs::read_dir(parent.path()).unwrap().count(),
+            0,
+            "a killed git leaves nothing behind"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_git_that_will_not_spawn_is_still_cortexs_fault() {
+        // The deadline runner must not turn a missing binary into a timeout.
+        let command = std::process::Command::new("/nonexistent/cortex-test-git");
+        assert!(run_git(command, Duration::from_secs(1)).is_err());
+    }
+
+    #[test]
+    fn a_delivered_commit_that_is_not_an_object_id_is_a_delivered_tree_fault() {
+        let dir = tempfile::tempdir().unwrap().keep();
+        for bad in ["", "HEAD", "abc123", "--upload-pack=x", "main^{tree}"] {
+            match TreeCheckout::create(&dir, bad) {
+                Err(TreeCheckoutError::DeliveredTree(_)) => {}
+                Err(other) => panic!("{bad:?}: expected a delivered-tree fault, got {other:?}"),
+                Ok(_) => panic!("{bad:?} is not something to check out"),
+            }
+        }
+    }
+
+    #[test]
+    fn the_startup_sweep_removes_only_old_cortex_verify_directories() {
+        let parent = tempfile::tempdir().unwrap();
+        let make = |name: &str, age: Duration| {
+            let path = parent.path().join(name);
+            std::fs::create_dir(&path).unwrap();
+            std::fs::write(path.join("tree.txt"), "delivered").unwrap();
+            let old = std::time::SystemTime::now() - age;
+            std::fs::File::open(&path)
+                .unwrap()
+                .set_modified(old)
+                .unwrap();
+            path
+        };
+        let hour = Duration::from_secs(3600);
+        let stale_view = make("cortex-verify-objects-a", 3 * hour);
+        let stale_checkout = make("cortex-verify-b", 3 * hour);
+        let fresh = make("cortex-verify-c", Duration::ZERO);
+        let unrelated = make("something-else", 3 * hour);
+        let file = parent.path().join("cortex-verify-file");
+        std::fs::write(&file, "x").unwrap();
+
+        assert_eq!(sweep_stale_scratch_older_than(parent.path(), 2 * hour), 2);
+        assert!(!stale_view.exists());
+        assert!(!stale_checkout.exists());
+        assert!(fresh.exists(), "a live scratch directory is never swept");
+        assert!(unrelated.exists());
+        assert!(file.exists());
+        assert_eq!(sweep_stale_scratch(&parent.path().join("missing")), 0);
+    }
+
+    #[test]
+    fn a_checkout_in_a_non_repository_is_a_delivered_tree_fault() {
+        // No `.git` at all. The workspace is worker-writable, so a missing
+        // repository is something the worker could have done: charged.
+        let dir = tempfile::tempdir().unwrap().keep();
+        let missing = "0000000000000000000000000000000000000000";
+        match TreeCheckout::create(&dir, missing) {
+            Err(TreeCheckoutError::DeliveredTree(_)) => {}
+            Err(other) => panic!("expected a delivered-tree fault, got {other:?}"),
+            Ok(_) => panic!("there is nothing to check out"),
+        }
+    }
+
+    /// Everything a worker can plant in the workspace repository to make git
+    /// misbehave: an executable `post-checkout` hook that fails, in both the
+    /// default hooks directory and one named by `core.hooksPath`, and an
+    /// attributes file applying a required smudge filter that always fails.
+    #[cfg(unix)]
+    fn plant_hostile_repo_state(dir: &Path) {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let install_hook = |hooks: &Path| {
+            std::fs::create_dir_all(hooks).unwrap();
+            let hook = hooks.join("post-checkout");
+            std::fs::write(&hook, "#!/bin/sh\nexit 1\n").unwrap();
+            std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        install_hook(&dir.join(".git/hooks"));
+        let hooks_path = dir.join("hostile-hooks");
+        install_hook(&hooks_path);
+        let attributes = dir.join("hostile-attributes");
+        std::fs::write(&attributes, "* filter=x\n").unwrap();
+
+        let config = |key: &str, value: &str| {
+            let out = std::process::Command::new("git")
+                .args(["config", key, value])
+                .current_dir(dir)
+                .output()
+                .expect("git runs");
+            assert!(out.status.success(), "git config {key} failed");
+        };
+        config("core.hooksPath", hooks_path.to_str().unwrap());
+        config("core.attributesFile", attributes.to_str().unwrap());
+        config("filter.x.smudge", "false");
+        config("filter.x.required", "true");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn worker_planted_hooks_and_filters_do_not_stop_a_good_checkout() {
+        let (dir, base, _commit) = commit_with_tree_entry(".git");
+        plant_hostile_repo_state(&dir);
+
+        // The planted state really is hostile: a bare git cannot check out
+        // the good commit through it.
+        let bare = tempfile::tempdir().unwrap().keep().join("bare");
+        let naive = std::process::Command::new("git")
+            .args(["worktree", "add", "--detach"])
+            .arg(&bare)
+            .arg(&base)
+            .current_dir(&dir)
+            .output()
+            .expect("git runs");
+        assert!(
+            !naive.status.success(),
+            "the planted hooks and filters must break an unhardened checkout"
+        );
+        let _ = std::fs::remove_dir_all(&bare);
+
+        let checkout = TreeCheckout::create(&dir, &base)
+            .expect("hooks and filters in the worker-writable repository must not apply");
+        assert!(checkout.path.join("file.txt").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn worker_planted_state_does_not_change_who_pays_for_a_refused_tree() {
+        // With the same hostile repository state, a tree git refuses is
+        // still the worker's: the control never touches the workspace.
+        let (dir, _base, commit) = commit_with_tree_entry(".git");
+        plant_hostile_repo_state(&dir);
+        match TreeCheckout::create(&dir, &commit) {
+            Err(TreeCheckoutError::DeliveredTree(_)) => {}
+            Err(other) => panic!("expected a delivered-tree fault, got {other:?}"),
+            Ok(_) => panic!("git must refuse a tree with a .git entry"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_workspace_config_and_attributes_cannot_run_a_filter_or_break_a_checkout() {
+        use std::io::Write as _;
+
+        let (dir, _head) = repo_with_one_commit();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&dir)
+                .output()
+                .expect("git runs");
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        // An in-tree `.gitattributes` in the delivered commit, applying filter `x`.
+        std::fs::write(dir.join(".gitattributes"), "* filter=x\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-m", "attributes in the tree"]);
+        let head = git(&["rev-parse", "HEAD"]);
+
+        // The worker then writes filter `x` into the repository's own config
+        // and applies it from `info/attributes` as well.
+        let marker = tempfile::tempdir().unwrap().keep().join("smudge-ran");
+        let mut config = std::fs::OpenOptions::new()
+            .append(true)
+            .open(dir.join(".git/config"))
+            .unwrap();
+        writeln!(
+            config,
+            "[filter \"x\"]\n\tsmudge = \"sh -c 'touch {}; exit 1'\"\n\trequired = true",
+            marker.display()
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.join(".git/info")).unwrap();
+        std::fs::write(dir.join(".git/info/attributes"), "* filter=x\n").unwrap();
+
+        // The planted state really is hostile: a checkout that reads the
+        // workspace repository runs the filter and fails.
+        let naive_path = tempfile::tempdir().unwrap().keep().join("naive");
+        let naive = std::process::Command::new("git")
+            .args(["worktree", "add", "--detach"])
+            .arg(&naive_path)
+            .arg(&head)
+            .current_dir(&dir)
+            .output()
+            .expect("git runs");
+        assert!(!naive.status.success(), "the smudge filter must break it");
+        assert!(marker.exists(), "the smudge filter must have run");
+        std::fs::remove_file(&marker).unwrap();
+        let _ = std::fs::remove_dir_all(&naive_path);
+
+        // Cortex's checkout never reads that config or those attributes.
+        assert_eq!(check_commit(&dir, &head), CommitCheck::Resolves);
+        let checkout = TreeCheckout::create(&dir, &head)
+            .expect("the workspace's config and attributes must not apply");
+        assert!(checkout.path.join("file.txt").exists());
+        assert!(
+            !marker.exists(),
+            "the worker's smudge filter must never run under Cortex"
+        );
+    }
+
+    #[test]
+    fn a_workspace_whose_git_dir_is_renamed_away_is_missing_and_charged() {
+        let (dir, head) = repo_with_one_commit();
+        assert_eq!(check_commit(&dir, &head), CommitCheck::Resolves);
+        std::fs::rename(dir.join(".git"), dir.join("renamed-git")).unwrap();
+        assert_eq!(check_commit(&dir, &head), CommitCheck::Missing);
+    }
+
+    /// Every file under `dir`, recursively.
+    fn count_files(dir: &Path) -> usize {
+        std::fs::read_dir(dir)
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .map(|entry| {
+                        if entry.path().is_dir() {
+                            count_files(&entry.path())
+                        } else {
+                            1
+                        }
+                    })
+                    .sum()
+            })
+            .unwrap_or(0)
+    }
+
+    #[test]
+    fn the_control_leaves_nothing_behind_and_mints_nothing_in_the_workspace() {
+        let (dir, _base, commit) = commit_with_tree_entry(".git");
+        let parent = tempfile::tempdir().unwrap();
+        let objects_before = count_files(&dir.join(".git/objects"));
+
+        match TreeCheckout::create_in(parent.path(), &dir, &commit, CONTROL_MIN_FREE_BYTES) {
+            Err(TreeCheckoutError::DeliveredTree(_)) => {}
+            Err(other) => panic!("expected a delivered-tree fault, got {other:?}"),
+            Ok(_) => panic!("git must refuse a tree with a .git entry"),
+        }
+
+        assert_eq!(
+            std::fs::read_dir(parent.path()).unwrap().count(),
+            0,
+            "the failed checkout and the control must both be removed"
+        );
+        assert_eq!(
+            count_files(&dir.join(".git/objects")),
+            objects_before,
+            "the control must not write objects into the workspace repository"
+        );
+    }
+
+    #[test]
+    fn the_control_checkout_works_and_cleans_up_after_itself() {
+        let parent = tempfile::tempdir().unwrap();
+        control_checkout(parent.path()).expect("a control checkout must work");
+        assert_eq!(std::fs::read_dir(parent.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn the_free_space_floor_only_applies_when_the_space_is_known() {
+        assert_eq!(
+            has_room(
+                &std::env::temp_dir().join("no-such-dir-xyz"),
+                CONTROL_MIN_FREE_BYTES
+            ),
+            Ok(())
+        );
+        #[cfg(unix)]
+        {
+            assert!(free_bytes(&std::env::temp_dir()).is_some());
+            assert!(has_room(&std::env::temp_dir(), u64::MAX).is_err());
+            assert_eq!(has_room(&std::env::temp_dir(), 0), Ok(()));
+        }
+    }
+
+    #[test]
+    fn a_workspace_config_git_would_refuse_is_never_read_and_never_absorbs() {
+        // The worker rewrites `.git/config` to a repository format from the
+        // future, which makes git refuse to open the workspace repository.
+        // Cortex never opens it: git runs in Cortex's scratch repository and
+        // reads only the workspace's objects, so the config is not read at
+        // all and the real commit still resolves. Either way the answer is
+        // never `CheckFailed`, so nothing here can be absorbed.
+        let (dir, head) = repo_with_one_commit();
+        assert_eq!(check_commit(&dir, &head), CommitCheck::Resolves);
+        let config = dir.join(".git/config");
+        let text = std::fs::read_to_string(&config).unwrap();
+        assert!(text.contains("repositoryformatversion = 0"), "{text}");
+        std::fs::write(
+            &config,
+            text.replace(
+                "repositoryformatversion = 0",
+                "repositoryformatversion = 99",
+            ),
+        )
+        .unwrap();
+        assert_eq!(check_commit(&dir, &head), CommitCheck::Resolves);
+        assert_eq!(
+            check_commit(&dir, "0000000000000000000000000000000000000000"),
+            CommitCheck::Missing
+        );
+    }
+
+    #[test]
+    fn check_commit_says_missing_for_anything_the_worker_could_have_caused() {
+        let (dir, head) = repo_with_one_commit();
+        assert_eq!(check_commit(&dir, &head), CommitCheck::Resolves);
+        assert_eq!(
+            check_commit(&dir, "0000000000000000000000000000000000000000"),
+            CommitCheck::Missing
+        );
+
+        // Worker-controlled text that is not an object id never reaches git.
+        for malformed in [
+            "0\u{0}".to_string(),
+            "not-hex".to_string(),
+            String::new(),
+            "g".repeat(40),
+            head[..39].to_string(),
+            "a".repeat(200 * 1024),
+        ] {
+            assert_eq!(
+                check_commit(&dir, &malformed),
+                CommitCheck::Missing,
+                "a malformed commit must be Missing, not a spawn failure"
+            );
+        }
+
+        // A workspace with no repository, or none at all, is the worker's
+        // doing: charged, never `CheckFailed`.
+        let not_a_repo = tempfile::tempdir().unwrap().keep();
+        assert_eq!(check_commit(&not_a_repo, &head), CommitCheck::Missing);
+        assert_eq!(
+            check_commit(&not_a_repo.join("does-not-exist"), &head),
+            CommitCheck::Missing
+        );
+    }
+
+    #[test]
+    fn a_workspace_nested_in_another_repository_is_not_answered_by_it() {
+        let (outer, head) = repo_with_one_commit();
+        let nested = outer.join("workspace");
+        std::fs::create_dir_all(&nested).unwrap();
+        assert_eq!(
+            check_commit(&nested, &head),
+            CommitCheck::Missing,
+            "the enclosing repository must not answer for a workspace that is not one"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_head_whose_tree_cannot_be_read_is_a_delivered_tree_fault() {
+        // The head commit object resolves, but its root tree is gone, so the
+        // diff fails. The head resolves, so this is charged: nothing read from
+        // the worker-writable repository can prove the fault is Cortex's.
+        let db = test_db();
+        let (dir, base, head) = repo_with_base_and_delivery(&["src/lib.rs"]);
+        let run_id = seed_run_and_step(&db, "step-1");
+        assert!(db.record_step_work_contract(
+            "step-1",
+            &run_id,
+            1,
+            &contract_declaring(VerdictClass::Strong, &base),
+        ));
+        let tree = String::from_utf8(
+            std::process::Command::new("git")
+                .args(["rev-parse", &format!("{head}^{{tree}}")])
+                .current_dir(&dir)
+                .output()
+                .expect("git runs")
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+        let object = dir.join(".git/objects").join(&tree[..2]).join(&tree[2..]);
+        assert!(object.exists(), "the head's root tree is a loose object");
+        std::fs::remove_file(&object).unwrap();
+
+        match exam_integrity(&db, &facts_for(&dir, &head, &run_id, "step-1")).await {
+            ExamIntegrity::Unknown {
+                delivered_tree_caused,
+                ..
+            } => assert!(
+                delivered_tree_caused,
+                "a head that resolves but whose diff fails is charged"
+            ),
+            other => panic!("expected unknown integrity, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_base_whose_objects_are_gone_is_a_delivered_tree_fault() {
+        // The worker can delete objects from the store it writes to. The head
+        // still resolves, so the failed diff is charged: the answer must not
+        // turn on whether the base can still be read, because that is exactly
+        // what the worker can steer.
+        let db = test_db();
+        let (dir, base, head) = repo_with_base_and_delivery(&["src/lib.rs"]);
+        let run_id = seed_run_and_step(&db, "step-1");
+        assert!(db.record_step_work_contract(
+            "step-1",
+            &run_id,
+            1,
+            &contract_declaring(VerdictClass::Strong, &base),
+        ));
+        let object = dir.join(".git/objects").join(&base[..2]).join(&base[2..]);
+        assert!(object.exists(), "the base commit is a loose object");
+        std::fs::remove_file(&object).unwrap();
+        assert_eq!(check_commit(&dir, &head), CommitCheck::Resolves);
+
+        match exam_integrity(&db, &facts_for(&dir, &head, &run_id, "step-1")).await {
+            ExamIntegrity::Unknown {
+                delivered_tree_caused,
+                ..
+            } => assert!(
+                delivered_tree_caused,
+                "deleting the base's objects from the workspace store is charged"
+            ),
+            other => panic!("expected unknown integrity, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_diff_in_a_workspace_with_no_git_is_a_delivered_tree_fault() {
+        // No `.git` at all. The workspace is worker-writable, so that is
+        // something the worker could have done: charged.
+        let db = test_db();
+        let (dir, base, head) = repo_with_base_and_delivery(&["src/lib.rs"]);
+        let run_id = seed_run_and_step(&db, "step-1");
+        assert!(db.record_step_work_contract(
+            "step-1",
+            &run_id,
+            1,
+            &contract_declaring(VerdictClass::Strong, &base),
+        ));
+        std::fs::remove_dir_all(dir.join(".git")).unwrap();
+
+        match exam_integrity(&db, &facts_for(&dir, &head, &run_id, "step-1")).await {
+            ExamIntegrity::Unknown {
+                delivered_tree_caused,
+                ..
+            } => assert!(delivered_tree_caused, "a workspace with no .git is charged"),
+            other => panic!("expected unknown integrity, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn moving_an_exam_file_out_of_the_protected_path_is_still_detected() {
+        // Without `--no-renames` git may report the move as a rename whose
+        // protected side is not listed by `--name-only`; it must show up as a
+        // change to the exam path.
+        let db = test_db();
+        let (dir, base, _delivered) = repo_with_base_and_delivery(&["src/lib.rs"]);
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&dir)
+                .output()
+                .expect("git runs");
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        git(&["mv", "tests/e2e.rs", "docs_e2e.txt"]);
+        git(&["commit", "-m", "move the exam out"]);
+        let head = git(&["rev-parse", "HEAD"]);
+
+        let changed = changed_paths(&dir, &base, &head).expect("the diff works");
+        assert!(changed.contains(&"tests/e2e.rs".to_string()), "{changed:?}");
+        assert!(changed.contains(&"docs_e2e.txt".to_string()), "{changed:?}");
+
+        let run_id = seed_run_and_step(&db, "step-1");
+        assert!(db.record_step_work_contract(
+            "step-1",
+            &run_id,
+            1,
+            &contract_declaring(VerdictClass::Strong, &base),
+        ));
+        match exam_integrity(&db, &facts_for(&dir, &head, &run_id, "step-1")).await {
+            ExamIntegrity::ModifiedExam { paths } => {
+                assert!(paths.contains(&"tests/e2e.rs".to_string()), "{paths:?}");
+            }
+            other => panic!("expected a modified exam, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_delivered_tree_git_refuses_is_charged_not_absorbed() {
+        let db = test_db();
+        let (dir, base, head) = commit_with_tree_entry(".git");
+        let (run_id, lease_gen) = seed_verifying_step(&db, "step-1", &head);
+        db.save_check_specs(&run_id, "step-1", &[spec("c1")])
+            .unwrap();
+        // `Authored` so exam integrity passes and the checkout is reached.
+        assert!(db.record_step_work_contract(
+            "step-1",
+            &run_id,
+            lease_gen,
+            &contract_declaring(VerdictClass::Authored, &base),
+        ));
+        db.init_credit_balance("user-1", 1_000).expect("balance");
+        settle_call_for(&db, "user-1", "attempt-1", 300_000);
+        let runner = ScriptedRunner::new(vec![Ok(CheckOutcome::Passed)]);
+
+        assert_eq!(
+            verify_delivery(&db, &runner, &facts_for(&dir, &head, &run_id, "step-1")).await,
+            Some(Verdict::Inconclusive)
+        );
+        assert_eq!(runner.calls(), 0);
+        assert_eq!(
+            ending_cause(&db, "attempt-1").as_deref(),
+            Some("exam_tampered"),
+            "a commit the worker crafted so that git refuses it is not free work"
+        );
+        assert_eq!(
+            db.get_credit_balance("user-1").subscription_remaining,
+            997,
+            "300_000 micro-USD is exactly 3 whole credits at the seeded price"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_overlong_tree_entry_is_charged_not_absorbed() {
+        // "File name too long" is the checkout filesystem refusing what the
+        // worker delivered. It used to be absorbed as free work.
+        let db = test_db();
+        let (dir, base, head) = commit_with_tree_entry(&"a".repeat(300));
+        let (run_id, lease_gen) = seed_verifying_step(&db, "step-1", &head);
+        db.save_check_specs(&run_id, "step-1", &[spec("c1")])
+            .unwrap();
+        assert!(db.record_step_work_contract(
+            "step-1",
+            &run_id,
+            lease_gen,
+            &contract_declaring(VerdictClass::Authored, &base),
+        ));
+        db.init_credit_balance("user-1", 1_000).expect("balance");
+        settle_call_for(&db, "user-1", "attempt-1", 300_000);
+        let runner = ScriptedRunner::new(vec![Ok(CheckOutcome::Passed)]);
+
+        assert_eq!(
+            verify_delivery(&db, &runner, &facts_for(&dir, &head, &run_id, "step-1")).await,
+            Some(Verdict::Inconclusive)
+        );
+        assert_eq!(runner.calls(), 0);
+        assert_eq!(
+            ending_cause(&db, "attempt-1").as_deref(),
+            Some("exam_tampered"),
+            "an entry name the worker made too long for the filesystem is not free work"
+        );
+        assert_eq!(
+            db.get_credit_balance("user-1").subscription_remaining,
+            997,
+            "300_000 micro-USD is exactly 3 whole credits at the seeded price"
+        );
     }
 }

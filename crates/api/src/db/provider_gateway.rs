@@ -373,6 +373,16 @@ impl Database {
                        SELECT 1 FROM runs r
                        WHERE r.id = provider_spend_authorizations.run_id
                          AND r.status = 'cancelled'
+                   )
+                   -- F5 of the money-review fix pass: once an attempt has
+                   -- ended, no further provider call can be reserved
+                   -- against its authorization -- otherwise a call that
+                   -- lands after the ending (e.g. a straggling worker
+                   -- request racing the scheduler) would settle against
+                   -- an attempt nothing is billing for any more.
+                   AND NOT EXISTS (
+                       SELECT 1 FROM attempt_endings e
+                       WHERE e.attempt_id = provider_spend_authorizations.attempt_id
                    )",
                 params![claims.authorization_id, now_ms],
                 |row| {
@@ -1030,6 +1040,37 @@ mod tests {
             err, "spend authorization is missing, revoked, or expired",
             "an authorization whose run was cancelled must not be reservable, \
              even though the row itself is still `status = 'active'`"
+        );
+    }
+
+    // --- reserve_provider_request refuses an ended attempt's authorization ---
+
+    #[test]
+    fn reserve_provider_request_refuses_authorization_for_an_ended_attempt() {
+        // F5 of the money-review fix pass: once an attempt has ended, no
+        // further provider call can be reserved against its authorization.
+        // Without this, a straggling worker request racing the scheduler's
+        // own end-of-attempt bookkeeping could land after the ending and
+        // settle against an attempt nothing is billing for any more.
+        let db = test_db();
+        let claims = fixture(&db, 1_000_000, 1_000_000);
+
+        db.conn()
+            .execute(
+                "INSERT INTO attempt_endings
+                    (attempt_id, user_id, step_id, cause, worker_owned_by_cortex, ended_at, settled_at)
+                 VALUES ('attempt-1', 'tenant-1', 'step-1', 'failed', 0, ?1, ?1)",
+                params![NOW],
+            )
+            .unwrap();
+
+        let err = db
+            .reserve_provider_request(&claims, "chat:ended-attempt", "digest", 1_000, NOW)
+            .unwrap_err();
+        assert_eq!(
+            err, "spend authorization is missing, revoked, or expired",
+            "an authorization whose attempt has already ended must not be \
+             reservable, even though the row itself is still `status = 'active'`"
         );
     }
 

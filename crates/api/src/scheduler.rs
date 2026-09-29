@@ -58,6 +58,7 @@ async fn scheduler_loop(state: Arc<AppState>, mut rx: mpsc::Receiver<SchedulerEv
                 expire_stale_leases(&state, &mut sched).await;
                 expire_stale_resource_leases(&state).await;
                 expire_grace_periods(&state, &mut sched).await;
+                settle_pending_attempts_tick(&state).await;
                 cleanup_expired_keys(&state);
                 state.rate_limiter.cleanup();
                 reconcile_ready_steps(&state, &mut sched).await;
@@ -366,6 +367,46 @@ async fn dispatch_step(state: &AppState, step: &StepRef) -> DispatchOutcome {
         return DispatchOutcome::RetryLater;
     }
 
+    // --- Money gate: production dispatch requires a usable provider gateway ---
+    //
+    // Separate from the balance/spend-cap check just above. This answers a
+    // different question — "can Cortex make a priced call at all right now" —
+    // and belongs before any lease or path is spent: a step dispatched to a
+    // worker with no working gateway cannot make a priced call, so the worker
+    // would discover that failure itself, after Cortex already paid for the
+    // lease and the sandbox setup. A balance check has no place here; that is
+    // `check_usage_gate` above, on purpose (see `dispatch_money_gate`'s doc).
+    let gateway_on = crate::provider_gateway_http::is_gateway_on();
+    match cortex_core::billing_binding::dispatch_money_gate(crate::is_production_env(), gateway_on)
+    {
+        cortex_core::billing_binding::DispatchGate::Allow => {
+            // Close out a prior outage's event, if this run had one open. A
+            // no-op unless the run's last gateway event was `gateway_down`.
+            db.record_gateway_recovered_event(&step.run_id);
+        }
+        cortex_core::billing_binding::DispatchGate::AllowWithWarning => {
+            if !gateway_on {
+                tracing::warn!(
+                    step_id = %step.step_id,
+                    "provider gateway is off outside production — dispatching anyway"
+                );
+            }
+        }
+        cortex_core::billing_binding::DispatchGate::Block => {
+            tracing::error!(
+                step_id = %step.step_id,
+                user_id = %step.user_id,
+                "{} (step stays pending, will retry next tick)",
+                cortex_core::billing_binding::GATEWAY_DOWN_MESSAGE
+            );
+            // Run-visible, deduped once per run per outage — see
+            // `record_gateway_down_event`'s doc for why repeated ticks don't
+            // each write their own row.
+            db.record_gateway_down_event(&step.run_id);
+            return DispatchOutcome::RetryLater;
+        }
+    }
+
     // --- Path leases, at step scope ---
     //
     // Acquired here rather than at run creation. A run-scoped lease is held
@@ -620,7 +661,7 @@ async fn dispatch_step(state: &AppState, step: &StepRef) -> DispatchOutcome {
     // This sits upstream of F7: the step never reached a worker, let alone a
     // sandbox. It was found by wave 4 / Task 4, which is the first thing that
     // ever asked a step to actually run.
-    let lease_gen = match db.lease_step(&step.step_id, &worker_id, deadline) {
+    let lease_gen = match db.lease_step(&step.step_id, &worker_id, deadline, &attempt_id) {
         Some(g) => g,
         None => {
             // `lease_step`'s CAS only succeeds from 'pending' | 'ready' |
@@ -2003,6 +2044,21 @@ async fn expire_stale_resource_leases(state: &AppState) {
     }
 }
 
+/// Ticks the durable-record settler: for every `attempt_endings` row not yet
+/// settled, converts its observed settled cost to a ledger charge or a
+/// zero-amount absorb row. Idempotent and retryable, so a failure here just
+/// waits for the next tick rather than blocking the reconcile loop.
+async fn settle_pending_attempts_tick(state: &AppState) {
+    let db = match &state.db {
+        Some(db) => db,
+        None => return,
+    };
+
+    if let Err(e) = db.settle_pending_attempts() {
+        tracing::error!(error = %e, "settle_pending_attempts tick failed");
+    }
+}
+
 async fn reconcile_ready_steps(state: &AppState, sched: &mut SchedulerState) {
     let db = match &state.db {
         Some(db) => db,
@@ -2063,6 +2119,14 @@ async fn recover_from_db(state: &AppState, sched: &mut SchedulerState) {
             "recovery: expired {} stale resource leases",
             expired_resources.len()
         );
+    }
+
+    // Any `attempt_endings` row left unsettled by a crash between its own
+    // write and the settler's next tick gets picked up here, once, at
+    // startup — the durable record survived; only the ledger effect was
+    // pending.
+    if let Err(e) = db.settle_pending_attempts() {
+        tracing::error!(error = %e, "recovery: settle_pending_attempts failed");
     }
 
     let active_runs = db.get_active_run_ids();
@@ -2835,7 +2899,7 @@ mod tests {
         // run candidate.
         let dir = tempfile::tempdir().unwrap();
         let db = Database::open(&dir.path().join("scheduler-zen.sqlite"));
-        db.register_worker("worker-zen", "user-zen");
+        db.register_worker("worker-zen", "user-zen", false);
         db.upsert_provider_capability("worker-zen", "user-zen", "zen", None);
 
         let step = StepRef {
@@ -2867,7 +2931,7 @@ mod tests {
         // so the step could not reach a model at all.
         let dir = tempfile::tempdir().unwrap();
         let db = Database::open(&dir.path().join("scheduler-claims.sqlite"));
-        db.register_worker("worker-both", "user-both");
+        db.register_worker("worker-both", "user-both", false);
         for provider in ["claude", "openai", "gemini"] {
             db.upsert_provider_capability("worker-both", "user-both", provider, None);
         }
