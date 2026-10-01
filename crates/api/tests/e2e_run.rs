@@ -32,12 +32,32 @@ use tower::ServiceExt;
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
+/// Make the workspace a git repository with one commit. A run with no
+/// `repo_key` works on `local:<workspace>`, which the server fetches into the
+/// run's own repository, so the workspace needs a base commit to fetch.
+fn init_git_workspace(root: &std::path::Path) {
+    std::fs::write(root.join("README.md"), "test workspace\n").unwrap();
+    for args in [
+        vec!["init", "--quiet"],
+        vec!["config", "user.email", "test@example.com"],
+        vec!["config", "user.name", "Cortex Test"],
+        vec!["add", "README.md"],
+        vec!["commit", "--quiet", "-m", "initial"],
+    ] {
+        let _ = std::process::Command::new("git")
+            .args(&args)
+            .current_dir(root)
+            .output();
+    }
+}
+
 /// Build a test app with auth disabled and a temp workspace directory.
 /// Returns the Router, the AppState (for inspection), and the temp dir handle.
 async fn test_app() -> (axum::Router, Arc<AppState>, tempfile::TempDir) {
     let tmp = tempfile::tempdir().expect("failed to create temp dir");
     let workspace = tmp.path().to_path_buf();
     std::fs::create_dir_all(workspace.join(".cortex")).unwrap();
+    init_git_workspace(&workspace);
 
     let ledger_path = workspace.join(".cortex/ledger.jsonl");
     let state = AppState::new(ledger_path, workspace, None).await;
@@ -58,6 +78,7 @@ async fn test_app_with_limits(
     let tmp = tempfile::tempdir().expect("failed to create temp dir");
     let workspace = tmp.path().to_path_buf();
     std::fs::create_dir_all(workspace.join(".cortex")).unwrap();
+    init_git_workspace(&workspace);
 
     let ledger_path = workspace.join(".cortex/ledger.jsonl");
 

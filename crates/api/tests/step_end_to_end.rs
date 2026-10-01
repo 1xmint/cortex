@@ -173,18 +173,63 @@ async fn connect_worker(
     >,
     WorkerStream,
 ) {
+    let (sink, stream, _worker_id) = connect_worker_with_id(base_url, token).await;
+    (sink, stream)
+}
+
+/// The repository transport a real worker builds from an `ExecuteStep` frame:
+/// the brain's own HTTP origin, the worker's key and id, and a private cache.
+/// With this the step fetches its base bundle and uploads its head bundle
+/// through the real endpoints, exactly as `worker.rs` does.
+fn step_repo_for(
+    repo_key: Option<String>,
+    base_commit: Option<String>,
+    base_url: &str,
+    token: &str,
+    worker_id: &str,
+    cache_root: &std::path::Path,
+) -> Option<cortex_worker::repo_transport::StepRepo> {
+    Some(cortex_worker::repo_transport::StepRepo {
+        repo_key: repo_key.expect("the frame carries the repo_key"),
+        base_commit: base_commit.expect("the frame carries the base commit"),
+        transport: cortex_worker::repo_transport::RepoTransport {
+            base_url: base_url.to_string(),
+            token: token.to_string(),
+            worker_id: worker_id.to_string(),
+            cache_root: cache_root.to_path_buf(),
+        },
+    })
+}
+
+async fn connect_worker_with_id(
+    base_url: &str,
+    token: String,
+) -> (
+    futures_util::stream::SplitSink<
+        tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+        WsMessage,
+    >,
+    WorkerStream,
+    String,
+) {
     let ws_url = format!("{}/api/ws", base_url.replace("http://", "ws://"));
     let (ws_stream, _) = tokio_tungstenite::connect_async(&ws_url)
         .await
         .expect("worker connects");
     let (mut sink, mut stream) = ws_stream.split();
 
-    // Welcome, then Register.
-    let _ = timeout(Duration::from_secs(5), stream.next())
+    // Welcome (which names this worker), then Register.
+    let welcome = timeout(Duration::from_secs(5), stream.next())
         .await
         .expect("welcome arrives")
         .expect("stream open")
         .expect("ws ok");
+    let worker_id = match serde_json::from_str::<BrainMessage>(&welcome.into_text().unwrap()) {
+        Ok(BrainMessage::Welcome { worker_id, .. }) => worker_id,
+        other => panic!("first frame was not a Welcome: {other:?}"),
+    };
 
     let register = WorkerMessage::Register {
         token,
@@ -203,7 +248,7 @@ async fn connect_worker(
     .expect("register sent");
     tokio::time::sleep(Duration::from_millis(200)).await;
 
-    (sink, stream)
+    (sink, stream, worker_id)
 }
 
 /// Return the first `ExecuteStep` frame, whole.
@@ -245,7 +290,9 @@ async fn a_dispatched_step_can_reach_its_model_and_is_told_about_the_repository(
     let base_url = serve_app(app.clone()).await;
 
     // Worker first, then the run. See `connect_worker`.
-    let (_sink, mut stream) = connect_worker(&base_url, issue_worker_key(&state)).await;
+    let token = issue_worker_key(&state);
+    let (_sink, mut stream, worker_id) = connect_worker_with_id(&base_url, token.clone()).await;
+    let cache = tempfile::tempdir().expect("cache dir");
     let _run_id = create_run(&app, "make the arithmetic in src/lib.rs correct").await;
     let frame = first_execute_step(&mut stream).await;
 
@@ -255,6 +302,8 @@ async fn a_dispatched_step_can_reach_its_model_and_is_told_about_the_repository(
         context,
         egress,
         provider_egress,
+        repo_key,
+        base_commit,
         ..
     } = frame
     else {
@@ -324,6 +373,7 @@ async fn a_dispatched_step_can_reach_its_model_and_is_told_about_the_repository(
         provider_egress,
         provider_gateway: None,
         context,
+        repo: step_repo_for(repo_key, base_commit, &base_url, &token, &worker_id, cache.path()),
     };
 
     let job = cortex_worker::executor::build_job_for_test(&step, &task, &decision);
@@ -380,6 +430,42 @@ async fn a_dispatched_step_can_reach_its_model_and_is_told_about_the_repository(
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_dispatched_step_names_its_repository_and_an_old_frame_still_parses() {
+    let repo = real_repository();
+    let (app, state) = test_app(repo.path()).await;
+    let base_url = serve_app(app.clone()).await;
+
+    let (_sink, mut stream) = connect_worker(&base_url, issue_worker_key(&state)).await;
+    let _run_id = create_run(&app, "make the arithmetic in src/lib.rs correct").await;
+    let frame = first_execute_step(&mut stream).await;
+
+    // The frame names the run's repository and the commit to start from.
+    let BrainMessage::ExecuteStep {
+        repo_key,
+        base_commit,
+        ..
+    } = &frame
+    else {
+        unreachable!("first_execute_step only returns ExecuteStep")
+    };
+    let repo_key = repo_key.clone().expect("the frame carries the repo_key");
+    assert!(
+        repo_key.starts_with("local:"),
+        "a non-production run without a GitHub repository works on a local one: {repo_key}"
+    );
+    assert!(base_commit.is_some(), "the frame carries the base commit");
+
+    // A frame from a brain that predates the field still parses.
+    let mut value = serde_json::to_value(&frame).unwrap();
+    value.as_object_mut().unwrap().remove("repo_key");
+    let old: BrainMessage = serde_json::from_value(value).expect("old frame parses");
+    let BrainMessage::ExecuteStep { repo_key, .. } = old else {
+        unreachable!()
+    };
+    assert!(repo_key.is_none());
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_repository_with_no_manifest_still_reaches_its_model() {
     // The two grants are independent, and this is the direction that would be
     // easy to get wrong: a repository with nothing to resolve must still be
@@ -388,6 +474,18 @@ async fn a_repository_with_no_manifest_still_reaches_its_model() {
     let tmp = tempfile::tempdir().expect("temp dir");
     std::fs::create_dir_all(tmp.path().join(".cortex")).unwrap();
     std::fs::write(tmp.path().join("README.md"), "no manifests here\n").unwrap();
+    for args in [
+        vec!["init", "--quiet"],
+        vec!["config", "user.email", "test@example.com"],
+        vec!["config", "user.name", "Cortex Test"],
+        vec!["add", "README.md"],
+        vec!["commit", "--quiet", "-m", "initial"],
+    ] {
+        let _ = std::process::Command::new("git")
+            .args(&args)
+            .current_dir(tmp.path())
+            .output();
+    }
 
     let (app, state) = test_app(tmp.path()).await;
     let base_url = serve_app(app.clone()).await;
@@ -656,7 +754,9 @@ async fn cortex_completes_one_real_task_end_to_end() {
     cortex_api::verification_dispatcher::spawn(state.clone());
 
     let base_url = serve_app(app.clone()).await;
-    let (mut sink, mut stream) = connect_worker(&base_url, issue_worker_key(&state)).await;
+    let token = issue_worker_key(&state);
+    let (mut sink, mut stream, worker_id) = connect_worker_with_id(&base_url, token.clone()).await;
+    let cache = tempfile::tempdir().expect("cache dir");
     let run_id = create_run(&app, "fix the bug in src/lib.rs so that cargo test passes").await;
 
     let frame = first_execute_step(&mut stream).await;
@@ -669,6 +769,8 @@ async fn cortex_completes_one_real_task_end_to_end() {
         context,
         egress,
         provider_egress,
+        repo_key,
+        base_commit,
         ..
     } = frame
     else {
@@ -702,6 +804,7 @@ async fn cortex_completes_one_real_task_end_to_end() {
         provider_egress,
         provider_gateway: None,
         context,
+        repo: step_repo_for(repo_key, base_commit, &base_url, &token, &worker_id, cache.path()),
     };
 
     let (tx, mut rx) = tokio::sync::mpsc::channel::<cortex_worker::stream::WorkerEvent>(64);
@@ -991,7 +1094,9 @@ async fn drive_one_stubbed_task(scenario: &str) -> StubbedRun {
     cortex_api::verification_dispatcher::spawn(state.clone());
 
     let base_url = serve_app(app.clone()).await;
-    let (mut sink, mut stream) = connect_worker(&base_url, issue_worker_key(&state)).await;
+    let token = issue_worker_key(&state);
+    let (mut sink, mut stream, worker_id) = connect_worker_with_id(&base_url, token.clone()).await;
+    let cache = tempfile::tempdir().expect("cache dir");
 
     let goal =
         format!("fix the bug in src/lib.rs so that cargo test passes. STUB-SCENARIO: {scenario}");
@@ -1007,6 +1112,8 @@ async fn drive_one_stubbed_task(scenario: &str) -> StubbedRun {
         context,
         egress,
         provider_egress,
+        repo_key,
+        base_commit,
         ..
     } = frame
     else {
@@ -1036,6 +1143,7 @@ async fn drive_one_stubbed_task(scenario: &str) -> StubbedRun {
         provider_egress,
         provider_gateway: None,
         context,
+        repo: step_repo_for(repo_key, base_commit, &base_url, &token, &worker_id, cache.path()),
     };
 
     let (tx, mut rx) = tokio::sync::mpsc::channel::<cortex_worker::stream::WorkerEvent>(64);

@@ -44,9 +44,18 @@ fn db_unavailable() -> (StatusCode, Json<ErrorResponse>) {
 /// request without writing the token to disk. GitHub accepts a Basic auth
 /// header of `x-access-token:<token>`.
 fn auth_extraheader(token: &str) -> String {
+    format!(
+        "http.https://github.com/.extraheader={}",
+        extraheader_value(token)
+    )
+}
+
+/// The header itself (`Authorization: Basic ...`), for callers that hand it to
+/// git through the environment (`GIT_CONFIG_VALUE_n`) instead of argv.
+pub(crate) fn extraheader_value(token: &str) -> String {
     let encoded =
         base64::engine::general_purpose::STANDARD.encode(format!("x-access-token:{token}"));
-    format!("http.https://github.com/.extraheader=Authorization: Basic {encoded}")
+    format!("Authorization: Basic {encoded}")
 }
 
 /// Filesystem-safe directory name for a repo (`owner/repo` -> `owner__repo`).

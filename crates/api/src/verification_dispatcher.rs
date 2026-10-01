@@ -227,7 +227,10 @@ async fn run_claimed_job(
         step_id: job.step_id.clone(),
         attempt_id: job.attempt_id.clone(),
         attempt: job.lease_gen,
-        workspace_dir: state.workspace_dir.clone(),
+        // The run's own repository (`run_repo`): where the worker's head
+        // bundle landed, and the only place its commit can be looked up.
+        workspace_dir: crate::run_repo::run_repo_path(&state.workspace_dir, &job.run_id)
+            .unwrap_or_else(|| state.workspace_dir.clone()),
         // Frozen at enqueue. Never re-resolved — a job that looked this up
         // again could grade a tree the worker never delivered.
         head_commit: job.delivered_commit.clone(),

@@ -228,7 +228,16 @@ impl ObjectView {
 
         let workspace =
             std::path::absolute(workspace_dir).unwrap_or_else(|_| workspace_dir.to_path_buf());
-        let mut alternate = workspace.join(".git").join("objects").into_os_string();
+        // A checkout keeps its objects in `.git/objects`; a run repository
+        // (`run_repo`) is bare, so its objects sit directly in it.
+        let dot_git = workspace.join(".git");
+        let objects =
+            if std::fs::symlink_metadata(&dot_git).is_err() && workspace.join("objects").is_dir() {
+                workspace.join("objects")
+            } else {
+                dot_git.join("objects")
+            };
+        let mut alternate = objects.into_os_string();
         alternate.push("\n");
         let info = view.git_dir.join("objects").join("info");
         std::fs::create_dir_all(&info)
@@ -465,7 +474,7 @@ const GIT_DEADLINES: GitDeadlines = GitDeadlines {
 };
 
 /// What a git child did under [`run_git`].
-enum GitRun {
+pub(crate) enum GitRun {
     Finished(std::process::Output),
     /// Killed at its deadline, or a process it left behind still held its
     /// output pipes at the deadline.
@@ -513,7 +522,10 @@ fn kill_git(child: &mut std::process::Child) {
 /// A hand-rolled deadline rather than coreutils `timeout`: with `timeout`, a
 /// missing git binary is an exit status of 127, indistinguishable from git
 /// failing, and a spawn failure is exactly what must stay Cortex's.
-fn run_git(mut command: std::process::Command, deadline: Duration) -> std::io::Result<GitRun> {
+pub(crate) fn run_git(
+    mut command: std::process::Command,
+    deadline: Duration,
+) -> std::io::Result<GitRun> {
     command
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
@@ -563,7 +575,7 @@ fn run_git(mut command: std::process::Command, deadline: Duration) -> std::io::R
 /// name a repository, object store or extra config, and a fixed author and
 /// committer, so nothing about it depends on the machine's git setup or on
 /// anything the worker can write.
-fn control_git() -> std::process::Command {
+pub(crate) fn control_git() -> std::process::Command {
     let mut command = std::process::Command::new("git");
     command
         .args([
@@ -1407,6 +1419,8 @@ fn diff_failure_is_delivered_tree(workspace_dir: &Path, head: &str) -> bool {
 
 /// What ecosystems the workspace root declares, for path classification.
 fn ecosystem_facts_for(workspace_dir: &Path) -> EcosystemFacts {
+    // A run repository is bare: its manifests were snapshotted at run start.
+    let workspace_dir = crate::run_repo::probe_dir_for(workspace_dir);
     EcosystemFacts {
         has_cargo_manifest: workspace_dir.join("Cargo.toml").exists(),
         has_package_json: workspace_dir.join("package.json").exists(),

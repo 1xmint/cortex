@@ -578,6 +578,49 @@ pub async fn create_run(
         .and_then(|value| value.as_str())
         .map(String::from);
 
+    // The run's repo_key is the only repository it may touch: fetch it into
+    // the run's own repository before the run exists. This is a network fetch,
+    // so it happens BEFORE the scheduler_tx read guard is taken: holding that
+    // guard across it would stall whoever needs the write side meanwhile.
+    // Production requires a real GitHub repo_key; a keyless (or `local:`) run
+    // is a dev/test path.
+    let production = crate::is_production_env();
+    let staged = match req.repo_key.as_deref() {
+        Some(key) if !key.is_empty() => Some(
+            crate::run_repo::stage(
+                &state.workspace_dir,
+                state.clerk_secret_key.as_deref(),
+                &user.user_id,
+                key,
+                production,
+            )
+            .await
+            .map_err(|e| {
+                let status = match &e {
+                    crate::run_repo::PrepareError::BadRepo(_) => StatusCode::BAD_REQUEST,
+                    crate::run_repo::PrepareError::Reconnect(_) => StatusCode::UNPROCESSABLE_ENTITY,
+                    crate::run_repo::PrepareError::TryLater(_) => StatusCode::SERVICE_UNAVAILABLE,
+                    crate::run_repo::PrepareError::Ours(_) => StatusCode::INTERNAL_SERVER_ERROR,
+                };
+                (
+                    status,
+                    Json(ErrorResponse {
+                        error: e.message().to_string(),
+                    }),
+                )
+            })?,
+        ),
+        _ if production => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: "a run needs a GitHub repository (repo_key) to work on".into(),
+                }),
+            ));
+        }
+        _ => None,
+    };
+
     let scheduler_tx = state.scheduler_tx.read().await;
     let tx = scheduler_tx.as_ref().ok_or_else(|| {
         (
@@ -602,11 +645,14 @@ pub async fn create_run(
         req.group_id.as_deref(),
         req.conversation_id.as_deref(),
         authority_context,
+        staged,
     )
     .await
     .map_err(|e| {
         let status = if e.starts_with("resource conflict:") {
             StatusCode::CONFLICT
+        } else if e.starts_with("run repository:") {
+            StatusCode::INTERNAL_SERVER_ERROR
         } else {
             StatusCode::BAD_REQUEST
         };
@@ -1117,27 +1163,6 @@ fn pr_title_and_draft(base_title: String, is_failed: bool) -> (String, bool) {
     (failed_pr_title(base_title, is_failed), is_failed)
 }
 
-/// Build the `gh pr create` argv for the CLI fallback path. Pulled out so the
-/// draft flag's wiring can be asserted directly, without shelling out to `gh`.
-fn gh_pr_create_args(title: &str, body: &str, base: &str, head: &str, draft: bool) -> Vec<String> {
-    let mut args = vec![
-        "pr".to_string(),
-        "create".to_string(),
-        "--title".to_string(),
-        title.to_string(),
-        "--body".to_string(),
-        body.to_string(),
-        "--base".to_string(),
-        base.to_string(),
-        "--head".to_string(),
-        head.to_string(),
-    ];
-    if draft {
-        args.push("--draft".to_string());
-    }
-    args
-}
-
 /// Truncate a string, appending "..." if it exceeds `max_len`.
 fn truncate_str(s: &str, max_len: usize) -> String {
     if s.len() <= max_len {
@@ -1219,10 +1244,21 @@ pub(crate) fn validate_run_for_pr(
     Ok((goal, branch))
 }
 
+const RECONNECT_GITHUB: &str = "GitHub did not accept Cortex's access. Reconnect GitHub in your Cortex settings (the connection may have expired or may not include private repositories), then try again.";
+
+fn pr_error(status: StatusCode, msg: &str) -> (StatusCode, Json<ErrorResponse>) {
+    (
+        status,
+        Json(ErrorResponse {
+            error: msg.to_string(),
+        }),
+    )
+}
+
 /// The shared core behind `POST /api/runs/{id}/pr` and the `open_pr` agent
 /// tool's confirm handler (`crate::agent_confirm`): validate, push the run's
-/// branch, and create the GitHub PR. Tries the GitHub API first (if
-/// `GITHUB_TOKEN` is set), falls back to `gh` CLI.
+/// head from its run repository to the run's `repo_key` repository, and
+/// create the GitHub PR -- all with the run owner's own GitHub token.
 pub(crate) async fn create_pr_core(
     state: &AppState,
     db: &crate::db::Database,
@@ -1242,28 +1278,75 @@ pub(crate) async fn create_pr_core(
     let is_failed = db.run_has_failed_step(run_id);
     let failed_checks = db.run_failed_check_names(run_id);
 
-    // Push the branch to origin
-    let push_output = std::process::Command::new("git")
-        .args(["push", "-u", "origin", &branch])
-        .current_dir(&state.workspace_dir)
-        .output()
-        .map_err(|e| {
-            (
+    // The run's repo_key is the only repository this run may touch. Owner and
+    // repo come from it -- never from the shared workspace's remotes.
+    let repo_key = db.get_run_repo_key(run_id).unwrap_or_default();
+    let (owner, repo) = crate::run_repo::github_owner_repo(&repo_key).ok_or_else(|| {
+        pr_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "this run has no GitHub repository, so there is nothing to open a pull request against",
+        )
+    })?;
+    let commit = db.get_run_latest_commit(run_id).ok_or_else(|| {
+        pr_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "run has no committed changes to deliver",
+        )
+    })?;
+    // Cortex does the GitHub I/O with the run owner's own token; workers
+    // never hold one.
+    let token = match github::github_oauth_token(state.clerk_secret_key.as_deref(), user_id).await {
+        Ok(Some(t)) => t,
+        Ok(None) => return Err(pr_error(StatusCode::UNPROCESSABLE_ENTITY, RECONNECT_GITHUB)),
+        Err(e) => {
+            tracing::warn!("github token lookup failed for PR: {e}");
+            return Err(pr_error(
+                StatusCode::BAD_GATEWAY,
+                "GitHub could not be reached; try again later",
+            ));
+        }
+    };
+
+    // Push the run's head from the run repository.
+    let repo_dir =
+        crate::run_repo::run_repo_path(&state.workspace_dir, run_id).ok_or_else(|| {
+            pr_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse {
-                    error: format!("failed to run git push: {e}"),
-                }),
+                "run id is not a valid repository name",
             )
         })?;
-
-    if !push_output.status.success() {
-        let stderr = String::from_utf8_lossy(&push_output.stderr);
-        return Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: format!("git push failed: {stderr}"),
-            }),
-        ));
+    let push = {
+        let (owner, repo, token, commit, branch) = (
+            owner.clone(),
+            repo.clone(),
+            token.clone(),
+            commit,
+            branch.clone(),
+        );
+        tokio::task::spawn_blocking(move || {
+            crate::run_repo::push_commit(&repo_dir, &owner, &repo, &token, &commit, &branch)
+        })
+        .await
+    };
+    match push {
+        Ok(Ok(())) => {}
+        Ok(Err(crate::run_repo::PushError::Reconnect(e))) => {
+            tracing::warn!("PR push refused by GitHub for run {run_id}: {e}");
+            return Err(pr_error(StatusCode::UNPROCESSABLE_ENTITY, RECONNECT_GITHUB));
+        }
+        Ok(Err(crate::run_repo::PushError::Failed(e))) => {
+            tracing::warn!("PR push failed for run {run_id}: {e}");
+            return Err(pr_error(
+                StatusCode::BAD_GATEWAY,
+                "could not push the run's branch to GitHub; try again later",
+            ));
+        }
+        Err(e) => {
+            return Err(pr_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("push task failed: {e}"),
+            ));
+        }
     }
 
     // Build PR metadata
@@ -1284,60 +1367,31 @@ pub(crate) async fn create_pr_core(
         &failed_checks,
     );
 
-    // Try GitHub API first, fall back to gh CLI
-    if let Some(gh_client) = &state.github_client {
-        if let Some((owner, repo)) = github::parse_github_remote(&state.workspace_dir) {
-            match gh_client
-                .create_pull_request(&owner, &repo, &title, &body, &branch, base, draft)
-                .await
-            {
-                Ok(pr) => {
-                    tracing::info!("PR #{} created via GitHub API: {}", pr.number, pr.html_url);
-                    return Ok(CreatePrResponse {
-                        pr_url: pr.html_url,
-                        branch,
-                    });
-                }
-                Err(e) => {
-                    tracing::warn!("GitHub API PR creation failed, falling back to gh CLI: {e}");
-                    // Fall through to gh CLI below
-                }
-            }
-        } else {
-            tracing::warn!("could not parse owner/repo from git remote, falling back to gh CLI");
+    let client = github::GitHubClient::with_token(token).ok_or_else(|| {
+        pr_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "could not build GitHub client",
+        )
+    })?;
+    match client
+        .create_pull_request(&owner, &repo, &title, &body, &branch, base, draft)
+        .await
+    {
+        Ok(pr) => {
+            tracing::info!("PR #{} created via GitHub API: {}", pr.number, pr.html_url);
+            Ok(CreatePrResponse {
+                pr_url: pr.html_url,
+                branch,
+            })
+        }
+        Err(e) => {
+            tracing::warn!("GitHub PR creation failed for run {run_id}: {e}");
+            Err(pr_error(
+                StatusCode::BAD_GATEWAY,
+                &format!("the branch was pushed but GitHub refused the pull request: {e}"),
+            ))
         }
     }
-
-    // Fallback: create PR via gh CLI
-    let gh_args = gh_pr_create_args(&title, &body, base, &branch, draft);
-    let pr_output = std::process::Command::new("gh")
-        .args(&gh_args)
-        .current_dir(&state.workspace_dir)
-        .output()
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse {
-                    error: format!("failed to run gh pr create: {e}"),
-                }),
-            )
-        })?;
-
-    if !pr_output.status.success() {
-        let stderr = String::from_utf8_lossy(&pr_output.stderr);
-        return Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: format!("gh pr create failed: {stderr}"),
-            }),
-        ));
-    }
-
-    let pr_url = String::from_utf8_lossy(&pr_output.stdout)
-        .trim()
-        .to_string();
-
-    Ok(CreatePrResponse { pr_url, branch })
 }
 
 /// `POST /api/runs/{id}/pr` — push the run's branch and create a GitHub PR.
@@ -1994,38 +2048,6 @@ mod validate_run_for_pr_tests {
         let (title, draft) = pr_title_and_draft("cortex: do the thing".to_string(), false);
         assert_eq!(title, "cortex: do the thing");
         assert!(!draft, "a verified run must not open as a draft PR");
-    }
-
-    /// `create_pr_core`'s `gh` CLI fallback path -- asserts the exact argv
-    /// so a dropped `--draft` push is caught here, not in production.
-    #[test]
-    fn gh_pr_create_args_includes_draft_flag_for_a_failed_run() {
-        let args = gh_pr_create_args(
-            "[failed checks] cortex: do the thing",
-            "body",
-            "main",
-            "cortex/do-the-thing",
-            true,
-        );
-        assert!(
-            args.iter().any(|a| a == "--draft"),
-            "failed run's argv must request a draft PR: {args:?}"
-        );
-    }
-
-    #[test]
-    fn gh_pr_create_args_omits_draft_flag_for_a_verified_run() {
-        let args = gh_pr_create_args(
-            "cortex: do the thing",
-            "body",
-            "main",
-            "cortex/do-the-thing",
-            false,
-        );
-        assert!(
-            !args.iter().any(|a| a == "--draft"),
-            "verified run's argv must not request a draft PR: {args:?}"
-        );
     }
 
     #[tokio::test]

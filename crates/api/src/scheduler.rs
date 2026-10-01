@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -665,6 +665,25 @@ async fn dispatch_step(state: &AppState, step: &StepRef) -> DispatchOutcome {
         return DispatchOutcome::RetryLater;
     }
 
+    // The run's repository, on the server (`run_repo`). Made at run start;
+    // made here only for a run that has none yet. Before the lease, so a repo
+    // that cannot be had costs no attempt and no charge.
+    let run_repo = match ensure_run_repository(state, db, step).await {
+        Ok(path) => path,
+        Err(outcome) => return outcome,
+    };
+    let repo_key = db
+        .get_run_repo_key(&step.run_id)
+        .filter(|key| !key.is_empty() && key != "default")
+        // A run with no repository (development only; production refused it
+        // at run start) works on the server's workspace, named the same way
+        // `ensure_run_repo` staged it, so the worker takes the transport path
+        // too rather than falling back to its own directory.
+        .or_else(|| {
+            (!crate::is_production_env())
+                .then(|| format!("local:{}", state.workspace_dir.display()))
+        });
+
     let attempt_id = Uuid::new_v4().to_string();
     let lease_duration = step.kind.lease_duration_ms();
     let now_ms = chrono::Utc::now().timestamp_millis();
@@ -759,11 +778,24 @@ async fn dispatch_step(state: &AppState, step: &StepRef) -> DispatchOutcome {
 
     // Build step context from predecessors, then orient it in the repository.
     let context = build_step_context(db, &step.run_id, &step.step_id);
-    let context = with_repo_map(context, state, decision.provider, decision.tier);
+    let context = with_repo_map(
+        context,
+        state,
+        crate::run_repo::local_source_dir(
+            repo_key.as_deref(),
+            &state.workspace_dir,
+            crate::is_production_env(),
+        )
+        .as_deref(),
+        decision.provider,
+        decision.tier,
+    );
 
     // Workspace context: use run_id as logical workspace, look up latest commit
     // from predecessor steps, and pass file_paths from the run's goal
-    let base_commit = db.get_run_latest_commit(&step.run_id);
+    let base_commit = db
+        .get_run_latest_commit(&step.run_id)
+        .or_else(|| crate::run_repo::read_base(&run_repo));
     let allowed_paths = db.get_run_file_paths(&step.run_id);
     let planner_seed = db
         .get_step_recipe_seed_json(&step.step_id)
@@ -775,8 +807,8 @@ async fn dispatch_step(state: &AppState, step: &StepRef) -> DispatchOutcome {
     // Derive once, then use the result twice: frozen for verification, and
     // downgraded to display strings for the worker contract. Deriving twice
     // would risk the exam differing from the one the worker was shown.
-    let check_specs =
-        derive_step_check_specs(step.kind, risk, &allowed_paths, &state.workspace_dir);
+    let probe_dir = crate::run_repo::probe_dir_for(&run_repo);
+    let check_specs = derive_step_check_specs(step.kind, risk, &allowed_paths, &probe_dir);
 
     let effective_work_kind = step
         .work_kind
@@ -878,7 +910,7 @@ async fn dispatch_step(state: &AppState, step: &StepRef) -> DispatchOutcome {
     // something the task did not author. The task contract has no say: an
     // objective that says "install the dependencies" does not open npm; a
     // `package.json` does.
-    let egress = derive_step_egress(step.kind, &state.workspace_dir);
+    let egress = derive_step_egress(step.kind, &probe_dir);
     if !egress.is_deny() {
         tracing::info!(
             step_id = %step.step_id,
@@ -964,6 +996,7 @@ async fn dispatch_step(state: &AppState, step: &StepRef) -> DispatchOutcome {
         lease_deadline_ms: deadline,
         workspace_id: step.run_id.clone(),
         base_commit,
+        repo_key,
         allowed_paths,
         task,
         decision,
@@ -1790,15 +1823,79 @@ fn build_step_context(db: &Database, run_id: &str, step_id: &str) -> StepContext
 fn with_repo_map(
     mut context: StepContext,
     state: &AppState,
+    source_dir: Option<&Path>,
     provider: ProviderId,
     tier: Tier,
 ) -> StepContext {
+    // Only a repository that is a plain checkout on this host can be mapped
+    // (`local:` keys, outside production). A GitHub run's repository is bare
+    // and its checkout lives on the worker, so it gets no map rather than the
+    // map of some other repository.
+    let Some(source_dir) = source_dir else {
+        return context;
+    };
     let budget = token_budget(provider, tier) / REPO_MAP_BUDGET_FRACTION;
     context.repo_map = state
         .repo_map_cache
-        .get(&state.workspace_dir, budget as usize)
+        .get(source_dir, budget as usize)
         .map(|rendered| rendered.to_string());
     context
+}
+
+/// The run's repository, making it if the run has none yet (see
+/// `run_repo::ensure_run_repo`). `Err` carries what dispatch should do
+/// instead: try again later when the fault is GitHub's or ours (no attempt
+/// exists, so nothing is charged either way), or fail the step when the
+/// repository can never be had (no GitHub connection, a repo_key that names
+/// nothing usable, `local:` in production).
+async fn ensure_run_repository(
+    state: &AppState,
+    db: &crate::db::Database,
+    step: &StepRef,
+) -> Result<PathBuf, DispatchOutcome> {
+    use crate::run_repo::PrepareError;
+    let repo_key = db.get_run_repo_key(&step.run_id);
+    let outcome = crate::run_repo::ensure_run_repo(
+        &state.workspace_dir,
+        state.clerk_secret_key.as_deref(),
+        &step.user_id,
+        &step.run_id,
+        repo_key.as_deref(),
+        crate::is_production_env(),
+    )
+    .await;
+    let error = match outcome {
+        Ok(path) => return Ok(path),
+        Err(error) => error,
+    };
+    match &error {
+        PrepareError::TryLater(_) | PrepareError::Ours(_) => {
+            tracing::warn!(
+                step_id = %step.step_id,
+                "run repository unavailable, step stays queued: {}",
+                error.message()
+            );
+            Err(DispatchOutcome::RetryLater)
+        }
+        PrepareError::BadRepo(_) | PrepareError::Reconnect(_) => {
+            tracing::warn!(
+                step_id = %step.step_id,
+                "run repository cannot be had, failing the step (no attempt, no charge): {}",
+                error.message()
+            );
+            if db.fail_unleased_step(&step.step_id, error.message(), Some("NoRepo")) {
+                state
+                    .emit_scheduler_event(SchedulerEvent::StepFailed {
+                        run_id: step.run_id.clone(),
+                        step_id: step.step_id.clone(),
+                    })
+                    .await;
+                Err(DispatchOutcome::Dispatched)
+            } else {
+                Err(DispatchOutcome::RetryLater)
+            }
+        }
+    }
 }
 
 // --- Load ready steps ---
@@ -2428,6 +2525,7 @@ pub async fn create_run_from_goal(
     group_id: Option<&str>,
     conversation_id: Option<&str>,
     authority_context: Option<serde_json::Value>,
+    staged: Option<crate::run_repo::Staged>,
 ) -> Result<String, String> {
     use cortex_engine::decomposer::decompose_goal;
 
@@ -2497,6 +2595,23 @@ pub async fn create_run_from_goal(
             authority_context.as_ref(),
         )
         .map_err(|err| err.message())?;
+
+    // The run's repository was fetched before the run existed (so a missing
+    // token or a GitHub outage never leaves a run behind). Give it the run's
+    // name now, before the scheduler can dispatch anything. If that cannot be
+    // done it is Cortex's own failure: cancel the run, which has not started
+    // and has cost nothing.
+    if let Some(staged) = staged {
+        if let Err(e) = staged.promote(&run_id) {
+            tracing::error!(run_id = %run_id, error = %e, "could not place the run repository");
+            if let Err(cancel) = db.cancel_run(&run_id, user_id, "run repository unavailable") {
+                tracing::error!(run_id = %run_id, error = ?cancel, "could not cancel the run");
+            }
+            return Err(format!(
+                "run repository: could not prepare the repository: {e}"
+            ));
+        }
+    }
 
     scheduler_tx
         .send(SchedulerEvent::RunCreated {
@@ -3014,6 +3129,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_v3_worker_is_never_leased_a_step() {
+        // A worker that predates the repository transport never uploads its
+        // commits, so any step it ran would fail verification and be charged
+        // to the customer. It must not be found at all: no lease, no attempt.
+        let temporary = tempfile::tempdir().expect("temporary workspace");
+        let workspace = temporary.path().to_path_buf();
+        std::fs::create_dir_all(workspace.join(".cortex")).expect("workspace metadata");
+        let state = AppState::new(workspace.join(".cortex/ledger.jsonl"), workspace, None).await;
+
+        let (tx, _rx) = mpsc::channel(8);
+        state
+            .register_worker("old".to_string(), "user-v3".to_string(), Vec::new(), 3, tx)
+            .await;
+        assert!(state.find_worker_for_user("user-v3").await.is_none());
+
+        let (tx, _rx) = mpsc::channel(8);
+        state
+            .register_worker(
+                "new".to_string(),
+                "user-v3".to_string(),
+                Vec::new(),
+                cortex_core::protocol::PROTOCOL_VERSION,
+                tx,
+            )
+            .await;
+        let found = state.find_worker_for_user("user-v3").await;
+        assert_eq!(found.map(|(id, _)| id).as_deref(), Some("new"));
+    }
+
+    #[tokio::test]
     async fn a_cancelled_ready_step_queued_behind_the_cap_is_dropped_not_requeued() {
         // Regression for the bounce found in PR #60 review: `dispatch_step`
         // used to return `RetryLater` for a step that turned out to be
@@ -3047,6 +3192,7 @@ mod tests {
                 user_id: user_id.to_string(),
                 available_providers: Vec::new(),
                 disabled_providers: HashSet::new(),
+                protocol_version: cortex_core::protocol::PROTOCOL_VERSION,
                 tx,
             },
         );

@@ -12,7 +12,9 @@ use uuid::Uuid;
 
 use cortex_core::billing_binding::{classify_worker_failure, AttemptEndCause};
 use cortex_core::failure::WorkerFailureKind;
-use cortex_core::protocol::{BrainMessage, StepOutput, WorkerMessage, PROTOCOL_VERSION};
+use cortex_core::protocol::{
+    BrainMessage, StepOutput, WorkerMessage, MIN_STEP_PROTOCOL_VERSION, PROTOCOL_VERSION,
+};
 use cortex_core::routing::RiskLevel;
 use cortex_core::task::TaskContract;
 use cortex_engine::captain::SchedulerEvent;
@@ -289,9 +291,27 @@ async fn handle_worker_msg(
                     worker_id.to_string(),
                     user_id.clone(),
                     provider_ids,
+                    protocol_version,
                     brain_tx.clone(),
                 )
                 .await;
+
+            if protocol_version < MIN_STEP_PROTOCOL_VERSION {
+                tracing::warn!(
+                    "worker {worker_id} speaks protocol v{protocol_version}, older than \
+                     v{MIN_STEP_PROTOCOL_VERSION}: it will not be given steps"
+                );
+                let _ = brain_tx
+                    .send(BrainMessage::CancelStep {
+                        step_id: "protocol".into(),
+                        reason: format!(
+                            "update your Cortex worker: it speaks protocol v{protocol_version} and \
+                             this brain needs v{MIN_STEP_PROTOCOL_VERSION} or newer, so it will \
+                             not be given any steps"
+                        ),
+                    })
+                    .await;
+            }
 
             state
                 .emit_scheduler_event(SchedulerEvent::WorkerConnected {
@@ -649,7 +669,11 @@ async fn handle_worker_msg(
                             // Run on the blocking pool: it shells out to git
                             // and this is an async handler.
                             let commit_check = {
-                                let workspace = state.workspace_dir.clone();
+                                // The run's own repository, where the worker's
+                                // head bundle was ingested (`run_repo`).
+                                let workspace =
+                                    crate::run_repo::run_repo_path(&state.workspace_dir, &run_id)
+                                        .unwrap_or_else(|| state.workspace_dir.clone());
                                 let head_to_check = head.clone();
                                 tokio::task::spawn_blocking(move || {
                                     crate::verification_driver::check_commit(
@@ -1895,7 +1919,7 @@ pub(crate) fn record_step_usage(
     }
 }
 
-async fn authenticate_worker(state: &AppState, token: &str) -> Result<String, String> {
+pub(crate) async fn authenticate_worker(state: &AppState, token: &str) -> Result<String, String> {
     // A `cwk_` worker service credential, checked FIRST.
     //
     // First because it is the only credential a headless worker can actually
@@ -3106,6 +3130,18 @@ mod attempt_end_paths {
         String::from_utf8_lossy(&out.stdout).trim().to_string()
     }
 
+    /// The run repository of `step_id`'s run (see `run_repo`), as a plain
+    /// checkout so the tests can commit in it: the object view reads
+    /// `.git/objects` when there is a `.git`.
+    fn init_run_repo(state: &AppState, step_id: &str) -> std::path::PathBuf {
+        let db = state.db.as_ref().expect("database");
+        let run_id = db.get_step_run_id(step_id).expect("the step's run");
+        let repo = crate::run_repo::run_repo_path(&state.workspace_dir, &run_id).expect("run id");
+        std::fs::create_dir_all(&repo).expect("run repo dir");
+        git_in(&repo, &["init"]);
+        repo
+    }
+
     /// A customer-owned worker's step that has started, on a funded account,
     /// with one genuinely settled 300_000 micro-USD call.
     fn running_step_with_settled_call(state: &AppState, attempt_id: &str) -> (String, String, i64) {
@@ -3170,9 +3206,9 @@ mod attempt_end_paths {
     #[tokio::test]
     async fn a_head_commit_missing_from_a_healthy_workspace_repo_is_charged() {
         let state = state().await;
-        git_in(&state.workspace_dir, &["init"]);
         let (worker_id, step_id, lease_gen) =
             running_step_with_settled_call(&state, "attempt-head-missing");
+        init_run_repo(&state, &step_id);
 
         deliver(
             &state,
@@ -3216,9 +3252,9 @@ mod attempt_end_paths {
         // fail, which looks exactly like Cortex's own fault; it must not buy a
         // free attempt.
         let state = state().await;
-        git_in(&state.workspace_dir, &["init"]);
         let (worker_id, step_id, lease_gen) =
             running_step_with_settled_call(&state, "attempt-head-nul");
+        init_run_repo(&state, &step_id);
 
         deliver(
             &state,
@@ -3271,8 +3307,10 @@ mod attempt_end_paths {
         // absorbed (Cortex never reads that config; the head is simply not
         // in the object store).
         let state = state().await;
-        git_in(&state.workspace_dir, &["init"]);
-        let config = state.workspace_dir.join(".git/config");
+        let (worker_id, step_id, lease_gen) =
+            running_step_with_settled_call(&state, "attempt-bad-format");
+        let repo = init_run_repo(&state, &step_id);
+        let config = repo.join(".git/config");
         let text = std::fs::read_to_string(&config).expect("repository config");
         assert!(text.contains("repositoryformatversion = 0"), "{text}");
         std::fs::write(
@@ -3283,8 +3321,6 @@ mod attempt_end_paths {
             ),
         )
         .expect("rewrite repository config");
-        let (worker_id, step_id, lease_gen) =
-            running_step_with_settled_call(&state, "attempt-bad-format");
 
         deliver(
             &state,
@@ -3312,10 +3348,12 @@ mod attempt_end_paths {
         // own database refusing the enqueue. Simulated by removing the
         // verification queue's table, which makes the enqueue insert error.
         let state = state().await;
-        git_in(&state.workspace_dir, &["init"]);
+        let (worker_id, step_id, lease_gen) =
+            running_step_with_settled_call(&state, "attempt-enqueue-fails");
+        let repo = init_run_repo(&state, &step_id);
         let head = {
             git_in(
-                &state.workspace_dir,
+                &repo,
                 &[
                     "-c",
                     "user.name=Test",
@@ -3329,10 +3367,8 @@ mod attempt_end_paths {
                     "delivered",
                 ],
             );
-            git_in(&state.workspace_dir, &["rev-parse", "HEAD"])
+            git_in(&repo, &["rev-parse", "HEAD"])
         };
-        let (worker_id, step_id, lease_gen) =
-            running_step_with_settled_call(&state, "attempt-enqueue-fails");
         {
             let db = state.db.as_ref().expect("database");
             db.conn()

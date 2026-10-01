@@ -17,6 +17,9 @@ use cortex_core::protocol::{
 use cortex_worker::executor::{detect_available_providers, Executor, StepExecution};
 // In the library, not here, so the end-to-end test sends the frame this binary
 // would have sent rather than one it built itself. See `report`'s module docs.
+use cortex_worker::repo_transport::{
+    default_cache_root, http_base_from_ws, RepoTransport, StepRepo,
+};
 use cortex_worker::report::worker_event_to_message;
 use cortex_worker::stream::WorkerEvent;
 
@@ -83,6 +86,33 @@ async fn main() {
     }
 }
 
+/// The repository a step works in, from what the brain sent and how this
+/// worker reached it. `None` when the brain named no repository or commit, or
+/// the brain URL is not a WebSocket URL to derive the HTTP origin from.
+fn step_repo(
+    brain_url: &str,
+    token: &str,
+    worker_id: &str,
+    repo_key: Option<String>,
+    base_commit: Option<String>,
+) -> Option<StepRepo> {
+    let (repo_key, base_commit) = (repo_key?, base_commit?);
+    let Some(base_url) = http_base_from_ws(brain_url) else {
+        tracing::warn!("cannot derive the brain's HTTP address from {brain_url}");
+        return None;
+    };
+    Some(StepRepo {
+        repo_key,
+        base_commit,
+        transport: RepoTransport {
+            base_url,
+            token: token.to_string(),
+            worker_id: worker_id.to_string(),
+            cache_root: default_cache_root(),
+        },
+    })
+}
+
 async fn connect_and_run(
     url: &str,
     token: &str,
@@ -144,7 +174,7 @@ async fn connect_and_run(
                                 tracing::info!("session: {session_id}, worker: {worker_id}, protocol: v{protocol_version}");
                             }
                             BrainMessage::ExecuteStep {
-                                run_id, step_id, attempt_id, lease_gen,
+                                run_id, step_id, attempt_id, lease_gen, base_commit, repo_key,
                                 task, decision, delegation, egress,
                                 provider_egress, provider_gateway, context, ..
                             } => {
@@ -251,6 +281,17 @@ async fn connect_and_run(
                                     // through `cortex_core::provenance`, which
                                     // frames every piece of it as data.
                                     context,
+                                    // Where the step's code comes from. The
+                                    // brain names the run's repository and the
+                                    // commit to start at (this used to be
+                                    // dropped into `..`, so the worktree was
+                                    // always cut from whatever HEAD the worker
+                                    // was started in). The worker fetches it
+                                    // from the brain as a bundle and holds no
+                                    // GitHub token. Without both, or without a
+                                    // usable brain URL, it keeps the old
+                                    // behaviour.
+                                    repo: step_repo(url, token, &worker_id, repo_key, base_commit),
                                 };
 
                                 // Create cancel channel and register it
