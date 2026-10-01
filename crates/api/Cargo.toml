@@ -69,7 +69,7 @@ socket2 = "0.6"
 prometheus.workspace = true
 once_cell.workspace = true
 sentry = { version = "0.49", features = ["tracing"], optional = true }
-opentelemetry = { version = "0.32", optional = true }
+opentelemetry = { version = "0.33", optional = true }
 opentelemetry_sdk = { version = "0.32.1", optional = true, features = ["rt-tokio"] }
 opentelemetry-otlp = { version = "0.32", optional = true, features = ["grpc-tonic"] }
 tracing-opentelemetry = { version = "0.33", optional = true }
