@@ -5,6 +5,7 @@ pub mod engine;
 pub mod error;
 pub mod event;
 pub mod git;
+pub mod mission;
 pub mod sandbox;
 pub mod store;
 
