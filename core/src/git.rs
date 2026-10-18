@@ -41,6 +41,15 @@ fn git(dir: &Path, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
+/// Makes `dir` a repository on branch `main` whose first commit holds
+/// everything already in it.
+pub fn init_and_commit(dir: &Path, message: &str) -> Result<()> {
+    git(dir, &["init", "-q", "-b", "main"])?;
+    git(dir, &["add", "-A"])?;
+    git(dir, &["commit", "-q", "--allow-empty", "-m", message])?;
+    Ok(())
+}
+
 pub fn head(repo: &Path) -> Result<String> {
     git(repo, &["rev-parse", "HEAD"])
 }
