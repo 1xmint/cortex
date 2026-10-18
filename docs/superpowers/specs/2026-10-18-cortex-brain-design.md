@@ -274,7 +274,7 @@ Rules:
   publishing, anything destructive or irreversible. Between the person's own
   rules, the more cautious one wins.
 - Judgements inside conditions ("is this bug dangerous?") are made by a model
-  and logged as judgements, so the person can see and correct them.
+  and logged as judgements (3.12), so the person can see and correct them.
 - Cortex may suggest changes it learned ("you approve every plan without
   edits; stop asking?") but never changes the agreement without a yes.
 - Until the full agreement arrives (slice 3), a fixed minimal agreement is
@@ -330,6 +330,27 @@ time, cost, which checks passed, and a recording of the result. Results are
 generated files in `bench/results/`, never written by hand. This is the
 "how good is it" home in AGENTS.md, the source of skill memory, and the
 measure every slice is judged by, starting with slice 1.
+
+### 3.12 Judgements
+
+The brain makes many small calls: was that message a steer or an interrupt,
+is this bug dangerous, which engine should build this piece, does this
+request need a mission at all. All of them go through one **judgement**
+interface in the core: a fixed question, the allowed answers, the answer
+chosen and a confidence, each logged as an event. The person can see and
+correct any judgement, and corrections are logged too.
+
+Judgements never replace the places where the design forbids guessing:
+checks decide "done" (invariant 1), the working agreement's rules are
+evaluated by the core, and the mandatory asks in 3.7 are fixed.
+
+The first judge is the cheapest frontier model available through the same
+engines. Logged judgements with the person's corrections become a labelled
+set; a fast specialised model (for example a small local classifier such as
+GLiNER2) replaces the model judge for a kind of question only if the
+scoreboard shows it at least as accurate on that set. Hosted classifier
+services that need their own key or bill separately (for example Jev) are
+excluded by the owner's rules.
 
 ## 4. Technology per component (gold rule)
 
