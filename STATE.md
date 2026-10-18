@@ -130,6 +130,7 @@ What is true now and what comes next. Kept under 150 lines by CI.
    bench run in WSL Ubuntu).
 4. Next: slice 2, plain words in, proven work out (reordered by the owner
    on 2026-10-18): Cortex writes its own checks, Codex reviews them, and a
-   chat page sits on top
+   chat page sits on top, built brain first (planner, reviewer, bench),
+   then the page
    ([design](docs/superpowers/specs/2026-10-18-slice-2-plain-words-design.md),
    awaiting approval). Memory and the working agreement come after.

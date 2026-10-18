@@ -24,6 +24,35 @@ The test of success: **a person types a coding request into a web page, in
 plain words, and gets back working code that Cortex has proven, without ever
 writing or reading a check.**
 
+### 1.1 Corrections after the owner's review (2026-10-18)
+
+The owner restated the product: Cortex runs on whichever frontier models'
+APIs give the best result for the money, and later on open models on
+servers he owns. The Claude Code and Codex command lines are only how the
+builder tests during development. Three changes follow, all the builder's
+calls:
+
+1. **Roles, not vendors.** Planner, reviewer, worker and judge are roles.
+   Each role names a provider and a model in one setting, behind one
+   provider-neutral model interface (5.6). Slice 1's API engine is
+   Anthropic-only with the model written into the code; this slice fixes
+   that. Recorded in a new ADR 0006 (ADR 0005 stays as accepted).
+2. **Measure value, not just passes.** Every session records tokens and
+   cost per role, and bench results show cost per prompt. "Best bang for
+   the buck" cannot be chosen without it.
+3. **Brain before face.** The slice is built in two parts. Part A is the
+   brain: planner, reviewer and the new bench mode, run from the terminal.
+   Part B, the chat page and its protocol, starts only after Part A's bench
+   passes (section 6). A page on top of a brain that writes bad checks
+   would only show the bad checks faster.
+
+**Why no "whole team" of specialist roles yet.** The research behind the
+brain design (its section 2) found that what wins is short sessions with
+fresh context and independent checks, not many personas talking to each
+other. A team of roles is how the product should feel from outside. Inside,
+a role (researcher, prompter, artist) is added when a bench prompt shows
+the brain failing without it, and kept only if the bench shows it helps.
+
 ## 2. Goals
 
 1. **Cortex writes its own checks.** From a plain request (and the project,
@@ -110,7 +139,9 @@ as in slice 1, and the page can always rebuild what it shows from the log.
 
 ### 5.3 The reviewer (Codex)
 
-- `codex exec --json`, on the owner's Codex subscription, in its own
+- The reviewer is a role (5.6) and must be a different model family from
+  the planner's. In the product it is a model API. During development it
+  is `codex exec --json` on the owner's Codex subscription, in its own
   bubblewrap jail like the Claude engine, with no worktree access: the
   request and the draft checks are passed in as quoted data.
 - ADR 0005 admits Codex only after its must-fail test passes (asked to run
@@ -151,27 +182,52 @@ as in slice 1, and the page can always rebuild what it shows from the log.
 - The terminal keeps working: `cortex run "<request>"` without `--checks`
   now runs the same planner path; with `--checks` it behaves as in slice 1.
 
-### 5.6 Quota
+### 5.6 Roles, models and cost
 
-Each role names its model. Defaults: the planner and workers use Claude
-Code's Sonnet, not the CLI's default (Opus), because the owner's quota is the
-scarce thing; Codex reviews with its default. The bench result records the
-models used. Changing a default is a one-line setting.
+- **One model interface for every provider.** Three kinds of provider sit
+  behind it:
+  - the Anthropic API;
+  - any OpenAI-compatible API, which covers OpenAI and the common servers
+    for running open models locally (to be confirmed in ADR 0006);
+  - the Claude Code and Codex command lines, for development only.
+  Cortex's own tool loop (slice 1's API engine) works over the first two,
+  so no vendor's agent program sits between the brain and its tools in the
+  product.
+- **Each role picks provider and model in one setting.** Development
+  defaults: the planner and workers use Claude Code with Sonnet, not the
+  CLI's default (Opus), because the owner's quota is the scarce thing; the
+  reviewer uses Codex with its default.
+- **Cost is recorded per session**: provider, model, input and output
+  tokens, and money cost where the provider reports it (subscription runs
+  record tokens only). The bench results add cost per prompt and per role.
+  Choosing models by measured value per role is a later judgement (design
+  3.12); this slice only makes the numbers exist.
+- No live API run happens in this slice. Running the product path for
+  real needs API billing, which is the owner's call when Part A is proven.
 
 ## 6. When this slice is done
 
-1. In CI, with the fake engines: the whole path (plan, review, revise,
-   approve, freeze, see-fail, work, done) and its failure paths (planner
-   writes no checks, a check already passes, review says revise twice,
-   person changes a check, crash at every step) are proven, and the page's
-   protocol is tested against the core.
-2. On the owner's PC, two real runs only, because each decides something:
+**Part A, the brain (built first):**
+1. ADR 0006 accepted; roles and providers are settings; sessions record
+   tokens and cost.
+2. In CI, with fake engines and a fake reviewer: the whole path (plan,
+   review, revise, approve, freeze, see-fail, work, done) and its failure
+   paths (planner writes no checks, a check already passes, review says
+   revise twice, person changes a check, crash at every step) are proven,
+   driven from `cortex run "<request>"`.
+3. On the owner's PC, two real runs only, because each decides something:
    - Codex's must-fail test (decides whether Codex can be the reviewer).
    - The bench in the new mode (decides whether the planner's checks are
      good enough): **at least 7 of 10 pass the hidden checks**, and the
-     results file is committed.
-3. The owner opens the page, types one request of his own in each way of
+     results file, with cost per prompt, is committed.
+
+**Part B, the face (only after Part A's bench passes):**
+4. The page's protocol is tested against the core in CI.
+5. The owner opens the page, types one request of his own in each way of
    working, and gets proven work back.
+
+If Part A's bench falls short, Part B waits and the planner's brief is
+fixed first.
 
 ## 7. Settled by the builder
 
