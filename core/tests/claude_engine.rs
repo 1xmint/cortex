@@ -169,7 +169,8 @@ fn claude_errors_are_failures() {
     };
     assert!(reason.contains("Failed to authenticate"), "{reason}");
 
-    let (outcome, lines) = parse("{\"type\":\"system\",\"subtype\":\"init\"}\nnot json\n");
+    let (outcome, lines) =
+        parse("{\"type\":\"system\",\"subtype\":\"init\",\"apiKeySource\":\"none\"}\nnot json\n");
     assert!(
         matches!(outcome, SessionOutcome::Failed { .. }),
         "{outcome:?}"
