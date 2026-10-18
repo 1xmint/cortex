@@ -102,7 +102,7 @@ fn run_checks(worktree: &std::path::Path, checks: &std::path::Path) -> crate::Re
     Ok(report)
 }
 
-fn describe(out: &RunOutput) -> String {
+pub(crate) fn describe(out: &RunOutput) -> String {
     let mut text = if out.timed_out {
         "timed out; the command was stopped\n".to_string()
     } else {

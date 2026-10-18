@@ -2,6 +2,7 @@
 //! change files. What an engine says about its own result is only a note;
 //! Cortex's checks decide.
 
+pub mod api;
 pub mod claude;
 pub mod fake;
 
