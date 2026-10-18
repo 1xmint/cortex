@@ -37,6 +37,11 @@ What is true now and what comes next. Kept under 150 lines by CI.
   <mission>` finishes the mission as if nothing happened (kill-tested after
   every kind of event). A dead process's lock is taken over at once; a
   live one's is respected.
+- Steering: `cortex steer <mission> "<text>"` adds an instruction that every
+  later brief carries. `cortex stop <mission> ["<text>"]` cancels the running
+  session within about a second; with text the mission re-plans with it
+  (limited by the re-plan budget), without text it pauses until
+  `cortex resume`.
 - Brain design approved:
   [docs/superpowers/specs/2026-10-18-cortex-brain-design.md](docs/superpowers/specs/2026-10-18-cortex-brain-design.md).
   Approved by the owner on 2026-10-18 after an independent review and a
