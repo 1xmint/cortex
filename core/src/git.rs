@@ -4,6 +4,9 @@
 //! execute anything the worker planted: hooks, an fsmonitor, a filter
 //! driver chosen by `.gitattributes`, or a `.git` file pointing at a gitdir
 //! the worker made. Every call goes through `git()`, which turns those off.
+//! A repository the worker made inside its worktree has its own config and
+//! attributes, which those switches do not reach, so it is removed before
+//! any git call looks at the files.
 
 use crate::{Error, Result};
 use std::path::{Path, PathBuf};
@@ -19,6 +22,8 @@ fn git(dir: &Path, args: &[&str]) -> Result<String> {
         .args(["-c", "core.hooksPath=/dev/null"])
         .args(["-c", "core.fsmonitor=false"])
         .args(["-c", "core.attributesFile=/dev/null"])
+        .args(["-c", "diff.ignoreSubmodules=all"])
+        .args(["-c", "submodule.recurse=false"])
         .args([
             "-c",
             "user.name=Cortex",
@@ -27,6 +32,10 @@ fn git(dir: &Path, args: &[&str]) -> Result<String> {
         ])
         .args(args)
         .current_dir(dir)
+        .env_clear()
+        .envs(std::env::var_os("PATH").map(|p| ("PATH", p)))
+        .envs(std::env::var_os("SYSTEMROOT").map(|p| ("SYSTEMROOT", p)))
+        .env("HOME", "/")
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_TERMINAL_PROMPT", "0")
@@ -126,8 +135,12 @@ impl Worktree {
 
     /// Commits every change; `None` when there was nothing to commit.
     pub fn commit_all(&self, message: &str) -> Result<Option<String>> {
+        remove_nested_git(&self.path, true)?;
         self.checked_git(&["add", "-A"])?;
-        if self.checked_git(&["status", "--porcelain"])?.is_empty() {
+        if self
+            .checked_git(&["status", "--porcelain", "--ignore-submodules=all"])?
+            .is_empty()
+        {
             return Ok(None);
         }
         self.checked_git(&["commit", "-q", "--no-verify", "-m", message])?;
@@ -138,6 +151,29 @@ impl Worktree {
     pub fn discard(self) -> Result<()> {
         forget_worktree(&self.repo, &self.path)
     }
+}
+
+/// Deletes every `.git` below `dir` (but not the worktree's own), so files
+/// in a repository the worker made are committed as plain files and no
+/// git call reads that repository's config. Symlinks are never followed.
+fn remove_nested_git(dir: &Path, top: bool) -> Result<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let kind = entry.file_type()?;
+        if entry.file_name() == ".git" {
+            if top {
+                continue;
+            }
+            if kind.is_dir() {
+                std::fs::remove_dir_all(entry.path())?;
+            } else {
+                std::fs::remove_file(entry.path())?;
+            }
+        } else if kind.is_dir() {
+            remove_nested_git(&entry.path(), false)?;
+        }
+    }
+    Ok(())
 }
 
 /// Points `refs/heads/<branch>` at `commit`. The person's checked-out

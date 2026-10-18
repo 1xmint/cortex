@@ -19,8 +19,9 @@ What is true now and what comes next. Kept under 150 lines by CI.
   refused updates and deletes, project-scoped missions, and leases so one
   process drives a mission at a time.
 - Git: each worker session gets a disposable worktree; git run there
-  ignores planted hooks, fsmonitor, `.gitattributes` filters and a swapped
-  `.git` file. Accepted work moves a `cortex/...` branch, never the
+  ignores planted hooks, fsmonitor, `.gitattributes` filters, a swapped
+  `.git` file and any repository the worker makes inside it (removed
+  before commit, so its files are kept as plain files). Accepted work moves a `cortex/...` branch, never the
   person's checked-out one.
 - Checks: frozen read-only outside the worktree with a SHA-256
   fingerprint, run in the sandbox, seen failing before work starts (a
@@ -35,11 +36,12 @@ What is true now and what comes next. Kept under 150 lines by CI.
   it. `--engine claude` (the default), `--engine api` and the fake engine
   are wired.
 - Claude Code engine: runs `claude -p --restricted` on the person's
-  subscription inside a bubblewrap jail that shows only system files, its
-  own config (personal CLAUDE.md, plugins, skills and history hidden), the
+  subscription inside a bubblewrap jail that shows only system files, the
+  sign-in file, a throwaway copy of `~/.claude.json` (nothing else in
+  `~/.claude`, and nothing the session writes there survives), the
   worktree and the read-only checks. It has no shell: its only commands go
   through `cortex mcp` (`run`, `test`), each in the gVisor sandbox. A session
-  that would bill an API key is refused; a usage limit parks the mission
+  that would bill an API key, or does not say how it bills, is refused; a usage limit parks the mission
   until the reset time. Proven in CI with stand-in binaries only; a real
   signed-in session (`cargo test -- --ignored claude_cannot_run_shell`) has
   not run yet.
@@ -101,7 +103,9 @@ What is true now and what comes next. Kept under 150 lines by CI.
 
 - The Claude engine's jail must show Claude Code its own sign-in files, so
   keeping them from the model rests on Claude Code's `--restricted` mode and
-  deny rules, not on the jail. A `claude` installed under nvm or npm outside
+  deny rules, not on the jail. Only the sign-in file is shared; if Claude
+  Code refreshes it by replacing the file, the refresh is lost (unproven on
+  the real CLI). A `claude` installed under nvm or npm outside
   `/usr` and the home folder may not run in the jail.
 
 ## Next slices

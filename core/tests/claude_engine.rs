@@ -169,7 +169,8 @@ fn claude_errors_are_failures() {
     };
     assert!(reason.contains("Failed to authenticate"), "{reason}");
 
-    let (outcome, lines) = parse("{\"type\":\"system\",\"subtype\":\"init\"}\nnot json\n");
+    let (outcome, lines) =
+        parse("{\"type\":\"system\",\"subtype\":\"init\",\"apiKeySource\":\"none\"}\nnot json\n");
     assert!(
         matches!(outcome, SessionOutcome::Failed { .. }),
         "{outcome:?}"
@@ -190,6 +191,28 @@ fn claude_api_key_billing_is_refused() {
         panic!("{outcome:?}");
     };
     assert!(reason.contains("API key"), "{reason}");
+
+    // An init that does not say how it bills is refused too.
+    let (outcome, _) = parse(concat!(
+        r#"{"type":"system","subtype":"init"}"#,
+        "\n",
+        r#"{"type":"result","subtype":"success","is_error":false,"result":"done"}"#,
+        "\n"
+    ));
+    let SessionOutcome::Failed { reason } = outcome else {
+        panic!("{outcome:?}");
+    };
+    assert!(reason.contains("bill"), "{reason}");
+
+    // So is a session that never sends its init.
+    let (outcome, _) = parse(concat!(
+        r#"{"type":"result","subtype":"success","is_error":false,"result":"done"}"#,
+        "\n"
+    ));
+    assert!(
+        matches!(outcome, SessionOutcome::Failed { .. }),
+        "{outcome:?}"
+    );
 }
 
 #[cfg(target_os = "linux")]
@@ -228,6 +251,12 @@ try:
         problems.append("personal CLAUDE.md visible")
     if os.path.exists(os.path.join(home, ".claude/plugins/p.txt")):
         problems.append("plugins visible")
+    if os.path.exists(os.path.join(home, ".claude/settings.json")):
+        problems.append("personal settings visible")
+    # Writes to Claude Code's config must not reach the person's own.
+    os.makedirs(os.path.join(home, ".claude/hooks"), exist_ok=True)
+    open(os.path.join(home, ".claude/settings.json"), "w").write("planted")
+    open(os.path.join(home, ".claude.json"), "w").write("planted")
     open("from-engine.txt", "w").write("ok")
     cfg = json.loads(args[args.index("--mcp-config") + 1])["mcpServers"]["cortex"]
     p = subprocess.Popen([cfg["command"]] + cfg["args"], stdin=subprocess.PIPE,
@@ -271,6 +300,7 @@ sleep 60
         std::fs::write(d.join("home/.claude/CLAUDE.md"), "my private rules").unwrap();
         std::fs::write(d.join("home/.claude/plugins/p.txt"), "plugin").unwrap();
         std::fs::write(d.join("home/.claude.json"), "{}").unwrap();
+        std::fs::write(d.join("home/.claude/settings.json"), "mine").unwrap();
         std::fs::write(d.join("home/secret.txt"), "secret").unwrap();
         std::fs::write(d.join("outside.txt"), "outside").unwrap();
         std::fs::create_dir(d.join("bin")).unwrap();
@@ -322,6 +352,16 @@ sleep 60
             "my private rules"
         );
         assert!(d.join("home/.claude/plugins/p.txt").exists());
+        // Nothing the session wrote to its config reached the host.
+        assert_eq!(
+            std::fs::read_to_string(d.join("home/.claude/settings.json")).unwrap(),
+            "mine"
+        );
+        assert_eq!(
+            std::fs::read_to_string(d.join("home/.claude.json")).unwrap(),
+            "{}"
+        );
+        assert!(!d.join("home/.claude/hooks").exists());
     }
 
     #[test]

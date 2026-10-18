@@ -179,3 +179,71 @@ fn git_ignores_planted_hooks_and_gitdir() {
     assert!(commit.is_some());
     assert!(!marker.exists(), "filter driver ran under Cortex's git");
 }
+
+/// A repository the worker made inside its worktree, with a filter driver
+/// in its own config and attributes, edited after its last commit.
+#[cfg(unix)]
+fn plant_nested_repo(wt: &Path, marker: &Path) {
+    let sub = wt.join("sub");
+    std::fs::create_dir(&sub).unwrap();
+    plain_git(&sub, &["init", "-q"]);
+    std::fs::write(sub.join("f.txt"), "one\n").unwrap();
+    plain_git(&sub, &["add", "."]);
+    plain_git(&sub, &["commit", "-qm", "inner"]);
+    plain_git(
+        &sub,
+        &[
+            "config",
+            "filter.evil.clean",
+            &format!("touch {}; cat", marker.display()),
+        ],
+    );
+    std::fs::write(sub.join(".git/info/attributes"), "* filter=evil\n").unwrap();
+    std::fs::write(sub.join("f.txt"), "two\n").unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn git_ignores_nested_repo_config() {
+    let (dir, repo) = repo();
+    let base = head(&repo).unwrap();
+    let marker = dir.path().join("marker");
+
+    // Positive control: plain git in a checkout with such a repo runs it.
+    let ctl = dir.path().join("ctl");
+    plain_git(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "--detach",
+            ctl.to_str().unwrap(),
+            &base,
+        ],
+    );
+    plant_nested_repo(&ctl, &marker);
+    plain_git(&ctl, &["add", "-A"]);
+    plain_git(&ctl, &["status", "--porcelain"]);
+    assert!(
+        marker.exists(),
+        "control: nested filter should run under plain git"
+    );
+    std::fs::remove_file(&marker).unwrap();
+
+    let wt = create_worktree(&repo, &base, &dir.path().join("wt")).unwrap();
+    plant_nested_repo(&wt.path, &marker);
+    let commit = wt.commit_all("nested").unwrap().expect("a commit");
+    assert!(
+        !marker.exists(),
+        "nested repo's filter ran under Cortex's git"
+    );
+    // The nested files land as ordinary files, not as a link to a repo.
+    let tree = plain_git(&repo, &["ls-tree", "-r", &commit]);
+    assert!(
+        tree.contains("blob") && tree.contains("sub/f.txt"),
+        "{tree}"
+    );
+    assert!(!tree.contains("commit "), "{tree}");
+    assert!(!tree.contains("sub/.git"), "{tree}");
+}

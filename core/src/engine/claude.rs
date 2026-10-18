@@ -143,6 +143,8 @@ pub fn read_stream(reader: impl BufRead, on_line: &mut dyn FnMut(&str)) -> Sessi
 /// ended.
 #[derive(Default)]
 struct Stream {
+    /// Claude Code said it bills the signed-in subscription.
+    billing_ok: bool,
     rate_limited: bool,
     resets_at: Option<u64>,
     result: Option<SessionOutcome>,
@@ -155,18 +157,18 @@ impl Stream {
             return None;
         };
         match v["type"].as_str() {
-            Some("system") if v["subtype"] == "init" => {
-                if let Some(source) = v["apiKeySource"].as_str()
-                    && source != "none"
-                {
+            Some("system") if v["subtype"] == "init" => match v["apiKeySource"].as_str() {
+                Some("none") => self.billing_ok = true,
+                Some(source) => {
                     return Some(SessionOutcome::Failed {
                         reason: format!(
                             "Claude Code would bill an API key ({source}); \
-                             Cortex only uses the signed-in subscription"
+                                 Cortex only uses the signed-in subscription"
                         ),
                     });
                 }
-            }
+                None => return Some(unknown_billing()),
+            },
             Some("rate_limit_event") => {
                 let info = &v["rate_limit_info"];
                 if info["status"] == "rejected" {
@@ -175,6 +177,7 @@ impl Stream {
                 }
             }
             Some("assistant") if v["error"] == "rate_limit" => self.rate_limited = true,
+            Some("result") if !self.billing_ok => return Some(unknown_billing()),
             Some("result") => self.result = Some(self.judge(&v)),
             _ => {}
         }
@@ -229,6 +232,14 @@ impl Stream {
     }
 }
 
+/// Cortex never lets a session run when it cannot tell that it bills the
+/// subscription rather than an API key.
+fn unknown_billing() -> SessionOutcome {
+    SessionOutcome::Failed {
+        reason: "Claude Code did not say how it bills; update Claude Code".into(),
+    }
+}
+
 fn looks_limited(text: &str) -> bool {
     let text = text.to_lowercase();
     ["hit your limit", "usage limit", "rate limit"]
@@ -263,8 +274,6 @@ mod jail {
     use std::time::Instant;
 
     const STDERR_TAIL: usize = 2000;
-    /// Personal Claude Code folders a session must not pick up.
-    const HIDDEN: [&str; 5] = ["plugins", "skills", "agents", "commands", "projects"];
 
     pub fn run(
         engine: &ClaudeEngine,
@@ -277,11 +286,8 @@ mod jail {
             checks_dir: input.checks_dir.canonicalize()?,
             ..input.clone()
         };
-        // Covers the personal CLAUDE.md. `/dev/null` cannot: the jail's
-        // mounts allow no device files, so it would read as "permission
-        // denied" instead of empty.
-        let empty = Empty::new()?;
-        let mut cmd = jail(engine, &input, &empty.0)?;
+        let state = StateCopy::new(&engine.home)?;
+        let mut cmd = jail(engine, &input, &state.0)?;
         cmd.args(engine.build_args(&input))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -293,21 +299,24 @@ mod jail {
         outcome
     }
 
-    /// A fresh empty file, removed when dropped.
-    struct Empty(std::path::PathBuf);
+    /// A throwaway copy of `~/.claude.json` for one session, removed when
+    /// dropped, so nothing the session writes there reaches the person's.
+    struct StateCopy(std::path::PathBuf);
 
-    impl Empty {
-        fn new() -> Result<Self> {
-            let path = std::env::temp_dir().join(format!("cortex-empty-{}", uuid::Uuid::new_v4()));
-            std::fs::OpenOptions::new()
+    impl StateCopy {
+        fn new(home: &Path) -> Result<Self> {
+            let path = std::env::temp_dir().join(format!("cortex-state-{}", uuid::Uuid::new_v4()));
+            let text = std::fs::read(home.join(".claude.json")).unwrap_or_else(|_| b"{}".to_vec());
+            let mut file = std::fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
                 .open(&path)?;
+            file.write_all(&text)?;
             Ok(Self(path))
         }
     }
 
-    impl Drop for Empty {
+    impl Drop for StateCopy {
         fn drop(&mut self) {
             let _ = std::fs::remove_file(&self.0);
         }
@@ -390,7 +399,7 @@ mod jail {
         let _ = child.wait();
     }
 
-    fn jail(engine: &ClaudeEngine, input: &SessionInput, empty: &Path) -> Result<Command> {
+    fn jail(engine: &ClaudeEngine, input: &SessionInput, state: &Path) -> Result<Command> {
         let bwrap = find(Path::new("bwrap"))?;
         let claude = find(&engine.binary)?.canonicalize()?;
         let claude_dir = claude
@@ -422,20 +431,14 @@ mod jail {
             .args(["--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp"])
             .arg("--tmpfs")
             .arg(home);
-        // Claude Code keeps and refreshes its sign-in here.
-        cmd.arg("--bind-try").arg(&config).arg(&config);
-        let state = home.join(".claude.json");
-        cmd.arg("--bind-try").arg(&state).arg(&state);
-        let personal = config.join("CLAUDE.md");
-        if personal.exists() {
-            cmd.arg("--ro-bind").arg(empty).arg(&personal);
-        }
-        for name in HIDDEN {
-            let dir = config.join(name);
-            if dir.is_dir() {
-                cmd.arg("--tmpfs").arg(&dir);
-            }
-        }
+        // A fresh `~/.claude` holding only the sign-in, which Claude Code
+        // may refresh. Nothing else the person keeps there (settings,
+        // hooks, plugins, CLAUDE.md) is visible, and nothing the session
+        // writes there survives it.
+        cmd.arg("--tmpfs").arg(&config);
+        let creds = config.join(".credentials.json");
+        cmd.arg("--bind-try").arg(&creds).arg(&creds);
+        cmd.arg("--bind").arg(state).arg(home.join(".claude.json"));
         cmd.arg("--bind").arg(&input.worktree).arg(&input.worktree);
         cmd.arg("--ro-bind")
             .arg(&input.checks_dir)
