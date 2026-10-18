@@ -2,6 +2,7 @@
 
 pub mod error;
 pub mod event;
+pub mod git;
 pub mod sandbox;
 pub mod store;
 
