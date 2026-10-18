@@ -30,4 +30,4 @@ jobs:
           workspaces: core
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
-      - run: cargo test
+      - run: cargo test --no-fail-fast
