@@ -422,13 +422,20 @@ mod jail {
         for dir in ["/bin", "/sbin", "/lib", "/lib64", "/lib32"] {
             cmd.args(["--ro-bind-try", dir, dir]);
         }
-        cmd.args(["--ro-bind", "/etc", "/etc"])
-            .args([
-                "--ro-bind-try",
-                "/run/systemd/resolve",
-                "/run/systemd/resolve",
-            ])
-            .args(["--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp"])
+        cmd.args(["--ro-bind", "/etc", "/etc"]).args([
+            "--ro-bind-try",
+            "/run/systemd/resolve",
+            "/run/systemd/resolve",
+        ]);
+        // WSL links /etc/resolv.conf to /mnt/wsl/resolv.conf; without that
+        // one file Claude Code cannot look up its server's address.
+        if let Ok(resolv) = std::fs::canonicalize("/etc/resolv.conf")
+            && !resolv.starts_with("/etc")
+            && !resolv.starts_with("/run/systemd/resolve")
+        {
+            cmd.arg("--ro-bind").arg(&resolv).arg(&resolv);
+        }
+        cmd.args(["--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp"])
             .arg("--tmpfs")
             .arg(home);
         // A fresh `~/.claude` holding only the sign-in, which Claude Code
