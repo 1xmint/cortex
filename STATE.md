@@ -11,6 +11,10 @@ What is true now and what comes next. Kept under 150 lines by CI.
 - Code: one Rust crate in `core/` (binary `cortex`), checked on every PR by
   the `rust` job (format, lint, tests on Ubuntu 24.04). It only prints its
   version so far.
+- Sandbox (ADR 0004) works in CI: bubblewrap wraps gVisor (`runsc do
+  -force-overlay=false`, no network). `cortex doctor` proves a planted
+  secret is unreadable and the network unreachable. Not yet proven inside
+  WSL2 on the owner's PC.
 - Brain design approved:
   [docs/superpowers/specs/2026-10-18-cortex-brain-design.md](docs/superpowers/specs/2026-10-18-cortex-brain-design.md).
   Approved by the owner on 2026-10-18 after an independent review and a
