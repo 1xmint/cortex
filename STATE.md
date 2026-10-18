@@ -13,8 +13,8 @@ What is true now and what comes next. Kept under 150 lines by CI.
   version so far.
 - Sandbox (ADR 0004) works in CI: bubblewrap wraps gVisor (`runsc do
   -force-overlay=false`, no network). `cortex doctor` proves a planted
-  secret is unreadable and the network unreachable. Not yet proven inside
-  WSL2 on the owner's PC.
+  secret is unreadable and the network unreachable. Also proven in WSL2
+  Ubuntu on the owner's PC (2026-10-18).
 - Mission log (ADR 0003): append-only events per mission in SQLite (WAL),
   refused updates and deletes, project-scoped missions, and leases so one
   process drives a mission at a time.
@@ -47,9 +47,9 @@ What is true now and what comes next. Kept under 150 lines by CI.
   session that would bill an API key, or does not say how it bills, is
   refused. A usage limit parks the mission until the reset time: the park
   is recorded (a restart keeps waiting), `stop` ends it, and parked time
-  does not count against the 2 h. Proven in CI with stand-in binaries only; a real
-  signed-in session (`cargo test -- --ignored claude_cannot_run_shell`) has
-  not run yet.
+  does not count against the 2 h. Proven in CI with stand-in binaries, and
+  on 2026-10-18 with the real signed-in CLI (2.1.302) in WSL Ubuntu:
+  `cargo test -- --ignored claude_cannot_run_shell` passed.
 - API engine: `--engine api` talks to the Claude API directly
   (`claude-sonnet-5-5`, key from `ANTHROPIC_API_KEY`) with four tools: read,
   write and list files inside the worktree only, and `run`, which goes
@@ -70,7 +70,10 @@ What is true now and what comes next. Kept under 150 lines by CI.
   checks that fail on its starting project. `cortex bench --engine claude`
   runs them all as missions and writes `bench/results/<date>-<engine>.json`.
   CI proves the checks fail on every start and that known answers pass all
-  ten with the fake engine. No real engine has run it yet.
+  ten with the fake engine. First real run, 2026-10-18, Claude Code on the
+  owner's subscription: **10 of 10 passed**, each in one session, 10–20 s
+  each ([bench/results/2026-10-18-claude.json](bench/results/2026-10-18-claude.json)).
+  These prompts are now too easy to tell engines apart; harder ones are next.
 - Brain design approved:
   [docs/superpowers/specs/2026-10-18-cortex-brain-design.md](docs/superpowers/specs/2026-10-18-cortex-brain-design.md).
   Approved by the owner on 2026-10-18 after an independent review and a
@@ -79,9 +82,8 @@ What is true now and what comes next. Kept under 150 lines by CI.
   event log in SQLite ([0003](docs/adr/0003-event-log-in-sqlite.md)), sandbox
   ([0004](docs/adr/0004-sandbox-bubblewrap-gvisor.md)), engines
   ([0005](docs/adr/0005-engines.md)).
-- Slice 1 plan written:
-  [docs/superpowers/plans/2026-10-18-brain-slice-1.md](docs/superpowers/plans/2026-10-18-brain-slice-1.md).
-  Being built task by task.
+- Slice 1 ([plan](docs/superpowers/plans/2026-10-18-brain-slice-1.md)) is
+  built and proven on a real engine (2026-10-18).
 
 ## Decisions
 
@@ -112,6 +114,10 @@ What is true now and what comes next. Kept under 150 lines by CI.
   Code refreshes it by replacing the file, the refresh is lost (unproven on
   the real CLI). A `claude` installed under nvm or npm outside
   `/usr` and the home folder may not run in the jail.
+- Accepted work can include build leftovers: the real bench run committed
+  Python's `__pycache__` files alongside the answers.
+- The Claude engine runs whatever model the CLI defaults to (Opus on the
+  owner's plan), which spends the five-hour usage limit fastest.
 
 ## Next slices
 
@@ -119,8 +125,7 @@ What is true now and what comes next. Kept under 150 lines by CI.
 2. ADRs for the core, storage, sandbox and engines (done); later components
    get theirs when their slice starts. The first code PR adds build, lint and
    test checks to CI.
-3. First brain slice: built test-first, **unproven on a real engine**. It
-   is done when the owner, in WSL Ubuntu, runs `cortex doctor`,
-   `cargo test -- --ignored claude_cannot_run_shell` and
-   `cortex bench --engine claude`, at least 7 of 10 pass, and that results
-   file is committed.
+3. First brain slice: done 2026-10-18 (doctor, jail test and a 10 of 10
+   bench run in WSL Ubuntu).
+4. Next: a harder bench that real engines can fail, so scores mean
+   something; then the slice-2 plan from the design document.

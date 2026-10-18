@@ -1,0 +1,90 @@
+{
+  "engine": "claude",
+  "engine_version": "2.1.302 (Claude Code)",
+  "cortex_commit": "2263b2118bea87c347d62f457938eae307ed51fb",
+  "started": "2026-10-18T22:24:48Z",
+  "prompts": [
+    {
+      "id": "01-fizzbuzz",
+      "passed": true,
+      "sessions": 1,
+      "seconds": 12.604717319,
+      "blocked_checks": [],
+      "mission_id": "12cea6ca-762e-4bf8-95f5-fca5c9fa108c"
+    },
+    {
+      "id": "02-word-count",
+      "passed": true,
+      "sessions": 1,
+      "seconds": 10.605943125,
+      "blocked_checks": [],
+      "mission_id": "f7759937-1dbd-4799-9f85-2a506039a112"
+    },
+    {
+      "id": "03-roman",
+      "passed": true,
+      "sessions": 1,
+      "seconds": 20.272932577,
+      "blocked_checks": [],
+      "mission_id": "6a2d75c5-6828-40e9-b1be-43b0e6caf7f8"
+    },
+    {
+      "id": "04-json-merge",
+      "passed": true,
+      "sessions": 1,
+      "seconds": 19.792927138,
+      "blocked_checks": [],
+      "mission_id": "7a774159-c4c4-42c0-8578-80d4a7a7fc6c"
+    },
+    {
+      "id": "05-csv-stats",
+      "passed": true,
+      "sessions": 1,
+      "seconds": 16.960034495,
+      "blocked_checks": [],
+      "mission_id": "8eeeddf0-4e39-438a-848e-817898eebc1b"
+    },
+    {
+      "id": "06-brackets",
+      "passed": true,
+      "sessions": 1,
+      "seconds": 9.81490035,
+      "blocked_checks": [],
+      "mission_id": "c0768e86-0092-4151-92e6-0e71f695f1fa"
+    },
+    {
+      "id": "07-lru-cache",
+      "passed": true,
+      "sessions": 1,
+      "seconds": 10.229020818,
+      "blocked_checks": [],
+      "mission_id": "7ede3aec-56e7-4bc2-a9b2-62c60d04fa97"
+    },
+    {
+      "id": "08-todo-cli",
+      "passed": true,
+      "sessions": 1,
+      "seconds": 18.970487915,
+      "blocked_checks": [],
+      "mission_id": "7acc38c4-3cd8-4f3a-a524-2192b0f9ba1e"
+    },
+    {
+      "id": "09-markdown-toc",
+      "passed": true,
+      "sessions": 1,
+      "seconds": 16.994527054,
+      "blocked_checks": [],
+      "mission_id": "27bcacd8-4827-43f5-b15e-bffc17197828"
+    },
+    {
+      "id": "10-rate-limiter",
+      "passed": true,
+      "sessions": 1,
+      "seconds": 10.465744531,
+      "blocked_checks": [],
+      "mission_id": "f6094ba6-95a9-42fb-a5d1-0caccde35fb3"
+    }
+  ],
+  "passed": 10,
+  "total": 10
+}
