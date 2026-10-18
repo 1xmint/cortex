@@ -43,7 +43,7 @@ fn cannot_read_planted_key() {
 
 #[test]
 fn cannot_reach_network() {
-    let probe = "import socket; socket.create_connection(('1.1.1.1', 53), 3); print('NET OPEN')";
+    let probe = "import socket; socket.create_connection(('1.1.1.1', 53), 3); print('NET', 'OPEN')";
     let host = std::process::Command::new("python3")
         .args(["-c", probe])
         .output()
