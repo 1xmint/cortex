@@ -1,6 +1,7 @@
 # Cortex brain: architecture design
 
-Status: draft for owner approval (revised after independent review) ·
+Status: approved by the owner on 2026-10-18 ("work until the plan is
+completed"), after an independent review and a builder check ·
 Date: 2026-10-18
 
 This is the design the ADRs and the first brain slice are built from. It
@@ -409,13 +410,15 @@ against labelled examples, and bench prompts with art and sound.
 
 ## 6. Decisions that are the owner's
 
-1. **Turn on WSL2 on this PC.** All model-written code runs on a Linux side,
-   and on Windows that is WSL2, a Windows feature you switch on once.
-   Without it slice 1 cannot run anything, because unisolated runs are never
-   the fallback. Recommendation: yes.
-2. **Who Cortex serves first.** Recommendation: you, on your own machine,
-   with data kept per project and per person from day one, so hosting for
-   others and teams later is a move, not a rewrite.
+1. **A Linux side on this PC.** All model-written code runs on Linux. WSL2
+   is already switched on here (Docker Desktop uses it), but it has no
+   general Linux system yet. Installing one (Ubuntu, one command) is needed
+   before the slice 1 bench can run on this PC; until then the sandbox is
+   proven on GitHub's Linux machines. Unisolated runs are never the
+   fallback.
+2. **Who Cortex serves first:** the owner, on his own machine, with data
+   kept per project and per person from day one, so hosting for others and
+   teams later is a move, not a rewrite.
 
 Email notifications (slice 3) will need a way to send mail, which is a
 credential decision for then.
