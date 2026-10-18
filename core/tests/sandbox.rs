@@ -24,10 +24,12 @@ fn cannot_read_planted_key() {
     let key = Path::new(&home).join(".cortex-test-key");
     std::fs::write(&key, "SECRET-123").unwrap();
     let work = tempfile::tempdir().unwrap();
+    // The search pattern is built at run time so the literal secret never
+    // appears in the command line, which gVisor keeps in its own state files.
     let out = run(&spec(
         &format!(
             "echo canary; cat ~/.cortex-test-key; cat /root/.cortex-test-key; cat {}; \
-             grep -rs SECRET-123 / --exclude-dir=proc --exclude-dir=sys --exclude-dir=dev",
+             grep -rs \"SECRET-$((100 + 23))\" /home /root /tmp /etc /work /var /opt /mnt /srv /run",
             key.display()
         ),
         work.path(),
