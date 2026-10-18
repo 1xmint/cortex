@@ -18,6 +18,10 @@ What is true now and what comes next. Kept under 150 lines by CI.
 - Mission log (ADR 0003): append-only events per mission in SQLite (WAL),
   refused updates and deletes, project-scoped missions, and leases so one
   process drives a mission at a time.
+- Git: each worker session gets a disposable worktree; git run there
+  ignores planted hooks, fsmonitor, `.gitattributes` filters and a swapped
+  `.git` file. Accepted work moves a `cortex/...` branch, never the
+  person's checked-out one.
 - Brain design approved:
   [docs/superpowers/specs/2026-10-18-cortex-brain-design.md](docs/superpowers/specs/2026-10-18-cortex-brain-design.md).
   Approved by the owner on 2026-10-18 after an independent review and a
