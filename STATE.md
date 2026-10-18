@@ -73,7 +73,8 @@ What is true now and what comes next. Kept under 150 lines by CI.
   ten with the fake engine. First real run, 2026-10-18, Claude Code on the
   owner's subscription: **10 of 10 passed**, each in one session, 10–20 s
   each ([bench/results/2026-10-18-claude.json](bench/results/2026-10-18-claude.json)).
-  These prompts are now too easy to tell engines apart; harder ones are next.
+  These prompts are too easy to tell engines apart; slice 2 reuses them
+  with only the plain request, which is harder.
 - Brain design approved:
   [docs/superpowers/specs/2026-10-18-cortex-brain-design.md](docs/superpowers/specs/2026-10-18-cortex-brain-design.md).
   Approved by the owner on 2026-10-18 after an independent review and a
@@ -127,5 +128,8 @@ What is true now and what comes next. Kept under 150 lines by CI.
    test checks to CI.
 3. First brain slice: done 2026-10-18 (doctor, jail test and a 10 of 10
    bench run in WSL Ubuntu).
-4. Next: a harder bench that real engines can fail, so scores mean
-   something; then the slice-2 plan from the design document.
+4. Next: slice 2, plain words in, proven work out (reordered by the owner
+   on 2026-10-18): Cortex writes its own checks, Codex reviews them, and a
+   chat page sits on top
+   ([design](docs/superpowers/specs/2026-10-18-slice-2-plain-words-design.md),
+   awaiting approval). Memory and the working agreement come after.
