@@ -7,7 +7,10 @@ What is true now and what comes next. Kept under 150 lines by CI.
 ## Where things stand
 
 - Foundation: this repository, its rules ([AGENTS.md](AGENTS.md)) and the
-  checks that keep the docs honest. No product code yet.
+  checks that keep the docs honest.
+- Code: one Rust crate in `core/` (binary `cortex`), checked on every PR by
+  the `rust` job (format, lint, tests on Ubuntu 24.04). It only prints its
+  version so far.
 - Brain design approved:
   [docs/superpowers/specs/2026-10-18-cortex-brain-design.md](docs/superpowers/specs/2026-10-18-cortex-brain-design.md).
   Approved by the owner on 2026-10-18 after an independent review and a
