@@ -1,5 +1,6 @@
 use clap::{Parser, Subcommand, ValueEnum};
 use cortex::engine::Engine;
+use cortex::engine::api::{ApiEngine, HttpTransport};
 use cortex::engine::claude::ClaudeEngine;
 use cortex::engine::fake::FakeEngine;
 use cortex::event::Event;
@@ -151,9 +152,7 @@ fn engine(kind: EngineKind, fake_script: Option<PathBuf>) -> cortex::Result<Box<
             Ok(Box::new(FakeEngine::load(&path)?))
         }
         EngineKind::Claude => Ok(Box::new(ClaudeEngine::new(PathBuf::from("claude"))?)),
-        EngineKind::Api => Err(cortex::Error::Invalid(
-            "the API engine is not built yet".into(),
-        )),
+        EngineKind::Api => Ok(Box::new(ApiEngine::new(HttpTransport::from_env()?))),
     }
 }
 

@@ -32,7 +32,8 @@ What is true now and what comes next. Kept under 150 lines by CI.
   checks, sees them fail, then gives an engine up to 4 sessions (20 min
   each, 2 h total). Work is accepted only when every check passes, onto
   branch `cortex/<mission>`; `cortex status <mission>` shows how to merge
-  it. `--engine claude` (the default) and the fake engine are wired.
+  it. `--engine claude` (the default), `--engine api` and the fake engine
+  are wired.
 - Claude Code engine: runs `claude -p --restricted` on the person's
   subscription inside a bubblewrap jail that shows only system files, its
   own config (personal CLAUDE.md, plugins, skills and history hidden), the
@@ -42,6 +43,13 @@ What is true now and what comes next. Kept under 150 lines by CI.
   until the reset time. Proven in CI with stand-in binaries only; a real
   signed-in session (`cargo test -- --ignored claude_cannot_run_shell`) has
   not run yet.
+- API engine: `--engine api` talks to the Claude API directly
+  (`claude-sonnet-5-5`, key from `ANTHROPIC_API_KEY`) with four tools: read,
+  write and list files inside the worktree only, and `run`, which goes
+  through the gVisor sandbox. The key is sent in a header and scrubbed from
+  every transcript line and failure note. Stops after 50 turns. Proven in CI
+  against recorded replies and a local stand-in server; it has never called
+  the real API.
 - Crash recovery: if the process dies at any point, `cortex resume
   <mission>` finishes the mission as if nothing happened (kill-tested after
   every kind of event). A dead process's lock is taken over at once; a
