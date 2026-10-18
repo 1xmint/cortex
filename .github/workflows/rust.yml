@@ -17,6 +17,14 @@ jobs:
         working-directory: core
     steps:
       - uses: actions/checkout@v7
+      - name: Sandbox tools (bubblewrap, gVisor)
+        working-directory: .
+        run: |
+          # Ubuntu 24.04 blocks unprivileged user namespaces through AppArmor.
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          curl -fsSL https://gvisor.dev/archive.key | sudo gpg --dearmor -o /usr/share/keyrings/gvisor-archive-keyring.gpg
+          echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/gvisor-archive-keyring.gpg] https://storage.googleapis.com/gvisor/releases release main" | sudo tee /etc/apt/sources.list.d/gvisor.list
+          sudo apt-get update -q && sudo apt-get install -yq bubblewrap runsc
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: core
