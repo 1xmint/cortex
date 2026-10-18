@@ -43,3 +43,4 @@ What is true now and what comes next. Kept under 150 lines by CI.
    The technology ADRs add build, lint and test checks to CI.
 3. First brain slice, planned with superpowers:writing-plans and built
    test-first.
+See [missing](docs/does-not-exist.md).
