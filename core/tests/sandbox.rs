@@ -111,3 +111,14 @@ fn uses_gvisor_kernel() {
     let out = run(&spec("cat /proc/version", work.path())).unwrap();
     assert!(out.stdout.contains("gvisor"), "{out:?}");
 }
+
+#[test]
+fn doctor_reports_ok() {
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_cortex"))
+        .arg("doctor")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{stdout}");
+    assert!(stdout.contains("sandbox: ok"), "{stdout}");
+}
