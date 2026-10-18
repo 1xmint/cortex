@@ -11,7 +11,11 @@ What is true now and what comes next. Kept under 150 lines by CI.
 - Brain design approved:
   [docs/superpowers/specs/2026-10-18-cortex-brain-design.md](docs/superpowers/specs/2026-10-18-cortex-brain-design.md).
   Approved by the owner on 2026-10-18 after an independent review and a
-  builder check. ADRs from it come next.
+  builder check.
+- Foundational ADRs accepted: Rust core ([0002](docs/adr/0002-rust-core.md)),
+  event log in SQLite ([0003](docs/adr/0003-event-log-in-sqlite.md)), sandbox
+  ([0004](docs/adr/0004-sandbox-bubblewrap-gvisor.md)), engines
+  ([0005](docs/adr/0005-engines.md)). Slice 1 plan next.
 
 ## Decisions
 
@@ -41,7 +45,8 @@ What is true now and what comes next. Kept under 150 lines by CI.
 ## Next slices
 
 1. Brain architecture study → design document → owner approval (done).
-2. ADRs from the approved design, including one technology ADR per component.
-   The technology ADRs add build, lint and test checks to CI.
+2. ADRs for the core, storage, sandbox and engines (done); later components
+   get theirs when their slice starts. The first code PR adds build, lint and
+   test checks to CI.
 3. First brain slice, planned with superpowers:writing-plans and built
    test-first.
