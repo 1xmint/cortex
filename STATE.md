@@ -10,7 +10,8 @@ What is true now and what comes next. Kept under 150 lines by CI.
   checks that keep the docs honest. No product code yet.
 - Brain design drafted:
   [docs/superpowers/specs/2026-10-18-cortex-brain-design.md](docs/superpowers/specs/2026-10-18-cortex-brain-design.md).
-  Awaiting review and owner approval before any brain code is written.
+  Revised after an independent review and a builder check; awaiting owner
+  approval before any brain code is written.
 
 ## Decisions
 
