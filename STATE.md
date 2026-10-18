@@ -15,7 +15,10 @@ What is true now and what comes next. Kept under 150 lines by CI.
 - Foundational ADRs accepted: Rust core ([0002](docs/adr/0002-rust-core.md)),
   event log in SQLite ([0003](docs/adr/0003-event-log-in-sqlite.md)), sandbox
   ([0004](docs/adr/0004-sandbox-bubblewrap-gvisor.md)), engines
-  ([0005](docs/adr/0005-engines.md)). Slice 1 plan next.
+  ([0005](docs/adr/0005-engines.md)).
+- Slice 1 plan written:
+  [docs/superpowers/plans/2026-10-18-brain-slice-1.md](docs/superpowers/plans/2026-10-18-brain-slice-1.md).
+  Being built task by task.
 
 ## Decisions
 
