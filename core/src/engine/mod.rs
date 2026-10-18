@@ -2,6 +2,7 @@
 //! change files. What an engine says about its own result is only a note;
 //! Cortex's checks decide.
 
+pub mod claude;
 pub mod fake;
 
 use crate::Result;
@@ -14,6 +15,8 @@ use std::time::Duration;
 pub struct SessionInput {
     pub brief: String,
     pub worktree: PathBuf,
+    /// The frozen checks, which the engine's `test` tool runs read-only.
+    pub checks_dir: PathBuf,
     /// 1-based session number within the mission.
     pub session: u32,
     pub timeout: Duration,
