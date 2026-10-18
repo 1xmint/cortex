@@ -8,8 +8,9 @@ What is true now and what comes next. Kept under 150 lines by CI.
 
 - Foundation: this repository, its rules ([AGENTS.md](AGENTS.md)) and the
   checks that keep the docs honest. No product code yet.
-- Next: the brain architecture study, which ends in a design document the
-  owner approves before any brain code is written.
+- Brain design drafted:
+  [docs/superpowers/specs/2026-10-18-cortex-brain-design.md](docs/superpowers/specs/2026-10-18-cortex-brain-design.md).
+  Awaiting review and owner approval before any brain code is written.
 
 ## Decisions
 
