@@ -36,6 +36,15 @@ enum Cmd {
         /// What you want, in plain words.
         request: String,
     },
+    /// Continue a mission after a crash, restart or pause.
+    Resume {
+        mission: String,
+        #[arg(long, value_enum, default_value_t = EngineKind::Claude)]
+        engine: EngineKind,
+        /// Script for the fake engine.
+        #[arg(long)]
+        fake_script: Option<PathBuf>,
+    },
     /// Show where a mission stands and where its result is.
     Status { mission: String },
 }
@@ -59,6 +68,11 @@ fn main() -> ExitCode {
             fake_script,
             request,
         }) => run(&repo, &checks, engine, fake_script, &request),
+        Some(Cmd::Resume {
+            mission,
+            engine,
+            fake_script,
+        }) => resume(&MissionId(mission), engine, fake_script),
         Some(Cmd::Status { mission }) => status(&MissionId(mission)),
     };
     result.unwrap_or_else(|e| {
@@ -135,6 +149,15 @@ fn run(
         Outcome::Stuck { .. } => ExitCode::from(2),
         _ => ExitCode::SUCCESS,
     })
+}
+
+fn resume(
+    m: &MissionId,
+    kind: EngineKind,
+    fake_script: Option<PathBuf>,
+) -> cortex::Result<ExitCode> {
+    let _ = (m, kind, fake_script);
+    Err(cortex::Error::Invalid("resume is not built yet".into()))
 }
 
 fn status(m: &MissionId) -> cortex::Result<ExitCode> {
