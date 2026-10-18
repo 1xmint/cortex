@@ -277,7 +277,11 @@ mod jail {
             checks_dir: input.checks_dir.canonicalize()?,
             ..input.clone()
         };
-        let mut cmd = jail(engine, &input)?;
+        // Covers the personal CLAUDE.md. `/dev/null` cannot: the jail's
+        // mounts allow no device files, so it would read as "permission
+        // denied" instead of empty.
+        let empty = Empty::new()?;
+        let mut cmd = jail(engine, &input, &empty.0)?;
         cmd.args(engine.build_args(&input))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -287,6 +291,26 @@ mod jail {
         let outcome = watch(&mut child, &input, on_line, cancel);
         kill(&mut child);
         outcome
+    }
+
+    /// A fresh empty file, removed when dropped.
+    struct Empty(std::path::PathBuf);
+
+    impl Empty {
+        fn new() -> Result<Self> {
+            let path = std::env::temp_dir().join(format!("cortex-empty-{}", uuid::Uuid::new_v4()));
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)?;
+            Ok(Self(path))
+        }
+    }
+
+    impl Drop for Empty {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
     }
 
     fn watch(
@@ -366,7 +390,7 @@ mod jail {
         let _ = child.wait();
     }
 
-    fn jail(engine: &ClaudeEngine, input: &SessionInput) -> Result<Command> {
+    fn jail(engine: &ClaudeEngine, input: &SessionInput, empty: &Path) -> Result<Command> {
         let bwrap = find(Path::new("bwrap"))?;
         let claude = find(&engine.binary)?.canonicalize()?;
         let claude_dir = claude
@@ -404,7 +428,7 @@ mod jail {
         cmd.arg("--bind-try").arg(&state).arg(&state);
         let personal = config.join("CLAUDE.md");
         if personal.exists() {
-            cmd.args(["--ro-bind", "/dev/null"]).arg(&personal);
+            cmd.arg("--ro-bind").arg(empty).arg(&personal);
         }
         for name in HIDDEN {
             let dir = config.join(name);
