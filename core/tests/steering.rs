@@ -108,7 +108,9 @@ impl Env {
     fn interrupted(&self, m: &MissionId) -> usize {
         self.events(m)
             .iter()
-            .filter(|e| matches!(e, Event::SessionAbandoned { reason, .. } if reason == "interrupted"))
+            .filter(
+                |e| matches!(e, Event::SessionAbandoned { reason, .. } if reason == "interrupted"),
+            )
             .count()
     }
     fn worktrees(&self) -> usize {
@@ -166,7 +168,11 @@ fn stop_with_text_cancels_and_replans() {
         stop(&e.store, &m, Some("make the greeting lowercase")).unwrap();
         run.join().unwrap()
     });
-    assert!(begun.elapsed() < Duration::from_secs(15), "{:?}", begun.elapsed());
+    assert!(
+        begun.elapsed() < Duration::from_secs(15),
+        "{:?}",
+        begun.elapsed()
+    );
     assert!(matches!(outcome, Outcome::Done { .. }), "{outcome:?}");
     assert_eq!(e.interrupted(&m), 1, "{:#?}", e.events(&m));
     let briefs = e.briefs(&m);
@@ -191,7 +197,11 @@ fn stop_without_text_pauses_then_resume_finishes() {
         stop(&e.store, &m, None).unwrap();
         run.join().unwrap()
     });
-    assert!(begun.elapsed() < Duration::from_secs(15), "{:?}", begun.elapsed());
+    assert!(
+        begun.elapsed() < Duration::from_secs(15),
+        "{:?}",
+        begun.elapsed()
+    );
     assert_eq!(outcome, Outcome::Paused);
     assert_eq!(e.interrupted(&m), 1);
     assert!(matches!(e.events(&m).last(), Some(Event::MissionPaused)));

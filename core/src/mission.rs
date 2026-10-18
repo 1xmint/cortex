@@ -198,7 +198,24 @@ fn drive_held(
     }
 
     loop {
-        let events = only_events(store, m)?;
+        let logged = store.events(m)?;
+        let seen = logged.last().map_or(0, |(seq, _)| *seq);
+        let events: Vec<Event> = logged.into_iter().map(|(_, e)| e).collect();
+        if pause_requested(&events) {
+            store.append(m, &Event::MissionPaused)?;
+            return Ok(Outcome::Paused);
+        }
+        let replans = replans_asked(&events);
+        if replans > budgets.replans {
+            return stuck(
+                store,
+                m,
+                format!(
+                    "the plan was changed {replans} times, more than the {} allowed",
+                    budgets.replans
+                ),
+            );
+        }
         let used = sessions_used(&events);
         if used >= budgets.sessions {
             return stuck(
@@ -214,7 +231,7 @@ fn drive_held(
         let text = brief(
             &st.request,
             &last_failures(&events),
-            &steers_since_session(&events),
+            &added_by_person(&events),
         );
         let base = last_accepted(&events).unwrap_or_else(|| st.base.clone());
         let dest = work_dir(home, m).join(format!("s{session}"));
@@ -236,25 +253,37 @@ fn drive_held(
             timeout: budgets.session_timeout.min(left),
         };
         let mut transcript_err = None;
-        let outcome = engine.run(
-            &input,
-            &mut |line| {
-                if transcript_err.is_none()
-                    && let Err(e) = store.append(
-                        m,
-                        &Event::Transcript {
-                            session,
-                            line: line.to_string(),
-                        },
-                    )
-                {
-                    transcript_err = Some(e);
-                }
-            },
-            &CancelToken::new(),
-        )?;
+        let cancel = CancelToken::new();
+        let ended = AtomicBool::new(false);
+        let outcome = std::thread::scope(|s| {
+            s.spawn(|| watch_for_stop(store, m, seen, &cancel, &ended));
+            let r = engine.run(
+                &input,
+                &mut |line| {
+                    if transcript_err.is_none()
+                        && let Err(e) = store.append(
+                            m,
+                            &Event::Transcript {
+                                session,
+                                line: line.to_string(),
+                            },
+                        )
+                    {
+                        transcript_err = Some(e);
+                    }
+                },
+                &cancel,
+            );
+            ended.store(true, Ordering::SeqCst);
+            r
+        })?;
         if let Some(e) = transcript_err {
             return Err(e);
+        }
+        // The person stopped it: whatever the session did is dropped.
+        if cancel.is_cancelled() {
+            abandon(store, m, wt, session, INTERRUPTED)?;
+            continue;
         }
         match outcome {
             SessionOutcome::Ended { note } => {
@@ -293,6 +322,80 @@ fn drive_held(
 }
 
 const RATE_LIMITED: &str = "rate limited";
+const INTERRUPTED: &str = "interrupted";
+const STOP_POLL: Duration = Duration::from_millis(500);
+
+/// Cancels the running session once the person stops the mission, that
+/// is, once an `Interrupt` lands after event `seen`.
+fn watch_for_stop(
+    store: &Store,
+    m: &MissionId,
+    seen: u64,
+    cancel: &CancelToken,
+    ended: &AtomicBool,
+) {
+    let mut polled = Instant::now();
+    while !ended.load(Ordering::SeqCst) {
+        if polled.elapsed() >= STOP_POLL {
+            polled = Instant::now();
+            let stopped = store.events_after(m, seen).is_ok_and(|new| {
+                new.iter()
+                    .any(|(_, e)| matches!(e, Event::Interrupt { .. }))
+            });
+            if stopped {
+                cancel.cancel();
+                return;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Adds an instruction from the person; every later brief includes it.
+pub fn steer(store: &Store, m: &MissionId, text: &str) -> Result<()> {
+    still_open(store, m)?;
+    store.append(
+        m,
+        &Event::Steer {
+            text: text.to_string(),
+        },
+    )?;
+    Ok(())
+}
+
+/// Stops the running session. With text, the mission re-plans with it;
+/// without, the mission pauses until `resume`.
+pub fn stop(store: &Store, m: &MissionId, text: Option<&str>) -> Result<()> {
+    still_open(store, m)?;
+    store.append(
+        m,
+        &Event::Interrupt {
+            text: text.map(str::to_string),
+        },
+    )?;
+    Ok(())
+}
+
+/// Lets a paused mission, or one asked to pause, carry on when driven.
+pub fn resume(store: &Store, m: &MissionId) -> Result<()> {
+    let events = only_events(store, m)?;
+    started(&events)?;
+    if finished(&events) == Some(Outcome::Paused) || pause_requested(&events) {
+        store.append(m, &Event::MissionResumed)?;
+    }
+    Ok(())
+}
+
+fn still_open(store: &Store, m: &MissionId) -> Result<()> {
+    let events = only_events(store, m)?;
+    started(&events)?;
+    match finished(&events) {
+        Some(Outcome::Done { .. } | Outcome::Stuck { .. }) => {
+            Err(Error::Invalid(format!("mission {} is finished", m.0)))
+        }
+        _ => Ok(()),
+    }
+}
 
 /// Commits the session's work and runs every check on it. The commit, if
 /// all of them passed.
@@ -664,17 +767,40 @@ fn blocked_checks(events: &[Event]) -> Vec<String> {
         .collect()
 }
 
-/// Sessions that count against the budget: rate-limited ones do not.
+/// Sessions that count against the budget: rate-limited ones and ones the
+/// person stopped do not.
 fn sessions_used(events: &[Event]) -> u32 {
     let started = events
         .iter()
         .filter(|e| matches!(e, Event::SessionStarted { .. }))
         .count();
-    let rate_limited = events
+    let excused = events
         .iter()
-        .filter(|e| matches!(e, Event::SessionAbandoned { reason, .. } if reason == RATE_LIMITED))
+        .filter(|e| {
+            matches!(e, Event::SessionAbandoned { reason, .. }
+                if reason == RATE_LIMITED || reason == INTERRUPTED)
+        })
         .count();
-    (started - rate_limited) as u32
+    (started - excused) as u32
+}
+
+/// A stop without text that no pause or resume has answered yet.
+fn pause_requested(events: &[Event]) -> bool {
+    let start = events
+        .iter()
+        .rposition(|e| matches!(e, Event::MissionPaused | Event::MissionResumed))
+        .map_or(0, |i| i + 1);
+    events[start..]
+        .iter()
+        .any(|e| matches!(e, Event::Interrupt { text: None }))
+}
+
+/// How many times the person stopped the mission with a new direction.
+fn replans_asked(events: &[Event]) -> u32 {
+    events
+        .iter()
+        .filter(|e| matches!(e, Event::Interrupt { text: Some(_) }))
+        .count() as u32
 }
 
 fn last_session(events: &[Event]) -> u32 {
@@ -713,16 +839,14 @@ fn last_failures(events: &[Event]) -> Vec<Failure> {
         .collect()
 }
 
-/// Steers sent since the last session started, including during it.
-fn steers_since_session(events: &[Event]) -> Vec<String> {
-    let start = events
-        .iter()
-        .rposition(|e| matches!(e, Event::SessionStarted { .. }))
-        .map_or(0, |i| i + 1);
-    events[start..]
+/// Everything the person added, in order. Each session starts fresh, so
+/// all of it goes into every brief.
+fn added_by_person(events: &[Event]) -> Vec<String> {
+    events
         .iter()
         .filter_map(|e| match e {
             Event::Steer { text } => Some(text.clone()),
+            Event::Interrupt { text: Some(text) } => Some(text.clone()),
             _ => None,
         })
         .collect()

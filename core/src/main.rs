@@ -45,6 +45,13 @@ enum Cmd {
         #[arg(long)]
         fake_script: Option<PathBuf>,
     },
+    /// Add an instruction; the next session's brief includes it.
+    Steer { mission: String, text: String },
+    /// Stop the running session. With text, re-plan with it; without, pause.
+    Stop {
+        mission: String,
+        text: Option<String>,
+    },
     /// Show where a mission stands and where its result is.
     Status { mission: String },
 }
@@ -73,6 +80,12 @@ fn main() -> ExitCode {
             engine,
             fake_script,
         }) => resume(&MissionId(mission), engine, fake_script),
+        Some(Cmd::Steer { mission, text }) => open_store()
+            .and_then(|s| mission::steer(&s, &MissionId(mission), &text))
+            .map(|()| ExitCode::SUCCESS),
+        Some(Cmd::Stop { mission, text }) => open_store()
+            .and_then(|s| mission::stop(&s, &MissionId(mission), text.as_deref()))
+            .map(|()| ExitCode::SUCCESS),
         Some(Cmd::Status { mission }) => status(&MissionId(mission)),
     };
     result.unwrap_or_else(|e| {
@@ -163,6 +176,7 @@ fn resume(
 ) -> cortex::Result<ExitCode> {
     let mut engine = engine(kind, fake_script)?;
     let store = open_store()?;
+    mission::resume(&store, m)?;
     work(&store, m, engine.as_mut())
 }
 
