@@ -1,0 +1,4 @@
+[[check]]
+id = "behaviour"
+command = "python3 -B /checks/files/test.py"
+expect_exit = 0

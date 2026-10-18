@@ -56,6 +56,17 @@ enum Cmd {
     },
     /// Show where a mission stands and where its result is.
     Status { mission: String },
+    /// Run the bench prompts as missions and write a results file.
+    Bench {
+        #[arg(long, value_enum, default_value_t = EngineKind::Claude)]
+        engine: EngineKind,
+        /// Run only this prompt, e.g. `03-roman`.
+        #[arg(long)]
+        only: Option<String>,
+        /// The bench folder; results go in its `results/`.
+        #[arg(long, default_value = "bench")]
+        dir: PathBuf,
+    },
     /// Serves the sandboxed tools to an engine over stdio (used by engines).
     #[command(hide = true)]
     Mcp {
@@ -97,6 +108,7 @@ fn main() -> ExitCode {
             .and_then(|s| mission::stop(&s, &MissionId(mission), text.as_deref()))
             .map(|()| ExitCode::SUCCESS),
         Some(Cmd::Status { mission }) => status(&MissionId(mission)),
+        Some(Cmd::Bench { engine, only, dir }) => bench(engine, only.as_deref(), &dir),
         Some(Cmd::Mcp { worktree, checks }) => {
             cortex::mcp::serve(worktree, checks).map(|()| ExitCode::SUCCESS)
         }
@@ -179,6 +191,19 @@ fn work(store: &Store, m: &MissionId, engine: &mut dyn Engine) -> cortex::Result
         Outcome::Stuck { .. } => ExitCode::from(2),
         _ => ExitCode::SUCCESS,
     })
+}
+
+fn bench(kind: EngineKind, only: Option<&str>, dir: &std::path::Path) -> cortex::Result<ExitCode> {
+    let store = open_store()?;
+    let mut make = |p: &cortex::bench::Prompt| match kind {
+        EngineKind::Fake => engine(kind, Some(p.fake_solution())),
+        _ => engine(kind, None),
+    };
+    let (report, path) =
+        cortex::bench::run(dir, only, &home(), &store, &mut make, &dir.join("results"))?;
+    println!("passed {} of {}", report.passed, report.total);
+    println!("results: {}", path.display());
+    Ok(ExitCode::SUCCESS)
 }
 
 fn resume(

@@ -59,6 +59,11 @@ What is true now and what comes next. Kept under 150 lines by CI.
   session within about a second; with text the mission re-plans with it
   (limited by the re-plan budget), without text it pauses until
   `cortex resume`.
+- Bench: ten small prompts in [bench/](bench/README.md), each with hidden
+  checks that fail on its starting project. `cortex bench --engine claude`
+  runs them all as missions and writes `bench/results/<date>-<engine>.json`.
+  CI proves the checks fail on every start and that known answers pass all
+  ten with the fake engine. No real engine has run it yet.
 - Brain design approved:
   [docs/superpowers/specs/2026-10-18-cortex-brain-design.md](docs/superpowers/specs/2026-10-18-cortex-brain-design.md).
   Approved by the owner on 2026-10-18 after an independent review and a
@@ -105,5 +110,8 @@ What is true now and what comes next. Kept under 150 lines by CI.
 2. ADRs for the core, storage, sandbox and engines (done); later components
    get theirs when their slice starts. The first code PR adds build, lint and
    test checks to CI.
-3. First brain slice, planned with superpowers:writing-plans and built
-   test-first.
+3. First brain slice: built test-first, **unproven on a real engine**. It
+   is done when the owner, in WSL Ubuntu, runs `cortex doctor`,
+   `cargo test -- --ignored claude_cannot_run_shell` and
+   `cortex bench --engine claude`, at least 7 of 10 pass, and that results
+   file is committed.

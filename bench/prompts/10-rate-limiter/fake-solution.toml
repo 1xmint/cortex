@@ -1,0 +1,22 @@
+[[session]]
+note = "solved"
+[[session.write]]
+path = "ratelimit.py"
+content = '''
+from collections import deque
+
+
+class RateLimiter:
+    def __init__(self, limit, window, clock):
+        self.limit, self.window, self.clock = limit, window, clock
+        self.calls = deque()
+
+    def allow(self):
+        now = self.clock()
+        while self.calls and self.calls[0] <= now - self.window:
+            self.calls.popleft()
+        if len(self.calls) < self.limit:
+            self.calls.append(now)
+            return True
+        return False
+'''
