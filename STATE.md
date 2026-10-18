@@ -28,6 +28,11 @@ What is true now and what comes next. Kept under 150 lines by CI.
 - Engines: one interface for whatever does a session's work, with a
   cancel switch and a time limit. A scripted fake engine stands in for
   real models in tests; it cannot write outside its worktree.
+- Mission loop: `cortex run --repo --checks "<request>"` freezes the
+  checks, sees them fail, then gives an engine up to 4 sessions (20 min
+  each, 2 h total). Work is accepted only when every check passes, onto
+  branch `cortex/<mission>`; `cortex status <mission>` shows how to merge
+  it. Only the fake engine is wired so far.
 - Brain design approved:
   [docs/superpowers/specs/2026-10-18-cortex-brain-design.md](docs/superpowers/specs/2026-10-18-cortex-brain-design.md).
   Approved by the owner on 2026-10-18 after an independent review and a
