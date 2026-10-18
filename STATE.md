@@ -15,6 +15,9 @@ What is true now and what comes next. Kept under 150 lines by CI.
   -force-overlay=false`, no network). `cortex doctor` proves a planted
   secret is unreadable and the network unreachable. Not yet proven inside
   WSL2 on the owner's PC.
+- Mission log (ADR 0003): append-only events per mission in SQLite (WAL),
+  refused updates and deletes, project-scoped missions, and leases so one
+  process drives a mission at a time.
 - Brain design approved:
   [docs/superpowers/specs/2026-10-18-cortex-brain-design.md](docs/superpowers/specs/2026-10-18-cortex-brain-design.md).
   Approved by the owner on 2026-10-18 after an independent review and a
