@@ -7,7 +7,7 @@ use cortex::mission::{Budgets, Outcome, drive, resume, start, steer, stop};
 use cortex::store::{MissionId, Store};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 fn plain_git(dir: &Path, args: &[&str]) -> String {
     let out = Command::new("git")
@@ -33,6 +33,18 @@ fn session(delay_ms: u64, content: &str) -> String {
     format!(
         "[[session]]\ndelay_ms = {delay_ms}\n[[session.write]]\npath = \"out.txt\"\ncontent = \"{content}\\n\"\n"
     )
+}
+
+/// A session that hits the usage limit and asks to wait `secs`.
+fn limited(secs: u64) -> String {
+    format!("[[session]]\nrate_limited_s = {secs}\n")
+}
+
+fn unix_now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
 }
 
 struct Env {
@@ -242,4 +254,73 @@ fn replan_budget_exhausted_is_stuck() {
         Some(Event::MissionStuck { .. })
     ));
     assert_eq!(e.worktrees(), 1);
+}
+
+#[test]
+fn stop_during_park_pauses_promptly() {
+    let e = env();
+    let m = e.start();
+    let script = format!("{}{RIGHT}", limited(60));
+    let begun = Instant::now();
+    let outcome = std::thread::scope(|s| {
+        let run = s.spawn(|| e.drive(&m, &script, &Budgets::default()));
+        while !e
+            .events(&m)
+            .iter()
+            .any(|e| matches!(e, Event::Parked { .. }))
+        {
+            assert!(begun.elapsed() < Duration::from_secs(10), "never parked");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        stop(&e.store, &m, None).unwrap();
+        run.join().unwrap()
+    });
+    assert!(
+        begun.elapsed() < Duration::from_secs(15),
+        "{:?}",
+        begun.elapsed()
+    );
+    assert_eq!(outcome, Outcome::Paused);
+    assert_eq!(e.briefs(&m).len(), 1);
+}
+
+#[test]
+fn park_outlives_a_restart() {
+    let e = env();
+    let m = e.start();
+    // A process that died while parked left this behind.
+    let until = unix_now() + 3;
+    e.store
+        .append(
+            &m,
+            &Event::Parked {
+                until_unix: until,
+                reason: "rate limited".into(),
+            },
+        )
+        .unwrap();
+    let outcome = std::thread::scope(|s| {
+        let run = s.spawn(|| e.drive(&m, RIGHT, &Budgets::default()));
+        e.wait_for_sessions(&m, 1);
+        assert!(unix_now() >= until, "a session started while parked");
+        run.join().unwrap()
+    });
+    assert!(matches!(outcome, Outcome::Done { .. }), "{outcome:?}");
+}
+
+#[test]
+fn parked_time_is_off_the_mission_clock() {
+    let e = env();
+    let m = e.start();
+    let budgets = Budgets {
+        mission_timeout: Duration::from_secs(10),
+        ..Budgets::default()
+    };
+    let script = format!("{}{RIGHT}", limited(12));
+    let outcome = e.drive(&m, &script, &budgets);
+    assert!(
+        matches!(outcome, Outcome::Done { .. }),
+        "{outcome:?} {:#?}",
+        e.events(&m)
+    );
 }

@@ -239,3 +239,27 @@ fn check_passing_before_work_makes_mission_stuck() {
     // No session was spent on a mission that can never be proven.
     assert!(e.briefs(&m).is_empty());
 }
+
+#[test]
+fn checks_run_on_the_commit_not_the_worktree() {
+    let e = env();
+    let m = e.start();
+    // The right answer is on disk but ignored, so the commit lacks it.
+    let script = r#"
+[[session]]
+[[session.write]]
+path = "out.txt"
+content = "hello\n"
+[[session.write]]
+path = ".gitignore"
+content = "out.txt\n"
+"#;
+    let budgets = Budgets {
+        sessions: 1,
+        ..Budgets::default()
+    };
+    let outcome = e.drive(&m, script, &budgets);
+    assert!(matches!(outcome, Outcome::Stuck { .. }), "{outcome:?}");
+    assert_eq!(e.accepted(&m), 0);
+    assert_eq!(plain_git(&e.repo, &["worktree", "list"]).lines().count(), 1);
+}

@@ -175,3 +175,23 @@ fn mcp_test_records_no_events() {
     // Only Cortex's own check runs count, so the tool keeps no record.
     assert!(!e.home().join("cortex.db").exists());
 }
+
+#[test]
+fn mcp_test_cannot_change_the_worktree() {
+    let e = Env::new();
+    std::fs::write(
+        e.dir.path().join("checks/checks.toml"),
+        r#"
+[[check]]
+id = "leak"
+command = "cp /checks/files/expected.txt out.txt"
+expect_exit = 1
+"#,
+    )
+    .unwrap();
+    let mut c = e.client();
+    let (text, _) = c.tool("test", json!({}));
+    assert!(text.contains("leak: failed"), "{text}");
+    // The check ran on a copy, so the hidden answer never reached the project.
+    assert!(!e.work().join("out.txt").exists());
+}
