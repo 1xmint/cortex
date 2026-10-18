@@ -1,0 +1,54 @@
+name: docs-truth
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  links:
+    name: links resolve
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check every Markdown link and path
+        uses: lycheeverse/lychee-action@v2
+        with:
+          # --offline: check relative files and anchors only, so the build
+          # does not flake on third-party websites.
+          args: --offline --no-progress --include-fragments './**/*.md'
+          fail: true
+
+  adr-index:
+    name: adr index current
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: bash scripts/adr-index.sh
+      - name: Index matches the ADR files
+        run: |
+          git diff --exit-code docs/adr/README.md || {
+            echo "docs/adr/README.md is stale. Run scripts/adr-index.sh and commit."
+            exit 1
+          }
+
+  state:
+    name: state current
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: STATE.md cap and freshness
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          if [ -n "$BASE_SHA" ]; then
+            bash scripts/check-state.sh "$BASE_SHA" "$PR_BODY"
+          else
+            bash scripts/check-state.sh
+          fi
