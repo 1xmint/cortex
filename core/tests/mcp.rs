@@ -195,3 +195,22 @@ expect_exit = 1
     // The check ran on a copy, so the hidden answer never reached the project.
     assert!(!e.work().join("out.txt").exists());
 }
+
+#[test]
+fn mcp_test_copy_does_not_follow_links() {
+    let e = Env::new();
+    let secret = e.dir.path().join("secret.txt");
+    std::fs::write(&secret, "host secret\n").unwrap();
+    std::os::unix::fs::symlink(&secret, e.work().join("link")).unwrap();
+    std::fs::write(
+        e.dir.path().join("checks/checks.toml"),
+        "[[check]]\nid = \"peek\"\ncommand = \"cat link\"\nexpect_exit = 1\n",
+    )
+    .unwrap();
+    let mut c = e.client();
+    let (text, _) = c.tool("test", json!({}));
+    // The link stays a link, so it points nowhere inside the sandbox and
+    // `cat` fails, as the check expects.
+    assert!(text.contains("peek: passed"), "{text}");
+    assert!(!text.contains("host secret"), "{text}");
+}

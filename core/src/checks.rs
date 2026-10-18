@@ -51,6 +51,12 @@ impl CheckSet {
         let text = std::fs::read_to_string(toml_path)?;
         let file: ChecksFile = toml::from_str(&text)
             .map_err(|e| Error::Invalid(format!("{}: {e}", toml_path.display())))?;
+        if file.check.is_empty() {
+            return Err(Error::Invalid(format!(
+                "{} has no checks; a check set that cannot fail proves nothing",
+                toml_path.display()
+            )));
+        }
         let mut seen = std::collections::HashSet::new();
         for c in &file.check {
             if !seen.insert(c.id.as_str()) {
