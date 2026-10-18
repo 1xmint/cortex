@@ -174,17 +174,19 @@ fn missions_are_scoped_to_project() {
 #[test]
 fn lease_blocks_second_holder_until_stale() {
     let (_d, store) = temp_store();
-    let store = store.with_lease_ttl(Duration::from_millis(300));
+    // Generous margins: a slow CI runner once took over 300 ms between two
+    // calls.
+    let store = store.with_lease_ttl(Duration::from_millis(1500));
     let m = store.create_mission(&project("p"), "josh").unwrap();
     assert!(store.take_lease(&m, "one").unwrap());
     assert!(!store.take_lease(&m, "two").unwrap());
     // Renewing keeps it held.
-    std::thread::sleep(Duration::from_millis(200));
+    std::thread::sleep(Duration::from_millis(1000));
     store.renew_lease(&m, "one").unwrap();
-    std::thread::sleep(Duration::from_millis(200));
+    std::thread::sleep(Duration::from_millis(1000));
     assert!(!store.take_lease(&m, "two").unwrap());
     // Once stale, another holder may take it.
-    std::thread::sleep(Duration::from_millis(400));
+    std::thread::sleep(Duration::from_millis(2000));
     assert!(store.take_lease(&m, "two").unwrap());
     assert!(!store.take_lease(&m, "one").unwrap());
     // Releasing frees it at once.
