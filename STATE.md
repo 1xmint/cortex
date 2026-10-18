@@ -22,6 +22,9 @@ What is true now and what comes next. Kept under 150 lines by CI.
   ignores planted hooks, fsmonitor, `.gitattributes` filters and a swapped
   `.git` file. Accepted work moves a `cortex/...` branch, never the
   person's checked-out one.
+- Checks: frozen read-only outside the worktree with a SHA-256
+  fingerprint, run in the sandbox, seen failing before work starts (a
+  check that already passes is blocked and the mission cannot finish).
 - Brain design approved:
   [docs/superpowers/specs/2026-10-18-cortex-brain-design.md](docs/superpowers/specs/2026-10-18-cortex-brain-design.md).
   Approved by the owner on 2026-10-18 after an independent review and a
