@@ -88,9 +88,11 @@ mod imp {
         let secret = format!("cortex-secret-{}", std::process::id());
         let key = outside.join("key");
         std::fs::write(&key, &secret)?;
+        // The marker is built at run time: newer Python echoes the failing
+        // source line, so a literal 'NET OPEN' would appear on failure too.
         let cmd = format!(
             "echo cortex-canary; cat /proc/version; cat {key} 2>&1; \
-             python3 -c \"import socket; socket.create_connection(('1.1.1.1', 53), 3); print('NET OPEN')\" 2>&1",
+             python3 -c \"import socket; socket.create_connection(('1.1.1.1', 53), 3); print('NET', 'OPEN')\" 2>&1",
             key = key.display()
         );
         let result = run(&RunSpec {
