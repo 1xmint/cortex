@@ -141,10 +141,15 @@ fn run(
     let mut engine = engine(kind, fake_script)?;
     let store = open_store()?;
     let m = mission::start(&store, &home(), repo, checks, request, &person())?;
+    work(&store, &m, engine.as_mut())
+}
+
+/// Drives the mission and reports how it ended.
+fn work(store: &Store, m: &MissionId, engine: &mut dyn Engine) -> cortex::Result<ExitCode> {
     println!("mission {}", m.0);
     std::io::stdout().flush()?;
-    let outcome = mission::drive(&store, &home(), &m, engine.as_mut(), &Budgets::default())?;
-    report(&store, &m, &outcome)?;
+    let outcome = mission::drive(store, &home(), m, engine, &Budgets::default())?;
+    report(store, m, &outcome)?;
     Ok(match outcome {
         Outcome::Stuck { .. } => ExitCode::from(2),
         _ => ExitCode::SUCCESS,
@@ -156,8 +161,9 @@ fn resume(
     kind: EngineKind,
     fake_script: Option<PathBuf>,
 ) -> cortex::Result<ExitCode> {
-    let _ = (m, kind, fake_script);
-    Err(cortex::Error::Invalid("resume is not built yet".into()))
+    let mut engine = engine(kind, fake_script)?;
+    let store = open_store()?;
+    work(&store, m, engine.as_mut())
 }
 
 fn status(m: &MissionId) -> cortex::Result<ExitCode> {

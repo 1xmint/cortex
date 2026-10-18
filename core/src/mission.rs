@@ -5,7 +5,7 @@
 use crate::checks::{CheckSet, Frozen, check_all, freeze, red_run};
 use crate::engine::{CancelToken, Engine, SessionInput, SessionOutcome};
 use crate::event::Event;
-use crate::git::{Worktree, accept, create_worktree, head};
+use crate::git::{Worktree, accept, create_worktree, forget_worktree, head, open_worktree};
 use crate::store::{MissionId, ProjectId, Store};
 use crate::{Error, Result};
 use std::path::{Path, PathBuf};
@@ -95,7 +95,7 @@ pub fn drive(
     budgets: &Budgets,
 ) -> Result<Outcome> {
     let holder = format!("{}-{}", std::process::id(), uuid::Uuid::new_v4());
-    if !store.take_lease(m, &holder)? {
+    if !store.take_lease(m, &holder)? && !take_from_dead(store, m, &holder)? {
         return Err(Error::Blocked(format!(
             "mission {} is being run by another process",
             m.0
@@ -110,6 +110,39 @@ pub fn drive(
     });
     store.release_lease(m, &holder)?;
     result
+}
+
+/// Takes over a lease whose holder process has died, so a crashed run can
+/// be resumed at once instead of after the lease goes stale.
+fn take_from_dead(store: &Store, m: &MissionId, holder: &str) -> Result<bool> {
+    match store.lease_holder(m)? {
+        Some(old) if !holder_alive(&old) => store.replace_lease(m, &old, holder),
+        _ => Ok(false),
+    }
+}
+
+/// Whether the process named in a lease holder (`<pid>-<uuid>`) still runs
+/// on this machine. Unknown means alive.
+fn holder_alive(holder: &str) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        let Some(pid) = holder
+            .split('-')
+            .next()
+            .and_then(|p| p.parse::<i32>().ok())
+            .filter(|p| *p > 0)
+        else {
+            return true;
+        };
+        // Signal 0 only asks whether the process exists.
+        let r = unsafe { libc::kill(pid, 0) };
+        r == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = holder;
+        true
+    }
 }
 
 fn heartbeat(store: &Store, m: &MissionId, holder: &str, stop: &AtomicBool) {
@@ -140,11 +173,14 @@ fn drive_held(
     }
     let st = started(&events)?;
     let frozen = plan(store, home, m, &events)?;
-    if !red_run_done(&only_events(store, m)?) {
-        let wt = fresh_worktree(&st.repo, &st.base, &work_dir(home, m).join("red"))?;
+    let red_dir = work_dir(home, m).join("red");
+    if !red_run_done(&only_events(store, m)?, &frozen) {
+        let wt = fresh_worktree(&st.repo, &st.base, &red_dir)?;
         let report = red_run(&frozen, &wt.path, store, m);
         wt.discard()?;
         report?;
+    } else if red_dir.exists() {
+        forget_worktree(&st.repo, &red_dir)?;
     }
     let blocked = blocked_checks(&only_events(store, m)?);
     if !blocked.is_empty() {
@@ -156,6 +192,9 @@ fn drive_held(
                 blocked.join(", ")
             ),
         );
+    }
+    if let Some(done) = recover(store, m, &st, &frozen)? {
+        return Ok(done);
     }
 
     loop {
@@ -226,23 +265,8 @@ fn drive_held(
                         engine_note: note,
                     },
                 )?;
-                if let Some(commit) = check_session(store, m, &frozen, &wt, session)? {
-                    store.append(
-                        m,
-                        &Event::CommitAccepted {
-                            session,
-                            commit: commit.clone(),
-                        },
-                    )?;
-                    accept(&st.repo, &result_branch(m), &commit)?;
-                    store.append(
-                        m,
-                        &Event::MissionDone {
-                            commit: commit.clone(),
-                        },
-                    )?;
-                    wt.discard()?;
-                    return Ok(Outcome::Done { commit });
+                if let Some(commit) = check_session(store, m, &frozen, &wt, session, &base)? {
+                    return complete(store, m, &st, wt, session, commit);
                 }
                 wt.discard()?;
             }
@@ -278,18 +302,183 @@ fn check_session(
     frozen: &Frozen,
     wt: &Worktree,
     session: u32,
+    base: &str,
 ) -> Result<Option<String>> {
-    let commit = match wt.commit_all(&format!("cortex: mission {} session {session}", m.0)) {
-        Ok(c) => c,
+    let Some(commit) = session_commit(store, m, wt, session, base)? else {
+        return Ok(None);
+    };
+    let passed = check_all(frozen, &wt.path, session, store, m)?;
+    Ok(commit.filter(|_| passed))
+}
+
+/// The session's work as a commit: `Some(None)` when it changed nothing,
+/// `None` when its `.git` was damaged and the session is abandoned. A
+/// commit made before a crash is found again rather than lost.
+fn session_commit(
+    store: &Store,
+    m: &MissionId,
+    wt: &Worktree,
+    session: u32,
+    base: &str,
+) -> Result<Option<Option<String>>> {
+    let made = wt
+        .commit_all(&format!("cortex: mission {} session {session}", m.0))
+        .and_then(|c| match c {
+            Some(c) => Ok(Some(c)),
+            None => head(&wt.path).map(|h| (h != base).then_some(h)),
+        });
+    match made {
+        Ok(c) => Ok(Some(c)),
         // The worker damaged its `.git`; its work cannot be trusted.
         Err(Error::Blocked(reason)) => {
             store.append(m, &Event::SessionAbandoned { session, reason })?;
+            Ok(None)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Records the accepted commit, moves the result branch to it and ends
+/// the mission. The worktree goes before `MissionDone`, so a finished
+/// mission never leaves one behind.
+fn complete(
+    store: &Store,
+    m: &MissionId,
+    st: &Started,
+    wt: Worktree,
+    session: u32,
+    commit: String,
+) -> Result<Outcome> {
+    store.append(
+        m,
+        &Event::CommitAccepted {
+            session,
+            commit: commit.clone(),
+        },
+    )?;
+    wt.discard()?;
+    finish(store, m, st, commit)
+}
+
+fn finish(store: &Store, m: &MissionId, st: &Started, commit: String) -> Result<Outcome> {
+    accept(&st.repo, &result_branch(m), &commit)?;
+    store.append(
+        m,
+        &Event::MissionDone {
+            commit: commit.clone(),
+        },
+    )?;
+    Ok(Outcome::Done { commit })
+}
+
+/// Finishes or clears away the last session a dead process left behind.
+/// `Some` when that session's work completes the mission.
+fn recover(store: &Store, m: &MissionId, st: &Started, frozen: &Frozen) -> Result<Option<Outcome>> {
+    let events = only_events(store, m)?;
+    let Some(i) = events
+        .iter()
+        .rposition(|e| matches!(e, Event::SessionStarted { .. }))
+    else {
+        return Ok(None);
+    };
+    let Event::SessionStarted {
+        session, worktree, ..
+    } = &events[i]
+    else {
+        unreachable!("rposition matched SessionStarted");
+    };
+    let (session, dest) = (*session, worktree.clone());
+    let after = &events[i + 1..];
+
+    if let Some(commit) = after.iter().find_map(|e| match e {
+        Event::CommitAccepted { commit, .. } => Some(commit.clone()),
+        _ => None,
+    }) {
+        forget_worktree(&st.repo, &dest)?;
+        return finish(store, m, st, commit).map(Some);
+    }
+    if after
+        .iter()
+        .any(|e| matches!(e, Event::SessionAbandoned { .. }))
+    {
+        forget_worktree(&st.repo, &dest)?;
+        return Ok(None);
+    }
+    if !after
+        .iter()
+        .any(|e| matches!(e, Event::SessionEnded { .. }))
+    {
+        return abandon_dead(store, m, st, &dest, session);
+    }
+
+    // The session ended; what its checks said decides.
+    let blocked = blocked_checks(&events);
+    let runs: Vec<(&str, bool)> = after
+        .iter()
+        .filter_map(|e| match e {
+            Event::CheckRun {
+                session: s,
+                check_id,
+                passed,
+                ..
+            } if *s == session => Some((check_id.as_str(), *passed)),
+            _ => None,
+        })
+        .collect();
+    let complete_set = frozen
+        .set
+        .checks
+        .iter()
+        .filter(|c| !blocked.contains(&c.id))
+        .all(|c| runs.iter().any(|(id, _)| *id == c.id));
+    let all_passed = runs.iter().all(|(_, p)| *p);
+    if complete_set && !all_passed {
+        forget_worktree(&st.repo, &dest)?;
+        return Ok(None);
+    }
+    if !dest.exists() {
+        return abandon_dead(store, m, st, &dest, session);
+    }
+    let wt = match open_worktree(&st.repo, &dest) {
+        Ok(wt) => wt,
+        Err(Error::Blocked(reason)) => {
+            store.append(m, &Event::SessionAbandoned { session, reason })?;
+            forget_worktree(&st.repo, &dest)?;
             return Ok(None);
         }
         Err(e) => return Err(e),
     };
-    let passed = check_all(frozen, &wt.path, session, store, m)?;
-    Ok(commit.filter(|_| passed))
+    let base = last_accepted(&events).unwrap_or_else(|| st.base.clone());
+    let commit = if complete_set {
+        session_commit(store, m, &wt, session, &base)?.flatten()
+    } else {
+        check_session(store, m, frozen, &wt, session, &base)?
+    };
+    match commit {
+        Some(c) => complete(store, m, st, wt, session, c).map(Some),
+        None => {
+            wt.discard()?;
+            Ok(None)
+        }
+    }
+}
+
+fn abandon_dead(
+    store: &Store,
+    m: &MissionId,
+    st: &Started,
+    dest: &Path,
+    session: u32,
+) -> Result<Option<Outcome>> {
+    store.append(
+        m,
+        &Event::SessionAbandoned {
+            session,
+            reason: "process ended".into(),
+        },
+    )?;
+    forget_worktree(&st.repo, dest)?;
+    Ok(None)
 }
 
 fn abandon(store: &Store, m: &MissionId, wt: Worktree, session: u32, reason: &str) -> Result<()> {
@@ -346,9 +535,7 @@ fn work_dir(home: &Path, m: &MissionId) -> PathBuf {
 
 /// A worktree at `dest`, replacing anything a crashed run left there.
 fn fresh_worktree(repo: &Path, base: &str, dest: &Path) -> Result<Worktree> {
-    if dest.exists() {
-        std::fs::remove_dir_all(dest)?;
-    }
+    forget_worktree(repo, dest)?;
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -453,10 +640,18 @@ fn since_plan(events: &[Event]) -> &[Event] {
     &events[start..]
 }
 
-fn red_run_done(events: &[Event]) -> bool {
-    since_plan(events)
-        .iter()
-        .any(|e| matches!(e, Event::CheckRed { .. } | Event::CheckBlocked { .. }))
+/// True once every check of the current plan has a red-run result, so a
+/// red run cut short by a crash is run again.
+fn red_run_done(events: &[Event], frozen: &Frozen) -> bool {
+    let recent = since_plan(events);
+    frozen.set.checks.iter().all(|c| {
+        recent.iter().any(|e| match e {
+            Event::CheckRed { check_id, .. } | Event::CheckBlocked { check_id, .. } => {
+                *check_id == c.id
+            }
+            _ => false,
+        })
+    })
 }
 
 fn blocked_checks(events: &[Event]) -> Vec<String> {

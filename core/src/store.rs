@@ -212,6 +212,27 @@ impl Store {
         Ok(())
     }
 
+    /// Who holds the mission's lease, if anyone.
+    pub fn lease_holder(&self, m: &MissionId) -> Result<Option<String>> {
+        Ok(self
+            .conn()
+            .query_row(
+                "SELECT holder FROM leases WHERE mission_id = ?1",
+                params![m.0],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
+    /// Hands the lease from `old` to `new`, only if `old` still holds it.
+    pub fn replace_lease(&self, m: &MissionId, old: &str, new: &str) -> Result<bool> {
+        let n = self.conn().execute(
+            "UPDATE leases SET holder = ?3, heartbeat = ?4 WHERE mission_id = ?1 AND holder = ?2",
+            params![m.0, old, new, now_ms()],
+        )?;
+        Ok(n == 1)
+    }
+
     pub fn release_lease(&self, m: &MissionId, holder: &str) -> Result<()> {
         self.conn().execute(
             "DELETE FROM leases WHERE mission_id = ?1 AND holder = ?2",

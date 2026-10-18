@@ -33,6 +33,10 @@ What is true now and what comes next. Kept under 150 lines by CI.
   each, 2 h total). Work is accepted only when every check passes, onto
   branch `cortex/<mission>`; `cortex status <mission>` shows how to merge
   it. Only the fake engine is wired so far.
+- Crash recovery: if the process dies at any point, `cortex resume
+  <mission>` finishes the mission as if nothing happened (kill-tested after
+  every kind of event). A dead process's lock is taken over at once; a
+  live one's is respected.
 - Brain design approved:
   [docs/superpowers/specs/2026-10-18-cortex-brain-design.md](docs/superpowers/specs/2026-10-18-cortex-brain-design.md).
   Approved by the owner on 2026-10-18 after an independent review and a
