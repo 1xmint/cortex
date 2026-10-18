@@ -7,6 +7,7 @@ fn input(worktree: &Path, session: u32, brief: &str) -> SessionInput {
     SessionInput {
         brief: brief.to_string(),
         worktree: worktree.to_path_buf(),
+        checks_dir: worktree.join("checks"),
         session,
         timeout: Duration::from_secs(30),
     }

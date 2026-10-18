@@ -249,6 +249,7 @@ fn drive_held(
         let input = SessionInput {
             brief: text,
             worktree: dest,
+            checks_dir: frozen.dir.clone(),
             session,
             timeout: budgets.session_timeout.min(left),
         };

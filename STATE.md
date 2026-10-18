@@ -32,7 +32,16 @@ What is true now and what comes next. Kept under 150 lines by CI.
   checks, sees them fail, then gives an engine up to 4 sessions (20 min
   each, 2 h total). Work is accepted only when every check passes, onto
   branch `cortex/<mission>`; `cortex status <mission>` shows how to merge
-  it. Only the fake engine is wired so far.
+  it. `--engine claude` (the default) and the fake engine are wired.
+- Claude Code engine: runs `claude -p --restricted` on the person's
+  subscription inside a bubblewrap jail that shows only system files, its
+  own config (personal CLAUDE.md, plugins, skills and history hidden), the
+  worktree and the read-only checks. It has no shell: its only commands go
+  through `cortex mcp` (`run`, `test`), each in the gVisor sandbox. A session
+  that would bill an API key is refused; a usage limit parks the mission
+  until the reset time. Proven in CI with stand-in binaries only; a real
+  signed-in session (`cargo test -- --ignored claude_cannot_run_shell`) has
+  not run yet.
 - Crash recovery: if the process dies at any point, `cortex resume
   <mission>` finishes the mission as if nothing happened (kill-tested after
   every kind of event). A dead process's lock is taken over at once; a
@@ -77,7 +86,10 @@ What is true now and what comes next. Kept under 150 lines by CI.
 
 ## Known problems
 
-- None yet.
+- The Claude engine's jail must show Claude Code its own sign-in files, so
+  keeping them from the model rests on Claude Code's `--restricted` mode and
+  deny rules, not on the jail. A `claude` installed under nvm or npm outside
+  `/usr` and the home folder may not run in the jail.
 
 ## Next slices
 

@@ -1,5 +1,6 @@
 use clap::{Parser, Subcommand, ValueEnum};
 use cortex::engine::Engine;
+use cortex::engine::claude::ClaudeEngine;
 use cortex::engine::fake::FakeEngine;
 use cortex::event::Event;
 use cortex::mission::{self, Budgets, Outcome};
@@ -54,6 +55,14 @@ enum Cmd {
     },
     /// Show where a mission stands and where its result is.
     Status { mission: String },
+    /// Serves the sandboxed tools to an engine over stdio (used by engines).
+    #[command(hide = true)]
+    Mcp {
+        #[arg(long)]
+        worktree: PathBuf,
+        #[arg(long)]
+        checks: PathBuf,
+    },
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -87,6 +96,9 @@ fn main() -> ExitCode {
             .and_then(|s| mission::stop(&s, &MissionId(mission), text.as_deref()))
             .map(|()| ExitCode::SUCCESS),
         Some(Cmd::Status { mission }) => status(&MissionId(mission)),
+        Some(Cmd::Mcp { worktree, checks }) => {
+            cortex::mcp::serve(worktree, checks).map(|()| ExitCode::SUCCESS)
+        }
     };
     result.unwrap_or_else(|e| {
         eprintln!("cortex: {e}");
@@ -138,8 +150,9 @@ fn engine(kind: EngineKind, fake_script: Option<PathBuf>) -> cortex::Result<Box<
             })?;
             Ok(Box::new(FakeEngine::load(&path)?))
         }
-        EngineKind::Claude | EngineKind::Api => Err(cortex::Error::Invalid(
-            "only the fake engine is built so far".into(),
+        EngineKind::Claude => Ok(Box::new(ClaudeEngine::new(PathBuf::from("claude"))?)),
+        EngineKind::Api => Err(cortex::Error::Invalid(
+            "the API engine is not built yet".into(),
         )),
     }
 }
