@@ -202,7 +202,7 @@ mod jail {
     /// Stands in for `claude`: reports what it can see from inside the
     /// jail, and calls `cortex mcp` the way Claude Code would.
     const PROBE: &str = r#"#!/usr/bin/python3
-import json, os, subprocess, sys
+import json, os, subprocess, sys, traceback
 problems = []
 def emit(o):
     print(json.dumps(o), flush=True)
@@ -246,8 +246,8 @@ try:
     if "gvisor" not in reply.lower():
         problems.append("sandbox inside the jail failed: " + reply[:500])
     p.kill()
-except Exception as e:
-    problems.append("probe crashed: %r" % e)
+except Exception:
+    problems.append("probe crashed: " + traceback.format_exc())
 emit({"type": "result", "subtype": "success", "is_error": False,
       "result": "; ".join(problems) or "jail ok"})
 "#;
