@@ -1,0 +1,30 @@
+[[session]]
+note = "solved"
+[[session.write]]
+path = "roman.py"
+content = '''
+PAIRS = [(1000, "M"), (900, "CM"), (500, "D"), (400, "CD"), (100, "C"), (90, "XC"),
+         (50, "L"), (40, "XL"), (10, "X"), (9, "IX"), (5, "V"), (4, "IV"), (1, "I")]
+
+
+def to_roman(n):
+    if not isinstance(n, int) or not 1 <= n <= 3999:
+        raise ValueError(n)
+    out = ""
+    for value, letters in PAIRS:
+        while n >= value:
+            out += letters
+            n -= value
+    return out
+
+
+def from_roman(s):
+    total, i = 0, 0
+    for value, letters in PAIRS:
+        while s.startswith(letters, i):
+            total += value
+            i += len(letters)
+    if i != len(s) or not 1 <= total <= 3999 or to_roman(total) != s:
+        raise ValueError(s)
+    return total
+'''

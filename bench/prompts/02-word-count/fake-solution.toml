@@ -1,0 +1,11 @@
+[[session]]
+note = "solved"
+[[session.write]]
+path = "wordcount.py"
+content = '''
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as f:
+    text = f.read()
+print(text.count("\n"), len(text.split()), len(text))
+'''

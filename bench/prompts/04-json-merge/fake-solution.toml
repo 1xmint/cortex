@@ -1,0 +1,22 @@
+[[session]]
+note = "solved"
+[[session.write]]
+path = "merge.py"
+content = '''
+import json
+import sys
+
+
+def merge(base, over):
+    out = dict(base)
+    for key, value in over.items():
+        if isinstance(value, dict) and isinstance(out.get(key), dict):
+            out[key] = merge(out[key], value)
+        else:
+            out[key] = value
+    return out
+
+
+with open(sys.argv[1]) as a, open(sys.argv[2]) as b:
+    print(json.dumps(merge(json.load(a), json.load(b)), sort_keys=True, indent=2))
+'''

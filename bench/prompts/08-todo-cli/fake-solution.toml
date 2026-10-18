@@ -1,0 +1,26 @@
+[[session]]
+note = "solved"
+[[session.write]]
+path = "todo.py"
+content = '''
+import json
+import os
+import sys
+
+FILE = "todo.json"
+items = json.load(open(FILE)) if os.path.exists(FILE) else []
+cmd = sys.argv[1]
+if cmd == "add":
+    items.append({"text": " ".join(sys.argv[2:]), "done": False})
+elif cmd == "done":
+    n = int(sys.argv[2])
+    if not 1 <= n <= len(items):
+        print(f"no item {n}", file=sys.stderr)
+        sys.exit(1)
+    items[n - 1]["done"] = True
+elif cmd == "list":
+    for i, item in enumerate(items, 1):
+        print(f"{i}. [{'x' if item['done'] else ' '}] {item['text']}")
+with open(FILE, "w") as f:
+    json.dump(items, f)
+'''

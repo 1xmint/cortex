@@ -1,0 +1,21 @@
+[[session]]
+note = "solved"
+[[session.write]]
+path = "toc.py"
+content = '''
+import re
+import sys
+
+in_code = False
+for line in open(sys.argv[1], encoding="utf-8"):
+    if line.startswith("```"):
+        in_code = not in_code
+        continue
+    m = re.match(r"^(##|###) (.+?)\s*$", line)
+    if in_code or not m:
+        continue
+    title = m.group(2)
+    slug = re.sub(r"[^\w\- ]", "", title.lower()).replace("_", "").replace(" ", "-")
+    indent = "  " if m.group(1) == "###" else ""
+    print(f"{indent}- [{title}](#{slug})")
+'''

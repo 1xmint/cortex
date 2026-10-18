@@ -1,0 +1,20 @@
+[[session]]
+note = "solved"
+[[session.write]]
+path = "csvstats.py"
+content = '''
+import csv
+import sys
+
+path, column = sys.argv[1], sys.argv[2]
+with open(path, newline="") as f:
+    reader = csv.DictReader(f)
+    if column not in (reader.fieldnames or []):
+        print(f"no column {column}", file=sys.stderr)
+        sys.exit(2)
+    values = [float(row[column]) for row in reader if row[column].strip()]
+print(f"count: {len(values)}")
+print(f"min: {min(values):.2f}")
+print(f"max: {max(values):.2f}")
+print(f"mean: {sum(values) / len(values):.2f}")
+'''
