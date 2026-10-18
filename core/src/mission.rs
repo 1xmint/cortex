@@ -193,10 +193,18 @@ fn drive_held(
             ),
         );
     }
-    if let Some(done) = recover(store, m, &st, &frozen)? {
+    let checker = Checker {
+        repo: &st.repo,
+        dir: work_dir(home, m).join("checks"),
+        frozen: &frozen,
+    };
+    // A check checkout a dead process left behind.
+    forget_worktree(&st.repo, &checker.dir)?;
+    if let Some(done) = recover(store, m, &st, &checker)? {
         return Ok(done);
     }
 
+    let mut parked = Duration::ZERO;
     loop {
         let logged = store.events(m)?;
         let seen = logged.last().map_or(0, |(seq, _)| *seq);
@@ -224,7 +232,18 @@ fn drive_held(
                 format!("no session passed every check after {used} tries"),
             );
         }
-        let Some(left) = budgets.mission_timeout.checked_sub(begun.elapsed()) else {
+        // A usage limit, possibly set by a process that has since died.
+        if let Some(until) = parked_until(&events)
+            && until > unix_now()
+        {
+            parked += park(store, m, seen, until);
+            continue;
+        }
+        // Time spent parked is the provider's, not the mission's.
+        let Some(left) = budgets
+            .mission_timeout
+            .checked_sub(begun.elapsed().saturating_sub(parked))
+        else {
             return stuck(store, m, "the mission's time limit ran out".into());
         };
         let session = last_session(&events) + 1;
@@ -295,7 +314,7 @@ fn drive_held(
                         engine_note: note,
                     },
                 )?;
-                if let Some(commit) = check_session(store, m, &frozen, &wt, session, &base)? {
+                if let Some(commit) = check_session(store, m, &checker, &wt, session, &base)? {
                     return complete(store, m, &st, wt, session, commit);
                 }
                 wt.discard()?;
@@ -308,15 +327,16 @@ fn drive_held(
             }
             SessionOutcome::RateLimited { retry_after } => {
                 abandon(store, m, wt, session, RATE_LIMITED)?;
-                let wait = retry_after.min(left);
+                let secs = retry_after.as_secs() + u64::from(retry_after.subsec_nanos() > 0);
+                // The wait itself happens at the top of the loop, where a
+                // restarted process finds it too.
                 store.append(
                     m,
                     &Event::Parked {
-                        until_unix: unix_now() + wait.as_secs() as i64,
+                        until_unix: unix_now() + secs as i64,
                         reason: RATE_LIMITED.into(),
                     },
                 )?;
-                std::thread::sleep(wait);
             }
         }
     }
@@ -339,16 +359,65 @@ fn watch_for_stop(
     while !ended.load(Ordering::SeqCst) {
         if polled.elapsed() >= STOP_POLL {
             polled = Instant::now();
-            let stopped = store.events_after(m, seen).is_ok_and(|new| {
-                new.iter()
-                    .any(|(_, e)| matches!(e, Event::Interrupt { .. }))
-            });
-            if stopped {
+            if stop_asked(store, m, seen) {
                 cancel.cancel();
                 return;
             }
         }
         std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Whether the person stopped the mission after event `seen`.
+fn stop_asked(store: &Store, m: &MissionId, seen: u64) -> bool {
+    store.events_after(m, seen).is_ok_and(|new| {
+        new.iter()
+            .any(|(_, e)| matches!(e, Event::Interrupt { .. }))
+    })
+}
+
+/// Waits until `until` (unix seconds), or until the person stops the
+/// mission after event `seen`. The time it waited.
+fn park(store: &Store, m: &MissionId, seen: u64, until: i64) -> Duration {
+    let since = Instant::now();
+    let mut polled = Instant::now();
+    while unix_now() < until {
+        if polled.elapsed() >= STOP_POLL {
+            polled = Instant::now();
+            if stop_asked(store, m, seen) {
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    since.elapsed()
+}
+
+/// When the latest usage limit lifts.
+fn parked_until(events: &[Event]) -> Option<i64> {
+    events.iter().rev().find_map(|e| match e {
+        Event::Parked { until_unix, .. } => Some(*until_unix),
+        _ => None,
+    })
+}
+
+/// Where and against what a session's work is checked.
+struct Checker<'a> {
+    repo: &'a Path,
+    /// A clean checkout made for each check run, then removed.
+    dir: PathBuf,
+    frozen: &'a Frozen,
+}
+
+impl Checker<'_> {
+    /// Runs every check on a clean checkout of `rev`, so only what was
+    /// committed counts: files the session left out of the commit (ignored
+    /// ones, say) cannot make a check pass.
+    fn run(&self, store: &Store, m: &MissionId, rev: &str, session: u32) -> Result<bool> {
+        let wt = fresh_worktree(self.repo, rev, &self.dir)?;
+        let passed = check_all(self.frozen, &wt.path, session, store, m);
+        wt.discard()?;
+        passed
     }
 }
 
@@ -398,12 +467,13 @@ fn still_open(store: &Store, m: &MissionId) -> Result<()> {
     }
 }
 
-/// Commits the session's work and runs every check on it. The commit, if
-/// all of them passed.
+/// Commits the session's work and runs every check on that commit (on the
+/// base when the session changed nothing, so its failures still reach the
+/// next brief). The commit, if all of them passed.
 fn check_session(
     store: &Store,
     m: &MissionId,
-    frozen: &Frozen,
+    checker: &Checker,
     wt: &Worktree,
     session: u32,
     base: &str,
@@ -411,7 +481,7 @@ fn check_session(
     let Some(commit) = session_commit(store, m, wt, session, base)? else {
         return Ok(None);
     };
-    let passed = check_all(frozen, &wt.path, session, store, m)?;
+    let passed = checker.run(store, m, commit.as_deref().unwrap_or(base), session)?;
     Ok(commit.filter(|_| passed))
 }
 
@@ -477,7 +547,12 @@ fn finish(store: &Store, m: &MissionId, st: &Started, commit: String) -> Result<
 
 /// Finishes or clears away the last session a dead process left behind.
 /// `Some` when that session's work completes the mission.
-fn recover(store: &Store, m: &MissionId, st: &Started, frozen: &Frozen) -> Result<Option<Outcome>> {
+fn recover(
+    store: &Store,
+    m: &MissionId,
+    st: &Started,
+    checker: &Checker,
+) -> Result<Option<Outcome>> {
     let events = only_events(store, m)?;
     let Some(i) = events
         .iter()
@@ -529,7 +604,8 @@ fn recover(store: &Store, m: &MissionId, st: &Started, frozen: &Frozen) -> Resul
             _ => None,
         })
         .collect();
-    let complete_set = frozen
+    let complete_set = checker
+        .frozen
         .set
         .checks
         .iter()
@@ -556,7 +632,7 @@ fn recover(store: &Store, m: &MissionId, st: &Started, frozen: &Frozen) -> Resul
     let commit = if complete_set {
         session_commit(store, m, &wt, session, &base)?.flatten()
     } else {
-        check_session(store, m, frozen, &wt, session, &base)?
+        check_session(store, m, checker, &wt, session, &base)?
     };
     match commit {
         Some(c) => complete(store, m, st, wt, session, c).map(Some),

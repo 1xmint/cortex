@@ -180,3 +180,12 @@ expect_exit = 0
         Event::CheckRun { check_id, .. } if check_id == "always"
     )));
 }
+
+#[test]
+fn empty_check_set_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let toml = dir.path().join("checks.toml");
+    std::fs::write(&toml, "check = []\n").unwrap();
+    // No checks means nothing could ever fail, so nothing is proven.
+    assert!(CheckSet::load(&toml).is_err());
+}

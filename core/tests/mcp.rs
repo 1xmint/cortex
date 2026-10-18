@@ -175,3 +175,42 @@ fn mcp_test_records_no_events() {
     // Only Cortex's own check runs count, so the tool keeps no record.
     assert!(!e.home().join("cortex.db").exists());
 }
+
+#[test]
+fn mcp_test_cannot_change_the_worktree() {
+    let e = Env::new();
+    std::fs::write(
+        e.dir.path().join("checks/checks.toml"),
+        r#"
+[[check]]
+id = "leak"
+command = "cp /checks/files/expected.txt out.txt"
+expect_exit = 1
+"#,
+    )
+    .unwrap();
+    let mut c = e.client();
+    let (text, _) = c.tool("test", json!({}));
+    assert!(text.contains("leak: failed"), "{text}");
+    // The check ran on a copy, so the hidden answer never reached the project.
+    assert!(!e.work().join("out.txt").exists());
+}
+
+#[test]
+fn mcp_test_copy_does_not_follow_links() {
+    let e = Env::new();
+    let secret = e.dir.path().join("secret.txt");
+    std::fs::write(&secret, "host secret\n").unwrap();
+    std::os::unix::fs::symlink(&secret, e.work().join("link")).unwrap();
+    std::fs::write(
+        e.dir.path().join("checks/checks.toml"),
+        "[[check]]\nid = \"peek\"\ncommand = \"cat link\"\nexpect_exit = 1\n",
+    )
+    .unwrap();
+    let mut c = e.client();
+    let (text, _) = c.tool("test", json!({}));
+    // The link stays a link, so it points nowhere inside the sandbox and
+    // `cat` fails, as the check expects.
+    assert!(text.contains("peek: passed"), "{text}");
+    assert!(!text.contains("host secret"), "{text}");
+}

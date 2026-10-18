@@ -9,7 +9,9 @@
 //! content = "..."
 //! ```
 //!
-//! Session N uses entry N; past the end, the last entry repeats.
+//! Session N uses entry N; past the end, the last entry repeats. A session
+//! with `rate_limited_s = 60` writes nothing and reports the usage limit,
+//! asking to wait that many seconds.
 
 use super::{CancelToken, Engine, SessionInput, SessionOutcome};
 use crate::{Error, Result};
@@ -27,6 +29,7 @@ struct Session {
     #[serde(default)]
     delay_ms: u64,
     note: Option<String>,
+    rate_limited_s: Option<u64>,
     #[serde(default)]
     write: Vec<Write>,
 }
@@ -116,6 +119,11 @@ impl Engine for FakeEngine {
         if cancel.is_cancelled() {
             return Ok(SessionOutcome::Failed {
                 reason: "cancelled".into(),
+            });
+        }
+        if let Some(secs) = session.rate_limited_s {
+            return Ok(SessionOutcome::RateLimited {
+                retry_after: Duration::from_secs(secs),
             });
         }
 

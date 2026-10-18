@@ -9,7 +9,7 @@ use crate::sandbox::{self, RunOutput, RunSpec};
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::{ServiceExt, schemars, tool, tool_router};
 use serde::Deserialize;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 const DEFAULT_TIMEOUT_S: u32 = 120;
@@ -77,13 +77,52 @@ async fn blocking<T: Send + 'static>(
         .map_err(|e| e.to_string())
 }
 
-fn run_checks(worktree: &std::path::Path, checks: &std::path::Path) -> crate::Result<String> {
+/// A throwaway copy of a worktree, removed when dropped.
+struct Scratch(PathBuf);
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Copies `from` into `to` without following links: a link is recreated as
+/// a link, so it still resolves only inside the sandbox, and anything that
+/// is not a plain file, folder or link (a pipe, a device) is left out.
+fn copy_tree(from: &Path, to: &Path, top: bool) -> std::io::Result<()> {
+    std::fs::create_dir(to)?;
+    for entry in std::fs::read_dir(from)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        if top && name == ".git" {
+            continue;
+        }
+        let (src, dst) = (entry.path(), to.join(&name));
+        let kind = entry.file_type()?;
+        if kind.is_dir() {
+            copy_tree(&src, &dst, false)?;
+        } else if kind.is_file() {
+            std::fs::copy(&src, &dst)?;
+        } else if kind.is_symlink() {
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(std::fs::read_link(&src)?, &dst)?;
+        }
+    }
+    Ok(())
+}
+
+/// Runs the checks on a copy of the worktree, so a check that writes (say,
+/// copies a hidden file into place) cannot hand the engine the answer.
+fn run_checks(worktree: &Path, checks: &Path) -> crate::Result<String> {
     let set = CheckSet::load(&checks.join("checks.toml"))?;
+    let scratch =
+        Scratch(std::env::temp_dir().join(format!("cortex-test-{}", uuid::Uuid::new_v4())));
+    copy_tree(worktree, &scratch.0, true)?;
     let mut report = String::new();
     for check in &set.checks {
         let out = sandbox::run(&RunSpec {
             cmd: check.command.clone(),
-            workdir: worktree.to_path_buf(),
+            workdir: scratch.0.clone(),
             checks_dir: Some(checks.to_path_buf()),
             timeout: CHECK_TIMEOUT,
         })?;

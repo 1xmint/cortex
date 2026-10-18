@@ -26,6 +26,8 @@ What is true now and what comes next. Kept under 150 lines by CI.
 - Checks: frozen read-only outside the worktree with a SHA-256
   fingerprint, run in the sandbox, seen failing before work starts (a
   check that already passes is blocked and the mission cannot finish).
+  They run on a clean checkout of the session's commit, so only committed
+  work counts. A check set with no checks is refused.
 - Engines: one interface for whatever does a session's work, with a
   cancel switch and a time limit. A scripted fake engine stands in for
   real models in tests; it cannot write outside its worktree.
@@ -40,9 +42,12 @@ What is true now and what comes next. Kept under 150 lines by CI.
   sign-in file, a throwaway copy of `~/.claude.json` (nothing else in
   `~/.claude`, and nothing the session writes there survives), the
   worktree and the read-only checks. It has no shell: its only commands go
-  through `cortex mcp` (`run`, `test`), each in the gVisor sandbox. A session
-  that would bill an API key, or does not say how it bills, is refused; a usage limit parks the mission
-  until the reset time. Proven in CI with stand-in binaries only; a real
+  through `cortex mcp` (`run`, `test`), each in the gVisor sandbox; `test`
+  works on a throwaway copy, so a check cannot leave answers behind. A
+  session that would bill an API key, or does not say how it bills, is
+  refused. A usage limit parks the mission until the reset time: the park
+  is recorded (a restart keeps waiting), `stop` ends it, and parked time
+  does not count against the 2 h. Proven in CI with stand-in binaries only; a real
   signed-in session (`cargo test -- --ignored claude_cannot_run_shell`) has
   not run yet.
 - API engine: `--engine api` talks to the Claude API directly
