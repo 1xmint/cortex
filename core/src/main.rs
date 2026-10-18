@@ -36,6 +36,15 @@ enum Cmd {
         /// What you want, in plain words.
         request: String,
     },
+    /// Continue a mission after a crash, restart or pause.
+    Resume {
+        mission: String,
+        #[arg(long, value_enum, default_value_t = EngineKind::Claude)]
+        engine: EngineKind,
+        /// Script for the fake engine.
+        #[arg(long)]
+        fake_script: Option<PathBuf>,
+    },
     /// Show where a mission stands and where its result is.
     Status { mission: String },
 }
@@ -59,6 +68,11 @@ fn main() -> ExitCode {
             fake_script,
             request,
         }) => run(&repo, &checks, engine, fake_script, &request),
+        Some(Cmd::Resume {
+            mission,
+            engine,
+            fake_script,
+        }) => resume(&MissionId(mission), engine, fake_script),
         Some(Cmd::Status { mission }) => status(&MissionId(mission)),
     };
     result.unwrap_or_else(|e| {
@@ -127,14 +141,29 @@ fn run(
     let mut engine = engine(kind, fake_script)?;
     let store = open_store()?;
     let m = mission::start(&store, &home(), repo, checks, request, &person())?;
+    work(&store, &m, engine.as_mut())
+}
+
+/// Drives the mission and reports how it ended.
+fn work(store: &Store, m: &MissionId, engine: &mut dyn Engine) -> cortex::Result<ExitCode> {
     println!("mission {}", m.0);
     std::io::stdout().flush()?;
-    let outcome = mission::drive(&store, &home(), &m, engine.as_mut(), &Budgets::default())?;
-    report(&store, &m, &outcome)?;
+    let outcome = mission::drive(store, &home(), m, engine, &Budgets::default())?;
+    report(store, m, &outcome)?;
     Ok(match outcome {
         Outcome::Stuck { .. } => ExitCode::from(2),
         _ => ExitCode::SUCCESS,
     })
+}
+
+fn resume(
+    m: &MissionId,
+    kind: EngineKind,
+    fake_script: Option<PathBuf>,
+) -> cortex::Result<ExitCode> {
+    let mut engine = engine(kind, fake_script)?;
+    let store = open_store()?;
+    work(&store, m, engine.as_mut())
 }
 
 fn status(m: &MissionId) -> cortex::Result<ExitCode> {

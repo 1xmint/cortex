@@ -66,6 +66,46 @@ pub fn create_worktree(repo: &Path, base: &str, dest: &Path) -> Result<Worktree>
     })
 }
 
+/// Reattaches to a worktree Cortex made earlier, refusing it unless its
+/// `.git` file still points at the repository's own record of it.
+pub fn open_worktree(repo: &Path, dest: &Path) -> Result<Worktree> {
+    let modified = || Error::Blocked("worktree .git was modified".into());
+    let git_file = std::fs::read_to_string(dest.join(".git")).map_err(|_| modified())?;
+    let gitdir = git_file
+        .trim()
+        .strip_prefix("gitdir: ")
+        .ok_or_else(modified)?;
+    let common = git(
+        repo,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )?;
+    let gitdir = std::fs::canonicalize(gitdir).map_err(|_| modified())?;
+    let records = std::fs::canonicalize(Path::new(&common).join("worktrees"))?;
+    let back = std::fs::read_to_string(gitdir.join("gitdir")).map_err(|_| modified())?;
+    let points_back =
+        std::fs::canonicalize(back.trim()).ok() == std::fs::canonicalize(dest.join(".git")).ok();
+    if gitdir.parent() != Some(records.as_path()) || !points_back {
+        return Err(modified());
+    }
+    Ok(Worktree {
+        path: dest.to_path_buf(),
+        repo: repo.to_path_buf(),
+        git_file,
+    })
+}
+
+/// Removes a worktree's folder and git's record of it, whether or not
+/// either still exists.
+pub fn forget_worktree(repo: &Path, dest: &Path) -> Result<()> {
+    let path = dest.to_string_lossy().into_owned();
+    let _ = git(repo, &["worktree", "remove", "--force", &path]);
+    if dest.exists() {
+        std::fs::remove_dir_all(dest)?;
+    }
+    git(repo, &["worktree", "prune"])?;
+    Ok(())
+}
+
 impl Worktree {
     /// Refuses to run git if the worker replaced the `.git` file.
     fn checked_git(&self, args: &[&str]) -> Result<String> {
@@ -87,15 +127,7 @@ impl Worktree {
 
     /// Removes the worktree and its folder, even if the worker damaged it.
     pub fn discard(self) -> Result<()> {
-        let path = self.path.to_string_lossy().into_owned();
-        let removed = git(&self.repo, &["worktree", "remove", "--force", &path]);
-        if self.path.exists() {
-            std::fs::remove_dir_all(&self.path)?;
-        }
-        if removed.is_err() {
-            git(&self.repo, &["worktree", "prune"])?;
-        }
-        Ok(())
+        forget_worktree(&self.repo, &self.path)
     }
 }
 
