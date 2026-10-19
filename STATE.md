@@ -127,5 +127,8 @@ What is true now and what comes next. Kept under 150 lines by CI.
    test checks to CI.
 3. First brain slice: done 2026-10-18 (doctor, jail test and a 10 of 10
    bench run in WSL Ubuntu).
-4. Next: a harder bench that real engines can fail, so scores mean
-   something; then the slice-2 plan from the design document.
+4. Next: owner approval of the brain design version 2
+   ([draft](docs/superpowers/specs/2026-10-18-cortex-brain-design-v2.md)),
+   which reorders the slices: a harder bench with cost recording first, then
+   the planner, then the chat page. The slice-2 design in PR 26 closes as
+   superseded once version 2 is approved.
