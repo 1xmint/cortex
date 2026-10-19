@@ -7,6 +7,10 @@ pub mod claude;
 pub mod fake;
 
 use crate::Result;
+
+/// Names the brief templates' wording; bump it whenever any brief
+/// template changes, so results can be grouped by prompt.
+pub const PROMPT_VERSION: &str = "2026-10-18";
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};

@@ -1,7 +1,7 @@
 //! The mission log: an append-only event list per mission in SQLite
 //! (ADR 0003), plus leases so only one process drives a mission at a time.
 
-use crate::event::Event;
+use crate::event::{Event, SCHEMA_VERSION, upgrade};
 use crate::{Error, Result};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use std::path::Path;
@@ -13,6 +13,23 @@ pub struct MissionId(pub String);
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ProjectId(pub String);
+
+/// An event with the format version and build that wrote it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredEvent {
+    pub seq: u64,
+    pub schema_version: u32,
+    pub build: String,
+    pub prompt_version: String,
+    pub event: Event,
+}
+
+/// Columns added after slice 1, with the values old rows read as.
+const ADDED_COLUMNS: [(&str, &str); 3] = [
+    ("schema_version", "INTEGER NOT NULL DEFAULT 1"),
+    ("build", "TEXT NOT NULL DEFAULT 'unknown'"),
+    ("prompt_version", "TEXT NOT NULL DEFAULT ''"),
+];
 
 pub struct Store {
     conn: Mutex<Connection>,
@@ -62,6 +79,24 @@ impl From<serde_json::Error> for Error {
     }
 }
 
+/// Adds the post-slice-1 columns to an older database, once, in one
+/// transaction. Old rows keep their defaults and are never rewritten.
+fn add_missing_columns(conn: &mut Connection) -> Result<()> {
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let have: Vec<String> = {
+        let mut stmt = tx.prepare("SELECT name FROM pragma_table_info('events')")?;
+        stmt.query_map([], |r| r.get(0))?
+            .collect::<std::result::Result<_, _>>()?
+    };
+    for (name, decl) in ADDED_COLUMNS {
+        if !have.iter().any(|h| h == name) {
+            tx.execute_batch(&format!("ALTER TABLE events ADD COLUMN {name} {decl}"))?;
+        }
+    }
+    tx.commit()?;
+    Ok(())
+}
+
 fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -71,11 +106,12 @@ fn now_ms() -> i64 {
 
 impl Store {
     pub fn open(path: &Path) -> Result<Store> {
-        let conn = Connection::open(path)?;
+        let mut conn = Connection::open(path)?;
         conn.busy_timeout(Duration::from_secs(10))?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.execute_batch(SCHEMA)?;
+        add_missing_columns(&mut conn)?;
         Ok(Store {
             conn: Mutex::new(conn),
             lease_ttl: Duration::from_secs(15),
@@ -126,8 +162,18 @@ impl Store {
                 |r| r.get(0),
             )?;
             tx.execute(
-                "INSERT INTO events (mission_id, seq, kind, body_json, at) VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![m.0, seq, kind, body, now_ms()],
+                "INSERT INTO events (mission_id, seq, kind, body_json, at, schema_version, build, prompt_version)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    m.0,
+                    seq,
+                    kind,
+                    body,
+                    now_ms(),
+                    SCHEMA_VERSION,
+                    crate::BUILD,
+                    crate::engine::PROMPT_VERSION
+                ],
             )?;
             tx.commit()?;
             seq as u64
@@ -146,17 +192,45 @@ impl Store {
     }
 
     pub fn events_after(&self, m: &MissionId, seq: u64) -> Result<Vec<(u64, Event)>> {
+        Ok(self
+            .stored_events_after(m, seq)?
+            .into_iter()
+            .map(|e| (e.seq, e.event))
+            .collect())
+    }
+
+    /// Every event of the mission with the version and build that wrote it.
+    pub fn stored_events(&self, m: &MissionId) -> Result<Vec<StoredEvent>> {
+        self.stored_events_after(m, 0)
+    }
+
+    fn stored_events_after(&self, m: &MissionId, seq: u64) -> Result<Vec<StoredEvent>> {
         let conn = self.conn();
         let mut stmt = conn.prepare(
-            "SELECT seq, body_json FROM events WHERE mission_id = ?1 AND seq > ?2 ORDER BY seq",
+            "SELECT seq, body_json, schema_version, build, prompt_version FROM events
+             WHERE mission_id = ?1 AND seq > ?2 ORDER BY seq",
         )?;
         let rows = stmt.query_map(params![m.0, seq as i64], |r| {
-            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, i64>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, String>(4)?,
+            ))
         })?;
         let mut out = Vec::new();
         for row in rows {
-            let (seq, body) = row?;
-            out.push((seq as u64, serde_json::from_str(&body)?));
+            let (seq, body, version, build, prompt_version) = row?;
+            let version = u32::try_from(version)
+                .map_err(|_| Error::Invalid(format!("event {seq} has schema version {version}")))?;
+            out.push(StoredEvent {
+                seq: seq as u64,
+                schema_version: version,
+                build,
+                prompt_version,
+                event: upgrade(version, serde_json::from_str(&body)?)?,
+            });
         }
         Ok(out)
     }

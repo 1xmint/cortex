@@ -1,7 +1,24 @@
 //! What can happen in a mission. Events are only ever appended (ADR 0003).
 
+use crate::{Error, Result};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+
+/// The format events are written in. Version 1 is slice 1's; an event's
+/// version is stored beside it and old events are upgraded as they are
+/// read, never rewritten.
+pub const SCHEMA_VERSION: u32 = 2;
+
+/// Reads an event body written in format `version`.
+pub fn upgrade(version: u32, body: serde_json::Value) -> Result<Event> {
+    if version > SCHEMA_VERSION {
+        return Err(Error::Invalid(format!(
+            "event from a newer Cortex (schema version {version}, this build reads up to {SCHEMA_VERSION})"
+        )));
+    }
+    // 1 → 2 adds only new kinds and columns, so old bodies read as they are.
+    serde_json::from_value(body).map_err(|e| Error::Store(format!("event encoding: {e}")))
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]

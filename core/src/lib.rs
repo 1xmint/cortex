@@ -12,3 +12,6 @@ pub mod sandbox;
 pub mod store;
 
 pub use error::{Error, Result};
+
+/// The commit this binary was built from (12 characters), or `unknown`.
+pub const BUILD: &str = env!("CORTEX_BUILD");

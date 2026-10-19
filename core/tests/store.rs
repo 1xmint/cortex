@@ -227,3 +227,91 @@ fn concurrent_appends_from_two_connections_get_distinct_seqs() {
     seqs.sort();
     assert_eq!(seqs, (1..=100).collect::<Vec<u64>>());
 }
+
+#[test]
+fn appended_event_records_version_and_build() {
+    let (_dir, store) = temp_store();
+    let m = store.create_mission(&project("p"), "josh").unwrap();
+    store.append(&m, &Event::MissionPaused).unwrap();
+    let stored = store.stored_events(&m).unwrap();
+    assert_eq!(stored.len(), 1);
+    assert_eq!(stored[0].seq, 1);
+    assert_eq!(stored[0].schema_version, cortex::event::SCHEMA_VERSION);
+    assert_eq!(stored[0].schema_version, 2);
+    assert_eq!(stored[0].build, cortex::BUILD);
+    assert!(!stored[0].build.is_empty());
+    assert_eq!(stored[0].prompt_version, cortex::engine::PROMPT_VERSION);
+    assert!(!stored[0].prompt_version.is_empty());
+    assert_eq!(stored[0].event, Event::MissionPaused);
+}
+
+// Written by the slice-1 store at main 1e6238c36e7d: one mission, five events.
+const SLICE1_MISSION: &str = "0cd4abd8-b296-4d1d-a2a6-7295508b9f7d";
+
+#[test]
+fn slice1_database_upgrades_in_place() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("cortex.db");
+    std::fs::copy(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/slice1.db"),
+        &path,
+    )
+    .unwrap();
+    let m = MissionId(SLICE1_MISSION.to_string());
+    {
+        let store = Store::open(&path).unwrap();
+        let old = store.stored_events(&m).unwrap();
+        assert_eq!(old.len(), 5);
+        assert!(old.iter().all(|e| e.schema_version == 1), "{old:?}");
+        assert!(old.iter().all(|e| e.build == "unknown"), "{old:?}");
+        assert!(matches!(old[0].event, Event::MissionStarted { .. }));
+        assert!(matches!(old[4].event, Event::MissionDone { .. }));
+        store.append(&m, &Event::MissionResumed).unwrap();
+        let all = store.stored_events(&m).unwrap();
+        assert_eq!(all[5].seq, 6);
+        assert_eq!(all[5].schema_version, 2);
+    }
+    let store = Store::open(&path).unwrap();
+    assert_eq!(store.events(&m).unwrap().len(), 6);
+    assert_eq!(store.stored_events(&m).unwrap()[0].schema_version, 1);
+}
+
+#[test]
+fn newer_event_is_refused_not_guessed() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("cortex.db");
+    let store = Store::open(&path).unwrap();
+    let m = store.create_mission(&project("p"), "josh").unwrap();
+    store.append(&m, &Event::MissionPaused).unwrap();
+    // Positive control: a current event reads back.
+    assert_eq!(store.events(&m).unwrap().len(), 1);
+    let raw = rusqlite::Connection::open(&path).unwrap();
+    raw.execute(
+        "INSERT INTO events (mission_id, seq, kind, body_json, at, schema_version) \
+         VALUES (?1, 2, 'mission_paused', '{\"kind\":\"mission_paused\"}', 0, 99)",
+        [&m.0],
+    )
+    .unwrap();
+    let err = store.events(&m).unwrap_err().to_string();
+    assert!(err.contains("99"), "{err}");
+    assert!(err.contains("newer Cortex"), "{err}");
+}
+
+#[test]
+fn version_columns_cannot_be_updated() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("cortex.db");
+    let store = Store::open(&path).unwrap();
+    let m = store.create_mission(&project("p"), "josh").unwrap();
+    store.append(&m, &Event::MissionPaused).unwrap();
+    let raw = rusqlite::Connection::open(&path).unwrap();
+    for sql in [
+        "UPDATE events SET build = 'x'",
+        "UPDATE events SET schema_version = 1",
+        "UPDATE events SET prompt_version = 'x'",
+    ] {
+        let err = raw.execute(sql, []).unwrap_err().to_string();
+        assert!(err.contains("append-only"), "{sql}: {err}");
+    }
+    assert_eq!(store.stored_events(&m).unwrap()[0].build, cortex::BUILD);
+}
