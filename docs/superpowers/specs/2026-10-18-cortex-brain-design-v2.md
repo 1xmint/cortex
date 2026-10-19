@@ -234,7 +234,10 @@ action is recorded as:
 - its status, kept up to date;
 - how to cancel it;
 - how to reconcile it after a crash: ask the provider what happened
-  instead of submitting again.
+  instead of submitting again. If the crash came after submitting but
+  before the job ID was recorded, recovery uses the idempotency key; if
+  the provider cannot say what happened, the action stops for
+  reconciliation rather than guessing.
 A process that lost its lease is fenced: it cannot commit results. Workflow
 behaviour is pinned per mission, or migrated explicitly, across upgrades.
 
@@ -288,8 +291,12 @@ artifacts and evidence that serve it. **The roadmap is a view of these
 records**, not a separate document. A mission starts from a **charter**:
 the requirements it serves, the decisions it must respect and its budget.
 It reports back what it proved, the risks it found and any scope change it
-proposes. Only the person, or the judge in "just do it" mode with written
-reasons, changes a goal or a requirement.
+proposes. **Only the person changes a goal or a requirement they
+approved.** The judge may change plans freely within approved goals, but
+"just do it" mode does not by itself let it rewrite them. The person's
+working agreement may hand over that authority explicitly, for stated
+kinds of change and within stated limits (invariant 4); written reasons
+alone are never enough.
 
 This is the owner's "intent graph". It starts simple: plain records with
 links, no ontology. It grows only when the bench's continuing-project
@@ -343,7 +350,10 @@ The mission runs like this:
    - **Technical proof and creative quality are reported separately.** "It
      runs and passes its checks" is proof. "The art fits the style" is an
      assessment with a rubric, evidence and stated uncertainty, never a
-     pass flag on its own (invariant 1).
+     pass flag on its own (invariant 1). Passing technical checks does not
+     finish a mission that has an unmet creative requirement: that
+     requirement is either accepted (by the person, or as their agreement
+     allows) or reported as unresolved.
    - **A changed check is a new plan version.** In "build it with me" mode
      the person approves it, in plain words. In "just do it" mode the judge
      approves it with written reasons. Either way it is logged and shown.
@@ -417,8 +427,10 @@ is the pieces and dependencies from section 3.3, held as **data the planner
 rewrites** in the log. The roadmap and intent graphs the person sees, by
 layer, system or process, are **views drawn from that data** and from the
 intent records (section 3.2a). They are never a second source of truth to
-keep in sync. Each view records its own version, and CI rebuilds views
-from the log and compares them, so "cannot drift" is checked, not assumed.
+keep in sync. Each view records its own version, and CI checks that
+rebuilding views from recorded fixture logs gives the same result every
+time, so "cannot drift" is tested, not assumed. Live projects rebuild a
+view whenever its version is out of date.
 
 **Pieces meet through versioned contracts.** Pieces that never share a file
 can still clash: sprite sizes, animation timing and game logic depend on
@@ -464,7 +476,9 @@ integration is its own piece with its own checks.
   Cortex does not understand are refused**, including a provider's
   server-side tools, until they are supported through the action broker
   (section 3.8). Otherwise they would run outside the sandbox and the
-  person's approvals.
+  person's approvals. Unsupported server-side tools are switched off in
+  the request itself, before it is sent; refusing them afterwards would
+  be too late.
   Each adapter is tested in CI against recorded replies.
 - **Model profiles are configuration:**
   - endpoint;
@@ -738,9 +752,13 @@ cost.**
   - check rules for continuing work: preservation checks shown failing
     against a planted defect, replacing slice 1's "must start red" in
     `core/src/checks.rs`;
-  - the action broker's rules, for one owner (section 3.8);
-  - the schema for durable action records and piece contracts (sections
-    3.2 and 3.4), used fully when outside jobs and media arrive.
+  - the action broker's rules, for one owner, with identity and project
+    scope explicit from the start (section 3.8);
+  - piece contracts (section 3.4), enforced wherever the planner makes
+    pieces that depend on each other, including the media experiment;
+  - the schema for durable action records (section 3.2), proven against a
+    fake provider (including a crash after submitting) before the first
+    real outside job.
 - Triggered research and the cross-family reviewer, both behind switches.
 - Real runs (quota), sized from slice 2's measured cost and capped in
   advance:
