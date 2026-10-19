@@ -80,7 +80,20 @@ fn holdout_results_stay_in_holdout_dir() {
     // One small prompt and one multi task.
     assert_eq!(report.summary.total, 2);
     assert_eq!(path.parent().unwrap(), own);
-    assert_eq!(files_under(&own), vec![path]);
+    // Its page sits beside it, and nothing else is written.
+    let mut got = files_under(&own);
+    got.sort();
+    let mut want = vec![path.clone(), path.with_extension("html")];
+    want.sort();
+    assert_eq!(got, want);
+
+    // The page tool will not put a holdout page anywhere public either.
+    let outside = tmp.path().join("public-page.html");
+    let refused = bench::write_page(&path, Some(&outside));
+    assert!(matches!(refused, Err(Error::Invalid(_))), "{refused:?}");
+    assert!(!outside.exists());
+    let inside = own.join("again.html");
+    assert_eq!(bench::write_page(&path, Some(&inside)).unwrap(), inside);
 }
 
 #[test]

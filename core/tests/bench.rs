@@ -173,3 +173,36 @@ fn results_file_matches_schema() {
     );
     assert!(unknown.is_err());
 }
+
+#[test]
+fn a_failed_attempt_keeps_earlier_results() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("cortex.db")).unwrap();
+    let results = dir.path().join("results");
+    let mut made = 0;
+    let mut flaky = |t: &Task| -> cortex::Result<Box<dyn Engine>> {
+        made += 1;
+        if made == 2 {
+            return Err(cortex::Error::Invalid("sandbox hiccup".into()));
+        }
+        fake(t)
+    };
+    let failed = bench::run(
+        &bench_dir(),
+        &small(None),
+        &dir.path().join("home"),
+        &store,
+        &mut flaky,
+        &results,
+    );
+    assert!(failed.is_err(), "{failed:?}");
+    let written: Vec<PathBuf> = std::fs::read_dir(&results)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.extension().is_some_and(|x| x == "json"))
+        .collect();
+    assert_eq!(written.len(), 1, "{written:?}");
+    let report = bench::load(&written[0]).unwrap();
+    assert_eq!(report.attempts.len(), 1);
+    assert!(report.attempts[0].accepted);
+}

@@ -292,3 +292,29 @@ fn fake_engine_records_one_call_per_session() {
         assert_eq!(*spent, cortex::payload::Spend::Unknown);
     }
 }
+
+#[test]
+fn transcript_text_lives_in_deletable_payloads() {
+    let e = env();
+    let m = e.start();
+    let outcome = e.drive(&m, RIGHT, &Budgets::default());
+    assert!(matches!(outcome, Outcome::Done { .. }), "{outcome:?}");
+    let transcripts: Vec<serde_json::Value> = e
+        .events(&m)
+        .iter()
+        .map(|ev| serde_json::to_value(ev).unwrap())
+        .filter(|v| v["kind"] == "transcript")
+        .collect();
+    assert!(!transcripts.is_empty());
+    let mut texts = Vec::new();
+    for v in &transcripts {
+        // The event itself holds no model text, only where it lives.
+        assert!(v.get("line").is_none(), "{v}");
+        let r: cortex::payload::PayloadRef = serde_json::from_value(v["payload"].clone()).unwrap();
+        let body = e.store.payload(&r).unwrap().unwrap();
+        texts.push(String::from_utf8(body).unwrap());
+        e.store.delete_payload(&r).unwrap();
+        assert_eq!(e.store.payload(&r).unwrap(), None);
+    }
+    assert!(texts.iter().any(|t| t.starts_with("brief: ")), "{texts:?}");
+}
