@@ -137,5 +137,7 @@ What is true now and what comes next. Kept under 150 lines by CI.
 4. Brain design version 2 approved (done 2026-10-18).
 5. Next: slice 2 of version 2 (section 6): a bench of browser games and
    small web apps that can tell brains apart, cost per accepted result,
-   and full model-call records. Starts with its plan; needs the owner's
-   private holdout repository (design section 8).
+   and full model-call records. The private holdout repository
+   `1xmint/cortex-holdout` exists; the plan is
+   [docs/superpowers/plans/2026-10-18-brain-slice-2.md](docs/superpowers/plans/2026-10-18-brain-slice-2.md),
+   waiting for the owner's review.
