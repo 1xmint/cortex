@@ -255,6 +255,23 @@ pub fn run(
     Ok((report, path))
 }
 
+/// Writes the page for a results file to `out` (default: beside it). A
+/// results file inside a holdout bench may only have its page written
+/// inside that bench's `results/`.
+pub fn write_page(results: &Path, out: Option<&Path>) -> Result<PathBuf> {
+    let report = load(results)?;
+    let out = out.map_or_else(|| results.with_extension("html"), Path::to_path_buf);
+    let abs = std::path::absolute(results)?;
+    for dir in abs.ancestors().skip(1) {
+        if is_holdout(dir)? {
+            guard_results(dir, &out)?;
+            break;
+        }
+    }
+    std::fs::write(&out, page::render(&report))?;
+    Ok(out)
+}
+
 /// One try at `task`, worked under `dir/try-<n>`.
 fn attempt(
     task: &Task,
