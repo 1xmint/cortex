@@ -1,0 +1,15 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>Counter</title></head>
+<body>
+<h1>Counter</h1>
+<p id="count">0</p>
+<button id="plus">+</button>
+<script>
+// Shows 1 after any click: enough for the visible checks, wrong after that.
+document.getElementById("plus").addEventListener("click", () => {
+  document.getElementById("count").textContent = "1";
+});
+</script>
+</body>
+</html>

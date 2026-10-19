@@ -1,0 +1,4 @@
+[[check]]
+id = "keeps-counting"
+command = "/usr/local/lib/cortex-browser/node/bin/node /checks/files/keeps-counting.mjs"
+expect_exit = 0

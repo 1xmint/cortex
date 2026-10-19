@@ -155,3 +155,31 @@ fn fake_reports_brief_in_transcript() {
     let (_, lines) = run(&mut e, &input(wt.path(), 1, "short brief"));
     assert!(lines.contains(&"brief: short brief".to_string()));
 }
+
+#[test]
+fn fake_from_overlay_writes_every_file_but_why() {
+    let overlay = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(overlay.path().join("js")).unwrap();
+    std::fs::write(overlay.path().join("index.html"), "<p>hi</p>").unwrap();
+    std::fs::write(overlay.path().join("js/app.js"), "go()").unwrap();
+    std::fs::write(overlay.path().join("WHY.md"), "the gamer").unwrap();
+    let wt = tempfile::tempdir().unwrap();
+    let mut e = FakeEngine::from_overlay(overlay.path()).unwrap();
+    let (out, lines) = run(&mut e, &input(wt.path(), 1, "do it"));
+    assert!(matches!(out, SessionOutcome::Ended { .. }), "{out:?}");
+    assert_eq!(
+        std::fs::read_to_string(wt.path().join("js/app.js")).unwrap(),
+        "go()"
+    );
+    assert!(!wt.path().join("WHY.md").exists());
+    let writes: Vec<&String> = lines.iter().filter(|l| l.starts_with("wrote ")).collect();
+    assert_eq!(writes, ["wrote index.html", "wrote js/app.js"]);
+}
+
+#[test]
+fn fake_from_overlay_rejects_binary_files() {
+    let overlay = tempfile::tempdir().unwrap();
+    std::fs::write(overlay.path().join("logo.png"), [0x89, 0x50, 0xff, 0xfe]).unwrap();
+    let err = FakeEngine::from_overlay(overlay.path()).unwrap_err();
+    assert!(err.to_string().contains("logo.png"), "{err}");
+}

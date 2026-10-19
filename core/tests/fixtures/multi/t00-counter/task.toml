@@ -1,0 +1,5 @@
+# A deliberately tiny task: it exercises the multi-feature format, not a
+# worker. The features name what the checks look at.
+tier = "multi"
+kind = "fresh"
+features = ["count element", "starts at zero", "plus button", "adds one per click", "keeps counting"]

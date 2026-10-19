@@ -64,6 +64,46 @@ impl FakeEngine {
     pub fn load(path: &Path) -> Result<FakeEngine> {
         FakeEngine::from_toml(&std::fs::read_to_string(path)?)
     }
+
+    /// One session that writes every file under `dir`, at the same relative
+    /// path, leaving out a top-level `WHY.md` (a bench overlay's note).
+    /// Text only: a file that is not UTF-8 is an error.
+    pub fn from_overlay(dir: &Path) -> Result<FakeEngine> {
+        let mut write = Vec::new();
+        overlay_files(dir, "", &mut write)?;
+        write.retain(|w| w.path != crate::bench::task::WHY);
+        if write.is_empty() {
+            return Err(Error::Invalid(format!(
+                "overlay {} has no files",
+                dir.display()
+            )));
+        }
+        write.sort_by(|a, b| a.path.cmp(&b.path));
+        Ok(FakeEngine {
+            sessions: vec![Session {
+                delay_ms: 0,
+                note: Some("overlay written".into()),
+                rate_limited_s: None,
+                write,
+            }],
+        })
+    }
+}
+
+fn overlay_files(dir: &Path, prefix: &str, out: &mut Vec<Write>) -> Result<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let path = format!("{prefix}{name}");
+        if entry.file_type()?.is_dir() {
+            overlay_files(&entry.path(), &format!("{path}/"), out)?;
+        } else {
+            let content = String::from_utf8(std::fs::read(entry.path())?)
+                .map_err(|_| Error::Invalid(format!("overlay file {path} is not UTF-8 text")))?;
+            out.push(Write { path, content });
+        }
+    }
+    Ok(())
 }
 
 /// Only plain relative paths: no root, drive, `.` or `..`.

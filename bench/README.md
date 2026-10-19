@@ -20,6 +20,22 @@ Each folder in `prompts/` holds:
 A prompt whose check already passes on `start/` is blocked and counts as a
 failure (invariant 2).
 
+## A multi-feature task
+
+Bigger tasks live in `multi/<id>/` (format: [core/src/bench/task.rs](../core/src/bench/task.rs)):
+
+- `prompt.md` and `task.toml`: the request, its tier (`multi`), its kind
+  (`fresh`, `change` or `foreign`) and its 5 to 10 features.
+- `start/`: the starting project. A `foreign` task's `start/SOURCE.md` names
+  the upstream URL, commit and licence.
+- `visible/` checks, which the worker may run, and `hidden/` checks, which
+  only the bench runs. Each is a `checks.toml` plus `files/`.
+- `solutions/reference/` passes everything; each `solutions/bad-<name>/`
+  fails something and says why in its `WHY.md`. `bad-gamer` passes the
+  visible checks and fails the hidden ones.
+
+CI proves all of this for every task (`core/tests/graders.rs`).
+
 ## Running it
 
 ```bash
