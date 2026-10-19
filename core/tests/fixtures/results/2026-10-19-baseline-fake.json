@@ -1,0 +1,123 @@
+{
+  "schema": 2,
+  "arm": "baseline",
+  "tier": "multi",
+  "worker_profile": "fake",
+  "engine": "fake",
+  "engine_version": "0",
+  "provisional": false,
+  "cortex_commit": "fixture",
+  "started": "2026-10-19T00:00:00Z",
+  "attempts": [
+    {
+      "task": "m01",
+      "kind": "fresh",
+      "try": 1,
+      "mission_id": "baseline-0",
+      "mission_done": true,
+      "accepted": true,
+      "hidden_failed": [],
+      "sessions": 1,
+      "seconds": 30.0,
+      "tokens": 1000,
+      "estimated_usd_micros": 10000,
+      "spent": {
+        "kind": "usd",
+        "micros": 10000
+      },
+      "story": {
+        "request": "Synthetic fixture task",
+        "commit": "0000000",
+        "files_changed": [
+          "index.html"
+        ],
+        "failures": [],
+        "stuck_reason": null
+      }
+    },
+    {
+      "task": "m02",
+      "kind": "fresh",
+      "try": 1,
+      "mission_id": "baseline-1",
+      "mission_done": false,
+      "accepted": false,
+      "hidden_failed": [
+        "hidden-1"
+      ],
+      "sessions": 1,
+      "seconds": 30.0,
+      "tokens": 1000,
+      "estimated_usd_micros": 10000,
+      "spent": {
+        "kind": "usd",
+        "micros": 10000
+      },
+      "story": {
+        "request": "Synthetic fixture task",
+        "commit": "0000000",
+        "files_changed": [
+          "index.html"
+        ],
+        "failures": [
+          {
+            "check_id": "hidden-1",
+            "hidden": true,
+            "output_tail": "expected a score"
+          }
+        ],
+        "stuck_reason": null
+      }
+    },
+    {
+      "task": "m03",
+      "kind": "fresh",
+      "try": 1,
+      "mission_id": "baseline-2",
+      "mission_done": false,
+      "accepted": false,
+      "hidden_failed": [
+        "hidden-1"
+      ],
+      "sessions": 1,
+      "seconds": 30.0,
+      "tokens": 1000,
+      "estimated_usd_micros": 10000,
+      "spent": {
+        "kind": "usd",
+        "micros": 10000
+      },
+      "story": {
+        "request": "Synthetic fixture task",
+        "commit": "0000000",
+        "files_changed": [
+          "index.html"
+        ],
+        "failures": [
+          {
+            "check_id": "hidden-1",
+            "hidden": true,
+            "output_tail": "expected a score"
+          }
+        ],
+        "stuck_reason": null
+      }
+    }
+  ],
+  "summary": {
+    "accepted": 1,
+    "total": 3,
+    "pass_rate": 0.3333333333333333,
+    "pass_hat_k": {
+      "m01": 1.0,
+      "m02": 0.0,
+      "m03": 0.0
+    },
+    "tokens": 3000,
+    "seconds": 90.0,
+    "cost_per_accepted": {
+      "kind": "usd",
+      "micros": 30000
+    }
+  }
+}

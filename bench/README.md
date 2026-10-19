@@ -60,3 +60,21 @@ means unbounded, and any unpriced attempt makes it unknown, never 0. The
 slice-1 file `results/2026-10-18-claude.json` is schema 1 and is kept as it
 is. Results files are written only by this command, never by hand; commit
 them as they come out.
+
+Next to each `.json` the run writes a `.html` page: the header (arm, worker,
+pass rate, time, tokens, cost) and every attempt's story, with model-written
+text escaped and unknown costs said in words. `cortex bench page <file.json>`
+rebuilds it.
+
+## Comparing two brains
+
+```bash
+cortex bench compare results/a.json results/b.json --win-margin 2 --max-cost-ratio 1.5
+```
+
+Both files must cover the same tasks and tries. B wins only when it accepts
+at least `--win-margin` more results than A and its cost per accepted result
+is at most `--max-cost-ratio` times A's. A comparison PR states both numbers
+before the run. If either cost is unknown the verdict is undecided. The sign
+test p-value on the pairs only one arm passed is reported, not used as a
+gate.

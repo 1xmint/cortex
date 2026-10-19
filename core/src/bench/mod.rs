@@ -13,6 +13,8 @@ use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+pub mod compare;
+pub mod page;
 pub mod score;
 pub mod task;
 
@@ -160,7 +162,7 @@ pub fn budgets(tier: Tier) -> Budgets {
 /// Runs each chosen task `tries` times as a fresh mission with an engine
 /// from `make_engine`, grades every done multi mission on its hidden
 /// checks, and writes `<results>/<UTC date>-<arm>-<engine>.json` (with
-/// `-2`, `-3`… if that name is taken). Returns the report and the file it
+/// `-2`, `-3`… if that name is taken) with its `.html` page beside it. Returns the report and the file it
 /// wrote. A holdout bench refuses any `results` outside its own
 /// `results/`.
 pub fn run(
