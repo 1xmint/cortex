@@ -8,6 +8,7 @@ pub mod event;
 pub mod git;
 pub mod mcp;
 pub mod mission;
+pub mod model;
 pub mod payload;
 pub mod sandbox;
 pub mod store;

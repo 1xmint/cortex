@@ -3,6 +3,7 @@
 
 use cortex::engine::api::{ApiEngine, MAX_TURNS, ReplayTransport};
 use cortex::engine::{CancelToken, Engine, ModelCallRecord, SessionInput, SessionOutcome};
+use cortex::model::builtin;
 use cortex::payload::{Spend, Tokens};
 use serde_json::{Value, json};
 use std::path::Path;
@@ -92,8 +93,10 @@ fn api_engine_records_each_reply_as_a_model_call() {
         assert_eq!(r.session, 1);
         assert_eq!(r.role, "worker");
         assert_eq!(r.provider, "anthropic-api");
-        assert_eq!(r.profile, "default");
+        assert_eq!(r.profile, "api-sonnet");
+        // The replies name another model, so the profile's prices do not apply.
         assert_eq!(r.model, "claude-test-1");
+        assert_eq!(r.estimated_usd_micros, None);
         assert_eq!(r.params["max_tokens"], json!(8192));
         assert_eq!(
             r.tokens,
@@ -110,6 +113,34 @@ fn api_engine_records_each_reply_as_a_model_call() {
         let request: Value = serde_json::from_slice(r.request.as_ref().unwrap()).unwrap();
         assert_eq!(request, engine.transport.requests[i]);
     }
+}
+
+#[test]
+fn api_request_uses_profile_model() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut reply = done();
+    reply["model"] = json!("claude-sonnet-5-5");
+    reply["usage"] = json!({"input_tokens": 1000, "output_tokens": 100});
+    let mut engine = ApiEngine::new(ReplayTransport::new(vec![reply.clone()]));
+    assert_eq!(engine.version().unwrap(), "claude-sonnet-5-5");
+    let (_, _, records) = run_recorded(&mut engine, dir.path());
+    assert_eq!(engine.transport.requests[0]["model"], "claude-sonnet-5-5");
+    let request: Value = serde_json::from_slice(records[0].request.as_ref().unwrap()).unwrap();
+    assert_eq!(request["model"], "claude-sonnet-5-5");
+    // $2 per million in and $10 per million out.
+    assert_eq!(records[0].estimated_usd_micros, Some(3000));
+    assert_eq!(records[0].spent, Spend::Usd { micros: 3000 });
+
+    let mut opus = builtin("api-sonnet").unwrap();
+    opus.id = "api-opus".into();
+    opus.model = "claude-opus-5-5".into();
+    let mut engine = ApiEngine::with_profile(ReplayTransport::new(vec![reply]), opus);
+    let (_, _, records) = run_recorded(&mut engine, dir.path());
+    assert_eq!(engine.transport.requests[0]["model"], "claude-opus-5-5");
+    assert_eq!(records[0].profile, "api-opus");
+    // The reply came from Sonnet, so the profile cannot price it.
+    assert_eq!(records[0].estimated_usd_micros, None);
+    assert_eq!(records[0].spent, Spend::Unknown);
 }
 
 #[test]

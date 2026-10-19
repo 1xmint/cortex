@@ -36,8 +36,8 @@ What is true now and what comes next. Kept under 150 lines by CI.
   checks, sees them fail, then gives an engine up to 4 sessions (20 min
   each, 2 h total). Work is accepted only when every check passes, onto
   branch `cortex/<mission>`; `cortex status <mission>` shows how to merge
-  it. `--engine claude` (the default), `--engine api` and the fake engine
-  are wired.
+  it. `--worker <profile>` picks the model profile from
+  [core/profiles.toml](core/profiles.toml); claude-cli-sonnet is the default.
 - Claude Code engine: runs `claude -p --restricted` on the person's
   subscription inside a bubblewrap jail that shows only system files, the
   sign-in file, a throwaway copy of `~/.claude.json` (nothing else in
@@ -51,7 +51,7 @@ What is true now and what comes next. Kept under 150 lines by CI.
   does not count against the 2 h. Proven in CI with stand-in binaries, and
   on 2026-10-18 with the real signed-in CLI (2.1.302) in WSL Ubuntu:
   `cargo test -- --ignored claude_cannot_run_shell` passed.
-- API engine: `--engine api` talks to the Claude API directly
+- API engine: `--worker api-sonnet` talks to the Claude API directly
   (`claude-sonnet-5-5`, key from `ANTHROPIC_API_KEY`) with four tools: read,
   write and list files inside the worktree only, and `run`, which goes
   through the gVisor sandbox. The key is sent in a header and scrubbed from
@@ -68,7 +68,7 @@ What is true now and what comes next. Kept under 150 lines by CI.
   (limited by the re-plan budget), without text it pauses until
   `cortex resume`.
 - Bench: ten small prompts in [bench/](bench/README.md), each with hidden
-  checks that fail on its starting project. `cortex bench --engine claude`
+  checks that fail on its starting project. `cortex bench`
   runs them all as missions and writes `bench/results/<date>-<engine>.json`.
   CI proves the checks fail on every start and that known answers pass all
   ten with the fake engine. First real run, 2026-10-18, Claude Code on the
@@ -145,5 +145,5 @@ What is true now and what comes next. Kept under 150 lines by CI.
    and full model-call records. The private holdout repository
    `1xmint/cortex-holdout` exists; the plan is
    [docs/superpowers/plans/2026-10-18-brain-slice-2.md](docs/superpowers/plans/2026-10-18-brain-slice-2.md),
-   being built (task 3 of 11 done: browser checks, versioned events,
-   every model call recorded with deletable bodies).
+   being built (task 4 of 11 done: browser checks, versioned events,
+   every model call recorded with deletable bodies, model profiles).

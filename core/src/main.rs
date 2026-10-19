@@ -1,10 +1,11 @@
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Parser, Subcommand};
 use cortex::engine::Engine;
 use cortex::engine::api::{ApiEngine, HttpTransport};
 use cortex::engine::claude::ClaudeEngine;
 use cortex::engine::fake::FakeEngine;
 use cortex::event::Event;
 use cortex::mission::{self, Budgets, Outcome};
+use cortex::model::{EngineKind, Profile, Roles, find, load_profiles};
 use cortex::store::{MissionId, Store};
 use std::io::Write;
 use std::path::PathBuf;
@@ -30,8 +31,9 @@ enum Cmd {
         /// The checks that decide when the work is done.
         #[arg(long)]
         checks: PathBuf,
-        #[arg(long, value_enum, default_value_t = EngineKind::Claude)]
-        engine: EngineKind,
+        /// Which profile does the work (see `profiles.toml`); defaults to claude-cli-sonnet.
+        #[arg(long)]
+        worker: Option<String>,
         /// Script for the fake engine.
         #[arg(long)]
         fake_script: Option<PathBuf>,
@@ -41,8 +43,9 @@ enum Cmd {
     /// Continue a mission after a crash, restart or pause.
     Resume {
         mission: String,
-        #[arg(long, value_enum, default_value_t = EngineKind::Claude)]
-        engine: EngineKind,
+        /// Which profile does the work (see `profiles.toml`); defaults to claude-cli-sonnet.
+        #[arg(long)]
+        worker: Option<String>,
         /// Script for the fake engine.
         #[arg(long)]
         fake_script: Option<PathBuf>,
@@ -58,8 +61,9 @@ enum Cmd {
     Status { mission: String },
     /// Run the bench prompts as missions and write a results file.
     Bench {
-        #[arg(long, value_enum, default_value_t = EngineKind::Claude)]
-        engine: EngineKind,
+        /// Which profile does the work (see `profiles.toml`); defaults to claude-cli-sonnet.
+        #[arg(long)]
+        worker: Option<String>,
         /// Run only this prompt, e.g. `03-roman`.
         #[arg(long)]
         only: Option<String>,
@@ -77,13 +81,6 @@ enum Cmd {
     },
 }
 
-#[derive(Clone, Copy, ValueEnum)]
-enum EngineKind {
-    Fake,
-    Claude,
-    Api,
-}
-
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let result = match cli.command {
@@ -92,15 +89,15 @@ fn main() -> ExitCode {
         Some(Cmd::Run {
             repo,
             checks,
-            engine,
+            worker,
             fake_script,
             request,
-        }) => run(&repo, &checks, engine, fake_script, &request),
+        }) => run(&repo, &checks, worker, fake_script, &request),
         Some(Cmd::Resume {
             mission,
-            engine,
+            worker,
             fake_script,
-        }) => resume(&MissionId(mission), engine, fake_script),
+        }) => resume(&MissionId(mission), worker, fake_script),
         Some(Cmd::Steer { mission, text }) => open_store()
             .and_then(|s| mission::steer(&s, &MissionId(mission), &text))
             .map(|()| ExitCode::SUCCESS),
@@ -108,7 +105,7 @@ fn main() -> ExitCode {
             .and_then(|s| mission::stop(&s, &MissionId(mission), text.as_deref()))
             .map(|()| ExitCode::SUCCESS),
         Some(Cmd::Status { mission }) => status(&MissionId(mission)),
-        Some(Cmd::Bench { engine, only, dir }) => bench(engine, only.as_deref(), &dir),
+        Some(Cmd::Bench { worker, only, dir }) => bench(worker, only.as_deref(), &dir),
         Some(Cmd::Mcp { worktree, checks }) => {
             cortex::mcp::serve(worktree, checks).map(|()| ExitCode::SUCCESS)
         }
@@ -155,27 +152,39 @@ fn open_store() -> cortex::Result<Store> {
     Store::open(&home.join("cortex.db"))
 }
 
-fn engine(kind: EngineKind, fake_script: Option<PathBuf>) -> cortex::Result<Box<dyn Engine>> {
-    match kind {
+/// The worker profile: the one named, or the default role's.
+fn worker_profile(worker: Option<String>) -> cortex::Result<Profile> {
+    let id = worker.unwrap_or_else(|| Roles::default().worker);
+    find(&load_profiles(&home())?, &id)
+}
+
+fn engine(profile: Profile, fake_script: Option<PathBuf>) -> cortex::Result<Box<dyn Engine>> {
+    match profile.engine {
         EngineKind::Fake => {
             let path = fake_script.ok_or_else(|| {
-                cortex::Error::Invalid("--engine fake needs --fake-script".into())
+                cortex::Error::Invalid("the fake profile needs --fake-script".into())
             })?;
             Ok(Box::new(FakeEngine::load(&path)?))
         }
-        EngineKind::Claude => Ok(Box::new(ClaudeEngine::new(PathBuf::from("claude"))?)),
-        EngineKind::Api => Ok(Box::new(ApiEngine::new(HttpTransport::from_env()?))),
+        EngineKind::ClaudeCli => Ok(Box::new(ClaudeEngine::new(
+            PathBuf::from("claude"),
+            profile,
+        )?)),
+        EngineKind::Api => Ok(Box::new(ApiEngine::with_profile(
+            HttpTransport::from_env()?,
+            profile,
+        ))),
     }
 }
 
 fn run(
     repo: &std::path::Path,
     checks: &std::path::Path,
-    kind: EngineKind,
+    worker: Option<String>,
     fake_script: Option<PathBuf>,
     request: &str,
 ) -> cortex::Result<ExitCode> {
-    let mut engine = engine(kind, fake_script)?;
+    let mut engine = engine(worker_profile(worker)?, fake_script)?;
     let store = open_store()?;
     let m = mission::start(&store, &home(), repo, checks, request, &person())?;
     work(&store, &m, engine.as_mut())
@@ -193,11 +202,16 @@ fn work(store: &Store, m: &MissionId, engine: &mut dyn Engine) -> cortex::Result
     })
 }
 
-fn bench(kind: EngineKind, only: Option<&str>, dir: &std::path::Path) -> cortex::Result<ExitCode> {
+fn bench(
+    worker: Option<String>,
+    only: Option<&str>,
+    dir: &std::path::Path,
+) -> cortex::Result<ExitCode> {
+    let profile = worker_profile(worker)?;
     let store = open_store()?;
-    let mut make = |p: &cortex::bench::Prompt| match kind {
-        EngineKind::Fake => engine(kind, Some(p.fake_solution())),
-        _ => engine(kind, None),
+    let mut make = |p: &cortex::bench::Prompt| match profile.engine {
+        EngineKind::Fake => engine(profile.clone(), Some(p.fake_solution())),
+        _ => engine(profile.clone(), None),
     };
     let (report, path) =
         cortex::bench::run(dir, only, &home(), &store, &mut make, &dir.join("results"))?;
@@ -208,10 +222,10 @@ fn bench(kind: EngineKind, only: Option<&str>, dir: &std::path::Path) -> cortex:
 
 fn resume(
     m: &MissionId,
-    kind: EngineKind,
+    worker: Option<String>,
     fake_script: Option<PathBuf>,
 ) -> cortex::Result<ExitCode> {
-    let mut engine = engine(kind, fake_script)?;
+    let mut engine = engine(worker_profile(worker)?, fake_script)?;
     let store = open_store()?;
     mission::resume(&store, m)?;
     work(&store, m, engine.as_mut())

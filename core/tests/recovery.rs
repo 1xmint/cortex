@@ -65,7 +65,7 @@ impl Env {
     }
     fn engine_args(&self) -> Vec<String> {
         vec![
-            "--engine".into(),
+            "--worker".into(),
             "fake".into(),
             "--fake-script".into(),
             self.dir.path().join("script.toml").display().to_string(),
