@@ -42,7 +42,7 @@ struct ChecksFile {
 }
 
 const CHECK_TIMEOUT: Duration = Duration::from_secs(5 * 60);
-const TAIL: usize = 4000;
+pub(crate) const TAIL: usize = 4000;
 const PASSED_BEFORE_WORK: &str = "passed before any work";
 
 impl CheckSet {
@@ -212,7 +212,7 @@ fn blocked_since_last_plan(store: &Store, mission: &MissionId) -> Result<Vec<Str
     Ok(blocked)
 }
 
-fn tail(s: &str, max: usize) -> String {
+pub(crate) fn tail(s: &str, max: usize) -> String {
     if s.len() <= max {
         return s.to_string();
     }
