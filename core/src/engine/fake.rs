@@ -13,7 +13,8 @@
 //! with `rate_limited_s = 60` writes nothing and reports the usage limit,
 //! asking to wait that many seconds.
 
-use super::{CancelToken, Engine, SessionInput, SessionOutcome};
+use super::{CancelToken, Engine, ModelCallRecord, SessionInput, SessionOutcome};
+use crate::payload::{Spend, Tokens};
 use crate::{Error, Result};
 use serde::Deserialize;
 use std::path::{Component, Path};
@@ -84,6 +85,7 @@ impl Engine for FakeEngine {
         &mut self,
         input: &SessionInput,
         on_line: &mut dyn FnMut(&str),
+        record: &mut dyn FnMut(ModelCallRecord),
         cancel: &CancelToken,
     ) -> Result<SessionOutcome> {
         let idx = (input.session.saturating_sub(1) as usize).min(self.sessions.len() - 1);
@@ -121,6 +123,21 @@ impl Engine for FakeEngine {
                 reason: "cancelled".into(),
             });
         }
+        // One stand-in model call per session that got this far.
+        record(ModelCallRecord {
+            session: input.session,
+            role: "worker".into(),
+            provider: "fake".into(),
+            profile: "fake".into(),
+            model: "fake".into(),
+            params: serde_json::Value::Null,
+            tokens: Tokens::default(),
+            estimated_usd_micros: None,
+            spent: Spend::Unknown,
+            millis: start.elapsed().as_millis() as u64,
+            request: None,
+            response: None,
+        });
         if let Some(secs) = session.rate_limited_s {
             return Ok(SessionOutcome::RateLimited {
                 retry_after: Duration::from_secs(secs),
@@ -140,6 +157,7 @@ impl Engine for FakeEngine {
                 .note
                 .clone()
                 .unwrap_or_else(|| "fake session ended".into()),
+            reported_usd_micros: None,
         })
     }
 }

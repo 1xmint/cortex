@@ -49,6 +49,7 @@ fn every_kind() -> Vec<Event> {
         Event::SessionEnded {
             session: 1,
             engine_note: "done, I think".into(),
+            reported_estimate_usd_micros: None,
         },
         Event::SessionAbandoned {
             session: 2,

@@ -6,7 +6,8 @@
 //! bills the key in `ANTHROPIC_API_KEY`; `ReplayTransport` plays recorded
 //! replies so tests never spend money.
 
-use super::{CancelToken, Engine, SessionInput, SessionOutcome};
+use super::{CancelToken, DEFAULT_PROFILE, Engine, ModelCallRecord, SessionInput, SessionOutcome};
+use crate::payload::{Spend, Tokens};
 use crate::sandbox::{self, RunSpec};
 use crate::{Error, Result};
 use serde_json::{Value, json};
@@ -178,6 +179,7 @@ impl<T: Transport> Engine for ApiEngine<T> {
         &mut self,
         input: &SessionInput,
         on_line: &mut dyn FnMut(&str),
+        record: &mut dyn FnMut(ModelCallRecord),
         cancel: &CancelToken,
     ) -> Result<SessionOutcome> {
         let deadline = Instant::now() + input.timeout;
@@ -198,6 +200,7 @@ impl<T: Transport> Engine for ApiEngine<T> {
                 "tools": tools(),
                 "messages": messages,
             });
+            let sent = Instant::now();
             let reply = match self.transport.send(&body) {
                 Ok(reply) => reply,
                 Err(e) => {
@@ -206,7 +209,23 @@ impl<T: Transport> Engine for ApiEngine<T> {
                     });
                 }
             };
-            on_line(&self.transport.redact(&reply.to_string()));
+            let millis = sent.elapsed().as_millis() as u64;
+            let reply_text = self.transport.redact(&reply.to_string());
+            record(ModelCallRecord {
+                session: input.session,
+                role: "worker".into(),
+                provider: "anthropic-api".into(),
+                profile: DEFAULT_PROFILE.into(),
+                model: reply["model"].as_str().unwrap_or(MODEL).into(),
+                params: json!({"max_tokens": MAX_TOKENS}),
+                tokens: Tokens::from_usage(&reply["usage"]),
+                estimated_usd_micros: None,
+                spent: Spend::Unknown,
+                millis,
+                request: Some(self.transport.redact(&body.to_string()).into_bytes()),
+                response: Some(reply_text.clone().into_bytes()),
+            });
+            on_line(&reply_text);
             if reply["type"] == "error" {
                 return Ok(error_outcome(&reply, |t| self.transport.redact(t)));
             }
@@ -220,6 +239,7 @@ impl<T: Transport> Engine for ApiEngine<T> {
                     .collect();
                 return Ok(SessionOutcome::Ended {
                     note: note.join("\n"),
+                    reported_usd_micros: None,
                 });
             }
             let results: Vec<Value> = content

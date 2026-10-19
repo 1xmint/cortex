@@ -19,6 +19,7 @@ fn run(engine: &mut FakeEngine, input: &SessionInput) -> (SessionOutcome, Vec<St
         .run(
             input,
             &mut |l| lines.push(l.to_string()),
+            &mut |_| {},
             &CancelToken::new(),
         )
         .unwrap();
@@ -71,7 +72,8 @@ fn fake_repeats_last_session() {
         assert_eq!(
             out,
             SessionOutcome::Ended {
-                note: "all tests pass".into()
+                note: "all tests pass".into(),
+                reported_usd_micros: None,
             }
         );
         assert_eq!(
@@ -122,7 +124,7 @@ fn fake_stops_when_cancelled() {
     });
     let start = Instant::now();
     let out = e
-        .run(&input(wt.path(), 1, "x"), &mut |_| {}, &cancel)
+        .run(&input(wt.path(), 1, "x"), &mut |_| {}, &mut |_| {}, &cancel)
         .unwrap();
     assert!(start.elapsed() < Duration::from_secs(5));
     assert!(cancel.is_cancelled());
