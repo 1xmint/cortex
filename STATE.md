@@ -17,7 +17,8 @@ What is true now and what comes next. Kept under 150 lines by CI.
   Ubuntu on the owner's PC (2026-10-18).
 - Mission log (ADR 0003): append-only events per mission in SQLite (WAL),
   refused updates and deletes, project-scoped missions, and leases so one
-  process drives a mission at a time.
+  process drives a mission at a time. Each event records its format
+  version, build and prompt version; older events upgrade on read.
 - Git: each worker session gets a disposable worktree; git run there
   ignores planted hooks, fsmonitor, `.gitattributes` filters, a swapped
   `.git` file and any repository the worker makes inside it (removed
@@ -144,4 +145,4 @@ What is true now and what comes next. Kept under 150 lines by CI.
    and full model-call records. The private holdout repository
    `1xmint/cortex-holdout` exists; the plan is
    [docs/superpowers/plans/2026-10-18-brain-slice-2.md](docs/superpowers/plans/2026-10-18-brain-slice-2.md),
-   being built (task 1 of 11 done: browser checks).
+   being built (task 2 of 11 done: browser checks, versioned events).
