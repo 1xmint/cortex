@@ -273,6 +273,7 @@ fn drive_held(
             timeout: budgets.session_timeout.min(left),
         };
         let mut transcript_err = None;
+        let mut record_err = None;
         let cancel = CancelToken::new();
         let ended = AtomicBool::new(false);
         let outcome = std::thread::scope(|s| {
@@ -292,12 +293,19 @@ fn drive_held(
                         transcript_err = Some(e);
                     }
                 },
+                &mut |rec| {
+                    if record_err.is_none()
+                        && let Err(e) = store.record_model_call(m, rec)
+                    {
+                        record_err = Some(e);
+                    }
+                },
                 &cancel,
             );
             ended.store(true, Ordering::SeqCst);
             r
         })?;
-        if let Some(e) = transcript_err {
+        if let Some(e) = transcript_err.or(record_err) {
             return Err(e);
         }
         // The person stopped it: whatever the session did is dropped.
@@ -306,12 +314,16 @@ fn drive_held(
             continue;
         }
         match outcome {
-            SessionOutcome::Ended { note } => {
+            SessionOutcome::Ended {
+                note,
+                reported_usd_micros,
+            } => {
                 store.append(
                     m,
                     &Event::SessionEnded {
                         session,
                         engine_note: note,
+                        reported_estimate_usd_micros: reported_usd_micros,
                     },
                 )?;
                 if let Some(commit) = check_session(store, m, &checker, &wt, session, &base)? {

@@ -7,12 +7,13 @@
 //! `--restricted` and deny rules, so they cannot read the checks or the
 //! sign-in files the jail has to show it.
 
-use super::{CancelToken, Engine, SessionInput, SessionOutcome};
+use super::{CancelToken, DEFAULT_PROFILE, Engine, ModelCallRecord, SessionInput, SessionOutcome};
+use crate::payload::{Spend, Tokens};
 use crate::{Error, Result};
 use serde_json::Value;
 use std::io::BufRead;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// How long to park after a usage limit that gives no reset time.
 pub const RATE_LIMIT_WAIT: Duration = Duration::from_secs(30 * 60);
@@ -108,9 +109,10 @@ impl Engine for ClaudeEngine {
         &mut self,
         input: &SessionInput,
         on_line: &mut dyn FnMut(&str),
+        record: &mut dyn FnMut(ModelCallRecord),
         cancel: &CancelToken,
     ) -> Result<SessionOutcome> {
-        jail::run(self, input, on_line, cancel)
+        jail::run(self, input, on_line, record, cancel)
     }
 }
 
@@ -126,33 +128,63 @@ fn find(binary: &Path) -> Result<PathBuf> {
         .ok_or_else(|| Error::Blocked(format!("`{}` is not installed", binary.display())))
 }
 
-/// Reads a whole stream-json transcript. Each line goes to `on_line`.
-pub fn read_stream(reader: impl BufRead, on_line: &mut dyn FnMut(&str)) -> SessionOutcome {
-    let mut parser = Stream::default();
+/// Reads a whole stream-json transcript for one session. Each line goes to
+/// `on_line` and each model message to `record`.
+pub fn read_stream(
+    reader: impl BufRead,
+    session: u32,
+    on_line: &mut dyn FnMut(&str),
+    record: &mut dyn FnMut(ModelCallRecord),
+) -> SessionOutcome {
+    let mut parser = Stream::new(session);
     for line in reader.lines() {
         let Ok(line) = line else { break };
         on_line(&line);
-        if let Some(stop) = parser.feed(&line) {
+        if let Some(stop) = parser.feed(&line, record) {
+            parser.flush(record);
             return stop;
         }
     }
-    parser.finish("")
+    parser.finish("", record)
 }
 
 /// Follows Claude Code's stream-json output and decides how the session
 /// ended.
-#[derive(Default)]
 struct Stream {
+    session: u32,
     /// Claude Code said it bills the signed-in subscription.
     billing_ok: bool,
     rate_limited: bool,
     resets_at: Option<u64>,
     result: Option<SessionOutcome>,
+    /// The model message being read. Claude Code writes one line per
+    /// content block, each repeating the message's id and usage, so a
+    /// message is recorded once, with its last usage, when the next
+    /// message or the end arrives.
+    pending: Option<(String, ModelCallRecord)>,
+    /// When the previous message was recorded (or the session began).
+    since: Instant,
 }
 
 impl Stream {
+    fn new(session: u32) -> Self {
+        Stream {
+            session,
+            billing_ok: false,
+            rate_limited: false,
+            resets_at: None,
+            result: None,
+            pending: None,
+            since: Instant::now(),
+        }
+    }
+
     /// Takes one line. Returns an outcome when the session must stop now.
-    fn feed(&mut self, line: &str) -> Option<SessionOutcome> {
+    fn feed(
+        &mut self,
+        line: &str,
+        record: &mut dyn FnMut(ModelCallRecord),
+    ) -> Option<SessionOutcome> {
         let Ok(v) = serde_json::from_str::<Value>(line.trim()) else {
             return None;
         };
@@ -177,17 +209,81 @@ impl Stream {
                 }
             }
             Some("assistant") if v["error"] == "rate_limit" => self.rate_limited = true,
+            Some("assistant") => self.message(&v, line, record),
             Some("result") if !self.billing_ok => return Some(unknown_billing()),
-            Some("result") => self.result = Some(self.judge(&v)),
+            Some("result") => {
+                self.flush(record);
+                self.result = Some(self.judge(&v));
+            }
             _ => {}
         }
         None
     }
 
+    /// Notes one assistant line as part of its model message.
+    fn message(&mut self, v: &Value, line: &str, record: &mut dyn FnMut(ModelCallRecord)) {
+        let msg = &v["message"];
+        let model = msg["model"].as_str().unwrap_or_default();
+        // Claude Code's own stand-in replies never reached a model.
+        if model == "<synthetic>" {
+            return;
+        }
+        let id = msg["id"].as_str().unwrap_or_default().to_string();
+        let same = matches!(&self.pending, Some((p, _)) if !id.is_empty() && *p == id);
+        if !same {
+            self.flush(record);
+        }
+        let (_, rec) = self.pending.get_or_insert_with(|| {
+            (
+                id,
+                ModelCallRecord {
+                    session: self.session,
+                    role: "worker".into(),
+                    provider: "claude-cli".into(),
+                    profile: DEFAULT_PROFILE.into(),
+                    model: model.into(),
+                    params: Value::Null,
+                    tokens: Tokens::default(),
+                    estimated_usd_micros: None,
+                    spent: Spend::Subscription,
+                    millis: 0,
+                    request: None,
+                    response: Some(Vec::new()),
+                },
+            )
+        });
+        if !msg["usage"].is_null() {
+            rec.tokens = Tokens::from_usage(&msg["usage"]);
+        }
+        let body = rec.response.get_or_insert_with(Vec::new);
+        if !body.is_empty() {
+            body.push(b'\n');
+        }
+        body.extend_from_slice(line.trim().as_bytes());
+    }
+
+    /// Records the message being read, if any.
+    fn flush(&mut self, record: &mut dyn FnMut(ModelCallRecord)) {
+        if let Some((_, mut rec)) = self.pending.take() {
+            rec.millis = self.since.elapsed().as_millis() as u64;
+            self.since = Instant::now();
+            record(rec);
+        }
+    }
+
     fn judge(&self, result: &Value) -> SessionOutcome {
         let text = result["result"].as_str().unwrap_or_default();
         if result["is_error"] != true {
-            return SessionOutcome::Ended { note: text.into() };
+            // Claude Code's own estimate, in dollars, of what the session
+            // would cost at API prices.
+            let reported_usd_micros = result["total_cost_usd"]
+                .as_f64()
+                .filter(|d| d.is_finite() && *d >= 0.0)
+                .map(|d| (d * 1_000_000.0).round() as u64);
+            return SessionOutcome::Ended {
+                note: text.into(),
+                reported_usd_micros,
+            };
         }
         if self.rate_limited || looks_limited(text) {
             return SessionOutcome::RateLimited {
@@ -221,7 +317,12 @@ impl Stream {
         Duration::from_secs(resets.saturating_sub(now)).max(MIN_WAIT)
     }
 
-    fn finish(mut self, stderr_tail: &str) -> SessionOutcome {
+    fn finish(
+        mut self,
+        stderr_tail: &str,
+        record: &mut dyn FnMut(ModelCallRecord),
+    ) -> SessionOutcome {
+        self.flush(record);
         self.result
             .take()
             .unwrap_or_else(|| SessionOutcome::Failed {
@@ -255,6 +356,7 @@ mod jail {
         _engine: &ClaudeEngine,
         _input: &SessionInput,
         _on_line: &mut dyn FnMut(&str),
+        _record: &mut dyn FnMut(ModelCallRecord),
         _cancel: &CancelToken,
     ) -> Result<SessionOutcome> {
         Err(Error::Blocked(
@@ -279,6 +381,7 @@ mod jail {
         engine: &ClaudeEngine,
         input: &SessionInput,
         on_line: &mut dyn FnMut(&str),
+        record: &mut dyn FnMut(ModelCallRecord),
         cancel: &CancelToken,
     ) -> Result<SessionOutcome> {
         let input = SessionInput {
@@ -294,7 +397,7 @@ mod jail {
             .stderr(Stdio::piped())
             .process_group(0);
         let mut child = cmd.spawn()?;
-        let outcome = watch(&mut child, &input, on_line, cancel);
+        let outcome = watch(&mut child, &input, on_line, record, cancel);
         kill(&mut child);
         outcome
     }
@@ -326,6 +429,7 @@ mod jail {
         child: &mut Child,
         input: &SessionInput,
         on_line: &mut dyn FnMut(&str),
+        record: &mut dyn FnMut(ModelCallRecord),
         cancel: &CancelToken,
     ) -> Result<SessionOutcome> {
         let deadline = Instant::now() + input.timeout;
@@ -361,20 +465,23 @@ mod jail {
             }
         });
 
-        let mut stream = Stream::default();
+        let mut stream = Stream::new(input.session);
         loop {
             if cancel.is_cancelled() {
+                stream.flush(record);
                 return Ok(SessionOutcome::Failed {
                     reason: "cancelled".into(),
                 });
             }
             if Instant::now() >= deadline {
+                stream.flush(record);
                 return Ok(SessionOutcome::TimedOut);
             }
             match rx.recv_timeout(Duration::from_millis(100)) {
                 Ok(line) => {
                     on_line(&line);
-                    if let Some(stop) = stream.feed(&line) {
+                    if let Some(stop) = stream.feed(&line, record) {
+                        stream.flush(record);
                         return Ok(stop);
                     }
                 }
@@ -384,7 +491,7 @@ mod jail {
         }
         let _ = child.wait();
         let tail = String::from_utf8_lossy(&stderr.lock().unwrap()).into_owned();
-        Ok(stream.finish(&tail))
+        Ok(stream.finish(&tail, record))
     }
 
     /// Ends bubblewrap and so its whole PID namespace.

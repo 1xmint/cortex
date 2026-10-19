@@ -263,3 +263,32 @@ content = "out.txt\n"
     assert_eq!(e.accepted(&m), 0);
     assert_eq!(plain_git(&e.repo, &["worktree", "list"]).lines().count(), 1);
 }
+
+#[test]
+fn fake_engine_records_one_call_per_session() {
+    let e = env();
+    let m = e.start();
+    let script = format!("{WRONG}{}", RIGHT);
+    let outcome = e.drive(&m, &script, &Budgets::default());
+    assert!(matches!(outcome, Outcome::Done { .. }), "{outcome:?}");
+    let calls: Vec<Event> = e
+        .events(&m)
+        .into_iter()
+        .filter(|e| matches!(e, Event::ModelCall { .. }))
+        .collect();
+    assert_eq!(calls.len(), 2, "{calls:#?}");
+    for (i, call) in calls.iter().enumerate() {
+        let Event::ModelCall {
+            session,
+            provider,
+            spent,
+            ..
+        } = call
+        else {
+            unreachable!()
+        };
+        assert_eq!(*session, i as u32 + 1);
+        assert_eq!(provider, "fake");
+        assert_eq!(*spent, cortex::payload::Spend::Unknown);
+    }
+}

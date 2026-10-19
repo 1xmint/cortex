@@ -2,7 +2,8 @@
 //! recorded responses so no test ever calls the network or spends money.
 
 use cortex::engine::api::{ApiEngine, MAX_TURNS, ReplayTransport};
-use cortex::engine::{CancelToken, Engine, SessionInput, SessionOutcome};
+use cortex::engine::{CancelToken, Engine, ModelCallRecord, SessionInput, SessionOutcome};
+use cortex::payload::{Spend, Tokens};
 use serde_json::{Value, json};
 use std::path::Path;
 use std::time::Duration;
@@ -18,15 +19,25 @@ fn input(worktree: &Path) -> SessionInput {
 }
 
 fn run(engine: &mut ApiEngine<ReplayTransport>, dir: &Path) -> (SessionOutcome, Vec<String>) {
+    let (outcome, lines, _) = run_recorded(engine, dir);
+    (outcome, lines)
+}
+
+fn run_recorded(
+    engine: &mut ApiEngine<ReplayTransport>,
+    dir: &Path,
+) -> (SessionOutcome, Vec<String>, Vec<ModelCallRecord>) {
     let mut lines = Vec::new();
+    let mut records = Vec::new();
     let outcome = engine
         .run(
             &input(dir),
             &mut |l| lines.push(l.to_string()),
+            &mut |r| records.push(r),
             &CancelToken::new(),
         )
         .unwrap();
-    (outcome, lines)
+    (outcome, lines, records)
 }
 
 /// A reply that calls one tool.
@@ -69,6 +80,39 @@ fn tool_results(engine: &ApiEngine<ReplayTransport>) -> Vec<(String, bool)> {
 }
 
 #[test]
+fn api_engine_records_each_reply_as_a_model_call() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("readme.txt"), "project").unwrap();
+    let replay = ReplayTransport::from_json(include_str!("fixtures/api-session.json")).unwrap();
+    let mut engine = ApiEngine::new(replay);
+    let (_, lines, records) = run_recorded(&mut engine, dir.path());
+    assert_eq!(records.len(), 4, "{records:#?}");
+    for (i, r) in records.iter().enumerate() {
+        let n = i as u64 + 1;
+        assert_eq!(r.session, 1);
+        assert_eq!(r.role, "worker");
+        assert_eq!(r.provider, "anthropic-api");
+        assert_eq!(r.profile, "default");
+        assert_eq!(r.model, "claude-test-1");
+        assert_eq!(r.params["max_tokens"], json!(8192));
+        assert_eq!(
+            r.tokens,
+            Tokens {
+                input: Some(100 * n),
+                output: Some(10 * n),
+                ..Tokens::default()
+            }
+        );
+        assert_eq!(r.spent, Spend::Unknown);
+        // The body sent and the reply received, as the transcript saw them.
+        let response = String::from_utf8(r.response.clone().unwrap()).unwrap();
+        assert_eq!(response, lines[i]);
+        let request: Value = serde_json::from_slice(r.request.as_ref().unwrap()).unwrap();
+        assert_eq!(request, engine.transport.requests[i]);
+    }
+}
+
+#[test]
 fn api_engine_replays_session_and_writes_files() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("readme.txt"), "project").unwrap();
@@ -78,7 +122,8 @@ fn api_engine_replays_session_and_writes_files() {
     assert_eq!(
         outcome,
         SessionOutcome::Ended {
-            note: "Wrote src/out.txt.".into()
+            note: "Wrote src/out.txt.".into(),
+            reported_usd_micros: None,
         }
     );
     assert_eq!(

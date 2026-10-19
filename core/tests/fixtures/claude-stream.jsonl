@@ -1,8 +1,8 @@
 {"type":"system","subtype":"init","cwd":"/work","session_id":"s1","tools":["Read","Edit","Write","Glob","Grep","mcp__cortex__run","mcp__cortex__test"],"mcp_servers":[{"name":"cortex","status":"connected"}],"model":"claude-opus-5-5","permissionMode":"acceptEdits","apiKeySource":"none","claude_code_version":"2.1.302"}
-{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"I'll write the greeting."}]},"session_id":"s1"}
-{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Write","input":{"file_path":"/work/out.txt","content":"hello\n"}}]},"session_id":"s1"}
+{"type":"assistant","message":{"id":"msg_a","model":"claude-opus-5-5","role":"assistant","content":[{"type":"text","text":"I'll write the greeting."}],"usage":{"input_tokens":10,"output_tokens":5}},"session_id":"s1"}
+{"type":"assistant","message":{"id":"msg_a","model":"claude-opus-5-5","role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Write","input":{"file_path":"/work/out.txt","content":"hello\n"}}],"usage":{"input_tokens":10,"output_tokens":20,"cache_creation_input_tokens":300}},"session_id":"s1"}
 {"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"File created"}]},"session_id":"s1"}
-{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t2","name":"mcp__cortex__test","input":{}}]},"session_id":"s1"}
+{"type":"assistant","message":{"id":"msg_b","model":"claude-opus-5-5","role":"assistant","content":[{"type":"tool_use","id":"t2","name":"mcp__cortex__test","input":{}}],"usage":{"input_tokens":30,"output_tokens":7,"cache_read_input_tokens":100}},"session_id":"s1"}
 {"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t2","content":[{"type":"text","text":"greeting: passed (exit 0, expected 0)"}]}]},"session_id":"s1"}
-{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Wrote out.txt with the greeting; the test tool passes."}]},"session_id":"s1"}
+{"type":"assistant","message":{"id":"msg_c","model":"claude-opus-5-5","role":"assistant","content":[{"type":"text","text":"Wrote out.txt with the greeting; the test tool passes."}],"usage":{"input_tokens":40,"output_tokens":12}},"session_id":"s1"}
 {"type":"result","subtype":"success","is_error":false,"duration_ms":4200,"num_turns":3,"result":"Wrote out.txt with the greeting; the test tool passes.","session_id":"s1","total_cost_usd":0.01}

@@ -1,7 +1,8 @@
 //! The Claude Code engine: how it is started, and how its output is read.
 
 use cortex::engine::claude::{ClaudeEngine, RATE_LIMIT_WAIT, read_stream};
-use cortex::engine::{SessionInput, SessionOutcome};
+use cortex::engine::{ModelCallRecord, SessionInput, SessionOutcome};
+use cortex::payload::{Spend, Tokens};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -32,9 +33,20 @@ fn after<'a>(args: &'a [String], flag: &str) -> &'a str {
 }
 
 fn parse(text: &str) -> (SessionOutcome, Vec<String>) {
-    let mut lines = Vec::new();
-    let outcome = read_stream(text.as_bytes(), &mut |l| lines.push(l.to_string()));
+    let (outcome, lines, _) = parse_recorded(text);
     (outcome, lines)
+}
+
+fn parse_recorded(text: &str) -> (SessionOutcome, Vec<String>, Vec<ModelCallRecord>) {
+    let mut lines = Vec::new();
+    let mut records = Vec::new();
+    let outcome = read_stream(
+        text.as_bytes(),
+        1,
+        &mut |l| lines.push(l.to_string()),
+        &mut |r| records.push(r),
+    );
+    (outcome, lines, records)
 }
 
 fn now() -> u64 {
@@ -98,13 +110,67 @@ fn claude_args_have_no_shell_and_strict_mcp() {
 }
 
 #[test]
+fn claude_stream_records_one_call_per_model_message() {
+    let text = include_str!("fixtures/claude-stream.jsonl");
+    let (_, lines, records) = parse_recorded(text);
+    // Lines 2 and 3 are one message split by content block.
+    assert_eq!(records.len(), 3, "{records:#?}");
+    let tokens: Vec<Tokens> = records.iter().map(|r| r.tokens.clone()).collect();
+    assert_eq!(
+        tokens,
+        vec![
+            Tokens {
+                input: Some(10),
+                output: Some(20),
+                cache_read: None,
+                cache_write: Some(300),
+            },
+            Tokens {
+                input: Some(30),
+                output: Some(7),
+                cache_read: Some(100),
+                cache_write: None,
+            },
+            Tokens {
+                input: Some(40),
+                output: Some(12),
+                ..Tokens::default()
+            },
+        ]
+    );
+    for r in &records {
+        assert_eq!(r.session, 1);
+        assert_eq!(r.provider, "claude-cli");
+        assert_eq!(r.profile, "default");
+        assert_eq!(r.model, "claude-opus-5-5");
+        assert_eq!(r.spent, Spend::Subscription);
+        assert_eq!(r.request, None);
+    }
+    let first = String::from_utf8(records[0].response.clone().unwrap()).unwrap();
+    assert_eq!(first, format!("{}\n{}", lines[1], lines[2]));
+}
+
+#[test]
+fn claude_stream_skips_synthetic_messages() {
+    let (_, _, records) = parse_recorded(concat!(
+        r#"{"type":"system","subtype":"init","apiKeySource":"none"}"#,
+        "\n",
+        r#"{"type":"assistant","message":{"id":"x","model":"<synthetic>","content":[]}}"#,
+        "\n",
+        r#"{"type":"result","subtype":"success","is_error":false,"result":"done"}"#
+    ));
+    assert!(records.is_empty(), "{records:#?}");
+}
+
+#[test]
 fn claude_stream_fixture_parses() {
     let text = include_str!("fixtures/claude-stream.jsonl");
     let (outcome, lines) = parse(text);
     assert_eq!(
         outcome,
         SessionOutcome::Ended {
-            note: "Wrote out.txt with the greeting; the test tool passes.".into()
+            note: "Wrote out.txt with the greeting; the test tool passes.".into(),
+            reported_usd_micros: Some(10_000),
         }
     );
     assert_eq!(lines.len(), text.lines().filter(|l| !l.is_empty()).count());
@@ -148,7 +214,8 @@ fn claude_rate_limit_maps_to_parked() {
     assert_eq!(
         outcome,
         SessionOutcome::Ended {
-            note: "done".into()
+            note: "done".into(),
+            reported_usd_micros: None,
         }
     );
 }
@@ -319,7 +386,12 @@ sleep 60
     ) -> (SessionOutcome, Vec<String>) {
         let mut lines = Vec::new();
         let outcome = e
-            .run(input, &mut |l| lines.push(l.to_string()), cancel)
+            .run(
+                input,
+                &mut |l| lines.push(l.to_string()),
+                &mut |_| {},
+                cancel,
+            )
             .unwrap();
         (outcome, lines)
     }
@@ -332,7 +404,8 @@ sleep 60
         assert_eq!(
             outcome,
             SessionOutcome::Ended {
-                note: "jail ok".into()
+                note: "jail ok".into(),
+                reported_usd_micros: None,
             },
             "{lines:#?}"
         );

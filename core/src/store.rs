@@ -60,6 +60,15 @@ CREATE TRIGGER IF NOT EXISTS events_no_update BEFORE UPDATE ON events
 BEGIN SELECT RAISE(ABORT, 'append-only'); END;
 CREATE TRIGGER IF NOT EXISTS events_no_delete BEFORE DELETE ON events
 BEGIN SELECT RAISE(ABORT, 'append-only'); END;
+-- Model call bodies. No append-only triggers: deleting them is the point.
+CREATE TABLE IF NOT EXISTS payloads (
+    id         TEXT PRIMARY KEY,
+    mission_id TEXT NOT NULL REFERENCES missions(id),
+    project_id TEXT NOT NULL,
+    sha256     TEXT NOT NULL,
+    body       BLOB NOT NULL,
+    at         INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS leases (
     mission_id TEXT PRIMARY KEY REFERENCES missions(id),
     holder     TEXT NOT NULL,
@@ -97,7 +106,7 @@ fn add_missing_columns(conn: &mut Connection) -> Result<()> {
     Ok(())
 }
 
-fn now_ms() -> i64 {
+pub(crate) fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
@@ -128,7 +137,7 @@ impl Store {
         self.lease_ttl
     }
 
-    fn conn(&self) -> std::sync::MutexGuard<'_, Connection> {
+    pub(crate) fn conn(&self) -> std::sync::MutexGuard<'_, Connection> {
         self.conn.lock().unwrap_or_else(|p| p.into_inner())
     }
 

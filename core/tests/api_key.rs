@@ -79,6 +79,7 @@ fn api_key_never_in_transcript() {
         .run(
             &input,
             &mut |l| lines.push(l.to_string()),
+            &mut |_| {},
             &CancelToken::new(),
         )
         .unwrap();

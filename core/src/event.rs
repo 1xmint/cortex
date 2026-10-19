@@ -1,5 +1,6 @@
 //! What can happen in a mission. Events are only ever appended (ADR 0003).
 
+use crate::payload::{PayloadRef, Spend, Tokens};
 use crate::{Error, Result};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -20,6 +21,9 @@ pub fn upgrade(version: u32, body: serde_json::Value) -> Result<Event> {
     serde_json::from_value(body).map_err(|e| Error::Store(format!("event encoding: {e}")))
 }
 
+// Events are read and written one at a time, so the size of the largest
+// variant costs nothing worth boxing for.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Event {
@@ -57,6 +61,26 @@ pub enum Event {
     SessionEnded {
         session: u32,
         engine_note: String,
+        /// What the engine itself said the session cost, if it said.
+        #[serde(default)]
+        reported_estimate_usd_micros: Option<u64>,
+    },
+    /// One exchange with a model. The bodies live in the payload table.
+    ModelCall {
+        session: u32,
+        role: String,
+        provider: String,
+        profile: String,
+        model: String,
+        /// Settings as sent (max tokens and the like).
+        #[serde(default)]
+        params: serde_json::Value,
+        tokens: Tokens,
+        estimated_usd_micros: Option<u64>,
+        spent: Spend,
+        millis: u64,
+        request: Option<PayloadRef>,
+        response: Option<PayloadRef>,
     },
     SessionAbandoned {
         session: u32,
