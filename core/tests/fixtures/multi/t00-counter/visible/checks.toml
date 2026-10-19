@@ -1,0 +1,9 @@
+[[check]]
+id = "starts-at-zero"
+command = "/usr/local/lib/cortex-browser/node/bin/node /checks/files/starts-at-zero.mjs"
+expect_exit = 0
+
+[[check]]
+id = "click-adds-one"
+command = "/usr/local/lib/cortex-browser/node/bin/node /checks/files/click-adds-one.mjs"
+expect_exit = 0

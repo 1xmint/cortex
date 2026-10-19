@@ -9,7 +9,11 @@ use crate::store::{MissionId, Store};
 use crate::{Error, Result, git};
 use serde::Serialize;
 use std::path::{Path, PathBuf};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+pub mod task;
+
+use task::Tier;
 
 /// One prompt folder: `prompt.md`, `checks.toml`, `files/`, `start/` and
 /// `fake-solution.toml`.
@@ -69,7 +73,7 @@ pub fn make_repo(start: &Path, repo: &Path) -> Result<()> {
     git::init_and_commit(repo, "start")
 }
 
-fn copy_dir(from: &Path, to: &Path) -> Result<()> {
+pub(crate) fn copy_dir(from: &Path, to: &Path) -> Result<()> {
     for entry in std::fs::read_dir(from)? {
         let entry = entry?;
         let dest = to.join(entry.file_name());
@@ -81,6 +85,18 @@ fn copy_dir(from: &Path, to: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// The mission budgets for a tier. Multi-feature tasks get a 30-minute
+/// mission cap; small prompts keep the slice-1 defaults.
+pub fn budgets(tier: Tier) -> Budgets {
+    match tier {
+        Tier::Small => Budgets::default(),
+        Tier::Multi => Budgets {
+            mission_timeout: Duration::from_secs(30 * 60),
+            ..Budgets::default()
+        },
+    }
 }
 
 /// Runs every prompt (or just `only`) as a mission with a fresh engine
@@ -164,7 +180,7 @@ fn run_one(
     let checks = prompt.dir.join("checks.toml");
     let m = mission::start(store, home, repo, &checks, request.trim(), "bench")?;
     let clock = Instant::now();
-    let outcome = mission::drive(store, home, &m, engine, &Budgets::default())?;
+    let outcome = mission::drive(store, home, &m, engine, &budgets(Tier::Small))?;
     let seconds = clock.elapsed().as_secs_f64();
     let (sessions, blocked_checks) = tally(store, &m)?;
     Ok(PromptResult {
@@ -216,6 +232,20 @@ fn utc(secs: u64) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn multi_tier_caps_the_mission_at_30_minutes() {
+        let multi = budgets(Tier::Multi);
+        assert_eq!(multi.mission_timeout, Duration::from_secs(30 * 60));
+        assert_eq!(multi.sessions, 4);
+        assert_eq!(multi.session_timeout, Duration::from_secs(20 * 60));
+        assert_eq!(
+            budgets(Tier::Small).mission_timeout,
+            Budgets::default().mission_timeout
+        );
+    }
+
     #[test]
     fn utc_formats_known_instants() {
         assert_eq!(super::utc(0), "1970-01-01T00:00:00Z");
