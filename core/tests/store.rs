@@ -44,7 +44,7 @@ fn every_kind() -> Vec<Event> {
         },
         Event::Transcript {
             session: 1,
-            line: "edited main.rs".into(),
+            payload: None,
         },
         Event::SessionEnded {
             session: 1,
@@ -238,7 +238,7 @@ fn appended_event_records_version_and_build() {
     assert_eq!(stored.len(), 1);
     assert_eq!(stored[0].seq, 1);
     assert_eq!(stored[0].schema_version, cortex::event::SCHEMA_VERSION);
-    assert_eq!(stored[0].schema_version, 2);
+    assert_eq!(stored[0].schema_version, 3);
     assert_eq!(stored[0].build, cortex::BUILD);
     assert!(!stored[0].build.is_empty());
     assert_eq!(stored[0].prompt_version, cortex::engine::PROMPT_VERSION);
@@ -270,7 +270,7 @@ fn slice1_database_upgrades_in_place() {
         store.append(&m, &Event::MissionResumed).unwrap();
         let all = store.stored_events(&m).unwrap();
         assert_eq!(all[5].seq, 6);
-        assert_eq!(all[5].schema_version, 2);
+        assert_eq!(all[5].schema_version, 3);
     }
     let store = Store::open(&path).unwrap();
     assert_eq!(store.events(&m).unwrap().len(), 6);
@@ -315,4 +315,27 @@ fn version_columns_cannot_be_updated() {
         assert!(err.contains("append-only"), "{sql}: {err}");
     }
     assert_eq!(store.stored_events(&m).unwrap()[0].build, cortex::BUILD);
+}
+
+#[test]
+fn old_transcript_event_reads_without_its_text() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("cortex.db");
+    let store = Store::open(&path).unwrap();
+    let m = store.create_mission(&project("p"), "josh").unwrap();
+    let raw = rusqlite::Connection::open(&path).unwrap();
+    raw.execute(
+        "INSERT INTO events (mission_id, seq, kind, body_json, at, schema_version) \
+         VALUES (?1, 1, 'transcript', '{\"kind\":\"transcript\",\"session\":1,\"line\":\"old text\"}', 0, 2)",
+        [&m.0],
+    )
+    .unwrap();
+    let events = store.events(&m).unwrap();
+    assert_eq!(
+        events[0].1,
+        Event::Transcript {
+            session: 1,
+            payload: None
+        }
+    );
 }

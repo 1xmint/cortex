@@ -374,7 +374,7 @@ fn report(store: &Store, m: &MissionId, outcome: &Outcome) -> cortex::Result<()>
 }
 
 fn bench_tool(action: BenchCmd) -> cortex::Result<ExitCode> {
-    use cortex::bench::{self, compare, page};
+    use cortex::bench::{self, compare};
     match action {
         BenchCmd::Compare {
             a,
@@ -412,9 +412,7 @@ fn bench_tool(action: BenchCmd) -> cortex::Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
         BenchCmd::Page { results, out } => {
-            let report = bench::load(&results)?;
-            let out = out.unwrap_or_else(|| results.with_extension("html"));
-            std::fs::write(&out, page::render(&report))?;
+            let out = bench::write_page(&results, out.as_deref())?;
             println!("{}", out.display());
             Ok(ExitCode::SUCCESS)
         }

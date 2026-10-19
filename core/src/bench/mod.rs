@@ -162,9 +162,10 @@ pub fn budgets(tier: Tier) -> Budgets {
 /// Runs each chosen task `tries` times as a fresh mission with an engine
 /// from `make_engine`, grades every done multi mission on its hidden
 /// checks, and writes `<results>/<UTC date>-<arm>-<engine>.json` (with
-/// `-2`, `-3`… if that name is taken) with its `.html` page beside it. Returns the report and the file it
-/// wrote. A holdout bench refuses any `results` outside its own
-/// `results/`.
+/// `-2`, `-3`… if that name is taken) with its `.html` page beside it.
+/// Returns the report and the file it wrote. A holdout bench refuses any
+/// `results` outside its own `results/`. If an attempt fails to run, the
+/// attempts finished so far are still written before the error returns.
 pub fn run(
     bench: &Path,
     opts: &RunOptions,
@@ -196,31 +197,48 @@ pub fn run(
     let mut engine_name = String::new();
     let mut engine_version = String::new();
     let mut attempts = Vec::new();
-    for task in &chosen {
+    let mut failed = None;
+    'tasks: for task in &chosen {
         for try_no in 1..=opts.tries {
-            let mut engine = make_engine(task)?;
-            if engine_name.is_empty() {
-                engine_name = engine.name().to_string();
-                engine_version = engine.version()?;
+            let mut one = || -> Result<Attempt> {
+                let mut engine = make_engine(task)?;
+                if engine_name.is_empty() {
+                    engine_name = engine.name().to_string();
+                    engine_version = engine.version()?;
+                }
+                attempt(
+                    task,
+                    try_no,
+                    &runs.join(&task.id),
+                    home,
+                    store,
+                    engine.as_mut(),
+                )
+            };
+            match one() {
+                Ok(a) => {
+                    println!(
+                        "{} {} try {} ({} sessions, {:.0} s)",
+                        if a.accepted { "pass" } else { "FAIL" },
+                        a.task,
+                        a.try_no,
+                        a.sessions,
+                        a.seconds
+                    );
+                    attempts.push(a);
+                }
+                Err(e) => {
+                    failed = Some((format!("{} try {try_no}", task.id), e));
+                    break 'tasks;
+                }
             }
-            let a = attempt(
-                task,
-                try_no,
-                &runs.join(&task.id),
-                home,
-                store,
-                engine.as_mut(),
-            )?;
-            println!(
-                "{} {} try {} ({} sessions, {:.0} s)",
-                if a.accepted { "pass" } else { "FAIL" },
-                a.task,
-                a.try_no,
-                a.sessions,
-                a.seconds
-            );
-            attempts.push(a);
         }
+    }
+    // Nothing finished, so there is nothing to keep.
+    if attempts.is_empty()
+        && let Some((_, e)) = failed
+    {
+        return Err(e);
     }
     let summary = score::summarize(&attempts, opts.tries);
     let report = Report {
@@ -252,7 +270,31 @@ pub fn run(
     let text = serde_json::to_string_pretty(&report)
         .map_err(|e| Error::Invalid(format!("results: {e}")))?;
     std::fs::write(&path, text + "\n")?;
+    std::fs::write(path.with_extension("html"), page::render(&report))?;
+    if let Some((which, e)) = failed {
+        return Err(Error::Invalid(format!(
+            "{which} could not run ({e}); the attempts before it are in {}",
+            path.display()
+        )));
+    }
     Ok((report, path))
+}
+
+/// Writes the page for a results file to `out` (default: beside it). A
+/// results file inside a holdout bench may only have its page written
+/// inside that bench's `results/`.
+pub fn write_page(results: &Path, out: Option<&Path>) -> Result<PathBuf> {
+    let report = load(results)?;
+    let out = out.map_or_else(|| results.with_extension("html"), Path::to_path_buf);
+    let abs = std::path::absolute(results)?;
+    for dir in abs.ancestors().skip(1) {
+        if is_holdout(dir)? {
+            guard_results(dir, &out)?;
+            break;
+        }
+    }
+    std::fs::write(&out, page::render(&report))?;
+    Ok(out)
 }
 
 /// One try at `task`, worked under `dir/try-<n>`.
