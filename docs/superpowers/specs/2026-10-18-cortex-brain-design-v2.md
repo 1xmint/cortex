@@ -28,7 +28,7 @@ untrusted work, and checks that must be able to fail. Anthropic's
 Managed Agents (P, Apr 2026) and OpenHands' V1 SDK (P, MLSys 2026) arrived
 at the same shape independently.
 
-Seven things change:
+Eight things change:
 
 0. **The brain has layers:** conversation, strategy, mission planning,
    execution, verification, memory and research, and a runtime underneath
@@ -50,6 +50,18 @@ Seven things change:
 6. **Everything the harness does to work around a model is labelled and
    re-tested** at each model change, so the harness gets thinner as models
    improve (section 3.13).
+7. **The spine is specified, not only the layers:** how each model call
+   gets the right information (context assembly, section 3.3a), how
+   Cortex learns a repository it did not write (3.6a), capability packs
+   and creative inspection (3.8), and the creator-and-teacher experience
+   (3.7). A second Codex review asked whether Cortex is on the leading
+   tier: level on the runtime, a possible lead on verification and
+   intent, behind on repository understanding, context and the creator
+   experience. These additions close those gaps on paper. A fresh Codex
+   design written without seeing this one added the rest: memory that
+   tells said from observed from inferred, cost per accepted result as the
+   headline, testing the riskiest assumption first, standing mandates, and
+   browser games and small web apps as the first target.
 
 Section 7 lists every part of version 1 as kept, changed or dropped.
 
@@ -207,6 +219,10 @@ What crosses each boundary:
 | Artifacts ↔ verification | exact artifact and requirement versions | evidence, coverage, limits. Verification never quietly redefines success |
 | Memory ↔ any layer | scoped facts with source, freshness and uncertainty | proposed lessons, trusted only after validation |
 | Any layer ↔ runtime | proposed actions | grants, budget reservations, job handles, outcomes |
+
+**Context assembly** (section 3.3a) sits between memory and every model
+call. It decides what each call sees, and it is the runtime's job, not a
+model's.
 
 Version 1 and the first draft of this version had only planning, execution
 and verification. Strategy was folded into the planner, and the runtime
@@ -374,6 +390,11 @@ The mission runs like this:
    - with a strong worker model most pieces are never split;
    - the depth used and its outcome are logged, so skill memory learns the
      right depth per kind of task and model.
+   **The riskiest assumption goes first.** Before expensive work, the
+   first milestone tests whatever is most likely to sink the approach:
+   whether the core mechanic is fun, whether an outside service works as
+   documented, whether the art style can be produced at all. A cheap
+   failure here saves an expensive one later.
 4. **Work.** One worker session per piece, with fresh context. It gets the
    decision record and file pointers, not a prose summary, and commits
    small steps. Pieces with no dependency between them may run in
@@ -419,6 +440,46 @@ Version 1's rules for honest checks and against runaway loops all stay:
 - flaky checks are tracked;
 - each mission has a budget and a re-plan cap;
 - missions can be parked.
+
+### 3.3a Context assembly: what each model call sees
+
+A model only knows what Cortex hands it. The log, memory and the
+repository do not reach a model by themselves. So every model call gets a
+**context contract**, built by the runtime and recorded in the log:
+
+- **Binding constraints are always included**, each with its ID and
+  source: the requirements and decisions the mission charter names, and
+  the parts of the working agreement that apply. They are never left to a
+  summary. A constraint the person mentioned once becomes a requirement
+  record (section 3.2a), so it cannot fade.
+- **Scoped knowledge is attached where it applies:** conventions and API
+  quirks are linked to the files or interfaces they govern, and travel
+  with those files into a worker's context.
+- **Every retrieved item carries its source and version** (file and
+  commit, document and date, memory fact and status).
+- **Conflicts are shown, not resolved silently.** Superseded facts are
+  marked as such; two sources that disagree are both shown, with the
+  conflict named.
+- **A record of what was included and what was left out**, and why. When
+  a worker goes wrong, the log shows whether it was missing information.
+- **A token budget per role.** Over budget, Cortex drops the least
+  relevant evidence first, never binding constraints. Long sessions are
+  compacted, and a compacted summary keeps pointers back to its sources,
+  so the full text can be recovered.
+- **Refresh:** when a requirement, contract or file changes, contexts
+  built from the old version are stale, and running workers are told.
+
+**Content is evidence, never orders.** Everything Cortex reads (repository
+files, websites, tool output, media, retrieved memories) can inform a
+decision but can never give an order, grant a permission or authorize an
+action. Only the person, through the conversation and the working
+agreement, does that. Content is marked as quoted data in the context,
+and the action broker (section 3.8) enforces it: a request that traces
+only to content is refused, whatever the content says.
+
+**The test:** a long-horizon bench scenario in which a late request would
+break a constraint stated early, in passing. Cortex passes only if it
+notices and raises the conflict.
 
 ### 3.4 Creations are pieces; one writer per piece
 
@@ -525,16 +586,78 @@ integration is its own piece with its own checks.
 
 ### 3.6 Memory
 
-Unchanged from version 1: four kinds (working, project, personal, skill)
-plus facts with source and status. Two additions:
+Kept from version 1: four kinds (working, project, personal, skill) plus
+facts with source and status. Additions:
 - the bible and verified skills are kept as plain files in open formats
   (AGENTS.md style, SKILL.md), so they outlive any vendor;
 - **a skill carries the eval that proved it** and is re-checked when the
-  model changes. A stale skill is the memory version of a stale workaround.
+  model changes. A stale skill is the memory version of a stale workaround;
+- **every fact says how Cortex knows it:** the person *said* it, Cortex
+  *observed* it (a check ran, a file contains it), or Cortex *inferred*
+  it. Inferred facts stay tentative until the person confirms them or
+  evidence does. Each fact also carries its source, scope (person,
+  project), timestamp, confidence, sensitivity and the facts it replaces;
+- **the person can see and correct memory.** A correction marks the facts,
+  assumptions and evidence that depended on the old fact for review, so a
+  wrong guess cannot quietly become permanent;
+- **deletion is complete:** deleting a memory removes the original, its
+  index entries, summaries that quote it and memories derived from it.
+  Backups expire on a stated schedule;
+- **files and checks outrank summaries.** A summary is a way to find
+  things, never the authority.
 
-### 3.7 The working agreement
+### 3.6a Learning a repository Cortex did not write
 
-Unchanged from version 1.
+Many projects arrive with code already in them. Before planning work in
+an unfamiliar repository, Cortex builds a **project map**:
+
+- **an inventory:** packages, entry points, build and test commands, CI,
+  and per-directory instructions (AGENTS.md style files, read in order from
+  the root down to the file being changed);
+- **a map of modules, symbols and dependencies,** each entry linked to the
+  source line it came from;
+- **search:** exact text search and symbol and reference search first.
+  Meaning-based search (embeddings) is added only if the unfamiliar-repo
+  bench tasks show it helps;
+- **a baseline:** the existing tests are run once, so Cortex knows what
+  already passes and fails before it changes anything;
+- **change impact:** before a change, the map lists what else may be
+  affected, and those parts' checks become preservation checks
+  (section 3.3).
+
+The map and indexes update incrementally as files change. **They are
+disposable aids:** when the map and the source disagree, the source and
+the checks that ran win, and the map is rebuilt. This is proven on bench
+tasks in repositories Cortex did not write (section 3.11).
+
+### 3.7 The working agreement, and teaching
+
+Kept from version 1, with three additions.
+
+**Standing mandates.** "Just do it" runs under a mandate the person sets:
+its scope, budget, permissions, how often to report, and when to stop and
+ask. Permission to edit a project is never permission to publish, spend
+beyond the budget or delete. A mandate is a record in the strategy layer,
+so it survives across missions, and only the person widens it.
+
+**Switching modes keeps all progress.** The person can move from "just do
+it" to "build it with me" mid-task, take over a piece, discuss a decision
+and hand it back. The mission, its plan and its evidence carry on; nothing
+restarts.
+
+**Teaching is part of the agreement.** The person sets how much they want
+to learn and how deep explanations go, and can change it at any time.
+Claude Code's explanatory and learning styles already explain as they
+work, so explaining alone only matches them. Cortex does more:
+- explanations are grounded in the actual change and its evidence: this
+  code, this check, this failure and what fixed it;
+- they are attached to the intent records and artifacts, so "why is it
+  like this?" can be asked later about any part and still be answered
+  from the record;
+- "explain this part" works at any time, without stopping the work;
+- optional small exercises for people who want to learn by doing;
+- explanations describe decisions and the evidence behind them. They never
+  claim to show a model's hidden reasoning.
 
 ### 3.8 Tool layer
 
@@ -552,7 +675,8 @@ call that runs in the sandbox and returns data.
 - Version 1's tool security rules all stay:
   - per-piece allow-lists;
   - definitions pinned by fingerprint;
-  - output treated as data;
+  - output treated as data, now widened to all content (section 3.3a):
+    content cannot give orders, grant permissions or authorize actions;
   - idempotency keys on paid calls;
   - budget counting.
 
@@ -573,6 +697,25 @@ handle (section 3.2). The rules are defined in full now. **Early slices
 enforce them for one owner only**; accounts with many people, and their
 isolation from each other, are tested before any outside user, not built
 first.
+
+**Capability packs.** A new kind of work (images, audio, animation, 3D)
+plugs in as a pack, not as new brain code. A pack contains:
+- its tools and the artifact types it makes;
+- procedures for common jobs, and a description the planner can find, so
+  Cortex knows when and how to use it, not only that it exists;
+- prerequisites and the permissions it needs (granted by the broker);
+- checks and inspectors for its artifacts;
+- preview and export.
+Code is the first pack. A pack's procedures follow the skill rule: they
+carry the evals that proved them (section 3.6).
+
+**Creative inspection.** Version 1 kept media out of model context
+entirely. That stays true for the original files, which live in the
+artifact store by content fingerprint. But a capable model may now see
+**bounded previews**: a downscaled image, a short audio excerpt, a few
+video frames, chosen and recorded by context assembly. Without this,
+Cortex cannot judge its own creative work. The judgement is still an
+assessment with stated uncertainty, never a pass flag (invariant 1).
 
 ### 3.9 Sandbox
 
@@ -597,8 +740,12 @@ planner from another. The new bench has:
 
 - **Tiers:**
   - the existing ten small tasks, for regression, expected near 100%;
-  - **eight multi-feature tasks**: a small app or game with 5–10 features
-    that must work together. A worker on today's harness should pass these
+  - **eight multi-feature tasks**: browser games and small web apps with
+    5–10 features that must work together, checked by driving a real
+    (headless) browser. Browser games and small web apps are Cortex's
+    first target, so the bench starts there. At least two of the eight
+    change an existing project rather than starting fresh, and at least
+    one starts in a repository Cortex did not write (section 3.6a). A worker on today's harness should pass these
     about half the time or less.
   That makes about 20 tasks, the low end of Anthropic's advice to "start
   with 20–50". The tier grows with real failures.
@@ -617,6 +764,11 @@ planner from another. The new bench has:
   tested at a time.
 - **Results report a story, not only numbers:** for each mission, the
   spec, the milestones, what failed and why, and its cost.
+- **The headline number is total cost per accepted result:** everything a
+  mission spent, including failed attempts, retries and verification,
+  divided by the results that passed. Cheap calls that fail are not cheap.
+- **A strong, simple baseline:** one capable agent with the same tools and
+  no planner. Every brain feature must beat it, or it goes.
 - **Reliability and value:** pass^k over repeated tries, cost and tokens
   per success, and wall time. Comparisons are **paired** (the same tasks
   in both arms) and report their uncertainty, so a small win is not
@@ -625,6 +777,8 @@ planner from another. The new bench has:
   - a continuing project across several missions, including a changed
     goal;
   - steering mid-mission;
+  - a constraint stated once, early and in passing, that a late request
+    would break (section 3.3a);
   - a shared contract that changes, with stale evidence correctly
     invalidated;
   - a crash right after outside work was submitted: recovered without
@@ -726,7 +880,11 @@ owner's quota only where the result decides what gets built next.
 **Slice 2: a bench that can tell brains apart, and a log that counts
 cost.**
 - In CI only (no quota):
-  - eight multi-feature tasks with reference and known-bad solutions;
+  - eight multi-feature tasks (browser games and small web apps, some
+    changing an existing project) with reference and known-bad solutions,
+    and browser-driven checks;
+  - cost per accepted result on the results page, and the simple-agent
+    baseline as the comparison arm;
   - graders proven both ways;
   - schema-versioned events;
   - full model-call records with tokens and cost;
@@ -754,6 +912,11 @@ cost.**
     `core/src/checks.rs`;
   - the action broker's rules, for one owner, with identity and project
     scope explicit from the start (section 3.8);
+  - the smallest context contract (section 3.3a): binding constraints
+    always included, a record of what was included and left out, and
+    content kept as evidence;
+  - the smallest project map (section 3.6a): inventory, exact and symbol
+    search, and a baseline test run;
   - piece contracts (section 3.4), enforced wherever the planner makes
     pieces that depend on each other, including the media experiment;
   - the schema for durable action records (section 3.2), proven against a
@@ -789,11 +952,17 @@ proven:
 - see the spec in plain words;
 - approve it or just let it run;
 - watch the milestones as a roadmap view drawn from the log;
-- steer and stop.
+- steer and stop;
+- set how much to learn, ask "explain this part", and switch between
+  "build it with me" and "just do it" without losing progress.
 
-**Slice 5: memory and the working agreement**, as in version 1.
+**Slice 5: memory and the working agreement**, as in version 1, plus
+said, observed and inferred facts, memory the person can see and correct,
+complete deletion, and standing mandates.
 
-**Slice 6: media pieces**, model judges validated against labelled
+**Slice 6: media as capability packs**, with bounded previews for creative
+inspection. One game that combines code and made assets is proven end to
+end before any second medium is added. Model judges validated against labelled
 examples, and bench tasks with art and sound. A model judge is a note
 plus a measured agreement rate with people, never the only proof
 (invariant 1). Where possible, media checks that run come first: the asset
@@ -815,8 +984,9 @@ which is the owner's decision once slice 3 is proven.
 | 3.3 Honest-check and anti-runaway rules | Keep | — |
 | 3.4 Pieces and bible | Keep; one data model with milestones; views drawn from it; one writer per piece | Cognition, Cursor (P); Google/MIT study (S) |
 | 3.5 Engines | Change | Provider-neutral layer, profiles, cascade, value per role |
-| 3.6 Memory | Keep, two additions | Open file formats; skills carry their eval |
-| 3.7 Working agreement | Keep | — |
+| 3.6 Memory | Keep, additions | Open file formats; skills carry their eval; said, observed and inferred; correctable; complete deletion |
+| 3.7 Working agreement | Keep, additions | Standing mandates, mode switching that keeps progress, teaching |
+| 3.8 Media never in model context | Change | Originals stay in the store; bounded previews allowed for creative inspection |
 | 3.8 Tools behind MCP | Change | Own tool interface; MCP an adapter (S: spec churn; P: 2608.08654 cost) |
 | 3.9 Sandbox | Keep; Linux-only noted | — |
 | 3.10 Protocol | Keep | Codex split its protocol from MCP (S) |
@@ -824,6 +994,7 @@ which is the owner's decision once slice 3 is proven.
 | 3.12 Judgements | Keep | — |
 | — | New: 3.13 workaround flags | Stale scaffolding (P: Managed Agents) |
 | — | New: layers, strategy records (3, 3.2a), action broker (3.8), durable action records and data lifecycle (3.2), piece contracts (3.4) | Codex review, 2026-10-18 |
+| — | New: context assembly (3.3a), repository map (3.6a), capability packs (3.8), cost per accepted result and the simple baseline (3.11) | Codex tier review and fresh design, 2026-10-18 |
 | 5 Slice order | Change | Bench, then planner, then page |
 
 ## 8. Decisions that are the owner's
@@ -861,6 +1032,10 @@ which is the owner's decision once slice 3 is proven.
   broker grow before the bench shows they are needed, they become the
   weight this version warns about. Mitigation: build each in its smallest
   form, and grow it only when a long-horizon scenario fails.
+- **The spine additions widen the design again.** Context contracts,
+  project maps, packs and teaching could each grow large. Mitigation: each
+  lands in the smallest form named in section 6, and grows only when a
+  bench task or scenario fails without it.
 - **Open models' tool-call reliability is unverified.** The adapter is
   tested against a stand-in; real open-model runs wait for the owner's
   servers.
