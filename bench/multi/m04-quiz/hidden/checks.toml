@@ -1,0 +1,24 @@
+[[check]]
+id = "loads-file"
+command = "/usr/local/lib/cortex-browser/node/bin/node /checks/files/loads-file.mjs"
+expect_exit = 0
+
+[[check]]
+id = "timeout"
+command = "/usr/local/lib/cortex-browser/node/bin/node /checks/files/timeout.mjs"
+expect_exit = 0
+
+[[check]]
+id = "restart"
+command = "/usr/local/lib/cortex-browser/node/bin/node /checks/files/restart.mjs"
+expect_exit = 0
+
+[[check]]
+id = "shuffle"
+command = "/usr/local/lib/cortex-browser/node/bin/node /checks/files/shuffle.mjs"
+expect_exit = 0
+
+[[check]]
+id = "review-text"
+command = "/usr/local/lib/cortex-browser/node/bin/node /checks/files/review-text.mjs"
+expect_exit = 0

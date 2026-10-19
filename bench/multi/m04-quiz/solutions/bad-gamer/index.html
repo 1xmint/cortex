@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Quiz</title>
+<style>
+  body { font-family: sans-serif; max-width: 36em; margin: 2em auto; }
+  .choice { display: block; width: 100%; margin: 0.3em 0; padding: 0.5em; }
+  .right { color: #170; }
+  .wrong { color: #a12; }
+</style>
+</head>
+<body>
+<h1>Quiz</h1>
+<button id="start" hidden>Start</button>
+<section id="quiz" hidden>
+  <p>Score <span id="score">0</span> &middot; <span id="timer">10</span>s left</p>
+  <h2 id="question"></h2>
+  <div id="choices"></div>
+</section>
+<section id="results" hidden>
+  <p>You scored <span id="final-score"></span></p>
+  <ol id="review"></ol>
+  <button id="restart">Play again</button>
+</section>
+<script src="quiz.js"></script>
+</body>
+</html>

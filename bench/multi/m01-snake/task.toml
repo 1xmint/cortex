@@ -1,0 +1,12 @@
+tier = "multi"
+kind = "fresh"
+features = [
+  "start screen",
+  "arrow-key steering",
+  "growth on food",
+  "game over on wall or self",
+  "score",
+  "best score kept in localStorage",
+  "pause on Space",
+  "restart",
+]

@@ -1,0 +1,19 @@
+[[check]]
+id = "start-screen"
+command = "/usr/local/lib/cortex-browser/node/bin/node /checks/files/start-screen.mjs"
+expect_exit = 0
+
+[[check]]
+id = "answering"
+command = "/usr/local/lib/cortex-browser/node/bin/node /checks/files/answering.mjs"
+expect_exit = 0
+
+[[check]]
+id = "keys"
+command = "/usr/local/lib/cortex-browser/node/bin/node /checks/files/keys.mjs"
+expect_exit = 0
+
+[[check]]
+id = "results"
+command = "/usr/local/lib/cortex-browser/node/bin/node /checks/files/results.mjs"
+expect_exit = 0

@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Snake</title>
+<style>
+  body { font-family: sans-serif; text-align: center; }
+  #board { background: #111; display: block; margin: 0 auto; }
+  .overlay { margin: 1em; }
+</style>
+</head>
+<body>
+<h1>Snake</h1>
+<p>Score: <span id="score">0</span> &middot; Best: <span id="best">0</span>
+  <span id="paused" hidden>&middot; Paused</span></p>
+<canvas id="board" width="400" height="400"></canvas>
+<div id="start-screen" class="overlay"><button id="start">Start</button></div>
+<div id="game-over" class="overlay" hidden><p>Game over</p><button id="restart">Play again</button></div>
+<script src="game.js"></script>
+</body>
+</html>

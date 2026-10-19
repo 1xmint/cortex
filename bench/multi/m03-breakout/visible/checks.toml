@@ -1,0 +1,24 @@
+[[check]]
+id = "start-screen"
+command = "/usr/local/lib/cortex-browser/node/bin/node /checks/files/start-screen.mjs"
+expect_exit = 0
+
+[[check]]
+id = "paddle-keys"
+command = "/usr/local/lib/cortex-browser/node/bin/node /checks/files/paddle-keys.mjs"
+expect_exit = 0
+
+[[check]]
+id = "bounces"
+command = "/usr/local/lib/cortex-browser/node/bin/node /checks/files/bounces.mjs"
+expect_exit = 0
+
+[[check]]
+id = "bricks"
+command = "/usr/local/lib/cortex-browser/node/bin/node /checks/files/bricks.mjs"
+expect_exit = 0
+
+[[check]]
+id = "lives"
+command = "/usr/local/lib/cortex-browser/node/bin/node /checks/files/lives.mjs"
+expect_exit = 0

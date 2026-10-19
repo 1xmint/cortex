@@ -1,0 +1,19 @@
+[[check]]
+id = "start-screen"
+command = "/usr/local/lib/cortex-browser/node/bin/node /checks/files/start-screen.mjs"
+expect_exit = 0
+
+[[check]]
+id = "steering"
+command = "/usr/local/lib/cortex-browser/node/bin/node /checks/files/steering.mjs"
+expect_exit = 0
+
+[[check]]
+id = "eats-food"
+command = "/usr/local/lib/cortex-browser/node/bin/node /checks/files/eats-food.mjs"
+expect_exit = 0
+
+[[check]]
+id = "wall-ends-game"
+command = "/usr/local/lib/cortex-browser/node/bin/node /checks/files/wall-ends-game.mjs"
+expect_exit = 0

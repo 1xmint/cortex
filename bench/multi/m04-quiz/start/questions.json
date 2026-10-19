@@ -1,0 +1,27 @@
+[
+  {
+    "question": "What colour do you get by mixing blue and yellow?",
+    "choices": ["Green", "Purple", "Orange", "Brown"],
+    "answer": 0
+  },
+  {
+    "question": "How many legs does a spider have?",
+    "choices": ["Six", "Eight", "Ten", "Four"],
+    "answer": 1
+  },
+  {
+    "question": "Which planet is closest to the Sun?",
+    "choices": ["Venus", "Earth", "Mercury", "Mars"],
+    "answer": 2
+  },
+  {
+    "question": "What is 7 times 6?",
+    "choices": ["36", "48", "40", "42"],
+    "answer": 3
+  },
+  {
+    "question": "Which of these is a mammal?",
+    "choices": ["Whale", "Shark", "Trout", "Octopus"],
+    "answer": 0
+  }
+]

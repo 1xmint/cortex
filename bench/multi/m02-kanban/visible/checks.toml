@@ -1,0 +1,20 @@
+[[check]]
+id = "add-cards"
+command = "/usr/local/lib/cortex-browser/node/bin/node /checks/files/add-cards.mjs"
+expect_exit = 0
+
+[[check]]
+id = "move-buttons"
+command = "/usr/local/lib/cortex-browser/node/bin/node /checks/files/move-buttons.mjs"
+expect_exit = 0
+
+[[check]]
+id = "delete"
+command = "/usr/local/lib/cortex-browser/node/bin/node /checks/files/delete.mjs"
+expect_exit = 0
+
+[[check]]
+id = "edit"
+command = "/usr/local/lib/cortex-browser/node/bin/node /checks/files/edit.mjs"
+expect_exit = 0
+
