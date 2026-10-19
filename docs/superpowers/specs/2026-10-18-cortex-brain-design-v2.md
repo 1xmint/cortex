@@ -28,8 +28,13 @@ untrusted work, and checks that must be able to fail. Anthropic's
 Managed Agents (P, Apr 2026) and OpenHands' V1 SDK (P, MLSys 2026) arrived
 at the same shape independently.
 
-Six things change:
+Seven things change:
 
+0. **The brain has layers:** conversation, strategy, mission planning,
+   execution, verification, memory and research, and a runtime underneath
+   that no model can get around. The strategy layer keeps the project's
+   intent for years, beyond any one mission (sections 3 and 3.2a). An
+   independent review by Codex (gpt-6.1-sol) proposed this.
 1. **The plan's centre is a spec plus checks, planned progressively.** It is
    not a full graph built up front (section 3.3).
 2. **Evals come first.** Today's bench is too easy to tell one brain design
@@ -110,7 +115,8 @@ subscriptions, with no API key.
   parallel agents writing one thing make conflicting hidden decisions (P,
   opinion with examples). Cursor's results show that parallel work on
   separate parts does scale when a planner keeps it in order (P). Anthropic says multi-agent suits broad parallel research, not
-  "most coding tasks", at about 15 times the tokens (P). A Google/MIT
+  "most coding tasks". Its multi-agent system used about 15 times the
+  tokens of a chat, and a single agent about 4 times (P). A Google/MIT
   scaling study reports 39–70% losses for multi-agent setups on sequential
   tasks (S, abstract only, not verified). The MAST study of 1,600 traces
   found small gains over one agent and named verification failures as a
@@ -164,24 +170,47 @@ subscriptions, with no API key.
   - The OpenTelemetry conventions for AI are still in "development" status
     (S).
 
-## 3. The shape
+## 3. The shape: layers
+
+The brain has layers, as the owner guessed. Each layer has its own records,
+its own lifetime and its own permissions. **The layers are modules inside
+the one Rust process, not six permanent agents.** Codex's review
+(2026-10-18, gpt-6.1-sol) proposed this split and the builder agreed:
 
 ```
- person ──chat / terminal / API──▶  Cortex core (one process)
-                                     │
-            ┌────────────────────────┼─────────────────────────┐
-            ▼                        ▼                         ▼
-     Conversation             Missions (each an           Memory
-     (always open;            event log): planner,        (bible, agreement,
-      steer / interrupt)      worker, checker, judge      facts, skills)
-                                     │
-                     ┌───────────────┼────────────────┐
-                     ▼               ▼                ▼
-               Model layer       Tool layer         Sandbox
-           (roles → profiles;  (Cortex's own      (all untrusted
-            any provider)       interface; MCP     work)
-                                one adapter)
+ Conversation ⇄ Strategy ⇄ Mission planning ──▶ Execution
+                    ▲              ▲                 │
+                    └──────── Verification ◀─────────┘
+
+ Memory and research feed evidence to every layer.
+ The runtime (log, action broker, budgets, sandbox) sits under all of them,
+ and no model can get around it.
 ```
+
+| Layer | Holds | Lives for | Section |
+|---|---|---|---|
+| Conversation | what the person says; questions kept apart from instructions | always open | 3.1 |
+| **Strategy** | the project's intent: goals, requirements, constraints, decisions, open questions, long-term roadmap | the whole project, years | 3.2a |
+| Mission planning | spec, pieces, milestones, checks for one mission | one mission | 3.3 |
+| Execution | workers, tools, models | one piece | 3.5, 3.8 |
+| Verification | checks, evidence, creative assessments | per artifact version | 3.3, 3.11 |
+| Memory and research | bible, facts, skills, research notes | across projects | 3.6 |
+| Runtime | event log, action broker, budgets, recovery, sandbox | always | 3.2, 3.8, 3.9 |
+
+What crosses each boundary:
+
+| Boundary | Goes down | Comes back |
+|---|---|---|
+| Person ↔ strategy | goals, priorities, approvals, changes of direction | progress, risks, questions |
+| Strategy ↔ planning | a versioned mission charter: which requirements it serves, decisions, budget | what was shown to work, risks, proposed scope changes |
+| Planning ↔ execution | bounded work packages: input versions, output contract, checks, permissions | artifacts and failure evidence |
+| Artifacts ↔ verification | exact artifact and requirement versions | evidence, coverage, limits. Verification never quietly redefines success |
+| Memory ↔ any layer | scoped facts with source, freshness and uncertainty | proposed lessons, trusted only after validation |
+| Any layer ↔ runtime | proposed actions | grants, budget reservations, job handles, outcomes |
+
+Version 1 and the first draft of this version had only planning, execution
+and verification. Strategy was folded into the planner, and the runtime
+duties were scattered.
 
 ### 3.1 Conversation and missions
 
@@ -193,8 +222,27 @@ or an `interrupt`.
 Version 1's rules stay:
 - the log is append-only;
 - tables built from it are caches;
-- the worker session is the unit of recovery;
+- the worker session is the unit of recovery **for work inside the
+  worktree**, where redoing a session is safe;
 - effects outside the worktree carry idempotency keys.
+
+**Long outside work gets durable action records.** Paid generation, deploys
+and jobs that finish after a crash cannot simply be redone. Each such
+action is recorded as:
+- the intent to submit, written before submitting;
+- the provider's job ID;
+- its status, kept up to date;
+- how to cancel it;
+- how to reconcile it after a crash: ask the provider what happened
+  instead of submitting again.
+A process that lost its lease is fenced: it cannot commit results. Workflow
+behaviour is pinned per mission, or migrated explicitly, across upgrades.
+
+**Data lifecycle.** Full model requests and responses can hold private
+project material. The log keeps minimal audit events plus references to
+payloads stored separately and protected, with explicit retention and
+deletion rules (the owner sets them before any outside user). **Snapshots**
+let a years-old project wake without replaying its whole history.
 
 Additions, so that the log can still be read and replayed years from now:
 
@@ -222,6 +270,30 @@ Additions, so that the log can still be read and replayed years from now:
 The harness holds no state of its own. `wake(mission)` rebuilds everything
 from the log. This is the pattern in Managed Agents (P), and it already
 holds in slice 1's `cortex resume`.
+
+### 3.2a Strategy: the project's intent
+
+A mission is days of work. A project is years, and by year three the
+finished pieces would hide *why* the product is the way it is. So the
+project keeps its own **intent records**, separate from any mission's plan:
+- **goals:** what the creation is for and who it serves;
+- **requirements:** promises it must keep ("runs on a phone", "the boss
+  fight feels fair");
+- **constraints:** budget, style, platforms, rules;
+- **decisions:** what was chosen, when, why, and what it replaced;
+- **open questions:** what nobody has decided yet.
+
+Each record is versioned in the log and linked to the missions, pieces,
+artifacts and evidence that serve it. **The roadmap is a view of these
+records**, not a separate document. A mission starts from a **charter**:
+the requirements it serves, the decisions it must respect and its budget.
+It reports back what it proved, the risks it found and any scope change it
+proposes. Only the person, or the judge in "just do it" mode with written
+reasons, changes a goal or a requirement.
+
+This is the owner's "intent graph". It starts simple: plain records with
+links, no ontology. It grows only when the bench's continuing-project
+scenarios (section 3.11) show the simple form failing.
 
 ### 3.3 The loop: spec, milestone, work, check, judge
 
@@ -254,8 +326,24 @@ The mission runs like this:
    - A few whole-project checks are written with the spec. The rest are
      written for each milestone when it is detailed, before its work
      starts. That keeps checks in step with progressive planning.
-   - Every check is frozen, fingerprinted, and must be seen failing before
-     its work starts (invariant 2).
+   - Every check is frozen and fingerprinted, and must be **shown able to
+     fail** (invariant 2):
+     - a check for **new behaviour** must fail before work starts, and for
+       the expected reason (an assertion, not a broken setup);
+     - a check that **preserves existing behaviour** (regression) passes
+       before work starts, and must be shown failing against a planted
+       defect or a known-bad version.
+     Slice 1's code refuses any check that already passes. That is right
+     for a one-off task and wrong for a continuing project. The planner
+     slice changes it.
+   - **Every acceptance check traces to a requirement in the strategy
+     layer.** Requirements survive re-plans. A re-plan may not drop or
+     weaken a check without recording which requirement it covered and
+     why, and a fresh-context reviewer challenges coverage.
+   - **Technical proof and creative quality are reported separately.** "It
+     runs and passes its checks" is proof. "The art fits the style" is an
+     assessment with a rubric, evidence and stated uncertainty, never a
+     pass flag on its own (invariant 1).
    - **A changed check is a new plan version.** In "build it with me" mode
      the person approves it, in plain words. In "just do it" mode the judge
      approves it with written reasons. Either way it is logged and shown.
@@ -303,12 +391,14 @@ through it) runs a read-only research step when any of these holds:
   art style, game design, the audience. For creations this trigger fires
   almost every time;
 - a named API or library is newer than the model's knowledge cutoff (each
-  model profile records its cutoff);
+  model profile records its cutoff), or has changed since;
+- a consequential decision is uncertain, or sources conflict or are stale;
 - a check cannot be written without domain knowledge;
 - a worker hits the same failure twice.
 
-Findings go into the spec or the bible as a short note that cites its
-sources. Whether research should run more widely, for example before every
+Each research task has a decision question, an effort limit and a
+stopping condition. Findings go into the spec or the bible as a short note
+that cites its sources. Whether research should run more widely, for example before every
 coding milestone, is unmeasured. The bench decides it.
 
 Version 1's rules for honest checks and against runaway loops all stay:
@@ -325,8 +415,26 @@ Version 1's rules for honest checks and against runaway loops all stay:
 The creation graph and the project bible stay as in version 1. The graph
 is the pieces and dependencies from section 3.3, held as **data the planner
 rewrites** in the log. The roadmap and intent graphs the person sees, by
-layer, system or process, are **views drawn from that data**. They are
-never a second source of truth to keep in sync.
+layer, system or process, are **views drawn from that data** and from the
+intent records (section 3.2a). They are never a second source of truth to
+keep in sync. Each view records its own version, and CI rebuilds views
+from the log and compares them, so "cannot drift" is checked, not assumed.
+
+**Pieces meet through versioned contracts.** Pieces that never share a file
+can still clash: sprite sizes, animation timing and game logic depend on
+each other. So each piece declares:
+- an **input and output contract**: for example "sprites are 64×64 PNG
+  sheets, 8 frames, named by action";
+- an **artifact manifest**: each output's fingerprint, the inputs and
+  contract versions it was made from, and its usage terms.
+
+Work is scheduled against explicit project versions. Accepting finished
+pieces is serialized. **When a contract changes, every piece and every
+passed check that relied on the old version is marked stale** and re-run
+or re-planned. Ownership holds across missions, not only inside one, and
+also covers shared things such as the bible. Large media lives in an
+**artifact store** addressed by fingerprint, not in disposable git
+worktrees.
 
 Parallel work is allowed where it cannot conflict:
 - pieces with no dependency between them, such as a sprite set and a music
@@ -334,7 +442,9 @@ Parallel work is allowed where it cannot conflict:
 - read-only work: research, review, checks.
 
 Two workers never write to the same piece at once, which is where Cognition
-saw conflicting decisions. Parallel workers sit under the planner, which
+saw conflicting decisions. This is a default backed by that evidence, not a
+proven universal rule: several workers may explore or review in parallel,
+but one owner accepts. Parallel workers sit under the planner, which
 owns the order. Cursor's flat self-coordinating setup failed and its
 planner-led one worked. Finished pieces merge one at a time, and
 integration is its own piece with its own checks.
@@ -348,9 +458,13 @@ integration is its own piece with its own checks.
   - an OpenAI-compatible adapter, which also covers local open-model
     servers such as vLLM and llama.cpp.
   The OpenAI format is an adapter, not the internal model, because
-  vendor-specific features leak through it. **Content Cortex does not
+  vendor-specific features leak through it. **Data Cortex does not
   understand passes through unchanged**, so a provider's new features
-  (thinking blocks, caching, server-side tools) do not break the adapter.
+  (thinking blocks, caching hints) do not break the adapter. **Actions
+  Cortex does not understand are refused**, including a provider's
+  server-side tools, until they are supported through the action broker
+  (section 3.8). Otherwise they would run outside the sandbox and the
+  person's approvals.
   Each adapter is tested in CI against recorded replies.
 - **Model profiles are configuration:**
   - endpoint;
@@ -428,6 +542,24 @@ call that runs in the sandbox and returns data.
   - idempotency keys on paid calls;
   - budget counting.
 
+**Every action goes through one action broker** in the runtime layer. A
+model only ever proposes an action; the broker decides. Before anything
+runs, it checks:
+- **who**: the authenticated account and project, and that the person is
+  a member of it;
+- **what**: the action is a known capability, and the resource is in this
+  project's scope. Unknown capabilities are refused;
+- **approval**: the working agreement allows it, or the person approved it
+  (invariant 4);
+- **money**: the cost is reserved from the budget atomically before the
+  call, so two parallel workers cannot both spend the last of it.
+
+It then hands back a grant and, for long outside work, a durable job
+handle (section 3.2). The rules are defined in full now. **Early slices
+enforce them for one owner only**; accounts with many people, and their
+isolation from each other, are tested before any outside user, not built
+first.
+
 ### 3.9 Sandbox
 
 Unchanged: bubblewrap plus gVisor on Linux (WSL2 on the owner's PC),
@@ -472,7 +604,20 @@ planner from another. The new bench has:
 - **Results report a story, not only numbers:** for each mission, the
   spec, the milestones, what failed and why, and its cost.
 - **Reliability and value:** pass^k over repeated tries, cost and tokens
-  per success, and wall time.
+  per success, and wall time. Comparisons are **paired** (the same tasks
+  in both arms) and report their uncertainty, so a small win is not
+  mistaken for a real one.
+- **Long-horizon scenarios**, added as the features they test land:
+  - a continuing project across several missions, including a changed
+    goal;
+  - steering mid-mission;
+  - a shared contract that changes, with stale evidence correctly
+    invalidated;
+  - a crash right after outside work was submitted: recovered without
+    paying twice.
+  The short tasks cannot judge strategy, multi-day reliability or creative
+  quality, so the bench decides tuning (depth, research, roles), and these
+  scenarios guard the architecture.
 - **Plain-request mode:** Cortex gets only the request and writes its own
   spec and checks. The bench's own checks then judge the result.
 - **New tasks every release**, drawn from real failures. Transcripts are
@@ -505,6 +650,10 @@ longer help are removed. Each flag also has an expiry date, after which it
 must be re-justified or go. Without this the harness turns into the "dead
 weight" Anthropic describes. Skills (section 3.6) follow the same rule.
 
+**Stable boundaries are not workarounds.** The layers, the action broker,
+the checker owning pass and fail, and the sandbox exist because of what
+Cortex is, not because of a model's weakness. They do not expire.
+
 ## 4. Technology per component
 
 Version 1's table stands (Rust core, SQLite log, own durable execution,
@@ -524,12 +673,17 @@ staying with Rust is low-regret.
 
 ## 5. Answers to the owner's own ideas
 
+- **"The brain needs multiple layers."** Yes: conversation, strategy,
+  mission planning, execution, verification, memory and research, and the
+  runtime underneath (section 3). They are modules with clear boundaries,
+  not a crowd of agents, so the brain stays one program to maintain.
 - **"A planner that makes the plan: roadmap graphs, intent graphs, layers,
-  systems, processes."** Yes. The planner keeps a real graph of pieces
-  with their dependencies, tagged by layer and system. The person sees
-  roadmap and intent views drawn from it. The only change from the idea is
-  that the graph and the spec with its checks live in one place, the log.
-  The views are drawn from it, so they can never drift. Whether deeper,
+  systems, processes."** Yes, at two levels. The **intent graph** is the
+  strategy layer's records: goals, requirements, decisions (section 3.2a).
+  The **plan graph** is each mission's pieces with their dependencies,
+  tagged by layer and system. The person sees roadmap and intent views
+  drawn from both. Both live in one place, the log, and the views are
+  rebuilt and compared in CI, so they cannot drift unnoticed. Whether deeper,
   layered plans beat simpler ones on big projects is untested anywhere,
   so the bench decides how deep Cortex plans.
 - **"Progressive planning: the right items at the right moments, building
@@ -574,9 +728,19 @@ cost.**
   (request, what was built, what failed and why), pass rate, time and
   cost.
 
-**Slice 3: the planner.**
+**Slice 3: the planner, on top of minimal strategy and runtime.**
 - Spec, the pieces-and-milestones plan, both check layers, adaptive depth
   and the milestone judge, built test-first against fakes in CI.
+- The smallest form of the layers it rests on, so later slices extend
+  them instead of retrofitting them:
+  - intent records and mission charters (section 3.2a), with checks
+    traced to requirements;
+  - check rules for continuing work: preservation checks shown failing
+    against a planted defect, replacing slice 1's "must start red" in
+    `core/src/checks.rs`;
+  - the action broker's rules, for one owner (section 3.8);
+  - the schema for durable action records and piece contracts (sections
+    3.2 and 3.4), used fully when outside jobs and media arrive.
 - Triggered research and the cross-family reviewer, both behind switches.
 - Real runs (quota), sized from slice 2's measured cost and capped in
   advance:
@@ -592,6 +756,14 @@ cost.**
 OpenAI-compatible adapter (tested against a local stand-in server), and
 ADRs for the model layer and the tool interface. ADR 0005 (engines) gets a
 superseding ADR.
+
+**A small media experiment, during slice 3.** One tiny game whose art is
+made by code (SVG or pixel art drawn by a script), with no paid media API,
+because services billed separately are ruled out for development. It tests
+the boundaries early: a sprite contract shared by art and code, an artifact
+manifest, a contract change that marks stale work, and creative quality
+judged against a rubric the owner approves, reported apart from the
+technical checks.
 
 **Slice 4: the chat page.** The face on top of a planner that has been
 proven:
@@ -633,6 +805,7 @@ which is the owner's decision once slice 3 is proven.
 | 3.11 Scoreboard | Change: rebuilt first | Saturated at 10/10; tiers, holdout, pass^k, cost (P: Anthropic evals) |
 | 3.12 Judgements | Keep | — |
 | — | New: 3.13 workaround flags | Stale scaffolding (P: Managed Agents) |
+| — | New: layers, strategy records (3, 3.2a), action broker (3.8), durable action records and data lifecycle (3.2), piece contracts (3.4) | Codex review, 2026-10-18 |
 | 5 Slice order | Change | Bench, then planner, then page |
 
 ## 8. Decisions that are the owner's
@@ -666,6 +839,10 @@ which is the owner's decision once slice 3 is proven.
 - **Planner-written held-out checks may be wrong.** They can be too strict
   and block correct work, or too loose and prove nothing. The bench's own
   holdout is the check on them.
+- **The layers add up-front design work.** If the intent records or the
+  broker grow before the bench shows they are needed, they become the
+  weight this version warns about. Mitigation: build each in its smallest
+  form, and grow it only when a long-horizon scenario fails.
 - **Open models' tool-call reliability is unverified.** The adapter is
   tested against a stand-in; real open-model runs wait for the owner's
   servers.
