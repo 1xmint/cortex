@@ -8,7 +8,7 @@ use std::path::PathBuf;
 /// The format events are written in. Version 1 is slice 1's; an event's
 /// version is stored beside it and old events are upgraded as they are
 /// read, never rewritten.
-pub const SCHEMA_VERSION: u32 = 2;
+pub const SCHEMA_VERSION: u32 = 3;
 
 /// Reads an event body written in format `version`.
 pub fn upgrade(version: u32, body: serde_json::Value) -> Result<Event> {
@@ -18,6 +18,8 @@ pub fn upgrade(version: u32, body: serde_json::Value) -> Result<Event> {
         )));
     }
     // 1 → 2 adds only new kinds and columns, so old bodies read as they are.
+    // 2 → 3 moves transcript text into payloads; an old transcript event's
+    // inline `line` is dropped on read and its `payload` is `None`.
     serde_json::from_value(body).map_err(|e| Error::Store(format!("event encoding: {e}")))
 }
 
@@ -54,9 +56,12 @@ pub enum Event {
         worktree: PathBuf,
         brief: String,
     },
+    /// One transcript line. The text lives in the payload table, so it
+    /// can be deleted; the event only points at it.
     Transcript {
         session: u32,
-        line: String,
+        #[serde(default)]
+        payload: Option<PayloadRef>,
     },
     SessionEnded {
         session: u32,

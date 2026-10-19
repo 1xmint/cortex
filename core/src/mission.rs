@@ -282,13 +282,15 @@ fn drive_held(
                 &input,
                 &mut |line| {
                     if transcript_err.is_none()
-                        && let Err(e) = store.append(
-                            m,
-                            &Event::Transcript {
-                                session,
-                                line: line.to_string(),
-                            },
-                        )
+                        && let Err(e) = store.put_payload(m, line.as_bytes()).and_then(|r| {
+                            store.append(
+                                m,
+                                &Event::Transcript {
+                                    session,
+                                    payload: Some(r),
+                                },
+                            )
+                        })
                     {
                         transcript_err = Some(e);
                     }
