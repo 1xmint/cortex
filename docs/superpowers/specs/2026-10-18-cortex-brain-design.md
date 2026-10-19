@@ -1,7 +1,9 @@
 # Cortex brain: architecture design
 
-Status: approved by the owner on 2026-10-18 ("work until the plan is
-completed"), after an independent review and a builder check ·
+Status: superseded on 2026-10-18 by
+[version 2](2026-10-18-cortex-brain-design-v2.md). Was approved by the
+owner on 2026-10-18 ("work until the plan is completed"), after an
+independent review and a builder check ·
 Date: 2026-10-18
 
 This is the design the ADRs and the first brain slice are built from. It
