@@ -74,10 +74,11 @@ What is true now and what comes next. Kept under 150 lines by CI.
   owner's subscription: **10 of 10 passed**, each in one session, 10–20 s
   each ([bench/results/2026-10-18-claude.json](bench/results/2026-10-18-claude.json)).
   These prompts are now too easy to tell engines apart; harder ones are next.
-- Brain design approved:
-  [docs/superpowers/specs/2026-10-18-cortex-brain-design.md](docs/superpowers/specs/2026-10-18-cortex-brain-design.md).
-  Approved by the owner on 2026-10-18 after an independent review and a
-  builder check.
+- Brain design approved: version 2,
+  [docs/superpowers/specs/2026-10-18-cortex-brain-design-v2.md](docs/superpowers/specs/2026-10-18-cortex-brain-design-v2.md),
+  approved by the owner on 2026-10-18 after three Codex reviews. It
+  replaces [version 1](docs/superpowers/specs/2026-10-18-cortex-brain-design.md),
+  kept for history.
 - Foundational ADRs accepted: Rust core ([0002](docs/adr/0002-rust-core.md)),
   event log in SQLite ([0003](docs/adr/0003-event-log-in-sqlite.md)), sandbox
   ([0004](docs/adr/0004-sandbox-bubblewrap-gvisor.md)), engines
@@ -105,6 +106,12 @@ What is true now and what comes next. Kept under 150 lines by CI.
   levels.
 - 2026-10-18 — The gold rule (AGENTS.md invariant 5): technology is chosen per
   component for the best long-term result, recorded in an ADR.
+- 2026-10-18 — Brain design version 2 replaces version 1: layers with a
+  strategy layer for lasting intent, a spec plus checks planned
+  progressively, context assembly, a provider-neutral model layer, and
+  browser games and small web apps as the first target. Why: a skeptical
+  second look plus Codex reviews found version 1 weak on lasting intent,
+  context and evaluation. The slice-2 design (PR 26) closed as superseded.
 
 ## Known problems
 
@@ -127,8 +134,8 @@ What is true now and what comes next. Kept under 150 lines by CI.
    test checks to CI.
 3. First brain slice: done 2026-10-18 (doctor, jail test and a 10 of 10
    bench run in WSL Ubuntu).
-4. Next: owner approval of the brain design version 2
-   ([draft](docs/superpowers/specs/2026-10-18-cortex-brain-design-v2.md)),
-   which reorders the slices: a harder bench with cost recording first, then
-   the planner, then the chat page. The slice-2 design in PR 26 closes as
-   superseded once version 2 is approved.
+4. Brain design version 2 approved (done 2026-10-18).
+5. Next: slice 2 of version 2 (section 6): a bench of browser games and
+   small web apps that can tell brains apart, cost per accepted result,
+   and full model-call records. Starts with its plan; needs the owner's
+   private holdout repository (design section 8).

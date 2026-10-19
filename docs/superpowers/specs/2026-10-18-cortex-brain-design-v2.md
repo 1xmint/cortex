@@ -1,11 +1,11 @@
 # Cortex brain: architecture design, version 2
 
-Status: draft for the owner's approval
+Status: approved by the owner on 2026-10-18
 Date: 2026-10-18
 Replaces: [version 1](2026-10-18-cortex-brain-design.md) (approved the same
-day). Version 1 stays in the repository for history. Once this version is
-approved, version 1 is marked superseded and the open slice 2 design
-(PR 26) is closed in favour of the slice order in section 6.
+day). Version 1 stays in the repository for history, marked superseded.
+The earlier slice 2 design (PR 26) is closed in favour of the slice order
+in section 6.
 
 ## 0. Why a second version
 
