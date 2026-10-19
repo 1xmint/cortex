@@ -1,0 +1,19 @@
+[[check]]
+id = "adding"
+command = "/usr/local/lib/cortex-browser/node/bin/node /checks/files/adding.mjs"
+expect_exit = 0
+
+[[check]]
+id = "categories"
+command = "/usr/local/lib/cortex-browser/node/bin/node /checks/files/categories.mjs"
+expect_exit = 0
+
+[[check]]
+id = "edit-delete"
+command = "/usr/local/lib/cortex-browser/node/bin/node /checks/files/edit-delete.mjs"
+expect_exit = 0
+
+[[check]]
+id = "month-total"
+command = "/usr/local/lib/cortex-browser/node/bin/node /checks/files/month-total.mjs"
+expect_exit = 0

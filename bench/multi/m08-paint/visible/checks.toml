@@ -1,0 +1,29 @@
+[[check]]
+id = "draw"
+command = "/usr/local/lib/cortex-browser/node/bin/node /checks/files/draw.mjs"
+expect_exit = 0
+
+[[check]]
+id = "colours-sizes"
+command = "/usr/local/lib/cortex-browser/node/bin/node /checks/files/colours-sizes.mjs"
+expect_exit = 0
+
+[[check]]
+id = "eraser"
+command = "/usr/local/lib/cortex-browser/node/bin/node /checks/files/eraser.mjs"
+expect_exit = 0
+
+[[check]]
+id = "undo-redo"
+command = "/usr/local/lib/cortex-browser/node/bin/node /checks/files/undo-redo.mjs"
+expect_exit = 0
+
+[[check]]
+id = "clear"
+command = "/usr/local/lib/cortex-browser/node/bin/node /checks/files/clear.mjs"
+expect_exit = 0
+
+[[check]]
+id = "export"
+command = "/usr/local/lib/cortex-browser/node/bin/node /checks/files/export.mjs"
+expect_exit = 0

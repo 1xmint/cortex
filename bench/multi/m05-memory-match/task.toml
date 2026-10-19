@@ -1,0 +1,12 @@
+tier = "multi"
+kind = "change"
+features = [
+  "matching pairs still work",
+  "winning still works",
+  "move counter",
+  "timer from the first flip",
+  "three sizes",
+  "best score per size",
+  "best scores survive a reload",
+  "restart",
+]

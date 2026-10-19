@@ -1,0 +1,12 @@
+tier = "multi"
+kind = "fresh"
+features = [
+  "pen strokes and dots",
+  "eraser",
+  "five colours",
+  "three brush sizes",
+  "undo",
+  "redo",
+  "clear with confirm",
+  "PNG export",
+]

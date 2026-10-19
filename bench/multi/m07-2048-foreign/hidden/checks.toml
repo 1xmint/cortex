@@ -1,0 +1,34 @@
+[[check]]
+id = "random"
+command = "/usr/local/lib/cortex-browser/node/bin/node /checks/files/random.mjs"
+expect_exit = 0
+
+[[check]]
+id = "undo-score"
+command = "/usr/local/lib/cortex-browser/node/bin/node /checks/files/undo-score.mjs"
+expect_exit = 0
+
+[[check]]
+id = "undo-depth"
+command = "/usr/local/lib/cortex-browser/node/bin/node /checks/files/undo-depth.mjs"
+expect_exit = 0
+
+[[check]]
+id = "undo-saved"
+command = "/usr/local/lib/cortex-browser/node/bin/node /checks/files/undo-saved.mjs"
+expect_exit = 0
+
+[[check]]
+id = "animations-saved"
+command = "/usr/local/lib/cortex-browser/node/bin/node /checks/files/animations-saved.mjs"
+expect_exit = 0
+
+[[check]]
+id = "keeps-merging"
+command = "/usr/local/lib/cortex-browser/node/bin/node /checks/files/keeps-merging.mjs"
+expect_exit = 0
+
+[[check]]
+id = "keeps-going"
+command = "/usr/local/lib/cortex-browser/node/bin/node /checks/files/keeps-going.mjs"
+expect_exit = 0

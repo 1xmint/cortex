@@ -70,6 +70,9 @@ enum Cmd {
         /// The bench folder; results go in its `results/`.
         #[arg(long, default_value = "bench")]
         dir: PathBuf,
+        /// Write the results file here instead (refused for a holdout bench).
+        #[arg(long)]
+        results: Option<PathBuf>,
     },
     /// Serves the sandboxed tools to an engine over stdio (used by engines).
     #[command(hide = true)]
@@ -105,7 +108,12 @@ fn main() -> ExitCode {
             .and_then(|s| mission::stop(&s, &MissionId(mission), text.as_deref()))
             .map(|()| ExitCode::SUCCESS),
         Some(Cmd::Status { mission }) => status(&MissionId(mission)),
-        Some(Cmd::Bench { worker, only, dir }) => bench(worker, only.as_deref(), &dir),
+        Some(Cmd::Bench {
+            worker,
+            only,
+            dir,
+            results,
+        }) => bench(worker, only.as_deref(), &dir, results),
         Some(Cmd::Mcp { worktree, checks }) => {
             cortex::mcp::serve(worktree, checks).map(|()| ExitCode::SUCCESS)
         }
@@ -206,15 +214,16 @@ fn bench(
     worker: Option<String>,
     only: Option<&str>,
     dir: &std::path::Path,
+    results: Option<PathBuf>,
 ) -> cortex::Result<ExitCode> {
     let profile = worker_profile(worker)?;
+    let results = results.unwrap_or_else(|| dir.join("results"));
     let store = open_store()?;
     let mut make = |p: &cortex::bench::Prompt| match profile.engine {
         EngineKind::Fake => engine(profile.clone(), Some(p.fake_solution())),
         _ => engine(profile.clone(), None),
     };
-    let (report, path) =
-        cortex::bench::run(dir, only, &home(), &store, &mut make, &dir.join("results"))?;
+    let (report, path) = cortex::bench::run(dir, only, &home(), &store, &mut make, &results)?;
     println!("passed {} of {}", report.passed, report.total);
     println!("results: {}", path.display());
     Ok(ExitCode::SUCCESS)

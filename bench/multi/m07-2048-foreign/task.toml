@@ -1,0 +1,14 @@
+tier = "multi"
+kind = "foreign"
+features = [
+  "sliding and merging still work",
+  "saved games and the best score still survive a reload",
+  "keep going after 2048 still works",
+  "seeded games with ?seed=N",
+  "unseeded games stay random",
+  "one-level undo",
+  "undo restores the score and the move count",
+  "move counter",
+  "animations switch",
+  "the animations choice survives a reload",
+]

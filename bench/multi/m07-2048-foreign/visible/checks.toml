@@ -1,0 +1,19 @@
+[[check]]
+id = "seed"
+command = "/usr/local/lib/cortex-browser/node/bin/node /checks/files/seed.mjs"
+expect_exit = 0
+
+[[check]]
+id = "undo"
+command = "/usr/local/lib/cortex-browser/node/bin/node /checks/files/undo.mjs"
+expect_exit = 0
+
+[[check]]
+id = "moves"
+command = "/usr/local/lib/cortex-browser/node/bin/node /checks/files/moves.mjs"
+expect_exit = 0
+
+[[check]]
+id = "animations"
+command = "/usr/local/lib/cortex-browser/node/bin/node /checks/files/animations.mjs"
+expect_exit = 0
