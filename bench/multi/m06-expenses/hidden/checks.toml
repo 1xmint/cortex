@@ -1,0 +1,24 @@
+[[check]]
+id = "keeps-order"
+command = "/usr/local/lib/cortex-browser/node/bin/node /checks/files/keeps-order.mjs"
+expect_exit = 0
+
+[[check]]
+id = "keeps-refusing"
+command = "/usr/local/lib/cortex-browser/node/bin/node /checks/files/keeps-refusing.mjs"
+expect_exit = 0
+
+[[check]]
+id = "chart"
+command = "/usr/local/lib/cortex-browser/node/bin/node /checks/files/chart.mjs"
+expect_exit = 0
+
+[[check]]
+id = "csv"
+command = "/usr/local/lib/cortex-browser/node/bin/node /checks/files/csv.mjs"
+expect_exit = 0
+
+[[check]]
+id = "saved"
+command = "/usr/local/lib/cortex-browser/node/bin/node /checks/files/saved.mjs"
+expect_exit = 0

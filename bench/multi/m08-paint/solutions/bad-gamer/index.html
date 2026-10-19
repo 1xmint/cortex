@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Paint</title>
+<style>
+  body { font-family: system-ui, sans-serif; margin: 16px; }
+  .bar { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 8px; }
+  button { padding: 4px 10px; border: 1px solid #888; background: #f4f4f4; cursor: pointer; }
+  button.active { outline: 2px solid #2266dd; background: #dde8ff; }
+  .colour { width: 28px; height: 28px; }
+  #canvas { display: block; border: 0; padding: 0; cursor: crosshair; box-shadow: 0 0 0 1px #999; }
+</style>
+</head>
+<body>
+<h1>Paint</h1>
+<div class="bar">
+  <button id="pen" type="button">Pen</button>
+  <button id="eraser" type="button">Eraser</button>
+</div>
+<div class="bar">
+  <button class="colour" type="button" data-colour="#000000" style="background:#000000" aria-label="Black"></button>
+  <button class="colour" type="button" data-colour="#ff0000" style="background:#ff0000" aria-label="Red"></button>
+  <button class="colour" type="button" data-colour="#00ff00" style="background:#00ff00" aria-label="Green"></button>
+  <button class="colour" type="button" data-colour="#0000ff" style="background:#0000ff" aria-label="Blue"></button>
+  <button class="colour" type="button" data-colour="#ffff00" style="background:#ffff00" aria-label="Yellow"></button>
+</div>
+<div class="bar">
+  <button class="size" type="button" data-size="2">Small</button>
+  <button class="size" type="button" data-size="8">Medium</button>
+  <button class="size" type="button" data-size="20">Large</button>
+</div>
+<div class="bar">
+  <button id="undo" type="button">Undo</button>
+  <button id="redo" type="button">Redo</button>
+  <button id="clear" type="button">Clear</button>
+  <button id="export" type="button">Export PNG</button>
+</div>
+<canvas id="canvas" width="400" height="300"></canvas>
+<script src="paint.js"></script>
+</body>
+</html>

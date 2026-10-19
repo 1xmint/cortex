@@ -7,8 +7,8 @@ use crate::event::Event;
 use crate::mission::{self, Budgets, Outcome};
 use crate::store::{MissionId, Store};
 use crate::{Error, Result, git};
-use serde::Serialize;
-use std::path::{Path, PathBuf};
+use serde::{Deserialize, Serialize};
+use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub mod task;
@@ -66,6 +66,43 @@ pub fn prompts(bench: &Path) -> Result<Vec<Prompt>> {
     Ok(out)
 }
 
+/// `<bench>/bench.toml`, which is optional.
+#[derive(Deserialize)]
+struct BenchFile {
+    #[serde(default)]
+    holdout: bool,
+}
+
+/// Whether `<bench>/bench.toml` marks this bench as a private holdout set.
+pub fn is_holdout(bench: &Path) -> Result<bool> {
+    let path = bench.join("bench.toml");
+    if !path.exists() {
+        return Ok(false);
+    }
+    let file: BenchFile = toml::from_str(&std::fs::read_to_string(&path)?)
+        .map_err(|e| Error::Invalid(format!("{}: {e}", path.display())))?;
+    Ok(file.holdout)
+}
+
+/// A holdout bench's results may only go to its own `results/`, so
+/// nothing about its tasks can reach the public repository.
+fn guard_results(bench: &Path, results: &Path) -> Result<()> {
+    if !is_holdout(bench)? {
+        return Ok(());
+    }
+    let own = std::path::absolute(bench.join("results"))?;
+    let asked = std::path::absolute(results)?;
+    if asked.components().any(|c| c == Component::ParentDir) || !asked.starts_with(&own) {
+        return Err(Error::Invalid(format!(
+            "holdout bench: results must stay in {}, not {}",
+            own.display(),
+            results.display()
+        )));
+    }
+    println!("holdout run: results stay in {}", bench.display());
+    Ok(())
+}
+
 /// Copies a prompt's starting project into `repo` and commits it.
 pub fn make_repo(start: &Path, repo: &Path) -> Result<()> {
     std::fs::create_dir_all(repo)?;
@@ -102,7 +139,8 @@ pub fn budgets(tier: Tier) -> Budgets {
 /// Runs every prompt (or just `only`) as a mission with a fresh engine
 /// from `make_engine`, and writes `<results>/<UTC date>-<engine>.json`
 /// (with `-2`, `-3`… if that name is taken). Returns the report and the
-/// file it wrote.
+/// file it wrote. A holdout bench refuses any `results` outside its own
+/// `results/`.
 pub fn run(
     bench: &Path,
     only: Option<&str>,
@@ -111,6 +149,7 @@ pub fn run(
     make_engine: &mut dyn FnMut(&Prompt) -> Result<Box<dyn Engine>>,
     results: &Path,
 ) -> Result<(Report, PathBuf)> {
+    guard_results(bench, results)?;
     let chosen: Vec<Prompt> = prompts(bench)?
         .into_iter()
         .filter(|p| only.is_none_or(|id| p.id == id))

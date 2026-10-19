@@ -1,0 +1,29 @@
+[[check]]
+id = "keeps-matching"
+command = "/usr/local/lib/cortex-browser/node/bin/node /checks/files/keeps-matching.mjs"
+expect_exit = 0
+
+[[check]]
+id = "keeps-winning"
+command = "/usr/local/lib/cortex-browser/node/bin/node /checks/files/keeps-winning.mjs"
+expect_exit = 0
+
+[[check]]
+id = "timer"
+command = "/usr/local/lib/cortex-browser/node/bin/node /checks/files/timer.mjs"
+expect_exit = 0
+
+[[check]]
+id = "best-per-size"
+command = "/usr/local/lib/cortex-browser/node/bin/node /checks/files/best-per-size.mjs"
+expect_exit = 0
+
+[[check]]
+id = "best-reload"
+command = "/usr/local/lib/cortex-browser/node/bin/node /checks/files/best-reload.mjs"
+expect_exit = 0
+
+[[check]]
+id = "restart-timer"
+command = "/usr/local/lib/cortex-browser/node/bin/node /checks/files/restart-timer.mjs"
+expect_exit = 0

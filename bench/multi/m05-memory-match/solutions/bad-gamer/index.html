@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Memory match</title>
+<style>
+  body { font-family: sans-serif; margin: 2em; }
+  #board { display: grid; gap: 0.4em; }
+  .card { width: 4em; height: 4em; font-size: 1.4em; background: #357; color: #fff; border: 0; }
+  .card.flipped { background: #eee; color: #222; }
+  .card.matched { background: #cec; }
+  #bar { display: flex; gap: 1.5em; align-items: center; margin-bottom: 1em; }
+</style>
+</head>
+<body>
+<h1>Memory match</h1>
+<div id="bar">
+  <label>Size
+    <select id="size">
+      <option value="easy">Easy</option>
+      <option value="medium" selected>Medium</option>
+      <option value="hard">Hard</option>
+    </select>
+  </label>
+  <span>Moves: <b id="moves">0</b></span>
+  <span>Time: <b id="time">0</b>s</span>
+  <span>Best: <b id="best">-</b></span>
+  <button id="restart">Restart</button>
+</div>
+<div id="board"></div>
+<p id="won" hidden>You found every pair!</p>
+<script src="game.js"></script>
+</body>
+</html>

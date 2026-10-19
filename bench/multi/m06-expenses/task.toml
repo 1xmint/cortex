@@ -1,0 +1,13 @@
+tier = "multi"
+kind = "change"
+features = [
+  "adding and refusing bad input still work",
+  "list order and total still work",
+  "categories",
+  "delete",
+  "edit",
+  "monthly totals",
+  "category chart",
+  "CSV export",
+  "saved across reloads",
+]

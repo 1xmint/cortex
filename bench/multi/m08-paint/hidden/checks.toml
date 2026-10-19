@@ -1,0 +1,29 @@
+[[check]]
+id = "clear-cancel"
+command = "/usr/local/lib/cortex-browser/node/bin/node /checks/files/clear-cancel.mjs"
+expect_exit = 0
+
+[[check]]
+id = "undo-depth"
+command = "/usr/local/lib/cortex-browser/node/bin/node /checks/files/undo-depth.mjs"
+expect_exit = 0
+
+[[check]]
+id = "export-content"
+command = "/usr/local/lib/cortex-browser/node/bin/node /checks/files/export-content.mjs"
+expect_exit = 0
+
+[[check]]
+id = "ends-outside"
+command = "/usr/local/lib/cortex-browser/node/bin/node /checks/files/ends-outside.mjs"
+expect_exit = 0
+
+[[check]]
+id = "colour-pen"
+command = "/usr/local/lib/cortex-browser/node/bin/node /checks/files/colour-pen.mjs"
+expect_exit = 0
+
+[[check]]
+id = "blank-white"
+command = "/usr/local/lib/cortex-browser/node/bin/node /checks/files/blank-white.mjs"
+expect_exit = 0
