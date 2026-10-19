@@ -1,13 +1,25 @@
 // Every multi-feature task's graders, proven both ways: each check fails on
 // `start/`, the reference passes everything, and every bad solution fails
 // something. Loops over `bench/multi/` and the fixture, so new tasks are
-// covered without new tests.
+// covered without new tests. `CORTEX_BENCH_DIR` points them at another bench,
+// such as the private holdout.
 
 use cortex::bench::task::{Kind, Task, Tier, tasks};
 use cortex::checks::CheckSet;
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 fn all_tasks() -> Vec<Task> {
+    tasks_from(std::env::var_os("CORTEX_BENCH_DIR"))
+}
+
+/// The tasks in `bench`, or in this repo's bench and fixture when unset.
+fn tasks_from(bench: Option<OsString>) -> Vec<Task> {
+    if let Some(dir) = bench {
+        let out = tasks(Path::new(&dir), Some(Tier::Multi)).unwrap();
+        assert!(!out.is_empty(), "no multi tasks in {}", dir.display());
+        return out;
+    }
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let mut out = tasks(&root.join("../bench"), Some(Tier::Multi)).unwrap();
     out.extend(tasks(&root.join("tests/fixtures"), Some(Tier::Multi)).unwrap());
@@ -26,6 +38,30 @@ fn bads(task: &Task) -> Vec<PathBuf> {
         .collect();
     out.sort();
     out
+}
+
+#[test]
+fn graders_follow_bench_dir() {
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/multi/t00-counter");
+    let bench = tempfile::tempdir().unwrap();
+    copy_tree(&fixture, &bench.path().join("multi/t00-counter"));
+    let got = tasks_from(Some(bench.path().as_os_str().to_owned()));
+    let ids: Vec<&str> = got.iter().map(|t| t.id.as_str()).collect();
+    assert_eq!(ids, ["t00-counter"]);
+    assert!(got[0].dir.starts_with(bench.path()));
+}
+
+fn copy_tree(from: &Path, to: &Path) {
+    std::fs::create_dir_all(to).unwrap();
+    for e in std::fs::read_dir(from).unwrap() {
+        let e = e.unwrap();
+        let dest = to.join(e.file_name());
+        if e.file_type().unwrap().is_dir() {
+            copy_tree(&e.path(), &dest);
+        } else {
+            std::fs::copy(e.path(), dest).unwrap();
+        }
+    }
 }
 
 #[test]
@@ -88,28 +124,14 @@ fn task_files_are_complete() {
 // These run checks, so they need the Linux sandbox.
 #[cfg(target_os = "linux")]
 mod sandboxed {
-    use super::{all_tasks, bads};
+    use super::{all_tasks, bads, copy_tree};
     use cortex::bench::task::{grade, stage_checks};
     use cortex::checks::{CheckSet, freeze, red_run};
     use cortex::store::{ProjectId, Store};
-    use std::path::Path;
     use std::sync::Mutex;
 
     // One browser at a time: these checks start Chromium.
     static ONE_BROWSER: Mutex<()> = Mutex::new(());
-
-    fn copy_dir(from: &Path, to: &Path) {
-        std::fs::create_dir_all(to).unwrap();
-        for e in std::fs::read_dir(from).unwrap() {
-            let e = e.unwrap();
-            let dest = to.join(e.file_name());
-            if e.file_type().unwrap().is_dir() {
-                copy_dir(&e.path(), &dest);
-            } else {
-                std::fs::copy(e.path(), dest).unwrap();
-            }
-        }
-    }
 
     #[test]
     fn start_fails_every_check() {
@@ -118,7 +140,7 @@ mod sandboxed {
             let tmp = tempfile::tempdir().unwrap();
             let store = Store::open(&tmp.path().join("cortex.db")).unwrap();
             let work = tmp.path().join("work");
-            copy_dir(&task.dir.join("start"), &work);
+            copy_tree(&task.dir.join("start"), &work);
             for side in ["visible", "hidden"] {
                 let staged = stage_checks(&task.dir.join(side), &tmp.path().join(side)).unwrap();
                 let mission = store
