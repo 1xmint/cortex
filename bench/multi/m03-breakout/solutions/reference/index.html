@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Breakout</title>
+<style>
+  body { font-family: sans-serif; text-align: center; }
+  #board { background: #111; display: block; margin: 0 auto; width: 480px; height: 320px; }
+  .overlay { margin: 1em; }
+</style>
+</head>
+<body>
+<h1>Breakout</h1>
+<p>Level <span id="level">1</span> &middot; Score <span id="score">0</span> &middot; Lives <span id="lives">3</span></p>
+<canvas id="board" width="480" height="320"></canvas>
+<div id="start-screen" class="overlay"><button id="start">Start</button></div>
+<div id="won" class="overlay" hidden><p>You win!</p></div>
+<div id="lost" class="overlay" hidden><p>Game over</p></div>
+<script src="game.js"></script>
+</body>
+</html>
