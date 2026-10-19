@@ -1,6 +1,6 @@
 # State
 
-Updated: 2026-10-18
+Updated: 2026-10-19
 
 What is true now and what comes next. Kept under 150 lines by CI.
 
@@ -145,6 +145,6 @@ What is true now and what comes next. Kept under 150 lines by CI.
    and full model-call records. The private holdout repository
    `1xmint/cortex-holdout` exists; the plan is
    [docs/superpowers/plans/2026-10-18-brain-slice-2.md](docs/superpowers/plans/2026-10-18-brain-slice-2.md),
-   being built (task 6 of 11 done: browser checks, versioned events,
-   model-call records, model profiles, the multi-feature task format,
-   and four fresh multi-feature tasks).
+   being built (task 7 of 11 done: browser checks, versioned events,
+   model-call records, model profiles, the task format, eight multi
+   tasks (five fresh, two change, one foreign) and the holdout guard).

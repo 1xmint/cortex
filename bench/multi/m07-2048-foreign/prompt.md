@@ -28,7 +28,8 @@ What to add:
   with N. The same seed and the same moves always give the same board,
   and different seeds give different games. Every new game on that page,
   whether the first one or one started with "New Game", starts again from
-  N. Without `?seed`, the game stays random.
+  N, and a seeded page never reopens a saved game. Without `?seed`, the
+  game stays random.
 - **Undo.** A button with id `undo` takes back the last move that slid
   tiles: the board, the score and the move count all go back to just
   before it. There is one level only: a second undo in a row does

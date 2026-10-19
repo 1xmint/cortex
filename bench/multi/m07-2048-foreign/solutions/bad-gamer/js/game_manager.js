@@ -35,7 +35,8 @@ GameManager.prototype.isGameTerminated = function () {
 
 // Set up the game
 GameManager.prototype.setup = function () {
-  var previousState = this.storageManager.getGameState();
+  // A seeded page always starts a new game, so the seed decides the board
+  var previousState = this.seed === null ? this.storageManager.getGameState() : null;
 
   // Every new game starts the random numbers again (from the seed, if any)
   this.random   = makeRandom(this.seed);

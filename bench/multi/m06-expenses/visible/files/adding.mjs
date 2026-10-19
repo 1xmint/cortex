@@ -7,6 +7,7 @@ await withPage(async (page, ctx) => {
   const got = await rows(page);
   check("an expense is added", got.length === 1 && got[0].description === "Lunch", JSON.stringify(got));
   check("it shows its date and amount", got[0]?.date === "2026-03-04" && got[0]?.amount === "12.50", JSON.stringify(got));
+  check("it is filed under the default category", got[0]?.category === "food", JSON.stringify(got));
   check("the form is cleared", (await page.inputValue("#description")) === "" && (await page.inputValue("#amount")) === "");
 
   await submit(page, { description: "   ", amount: "3" });
