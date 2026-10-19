@@ -4,6 +4,8 @@ import { open, served, text, visible, finish } from "./common.mjs";
 await withPage(async (page, ctx) => {
   await page.clock.install();
   await open(page, ctx);
+  // Hold the clock still so a slow machine cannot add real time between steps.
+  await page.clock.pauseAt(Date.now() + 1000);
   const qs = await served(page);
   await page.locator("#start").click({ timeout: 2000 });
 
