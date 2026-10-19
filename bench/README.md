@@ -42,10 +42,21 @@ CI proves all of this for every task (`core/tests/graders.rs`).
 cortex bench --worker claude-cli-sonnet
 ```
 
-`--only 03-roman` runs one prompt; `--worker api-sonnet` uses the API engine
-(the profiles are in [core/profiles.toml](../core/profiles.toml)). Run it
-from the repository root, or pass `--dir`. Each run writes
-`results/<UTC date>-<engine>.json`: the engine and its version, the Cortex
-commit, and per prompt whether it passed, how many sessions and seconds it
-took, and any blocked checks. Results files are written only by this
-command, never by hand; commit them as they come out.
+`--tier small|multi|all` picks the tasks (default `all`), `--only 03-roman`
+runs one task, `--tries 3` runs each task three times as separate missions,
+and `--arm baseline` names the brain design being measured. `--worker
+api-sonnet` uses the API engine (the profiles are in
+[core/profiles.toml](../core/profiles.toml)). Run it from the repository
+root, or pass `--dir`.
+
+Each run writes `results/<UTC date>-<arm>-<engine>.json`, schema 2 (format:
+[core/src/bench/mod.rs](../core/src/bench/mod.rs)). Per attempt: whether the
+mission finished, whether the hidden checks then accepted it, sessions,
+seconds, tokens, estimated cost, and a short story (the request, the commit,
+files changed, failing checks, why it got stuck). The summary gives
+accepted of total, pass^k per task (passed every one of k tries), and cost
+per accepted result: failed attempts count toward the cost, nothing accepted
+means unbounded, and any unpriced attempt makes it unknown, never 0. The
+slice-1 file `results/2026-10-18-claude.json` is schema 1 and is kept as it
+is. Results files are written only by this command, never by hand; commit
+them as they come out.

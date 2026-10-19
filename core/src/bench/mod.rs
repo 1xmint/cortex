@@ -1,69 +1,90 @@
-//! The bench: fixed prompts with hidden checks, run as ordinary missions so
-//! the score measures the whole system. Results files are only ever
-//! written here, from real runs.
+//! The bench: tasks with hidden checks, run as ordinary missions so the
+//! score measures the whole system. Results files are only ever written
+//! here, from real runs.
 
 use crate::engine::Engine;
 use crate::event::Event;
 use crate::mission::{self, Budgets, Outcome};
+use crate::payload::Spend;
 use crate::store::{MissionId, Store};
 use crate::{Error, Result, git};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+pub mod score;
 pub mod task;
 
-use task::Tier;
+use score::{Attempt, Failure, Story, Summary};
+use task::{Task, Tier};
 
-/// One prompt folder: `prompt.md`, `checks.toml`, `files/`, `start/` and
-/// `fake-solution.toml`.
-#[derive(Debug, Clone)]
-pub struct Prompt {
-    pub id: String,
-    pub dir: PathBuf,
-}
+/// The results-file layout this code writes and reads.
+pub const SCHEMA: u32 = 2;
 
-impl Prompt {
-    pub fn fake_solution(&self) -> PathBuf {
-        self.dir.join("fake-solution.toml")
-    }
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct PromptResult {
-    pub id: String,
-    pub passed: bool,
-    pub sessions: u32,
-    pub seconds: f64,
-    pub blocked_checks: Vec<String>,
-    pub mission_id: String,
-}
-
-#[derive(Debug, Clone, Serialize)]
+/// One bench run: which brain ran it, every attempt, and the sums.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Report {
+    pub schema: u32,
+    /// Which brain design ran: `baseline` is the slice-1 loop.
+    pub arm: String,
+    /// `small`, `multi` or `all`.
+    pub tier: String,
+    pub worker_profile: String,
     pub engine: String,
     pub engine_version: String,
+    /// True when the worker's price or limits are not yet confirmed.
+    pub provisional: bool,
     pub cortex_commit: String,
     pub started: String,
-    pub prompts: Vec<PromptResult>,
-    pub passed: u32,
-    pub total: u32,
+    pub attempts: Vec<Attempt>,
+    pub summary: Summary,
 }
 
-/// The prompts under `<bench>/prompts`, in folder-name order.
-pub fn prompts(bench: &Path) -> Result<Vec<Prompt>> {
-    let mut out = Vec::new();
-    for entry in std::fs::read_dir(bench.join("prompts"))? {
-        let entry = entry?;
-        if entry.file_type()?.is_dir() {
-            out.push(Prompt {
-                id: entry.file_name().to_string_lossy().into_owned(),
-                dir: entry.path(),
-            });
+/// Reads a schema-2 results file. Slice-1 files have no `schema` field and
+/// are refused by name rather than misread.
+pub fn load(path: &Path) -> Result<Report> {
+    let text = std::fs::read_to_string(path)?;
+    let value: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|e| Error::Invalid(format!("{}: {e}", path.display())))?;
+    match value.get("schema").and_then(serde_json::Value::as_u64) {
+        None => Err(Error::Invalid(format!(
+            "{} is a schema 1 (slice-1) results file; only schema {SCHEMA} can be loaded",
+            path.display()
+        ))),
+        Some(n) if n != u64::from(SCHEMA) => Err(Error::Invalid(format!(
+            "{} is schema {n}; only schema {SCHEMA} can be loaded",
+            path.display()
+        ))),
+        Some(_) => serde_json::from_value(value)
+            .map_err(|e| Error::Invalid(format!("{}: {e}", path.display()))),
+    }
+}
+
+/// What to run and how to label it.
+#[derive(Debug, Clone)]
+pub struct RunOptions {
+    /// `None` runs every tier.
+    pub tier: Option<Tier>,
+    pub only: Option<String>,
+    pub arm: String,
+    /// Tries per task; pass^k uses k = tries.
+    pub tries: u32,
+    pub worker_profile: String,
+    pub provisional: bool,
+}
+
+impl Default for RunOptions {
+    fn default() -> Self {
+        RunOptions {
+            tier: None,
+            only: None,
+            arm: "baseline".into(),
+            tries: 1,
+            worker_profile: String::new(),
+            provisional: false,
         }
     }
-    out.sort_by(|a, b| a.id.cmp(&b.id));
-    Ok(out)
 }
 
 /// `<bench>/bench.toml`, which is optional.
@@ -103,7 +124,7 @@ fn guard_results(bench: &Path, results: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Copies a prompt's starting project into `repo` and commits it.
+/// Copies a task's starting project into `repo` and commits it.
 pub fn make_repo(start: &Path, repo: &Path) -> Result<()> {
     std::fs::create_dir_all(repo)?;
     copy_dir(start, repo)?;
@@ -136,28 +157,32 @@ pub fn budgets(tier: Tier) -> Budgets {
     }
 }
 
-/// Runs every prompt (or just `only`) as a mission with a fresh engine
-/// from `make_engine`, and writes `<results>/<UTC date>-<engine>.json`
-/// (with `-2`, `-3`… if that name is taken). Returns the report and the
-/// file it wrote. A holdout bench refuses any `results` outside its own
+/// Runs each chosen task `tries` times as a fresh mission with an engine
+/// from `make_engine`, grades every done multi mission on its hidden
+/// checks, and writes `<results>/<UTC date>-<arm>-<engine>.json` (with
+/// `-2`, `-3`… if that name is taken). Returns the report and the file it
+/// wrote. A holdout bench refuses any `results` outside its own
 /// `results/`.
 pub fn run(
     bench: &Path,
-    only: Option<&str>,
+    opts: &RunOptions,
     home: &Path,
     store: &Store,
-    make_engine: &mut dyn FnMut(&Prompt) -> Result<Box<dyn Engine>>,
+    make_engine: &mut dyn FnMut(&Task) -> Result<Box<dyn Engine>>,
     results: &Path,
 ) -> Result<(Report, PathBuf)> {
     guard_results(bench, results)?;
-    let chosen: Vec<Prompt> = prompts(bench)?
+    if opts.tries == 0 {
+        return Err(Error::Invalid("tries must be at least 1".into()));
+    }
+    let chosen: Vec<Task> = task::tasks(bench, opts.tier)?
         .into_iter()
-        .filter(|p| only.is_none_or(|id| p.id == id))
+        .filter(|t| opts.only.as_deref().is_none_or(|id| t.id == id))
         .collect();
     if chosen.is_empty() {
-        return Err(Error::Invalid(match only {
-            Some(id) => format!("no bench prompt {id}"),
-            None => "no bench prompts".into(),
+        return Err(Error::Invalid(match &opts.only {
+            Some(id) => format!("no bench task {id}"),
+            None => "no bench tasks".into(),
         }));
     }
     let now = SystemTime::now()
@@ -166,35 +191,56 @@ pub fn run(
         .as_secs();
     let started = utc(now);
     let runs = home.join("bench").join(started.replace([':', '-'], ""));
-    let mut report = Report {
-        engine: String::new(),
-        engine_version: String::new(),
+    let mut engine_name = String::new();
+    let mut engine_version = String::new();
+    let mut attempts = Vec::new();
+    for task in &chosen {
+        for try_no in 1..=opts.tries {
+            let mut engine = make_engine(task)?;
+            if engine_name.is_empty() {
+                engine_name = engine.name().to_string();
+                engine_version = engine.version()?;
+            }
+            let a = attempt(
+                task,
+                try_no,
+                &runs.join(&task.id),
+                home,
+                store,
+                engine.as_mut(),
+            )?;
+            println!(
+                "{} {} try {} ({} sessions, {:.0} s)",
+                if a.accepted { "pass" } else { "FAIL" },
+                a.task,
+                a.try_no,
+                a.sessions,
+                a.seconds
+            );
+            attempts.push(a);
+        }
+    }
+    let summary = score::summarize(&attempts, opts.tries);
+    let report = Report {
+        schema: SCHEMA,
+        arm: opts.arm.clone(),
+        tier: match opts.tier {
+            Some(Tier::Small) => "small",
+            Some(Tier::Multi) => "multi",
+            None => "all",
+        }
+        .into(),
+        worker_profile: opts.worker_profile.clone(),
+        engine: engine_name,
+        engine_version,
+        provisional: opts.provisional,
         cortex_commit: git::head(bench).unwrap_or_else(|_| "unknown".into()),
         started: started.clone(),
-        prompts: Vec::new(),
-        passed: 0,
-        total: 0,
+        attempts,
+        summary,
     };
-    for prompt in &chosen {
-        let mut engine = make_engine(prompt)?;
-        if report.engine.is_empty() {
-            report.engine = engine.name().to_string();
-            report.engine_version = engine.version()?;
-        }
-        let result = run_one(prompt, &runs.join(&prompt.id), home, store, engine.as_mut())?;
-        println!(
-            "{} {} ({} sessions, {:.0} s)",
-            if result.passed { "pass" } else { "FAIL" },
-            result.id,
-            result.sessions,
-            result.seconds
-        );
-        report.passed += u32::from(result.passed);
-        report.total += 1;
-        report.prompts.push(result);
-    }
     std::fs::create_dir_all(results)?;
-    let base = format!("{}-{}", &started[..10], report.engine);
+    let base = format!("{}-{}-{}", &started[..10], report.arm, report.engine);
     let mut path = results.join(format!("{base}.json"));
     let mut n = 2;
     while path.exists() {
@@ -207,44 +253,160 @@ pub fn run(
     Ok((report, path))
 }
 
-fn run_one(
-    prompt: &Prompt,
-    repo: &Path,
+/// One try at `task`, worked under `dir/try-<n>`.
+fn attempt(
+    task: &Task,
+    try_no: u32,
+    dir: &Path,
     home: &Path,
     store: &Store,
     engine: &mut dyn Engine,
-) -> Result<PromptResult> {
-    make_repo(&prompt.dir.join("start"), repo)?;
-    let request = std::fs::read_to_string(prompt.dir.join("prompt.md"))?;
-    let checks = prompt.dir.join("checks.toml");
-    let m = mission::start(store, home, repo, &checks, request.trim(), "bench")?;
+) -> Result<Attempt> {
+    let repo = dir.join(format!("try-{try_no}"));
+    make_repo(&task.dir.join("start"), &repo)?;
+    let request = std::fs::read_to_string(task.dir.join("prompt.md"))?;
+    let request = request.trim();
+    let checks = match task.tier {
+        Tier::Small => task.dir.join("checks.toml"),
+        Tier::Multi => task::stage_checks(
+            &task.dir.join("visible"),
+            &dir.join(format!("try-{try_no}-visible")),
+        )?,
+    };
+    let m = mission::start(store, home, &repo, &checks, request, "bench")?;
     let clock = Instant::now();
-    let outcome = mission::drive(store, home, &m, engine, &budgets(Tier::Small))?;
+    let outcome = mission::drive(store, home, &m, engine, &budgets(task.tier))?;
     let seconds = clock.elapsed().as_secs_f64();
-    let (sessions, blocked_checks) = tally(store, &m)?;
-    Ok(PromptResult {
-        id: prompt.id.clone(),
-        passed: matches!(outcome, Outcome::Done { .. }),
-        sessions,
-        seconds,
-        blocked_checks,
+    let commit = match outcome {
+        Outcome::Done { commit } => Some(commit),
+        _ => None,
+    };
+    let hidden = match (&commit, task.tier) {
+        (Some(commit), Tier::Multi) => hidden_failures(task, &repo, commit, dir, try_no)?,
+        _ => Vec::new(),
+    };
+    let log = read_log(store, &m)?;
+    let files_changed = match (&commit, &log.base_commit) {
+        (Some(c), Some(base)) => git::changed_files(&repo, base, c)?,
+        _ => Vec::new(),
+    };
+    let mut failures = log.failures;
+    failures.extend(hidden.iter().map(|(check_id, output_tail)| Failure {
+        check_id: check_id.clone(),
+        hidden: true,
+        output_tail: output_tail.clone(),
+    }));
+    Ok(Attempt {
+        task: task.id.clone(),
+        kind: task.kind,
+        try_no,
         mission_id: m.0,
+        mission_done: commit.is_some(),
+        accepted: commit.is_some() && hidden.is_empty(),
+        hidden_failed: hidden.into_iter().map(|(id, _)| id).collect(),
+        sessions: log.sessions,
+        seconds,
+        tokens: log.tokens,
+        estimated_usd_micros: log.estimated_usd_micros,
+        spent: score::total_spend(&log.spends),
+        story: Story {
+            request: request.to_string(),
+            commit,
+            files_changed,
+            failures,
+            stuck_reason: log.stuck_reason,
+        },
     })
 }
 
-fn tally(store: &Store, m: &MissionId) -> Result<(u32, Vec<String>)> {
-    let mut sessions = 0;
-    let mut blocked = Vec::new();
+/// Runs the task's hidden checks, in the sandbox, on `commit` checked out
+/// in a fresh worktree, and forgets the worktree after.
+fn hidden_failures(
+    task: &Task,
+    repo: &Path,
+    commit: &str,
+    dir: &Path,
+    try_no: u32,
+) -> Result<Vec<(String, String)>> {
+    let dest = dir.join(format!("try-{try_no}-graded"));
+    let wt = git::create_worktree(repo, commit, &dest)?;
+    let failed = task::failing(
+        &task.dir.join("hidden"),
+        &dir.join(format!("try-{try_no}-hidden")),
+        &wt.path,
+    );
+    git::forget_worktree(repo, &dest)?;
+    failed
+}
+
+/// What the event log says about one mission.
+#[derive(Default)]
+struct Log {
+    base_commit: Option<String>,
+    sessions: u32,
+    tokens: u64,
+    estimated_usd_micros: Option<u64>,
+    spends: Vec<Spend>,
+    /// Visible checks still failing at their last run, in the last session
+    /// that ran checks.
+    failures: Vec<Failure>,
+    stuck_reason: Option<String>,
+}
+
+fn read_log(store: &Store, m: &MissionId) -> Result<Log> {
+    let mut log = Log::default();
+    let mut priced = true;
+    let mut cost = 0u64;
+    let mut last_session = None;
+    let mut last_runs: BTreeMap<String, (bool, String)> = BTreeMap::new();
     for (_, e) in store.events(m)? {
         match e {
-            Event::SessionStarted { .. } => sessions += 1,
-            Event::CheckBlocked { check_id, .. } if !blocked.contains(&check_id) => {
-                blocked.push(check_id)
+            Event::MissionStarted { base_commit, .. } => log.base_commit = Some(base_commit),
+            Event::SessionStarted { .. } => log.sessions += 1,
+            Event::ModelCall {
+                tokens,
+                estimated_usd_micros,
+                spent,
+                ..
+            } => {
+                log.tokens += tokens.input.unwrap_or(0) + tokens.output.unwrap_or(0);
+                match estimated_usd_micros {
+                    Some(c) => cost += c,
+                    None => priced = false,
+                }
+                log.spends.push(spent);
             }
+            Event::CheckRun {
+                session,
+                check_id,
+                passed,
+                output_tail,
+                ..
+            } => {
+                if last_session != Some(session) {
+                    last_session = Some(session);
+                    last_runs.clear();
+                }
+                last_runs.insert(check_id, (passed, output_tail));
+            }
+            Event::MissionStuck { reason } => log.stuck_reason = Some(reason),
             _ => {}
         }
     }
-    Ok((sessions, blocked))
+    // No model calls means no price was ever reported: unknown, not 0.
+    if priced && !log.spends.is_empty() {
+        log.estimated_usd_micros = Some(cost);
+    }
+    log.failures = last_runs
+        .into_iter()
+        .filter(|(_, (passed, _))| !passed)
+        .map(|(check_id, (_, output_tail))| Failure {
+            check_id,
+            hidden: false,
+            output_tail,
+        })
+        .collect();
+    Ok(log)
 }
 
 /// `YYYY-MM-DDTHH:MM:SSZ` for seconds since 1970, by the days-to-civil

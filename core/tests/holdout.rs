@@ -3,14 +3,18 @@
 //! inside its own folder, so nothing about it can land in the public repo.
 
 use cortex::Error;
-use cortex::bench;
+use cortex::bench::task::{Task, Tier};
+use cortex::bench::{self, RunOptions};
 use cortex::engine::Engine;
 use cortex::engine::fake::FakeEngine;
 use cortex::store::Store;
 use std::path::{Path, PathBuf};
 
-fn fake(prompt: &bench::Prompt) -> cortex::Result<Box<dyn Engine>> {
-    Ok(Box::new(FakeEngine::load(&prompt.fake_solution())?))
+fn fake(t: &Task) -> cortex::Result<Box<dyn Engine>> {
+    Ok(Box::new(match t.tier {
+        Tier::Small => FakeEngine::load(&t.dir.join("fake-solution.toml"))?,
+        Tier::Multi => FakeEngine::from_overlay(&t.dir.join("solutions/reference"))?,
+    }))
 }
 
 fn copy(from: &Path, to: &Path) {
@@ -57,22 +61,24 @@ fn holdout_results_stay_in_holdout_dir() {
     );
     let store = Store::open(&tmp.path().join("cortex.db")).unwrap();
     let home = tmp.path().join("home");
+    let opts = RunOptions::default();
 
     // A public results folder is refused before anything runs.
     let public = tmp.path().join("public-results");
-    let refused = bench::run(&holdout, None, &home, &store, &mut fake, &public);
+    let refused = bench::run(&holdout, &opts, &home, &store, &mut fake, &public);
     assert!(matches!(refused, Err(Error::Invalid(_))), "{refused:?}");
     assert!(files_under(&public).is_empty());
     // So is a path that only looks inside the holdout.
     let sneaky = holdout.join("results/../../public-results");
-    let refused = bench::run(&holdout, None, &home, &store, &mut fake, &sneaky);
+    let refused = bench::run(&holdout, &opts, &home, &store, &mut fake, &sneaky);
     assert!(matches!(refused, Err(Error::Invalid(_))), "{refused:?}");
     assert!(files_under(&public).is_empty());
 
     // Its own results folder is fine, and the file lands there.
     let own = holdout.join("results");
-    let (report, path) = bench::run(&holdout, None, &home, &store, &mut fake, &own).unwrap();
-    assert_eq!(report.total, 1);
+    let (report, path) = bench::run(&holdout, &opts, &home, &store, &mut fake, &own).unwrap();
+    // One small prompt and one multi task.
+    assert_eq!(report.summary.total, 2);
     assert_eq!(path.parent().unwrap(), own);
     assert_eq!(files_under(&own), vec![path]);
 }

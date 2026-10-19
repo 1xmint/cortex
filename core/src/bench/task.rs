@@ -10,10 +10,10 @@
 //!   top of `start/`. Each bad has a `WHY.md` saying what is wrong with it.
 
 use super::copy_dir;
-use crate::checks::CheckSet;
+use crate::checks::{CheckSet, TAIL, tail};
 use crate::sandbox::{RunSpec, run};
 use crate::{Error, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -23,7 +23,7 @@ pub const WHY: &str = "WHY.md";
 
 const CHECK_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Tier {
     Small,
@@ -32,7 +32,7 @@ pub enum Tier {
 
 /// How the task starts: from nothing, from Cortex-written code to change,
 /// or from someone else's project.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Kind {
     Fresh,
@@ -171,13 +171,26 @@ pub fn grade(task: &Task, overlay: &Path, home: &Path) -> Result<Grade> {
     copy_dir(&task.dir.join("start"), &work)?;
     apply_overlay(overlay, &work)?;
     Ok(Grade {
-        visible_failed: failing(&task.dir.join("visible"), &root.join("visible"), &work)?,
-        hidden_failed: failing(&task.dir.join("hidden"), &root.join("hidden"), &work)?,
+        visible_failed: ids(failing(
+            &task.dir.join("visible"),
+            &root.join("visible"),
+            &work,
+        )?),
+        hidden_failed: ids(failing(
+            &task.dir.join("hidden"),
+            &root.join("hidden"),
+            &work,
+        )?),
     })
 }
 
-/// The ids of the checks in `dir` that do not pass on `work`.
-fn failing(dir: &Path, staged: &Path, work: &Path) -> Result<Vec<String>> {
+fn ids(failed: Vec<(String, String)>) -> Vec<String> {
+    failed.into_iter().map(|(id, _)| id).collect()
+}
+
+/// The checks in `dir` that do not pass on `work`, each with the tail of
+/// its output. The checks are staged at `staged` first.
+pub(crate) fn failing(dir: &Path, staged: &Path, work: &Path) -> Result<Vec<(String, String)>> {
     let toml = stage_checks(dir, staged)?;
     let set = CheckSet::load(&toml)?;
     let mut failed = Vec::new();
@@ -189,7 +202,8 @@ fn failing(dir: &Path, staged: &Path, work: &Path) -> Result<Vec<String>> {
             timeout: CHECK_TIMEOUT,
         })?;
         if out.timed_out || out.exit_code != check.expect_exit {
-            failed.push(check.id.clone());
+            let both = format!("{}{}", out.stdout, out.stderr);
+            failed.push((check.id.clone(), tail(&both, TAIL)));
         }
     }
     Ok(failed)

@@ -1,4 +1,6 @@
 use clap::{Parser, Subcommand};
+use cortex::bench::RunOptions;
+use cortex::bench::task::{Task, Tier};
 use cortex::engine::Engine;
 use cortex::engine::api::{ApiEngine, HttpTransport};
 use cortex::engine::claude::ClaudeEngine;
@@ -64,9 +66,18 @@ enum Cmd {
         /// Which profile does the work (see `profiles.toml`); defaults to claude-cli-sonnet.
         #[arg(long)]
         worker: Option<String>,
-        /// Run only this prompt, e.g. `03-roman`.
+        /// Run only this task, e.g. `03-roman`.
         #[arg(long)]
         only: Option<String>,
+        /// Which tasks: `small`, `multi` or `all`.
+        #[arg(long, default_value = "all")]
+        tier: String,
+        /// The name of the brain design being measured.
+        #[arg(long, default_value = "baseline")]
+        arm: String,
+        /// How many fresh tries each task gets.
+        #[arg(long, default_value_t = 1)]
+        tries: u32,
         /// The bench folder; results go in its `results/`.
         #[arg(long, default_value = "bench")]
         dir: PathBuf,
@@ -111,9 +122,33 @@ fn main() -> ExitCode {
         Some(Cmd::Bench {
             worker,
             only,
+            tier,
+            arm,
+            tries,
             dir,
             results,
-        }) => bench(worker, only.as_deref(), &dir, results),
+        }) => {
+            let opts = |profile: &Profile| -> cortex::Result<RunOptions> {
+                Ok(RunOptions {
+                    tier: match tier.as_str() {
+                        "small" => Some(Tier::Small),
+                        "multi" => Some(Tier::Multi),
+                        "all" => None,
+                        other => {
+                            return Err(cortex::Error::Invalid(format!(
+                                "--tier must be small, multi or all, not {other}"
+                            )));
+                        }
+                    },
+                    only: only.clone(),
+                    arm: arm.clone(),
+                    tries,
+                    worker_profile: profile.id.clone(),
+                    provisional: profile.provisional(),
+                })
+            };
+            bench(worker, &opts, &dir, results)
+        }
         Some(Cmd::Mcp { worktree, checks }) => {
             cortex::mcp::serve(worktree, checks).map(|()| ExitCode::SUCCESS)
         }
@@ -212,19 +247,32 @@ fn work(store: &Store, m: &MissionId, engine: &mut dyn Engine) -> cortex::Result
 
 fn bench(
     worker: Option<String>,
-    only: Option<&str>,
+    opts: &dyn Fn(&Profile) -> cortex::Result<RunOptions>,
     dir: &std::path::Path,
     results: Option<PathBuf>,
 ) -> cortex::Result<ExitCode> {
     let profile = worker_profile(worker)?;
+    let opts = opts(&profile)?;
     let results = results.unwrap_or_else(|| dir.join("results"));
     let store = open_store()?;
-    let mut make = |p: &cortex::bench::Prompt| match profile.engine {
-        EngineKind::Fake => engine(profile.clone(), Some(p.fake_solution())),
-        _ => engine(profile.clone(), None),
+    // The fake worker answers small prompts from their script and multi
+    // tasks with their reference solution.
+    let mut make = |t: &Task| -> cortex::Result<Box<dyn Engine>> {
+        match (&profile.engine, t.tier) {
+            (EngineKind::Fake, Tier::Small) => {
+                engine(profile.clone(), Some(t.dir.join("fake-solution.toml")))
+            }
+            (EngineKind::Fake, Tier::Multi) => Ok(Box::new(FakeEngine::from_overlay(
+                &t.dir.join("solutions").join("reference"),
+            )?)),
+            _ => engine(profile.clone(), None),
+        }
     };
-    let (report, path) = cortex::bench::run(dir, only, &home(), &store, &mut make, &results)?;
-    println!("passed {} of {}", report.passed, report.total);
+    let (report, path) = cortex::bench::run(dir, &opts, &home(), &store, &mut make, &results)?;
+    println!(
+        "accepted {} of {}",
+        report.summary.accepted, report.summary.total
+    );
     println!("results: {}", path.display());
     Ok(ExitCode::SUCCESS)
 }

@@ -63,6 +63,12 @@ pub fn head(repo: &Path) -> Result<String> {
     git(repo, &["rev-parse", "HEAD"])
 }
 
+/// The paths that differ between two commits.
+pub fn changed_files(repo: &Path, from: &str, to: &str) -> Result<Vec<String>> {
+    let out = git(repo, &["diff", "--name-only", from, to])?;
+    Ok(out.lines().map(str::to_string).collect())
+}
+
 /// A disposable checkout for one worker session, detached at its base.
 #[derive(Debug)]
 pub struct Worktree {
