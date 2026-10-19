@@ -38,9 +38,10 @@ Six things change:
    models by setting, and every call records tokens and cost (section 3.5).
 4. **Tools sit behind Cortex's own tool interface.** MCP becomes one
    adapter, not the core's plumbing (section 3.8).
-5. **The work runs as one pipeline with one writer at a time.** It is not a
-   team of agents with personas. Parallel work is allowed only where pieces
-   are truly independent (sections 3.3 and 3.4).
+5. **The work runs as one pipeline with one writer per piece.** It is not
+   a team of agents with personas. Separate pieces (game code, sprites,
+   music) may be built in parallel. Two writers never share one piece
+   (sections 3.3 and 3.4).
 6. **Everything the harness does to work around a model is labelled and
    re-tested** at each model change, so the harness gets thinner as models
    improve (section 3.13).
@@ -70,18 +71,25 @@ subscriptions, with no API key.
 
 **Planning**
 - **Long-running systems share one shape.** Anthropic's long-running
-  harness, Codex ExecPlans, Kiro, Spec Kit and Manus each keep three files
-  on disk (all P):
+  harness, Codex ExecPlans, Kiro and Spec Kit keep their plan as files on
+  disk (all P):
   - a spec: goals, non-goals, constraints, and what "done" means;
   - a milestone or feature list, with a way to check each item;
   - a status and decision log.
-  Each runs short fresh sessions that read those files, and checks gate
-  every step. Only Cursor has a separate planner role. It explores
-  continuously and starts each cycle fresh (P).
+  Manus keeps one `todo.md`. Each runs short fresh sessions that read those
+  files, and checks gate every step. Where a person approves varies:
+  Kiro and Spec Kit approve the spec, Codex approves milestones, and
+  Anthropic's harness has no person in the loop. Cursor runs separate
+  planner roles over many parallel workers. Its first flat setup, where
+  agents coordinated themselves, ran 20 agents at the speed of 2–3. The
+  version that worked put planners over workers (P).
 - **The only clean plan-versus-no-plan test** is arXiv 2609.20804 (P,
-  2026). Planning took a 30B model from 13.6% to 25.2%. For strong models
-  it moved success by about 2 points either way and cut cost by about 30%.
-  No study shows that deep, layered plans beat a simple list.
+  2026). It used open models only, on single-issue tasks (SWE-bench).
+  Planning took a 30B model from 13.6% to 25.2%. For the largest open
+  models (128B–550B) it moved success by about 2 points either way and cut
+  cost by about 30%. **Whether deep, layered plans beat a simple list on
+  long, multi-part projects is untested, not refuted.** The bench decides
+  it for Cortex.
 - **Plans should be cut as needed and revised from what actually happens.**
   ADaPT breaks a task down only when the worker fails (P). Plan-and-Act
   gained about 10 points by re-planning after each step (P, web tasks, not
@@ -91,14 +99,17 @@ subscriptions, with no API key.
   work together. The gap grows by about 27 points for each tenfold growth
   in code size. On long multi-step tasks the best models score only about
   25–39% (SWE-EVO, RoadmapBench, P).
-- **Research before building has thin evidence.** Fetching docs helps with
-  rare or new APIs and hurts with common ones (Jain et al., P). No study
-  shows web research before building improves results.
+- **Research before building is unmeasured.** The one related study (Jain
+  et al., P) measured fetching API docs, not research before a project. It
+  found docs help with rare or new APIs, and that poorly chosen docs hurt
+  with common ones. No study measures research before building, for code
+  or for creative work.
 
 **One agent or many**
 - **Several agents on one sequential job usually do worse.** Cognition says
-  parallel agents make conflicting hidden decisions (P, opinion with
-  examples). Anthropic says multi-agent suits broad parallel research, not
+  parallel agents writing one thing make conflicting hidden decisions (P,
+  opinion with examples). Cursor's results show that parallel work on
+  separate parts does scale when a planner keeps it in order (P). Anthropic says multi-agent suits broad parallel research, not
   "most coding tasks", at about 15 times the tokens (P). A Google/MIT
   scaling study reports 39–70% losses for multi-agent setups on sequential
   tasks (S, abstract only, not verified). The MAST study of 1,600 traces
@@ -112,15 +123,16 @@ subscriptions, with no API key.
   less cost (P, vendor data). We found no independent evidence for
   commercial router services.
 - **Review by another model family** reduces shared blind spots but does
-  not remove them. Models agree on the same wrong answer 60% of the time,
-  most of all within one family, and strong models agree even across
+  not remove them. When two models are both wrong, they give the same wrong
+  answer about 60% of the time, most of all within one family, and strong models agree even across
   families (P). No study measures this for code review. Checks that run
   are the stronger defence.
 
 **What survives model change**
 - **Harness workarounds go stale.** Anthropic added context resets for one
   model that became "dead weight" on the next (P). A 100-line, bash-only
-  agent reaches 74%+ on SWE-bench Verified because the models improved (P).
+  agent reaches 74%+ on SWE-bench Verified because the models improved
+  (mini-SWE-agent, from the project's own page).
   What lasted in other projects:
   - sandboxing;
   - a durable log;
@@ -201,7 +213,9 @@ Additions, so that the log can still be read and replayed years from now:
   prompt version.
 - **Replay mode:** a recorded mission's tool results can be replayed into a
   newer harness, so two harness versions can be compared on old missions
-  without spending model calls on the parts that did not change.
+  without spending model calls on the parts that did not change. Replay
+  holds only until the new harness asks the model something different;
+  from that point the run is live and spends quota.
 - **OpenTelemetry export** is a view built from the log, never the truth,
   because its conventions still change.
 
@@ -229,27 +243,43 @@ The mission runs like this:
    - constraints;
    - what "done" means, as checks;
    - a plain sentence for each check.
-   This is the one place a person approves in "build it with me" mode. In
-   "just do it" mode it runs straight on. Every vendor studied puts its
-   human gate here, and none gate each task.
-2. **Two layers of checks, written before any work.**
+   This is the main place a person approves in "build it with me" mode
+   (the working agreement can add more). In "just do it" mode it runs
+   straight on.
+2. **Two layers of checks.**
    - **Visible checks:** what workers build against.
    - **Held-out checks:** tests of how the features work together, error
      cases and whole-project behaviour. Workers never see them. They exist
      because of SpecBench: agents saturate the tests they can see.
-   - Both layers are frozen, fingerprinted, and must be seen failing
-     before work starts (invariant 2).
-3. **Milestones, planned progressively.** The planner lists milestones in
-   one line each and details only the next one. After each milestone it
-   re-plans from what the code and checks actually show. **Depth adapts:**
-   - a milestone is split further only when a worker fails or stalls on
-     it (ADaPT);
-   - with a strong worker model most milestones are never split;
+   - A few whole-project checks are written with the spec. The rest are
+     written for each milestone when it is detailed, before its work
+     starts. That keeps checks in step with progressive planning.
+   - Every check is frozen, fingerprinted, and must be seen failing before
+     its work starts (invariant 2).
+   - **A changed check is a new plan version.** In "build it with me" mode
+     the person approves it, in plain words. In "just do it" mode the judge
+     approves it with written reasons. Either way it is logged and shown.
+3. **Pieces and milestones, planned progressively.** The plan is one data
+   model:
+   - **Pieces** are the units of work: a system, a sprite set, a level.
+     Each piece names the pieces it depends on, its layer and system tags,
+     and its checks.
+   - **A milestone** is a group of pieces that together give something
+     that can be run and checked.
+   - Josh's layers, systems and processes are tags and dependencies on
+     pieces, and the roadmap view draws them (section 3.4).
+   The planner lists milestones in one line each and details only the
+   next one into pieces. After each milestone it re-plans from what the
+   code and checks actually show. **Depth adapts:**
+   - a piece is split further only when a worker fails or stalls on it
+     (ADaPT);
+   - with a strong worker model most pieces are never split;
    - the depth used and its outcome are logged, so skill memory learns the
      right depth per kind of task and model.
-4. **Work.** One worker session at a time per project, with fresh context.
-   It gets the decision record and file pointers, not a prose summary. It
-   commits small steps.
+4. **Work.** One worker session per piece, with fresh context. It gets the
+   decision record and file pointers, not a prose summary, and commits
+   small steps. Pieces with no dependency between them may run in
+   parallel (section 3.4).
 5. **Check.** The checker runs both layers in the sandbox. Only it flips a
    check to passing (invariant 1). **The harness owns pass and fail**, not
    the model. Anthropic found agents declare victory early when they can
@@ -268,13 +298,18 @@ bench, by planting known flaws in checks and comparing catch rates by
 family. It is not assumed.
 
 **Research is triggered, not a fixed stage.** The planner (or a worker,
-through it) may run a read-only research step when any of these holds:
-- a named API or library is unfamiliar or newer than the model;
+through it) runs a read-only research step when any of these holds:
+- **at spec time, for creative and domain questions:** genre, references,
+  art style, game design, the audience. For creations this trigger fires
+  almost every time;
+- a named API or library is newer than the model's knowledge cutoff (each
+  model profile records its cutoff);
 - a check cannot be written without domain knowledge;
 - a worker hits the same failure twice.
 
-Findings go into the spec as a short note that cites its sources. Research
-becomes a default only if the bench shows it helps.
+Findings go into the spec or the bible as a short note that cites its
+sources. Whether research should run more widely, for example before every
+coding milestone, is unmeasured. The bench decides it.
 
 Version 1's rules for honest checks and against runaway loops all stay:
 - checks live outside the worktree;
@@ -285,21 +320,24 @@ Version 1's rules for honest checks and against runaway loops all stay:
 - each mission has a budget and a re-plan cap;
 - missions can be parked.
 
-### 3.4 Creations are pieces; one writer at a time
+### 3.4 Creations are pieces; one writer per piece
 
-The creation graph and the project bible stay as in version 1. They are now
-held as **data the planner rewrites** (milestones and pieces in the log).
-The roadmap and intent graphs the person sees are **views generated from
-the log**, never a second source of truth to keep in sync.
+The creation graph and the project bible stay as in version 1. The graph
+is the pieces and dependencies from section 3.3, held as **data the planner
+rewrites** in the log. The roadmap and intent graphs the person sees, by
+layer, system or process, are **views drawn from that data**. They are
+never a second source of truth to keep in sync.
 
-Parallel work is allowed only where it cannot conflict:
-- pieces in different files or different media (a sprite set while the
-  code is built);
+Parallel work is allowed where it cannot conflict:
+- pieces with no dependency between them, such as a sprite set and a music
+  track while the code is built. For games this is the normal case;
 - read-only work: research, review, checks.
 
-Two workers never write to the same piece at once. Cognition and Cursor
-both saw parallel writers make conflicting decisions. Finished pieces merge
-one at a time, and integration is its own piece with its own checks.
+Two workers never write to the same piece at once, which is where Cognition
+saw conflicting decisions. Parallel workers sit under the planner, which
+owns the order. Cursor's flat self-coordinating setup failed and its
+planner-led one worked. Finished pieces merge one at a time, and
+integration is its own piece with its own checks.
 
 ### 3.5 Model layer: roles, profiles and cost
 
@@ -310,12 +348,16 @@ one at a time, and integration is its own piece with its own checks.
   - an OpenAI-compatible adapter, which also covers local open-model
     servers such as vLLM and llama.cpp.
   The OpenAI format is an adapter, not the internal model, because
-  vendor-specific features leak through it.
+  vendor-specific features leak through it. **Content Cortex does not
+  understand passes through unchanged**, so a provider's new features
+  (thinking blocks, caching, server-side tools) do not break the adapter.
+  Each adapter is tested in CI against recorded replies.
 - **Model profiles are configuration:**
   - endpoint;
   - model ID;
   - price per token;
   - context limit;
+  - knowledge cutoff (used by the research trigger);
   - capability tags;
   - known tool-call quirks.
   Adding a model is a profile, not code. A switch from a local model to a
@@ -329,7 +371,8 @@ one at a time, and integration is its own piece with its own checks.
     stronger profile;
   - a worker may make an **advisor call**: a cheap worker asks the planner
     profile for a short plan mid-task. This is built provider-neutrally,
-    not on Anthropic's own advisor tool.
+    not on Anthropic's own advisor tool. The advisor gets only what the
+    worker may read, never the held-out checks.
 - **Value is measured per role:**
   - first-try pass rate;
   - retries;
@@ -337,10 +380,20 @@ one at a time, and integration is its own piece with its own checks.
   - defects the held-out checks found later.
   "Best bang for the buck" is chosen from these numbers on the bench, and
   re-measured when a model or price changes.
-- **The command-line engines stay development-only.** Claude Code and Codex
-  run behind the same engine interface on the owner's subscriptions, so
-  the bench can run without API billing. Their behaviour must never shape
-  the event schema or the brain's logic.
+- **The command-line engines stay development-only, and sit under
+  Cortex's own loop.** Claude Code and Codex run on the owner's
+  subscriptions, so the bench can run without API billing. For bench runs
+  they are used as a model behind the model layer, not as an agent with a
+  plan of their own:
+  - their built-in tools are off;
+  - they see only Cortex's prompts and Cortex's tools, as slice 1's jail
+    already does;
+  - Cortex's planner, judge and checker run the mission;
+  - tokens are recorded as the command line reports them.
+  What still differs from the product is the command line's own system
+  prompt. So every bench result from a command-line run is labelled
+  **provisional** until it is confirmed on the API (section 8). Their
+  behaviour must never shape the event schema or the brain's logic.
 
 ### 3.6 Memory
 
@@ -380,7 +433,10 @@ call that runs in the sandbox and returns data.
 Unchanged: bubblewrap plus gVisor on Linux (WSL2 on the owner's PC),
 Firecracker on hosted Linux later. **Known limit:** the sandbox is
 Linux-only. The product will be hosted on Linux and the owner's PC uses
-WSL2, so this is accepted. The sandbox stays behind one `execute`
+WSL2, so this is accepted. For the later desktop app, untrusted work runs
+on the hosted Linux service by default, or in WSL2 or a Linux VM if the
+person chooses local work. Never on the bare host (invariant 3). Its ADR
+comes with the desktop slice. The sandbox stays behind one `execute`
 interface, so a different implementation can replace it.
 
 ### 3.10 Faces and the protocol
@@ -393,15 +449,28 @@ the chat page first.
 Today's ten prompts all passed in one session each. They cannot tell one
 planner from another. The new bench has:
 
-- **Tiers:** the existing small tasks (regression, expected near 100%), and
-  **multi-feature tasks** (a small app with 5–10 features that must work
-  together). The top tier is one that current best models pass under about
-  half the time.
-- **A hidden holdout set**, never used while tuning prompts or skills. This
-  is separate from the planner's held-out checks: the holdout measures
-  Cortex, and the planner's held-out checks measure the workers.
+- **Tiers:**
+  - the existing ten small tasks, for regression, expected near 100%;
+  - **eight multi-feature tasks**: a small app or game with 5–10 features
+    that must work together. A worker on today's harness should pass these
+    about half the time or less.
+  That makes about 20 tasks, the low end of Anthropic's advice to "start
+  with 20–50". The tier grows with real failures.
+- **A hidden holdout set** of four more multi-feature tasks, never used
+  while tuning prompts or skills. It lives in a **private repository**,
+  because this one is public and anything in it can reach model training.
+  This is separate from the planner's held-out checks: the holdout
+  measures Cortex, and the planner's held-out checks measure the workers.
 - **Graders proven both ways.** A reference solution must pass. Known-bad
   solutions must fail, including one that only games the visible checks.
+  The builder writes these with each task, and CI proves them.
+- **Decisions are set in advance.** Before any comparison run, the PR
+  states the margin that counts as a win and the most it may cost. For
+  example: "the planner wins if at least 2 more multi-feature tasks pass
+  across all tries, at no more than 1.5 times the tokens". One switch is
+  tested at a time.
+- **Results report a story, not only numbers:** for each mission, the
+  spec, the milestones, what failed and why, and its cost.
 - **Reliability and value:** pass^k over repeated tries, cost and tokens
   per success, and wall time.
 - **Plain-request mode:** Cortex gets only the request and writes its own
@@ -430,9 +499,11 @@ milestone smaller, resetting context. Each flag records:
 - why it was added;
 - the bench result that justified it.
 
-When a role's model changes, every flag is re-tested on and off, and flags
-that no longer help are removed. Without this the harness turns into the
-"dead weight" Anthropic describes.
+When a role's model changes, the flags are re-tested on and off in groups,
+on the multi-feature tier only, to keep the quota cost down. Flags that no
+longer help are removed. Each flag also has an expiry date, after which it
+must be re-justified or go. Without this the harness turns into the "dead
+weight" Anthropic describes. Skills (section 3.6) follow the same rule.
 
 ## 4. Technology per component
 
@@ -454,26 +525,30 @@ staying with Rust is low-regret.
 ## 5. Answers to the owner's own ideas
 
 - **"A planner that makes the plan: roadmap graphs, intent graphs, layers,
-  systems, processes."** Yes, the person sees all of these. They are drawn
-  from the log, and the truth underneath is the spec and its checks. The
-  evidence shows that what helps is the content (intent, constraints,
-  checks). It shows nothing for the graph format itself. Keeping one truth
-  is what stops the drift that sank version 1 of Cortex.
+  systems, processes."** Yes. The planner keeps a real graph of pieces
+  with their dependencies, tagged by layer and system. The person sees
+  roadmap and intent views drawn from it. The only change from the idea is
+  that the graph and the spec with its checks live in one place, the log.
+  The views are drawn from it, so they can never drift. Whether deeper,
+  layered plans beat simpler ones on big projects is untested anywhere,
+  so the bench decides how deep Cortex plans.
 - **"Progressive planning: the right items at the right moments, building
-  on top strategically."** This is exactly what the evidence supports, and
-  it is now the design. The planner details only the next milestone,
-  re-plans from what really happened, and splits work smaller only where
-  it proves hard.
+  on top strategically."** This is what the evidence supports, and it is
+  now the design. The planner details only the next milestone, re-plans
+  from what really happened, and splits work smaller only where it proves
+  hard.
 - **"Incredible research about exactly the right things."** Research runs
-  when there is a reason: a new API, an unknown domain, or a repeated
-  failure. The bench decides whether it should run more often. Research by
-  default made common coding tasks worse in the one study that measured
-  it.
+  on every creation at spec time for the creative and domain questions:
+  genre, references, style, audience. Later it runs whenever there is a
+  reason: a new API, an unknown domain, or a repeated failure. Nobody has
+  measured whether research before every coding step helps, so the bench
+  decides that.
 - **"Performs like a whole coordinated team."** From the outside, yes:
   planning, building, checking, reviewing, researching and, later, art and
-  sound. On the inside it is one pipeline with one writer at a time,
-  because teams of agents editing one thing do measurably worse. A role is
-  added when the bench shows the brain failing without it.
+  sound, with separate pieces built at the same time. On the inside a
+  planner owns the order, and each piece has one writer. Teams of agents
+  editing the same thing do measurably worse. A role is added when the
+  bench shows the brain failing without it.
 
 ## 6. Order of building (replaces version 1's slices 2–5)
 
@@ -483,28 +558,40 @@ owner's quota only where the result decides what gets built next.
 **Slice 2: a bench that can tell brains apart, and a log that counts
 cost.**
 - In CI only (no quota):
-  - the new bench tiers with reference and known-bad solutions;
+  - eight multi-feature tasks with reference and known-bad solutions;
   - graders proven both ways;
   - schema-versioned events;
   - full model-call records with tokens and cost;
-  - the provider-neutral model layer with profiles;
-  - an OpenAI-compatible adapter tested against a local stand-in server.
-- One real run (quota): today's harness on the new bench through Claude
-  Code. This decides whether the bench discriminates. If the new tiers all
-  pass, the tasks are made harder before slice 3.
-- **What the owner sees:** a results page listing each task, pass^k, time
-  and cost.
+  - the smallest model layer that puts the command-line engines under
+    Cortex's own loop (section 3.5);
+  - a results page.
+- One real run (quota): today's harness on the new tier, through Claude
+  Code with a cheaper worker model (Sonnet), one try per task, each capped
+  at 30 minutes. This answers two things: whether the tier discriminates
+  (if every task passes, the tasks get harder), and what one run really
+  costs, so slice 3's comparison is sized from fact.
+- **What the owner sees:** a results page with each mission's story
+  (request, what was built, what failed and why), pass rate, time and
+  cost.
 
 **Slice 3: the planner.**
-- Spec, visible and held-out checks, progressive milestones, adaptive
-  depth and the milestone judge, built test-first against fakes in CI.
+- Spec, the pieces-and-milestones plan, both check layers, adaptive depth
+  and the milestone judge, built test-first against fakes in CI.
 - Triggered research and the cross-family reviewer, both behind switches.
-- Real runs (quota): the plain-request bench with the planner, compared
-  with today's harness on the same tasks. Then the switches for research
-  and review are tested on and off. **Done** when the planner beats the
-  baseline on the multi-feature tier at an acceptable cost.
-- **What the owner sees:** the same results page, with "with planner"
-  against "without".
+- Real runs (quota), sized from slice 2's measured cost and capped in
+  advance:
+  - the plain-request bench with the planner against today's harness, on
+    the same tasks, three tries each;
+  - then each switch on its own.
+  **Done** when the planner meets the win margin set in advance (section
+  3.11). If it does not, the planner gets simpler, not bigger.
+- **What the owner sees:** the results page, with "with planner" against
+  "without", and the roadmap view of each planned mission.
+
+**Before paid runs:** the full provider-neutral layer, the
+OpenAI-compatible adapter (tested against a local stand-in server), and
+ADRs for the model layer and the tool interface. ADR 0005 (engines) gets a
+superseding ADR.
 
 **Slice 4: the chat page.** The face on top of a planner that has been
 proven:
@@ -517,9 +604,13 @@ proven:
 **Slice 5: memory and the working agreement**, as in version 1.
 
 **Slice 6: media pieces**, model judges validated against labelled
-examples, and bench tasks with art and sound.
+examples, and bench tasks with art and sound. A model judge is a note
+plus a measured agreement rate with people, never the only proof
+(invariant 1). Where possible, media checks that run come first: the asset
+loads, has the right size and format, and plays in the build.
 
-**Not in this order:** a live run on paid APIs. That needs API billing,
+**Not in this order:** a short confirmation run on paid APIs, which turns
+the provisional bench results into real ones. That needs API billing,
 which is the owner's decision once slice 3 is proven.
 
 ## 7. Version 1, section by section
@@ -532,7 +623,7 @@ which is the owner's decision once slice 3 is proven.
 | 3.3 Planner builds graph and acceptance list up front | Change | Spec plus two check layers, progressive milestones, judge (P: SpecBench, ADaPT, 2609.20804) |
 | 3.3 Cross-family check review | Change: second layer, measured | Correlated-error data (P); no code-review study |
 | 3.3 Honest-check and anti-runaway rules | Keep | — |
-| 3.4 Pieces and bible | Keep; graph becomes a view; one writer | Cognition, Cursor (P); Google/MIT study (S) |
+| 3.4 Pieces and bible | Keep; one data model with milestones; views drawn from it; one writer per piece | Cognition, Cursor (P); Google/MIT study (S) |
 | 3.5 Engines | Change | Provider-neutral layer, profiles, cascade, value per role |
 | 3.6 Memory | Keep, two additions | Open file formats; skills carry their eval |
 | 3.7 Working agreement | Keep | — |
@@ -548,16 +639,30 @@ which is the owner's decision once slice 3 is proven.
 
 1. **Approve this version** in place of version 1 and the open slice 2
    design.
-2. **Later, not now:** API billing for a live product run, after slice 3.
+2. **A private repository for the bench holdout** (for example
+   `1xmint/cortex-holdout`), needed in slice 2.
+3. **Later, not now:** API billing for a confirmation run, after slice 3.
 
 ## 9. Open risks
 
 - **Several key claims rest on secondary sources:** the Google/MIT scaling
   study, MCP's churn, and the Codex protocol history. The ADRs re-check
   any claim they rely on.
-- **A harder bench costs more quota per run.** Mitigations: the
-  multi-feature tier stays small (a handful of tasks), and real runs
-  happen only when they decide something.
+- **A harder bench costs much more quota per run.** Multi-feature tasks
+  take tens of minutes, not seconds. Eight tasks, three tries and two arms
+  is 48 missions, likely several five-hour usage windows. Mitigations:
+  - a cheaper worker model;
+  - a time cap per mission;
+  - one switch at a time;
+  - slice 2's single run measures the real cost before slice 3 commits to
+    any number.
+- **Bench results from the command-line engines are provisional.** Their
+  own system prompt still differs from the product's. A paid confirmation
+  run settles them.
+- **Upkeep grows with the bench:** every task needs a reference and a
+  known-bad solution, and each model change means re-testing flags and
+  skills. Mitigations: grouped re-tests on the top tier only, and flag
+  expiry dates.
 - **Planner-written held-out checks may be wrong.** They can be too strict
   and block correct work, or too loose and prove nothing. The bench's own
   holdout is the check on them.
