@@ -83,6 +83,10 @@ What is true now and what comes next. Kept under 150 lines by CI.
   event log in SQLite ([0003](docs/adr/0003-event-log-in-sqlite.md)), sandbox
   ([0004](docs/adr/0004-sandbox-bubblewrap-gvisor.md)), engines
   ([0005](docs/adr/0005-engines.md)).
+- Browser checks (ADR [0006](docs/adr/0006-browser-checks.md)): headless
+  Chromium via Playwright runs inside the sandbox, offline, against the
+  work served on loopback; a page error fails the check and a hung page is
+  killed at the time limit. Proven in CI.
 - Slice 1 ([plan](docs/superpowers/plans/2026-10-18-brain-slice-1.md)) is
   built and proven on a real engine (2026-10-18).
 
@@ -140,4 +144,4 @@ What is true now and what comes next. Kept under 150 lines by CI.
    and full model-call records. The private holdout repository
    `1xmint/cortex-holdout` exists; the plan is
    [docs/superpowers/plans/2026-10-18-brain-slice-2.md](docs/superpowers/plans/2026-10-18-brain-slice-2.md),
-   waiting for the owner's review.
+   being built (task 1 of 11 done: browser checks).

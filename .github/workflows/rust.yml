@@ -25,6 +25,9 @@ jobs:
           curl -fsSL https://gvisor.dev/archive.key | sudo gpg --dearmor -o /usr/share/keyrings/gvisor-archive-keyring.gpg
           echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/gvisor-archive-keyring.gpg] https://storage.googleapis.com/gvisor/releases release main" | sudo tee /etc/apt/sources.list.d/gvisor.list
           sudo apt-get update -q && sudo apt-get install -yq bubblewrap runsc
+      - name: Browser tools (Node, Playwright, Chromium)
+        working-directory: .
+        run: bash scripts/install-browser-tools.sh
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: core

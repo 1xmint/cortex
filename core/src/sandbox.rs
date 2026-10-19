@@ -155,7 +155,12 @@ mod imp {
         for dir in ["/bin", "/sbin", "/lib", "/lib64", "/lib32"] {
             cmd.args(["--ro-bind-try", dir, dir]);
         }
-        for file in ["/etc/alternatives", "/etc/ld.so.cache", "/etc/ld.so.conf"] {
+        for file in [
+            "/etc/alternatives",
+            "/etc/ld.so.cache",
+            "/etc/ld.so.conf",
+            "/etc/fonts",
+        ] {
             cmd.args(["--ro-bind-try", file, file]);
         }
         cmd.arg("--ro-bind")
