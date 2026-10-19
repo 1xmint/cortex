@@ -1,0 +1,30 @@
+[[check]]
+id = "blank-ignored"
+command = "/usr/local/lib/cortex-browser/node/bin/node /checks/files/blank-ignored.mjs"
+expect_exit = 0
+
+[[check]]
+id = "edit-cancel"
+command = "/usr/local/lib/cortex-browser/node/bin/node /checks/files/edit-cancel.mjs"
+expect_exit = 0
+
+[[check]]
+id = "drag-drop"
+command = "/usr/local/lib/cortex-browser/node/bin/node /checks/files/drag-drop.mjs"
+expect_exit = 0
+
+[[check]]
+id = "filter"
+command = "/usr/local/lib/cortex-browser/node/bin/node /checks/files/filter.mjs"
+expect_exit = 0
+
+[[check]]
+id = "saved"
+command = "/usr/local/lib/cortex-browser/node/bin/node /checks/files/saved.mjs"
+expect_exit = 0
+
+[[check]]
+id = "order"
+command = "/usr/local/lib/cortex-browser/node/bin/node /checks/files/order.mjs"
+expect_exit = 0
+

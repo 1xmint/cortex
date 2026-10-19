@@ -1,0 +1,12 @@
+tier = "multi"
+kind = "fresh"
+features = [
+  "start screen",
+  "paddle on arrow keys",
+  "paddle follows the mouse",
+  "ball bounces off walls and paddle",
+  "bricks break and score",
+  "three lives",
+  "second level",
+  "win and lose screens",
+]

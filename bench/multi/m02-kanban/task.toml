@@ -1,0 +1,12 @@
+tier = "multi"
+kind = "fresh"
+features = [
+  "add cards",
+  "edit a card inline",
+  "delete cards",
+  "move cards with buttons",
+  "drag and drop between columns",
+  "filter by text",
+  "column counts",
+  "saved across reloads",
+]

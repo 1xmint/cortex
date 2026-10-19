@@ -1,0 +1,12 @@
+tier = "multi"
+kind = "fresh"
+features = [
+  "questions load from questions.json",
+  "start screen",
+  "one question at a time with four choices",
+  "running score",
+  "ten-second timer per question",
+  "results with a review of every answer",
+  "number keys and Enter",
+  "restart in a new random order",
+]

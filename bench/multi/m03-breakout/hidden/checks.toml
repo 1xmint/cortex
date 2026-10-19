@@ -1,0 +1,34 @@
+[[check]]
+id = "mouse"
+command = "/usr/local/lib/cortex-browser/node/bin/node /checks/files/mouse.mjs"
+expect_exit = 0
+
+[[check]]
+id = "level-two"
+command = "/usr/local/lib/cortex-browser/node/bin/node /checks/files/level-two.mjs"
+expect_exit = 0
+
+[[check]]
+id = "win"
+command = "/usr/local/lib/cortex-browser/node/bin/node /checks/files/win.mjs"
+expect_exit = 0
+
+[[check]]
+id = "brick-side"
+command = "/usr/local/lib/cortex-browser/node/bin/node /checks/files/brick-side.mjs"
+expect_exit = 0
+
+[[check]]
+id = "paddle-angle"
+command = "/usr/local/lib/cortex-browser/node/bin/node /checks/files/paddle-angle.mjs"
+expect_exit = 0
+
+[[check]]
+id = "serve-reset"
+command = "/usr/local/lib/cortex-browser/node/bin/node /checks/files/serve-reset.mjs"
+expect_exit = 0
+
+[[check]]
+id = "real-time"
+command = "/usr/local/lib/cortex-browser/node/bin/node /checks/files/real-time.mjs"
+expect_exit = 0
