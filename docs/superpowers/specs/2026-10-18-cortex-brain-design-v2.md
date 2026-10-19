@@ -460,10 +460,15 @@ repository do not reach a model by themselves. So every model call gets a
 - **Conflicts are shown, not resolved silently.** Superseded facts are
   marked as such; two sources that disagree are both shown, with the
   conflict named.
-- **A record of what was included and what was left out**, and why. When
-  a worker goes wrong, the log shows whether it was missing information.
+- **A record of what was included and what was left out**, and why. "Left
+  out" means candidates that were considered and dropped, not everything
+  Cortex could have retrieved. When a worker goes wrong, the log shows
+  whether it was missing information.
 - **A token budget per role.** Over budget, Cortex drops the least
-  relevant evidence first, never binding constraints. Long sessions are
+  relevant evidence first, never binding constraints. If the binding
+  constraints alone do not fit, Cortex narrows the task, moves it to a
+  model with a larger context, or stops and asks. It never silently cuts
+  them. Long sessions are
   compacted, and a compacted summary keeps pointers back to its sources,
   so the full text can be recovered.
 - **Refresh:** when a requirement, contract or file changes, contexts
@@ -473,9 +478,12 @@ repository do not reach a model by themselves. So every model call gets a
 files, websites, tool output, media, retrieved memories) can inform a
 decision but can never give an order, grant a permission or authorize an
 action. Only the person, through the conversation and the working
-agreement, does that. Content is marked as quoted data in the context,
-and the action broker (section 3.8) enforces it: a request that traces
-only to content is refused, whatever the content says.
+agreement, does that. Content is marked as quoted data in the context.
+The real enforcement does not depend on what a model claims: the action
+broker (section 3.8) only acts on grants it issued itself, tied to the
+person's approvals and standing mandates by their IDs. Repository
+instructions and pack procedures may guide how authorized work is done,
+but they can never widen what is authorized.
 
 **The test:** a long-horizon bench scenario in which a late request would
 break a constraint stated early, in passing. Cortex passes only if it
@@ -601,8 +609,15 @@ facts with source and status. Additions:
   assumptions and evidence that depended on the old fact for review, so a
   wrong guess cannot quietly become permanent;
 - **deletion is complete:** deleting a memory removes the original, its
-  index entries, summaries that quote it and memories derived from it.
-  Backups expire on a stated schedule;
+  index entries, summaries that quote it, memories derived from it, and
+  the stored conversation and model payloads, snapshots and replay
+  material that could recreate it. This works with the append-only log
+  because the log keeps only minimal audit events that point at payloads
+  stored separately (section 3.2): the payload is deleted, and the log
+  keeps a content-free record that something was deleted. Backups expire
+  on a schedule the owner sets before any outside user, and restoring a
+  backup re-applies every deletion made since, so deleted memories never
+  come back;
 - **files and checks outrank summaries.** A summary is a way to find
   things, never the authority.
 
@@ -638,12 +653,17 @@ Kept from version 1, with three additions.
 its scope, budget, permissions, how often to report, and when to stop and
 ask. Permission to edit a project is never permission to publish, spend
 beyond the budget or delete. A mandate is a record in the strategy layer,
-so it survives across missions, and only the person widens it.
+so it survives across missions, and only the person widens it. Narrowing
+a mandate takes effect at once: actions it no longer covers are blocked,
+including ones already queued.
 
 **Switching modes keeps all progress.** The person can move from "just do
 it" to "build it with me" mid-task, take over a piece, discuss a decision
 and hand it back. The mission, its plan and its evidence carry on; nothing
-restarts.
+restarts. When the person takes over a piece, it changes owner
+explicitly (one writer per piece, section 3.4), and when they hand it
+back, checks run again on whatever they changed. Progress that is still
+valid is kept; evidence their edits affected is marked stale.
 
 **Teaching is part of the agreement.** The person sets how much they want
 to learn and how deep explanations go, and can change it at any time.
@@ -706,7 +726,8 @@ plugs in as a pack, not as new brain code. A pack contains:
 - prerequisites and the permissions it needs (granted by the broker);
 - checks and inspectors for its artifacts;
 - preview and export.
-Code is the first pack. A pack's procedures follow the skill rule: they
+Code is the first pack. The pack format starts as a small manifest, not a
+plugin framework. A pack's procedures follow the skill rule: they
 carry the evals that proved them (section 3.6).
 
 **Creative inspection.** Version 1 kept media out of model context
@@ -764,11 +785,19 @@ planner from another. The new bench has:
   tested at a time.
 - **Results report a story, not only numbers:** for each mission, the
   spec, the milestones, what failed and why, and its cost.
-- **The headline number is total cost per accepted result:** everything a
-  mission spent, including failed attempts, retries and verification,
-  divided by the results that passed. Cheap calls that fail are not cheap.
+- **The headline number is total cost per accepted result:** across a
+  comparison batch, the cost of every attempt (including failed attempts,
+  retries and verification) divided by the number of accepted results.
+  With no accepted result it is reported as unbounded, never as zero.
+  Cheap calls that fail are not cheap. While development runs on
+  subscriptions, tokens, time and an *estimated* API-equivalent cost are
+  reported separately from money actually spent, and a cost that is not
+  known is shown as unknown, not zero.
 - **A strong, simple baseline:** one capable agent with the same tools and
-  no planner. Every brain feature must beat it, or it goes.
+  no planner. Every optional performance feature (planning depth,
+  research, extra roles) must beat it, or it goes. Safety and authority
+  boundaries (section 3.13) are not judged this way: they must pass their
+  adversarial checks even when they cost more.
 - **Reliability and value:** pass^k over repeated tries, cost and tokens
   per success, and wall time. Comparisons are **paired** (the same tasks
   in both arms) and report their uncertainty, so a small win is not
@@ -915,8 +944,9 @@ cost.**
   - the smallest context contract (section 3.3a): binding constraints
     always included, a record of what was included and left out, and
     content kept as evidence;
-  - the smallest project map (section 3.6a): inventory, exact and symbol
-    search, and a baseline test run;
+  - the smallest project map (section 3.6a): an inventory, search and a
+    baseline test run. Symbol maps and incremental updates come when the
+    unfamiliar-repository tasks show they are needed;
   - piece contracts (section 3.4), enforced wherever the planner makes
     pieces that depend on each other, including the media experiment;
   - the schema for durable action records (section 3.2), proven against a
@@ -955,10 +985,13 @@ proven:
 - steer and stop;
 - set how much to learn, ask "explain this part", and switch between
   "build it with me" and "just do it" without losing progress.
+The smallest standing mandate (scope, budget, permissions, when to stop
+and ask) lands in this slice, before "just do it" is offered. Slice 5
+completes it.
 
 **Slice 5: memory and the working agreement**, as in version 1, plus
 said, observed and inferred facts, memory the person can see and correct,
-complete deletion, and standing mandates.
+complete deletion, and the full standing mandates.
 
 **Slice 6: media as capability packs**, with bounded previews for creative
 inspection. One game that combines code and made assets is proven end to
