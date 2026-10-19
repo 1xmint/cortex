@@ -62,7 +62,10 @@ enum Cmd {
     /// Show where a mission stands and where its result is.
     Status { mission: String },
     /// Run the bench prompts as missions and write a results file.
+    #[command(args_conflicts_with_subcommands = true)]
     Bench {
+        #[command(subcommand)]
+        action: Option<BenchCmd>,
         /// Which profile does the work (see `profiles.toml`); defaults to claude-cli-sonnet.
         #[arg(long)]
         worker: Option<String>,
@@ -95,6 +98,28 @@ enum Cmd {
     },
 }
 
+#[derive(Subcommand)]
+enum BenchCmd {
+    /// Compare two arms' results files from a paired run.
+    Compare {
+        a: PathBuf,
+        b: PathBuf,
+        /// How many more accepted results B needs than A to win.
+        #[arg(long, default_value_t = 2)]
+        win_margin: u32,
+        /// The most B's cost per accepted result may be, as a multiple of A's.
+        #[arg(long, default_value_t = 1.5)]
+        max_cost_ratio: f64,
+    },
+    /// Write the HTML page for a results file.
+    Page {
+        results: PathBuf,
+        /// Where to write it; defaults to the results file with `.html`.
+        #[arg(short, long)]
+        out: Option<PathBuf>,
+    },
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let result = match cli.command {
@@ -120,6 +145,11 @@ fn main() -> ExitCode {
             .map(|()| ExitCode::SUCCESS),
         Some(Cmd::Status { mission }) => status(&MissionId(mission)),
         Some(Cmd::Bench {
+            action: Some(action),
+            ..
+        }) => bench_tool(action),
+        Some(Cmd::Bench {
+            action: None,
             worker,
             only,
             tier,
@@ -341,4 +371,52 @@ fn report(store: &Store, m: &MissionId, outcome: &Outcome) -> cortex::Result<()>
         Outcome::Paused => println!("state: paused (cortex resume {} continues it)", m.0),
     }
     Ok(())
+}
+
+fn bench_tool(action: BenchCmd) -> cortex::Result<ExitCode> {
+    use cortex::bench::{self, compare, page};
+    match action {
+        BenchCmd::Compare {
+            a,
+            b,
+            win_margin,
+            max_cost_ratio,
+        } => {
+            let (ra, rb) = (bench::load(&a)?, bench::load(&b)?);
+            let rule = compare::Rule {
+                win_margin,
+                max_cost_ratio,
+            };
+            let c = compare::compare(&ra, &rb, &rule)?;
+            println!("A {}: {} accepted", ra.arm, c.accepted.0);
+            println!("B {}: {} accepted", rb.arm, c.accepted.1);
+            println!(
+                "only A passed {}, only B passed {} (sign test p = {:.4})",
+                c.discordant.0, c.discordant.1, c.p_value
+            );
+            let ratio = match c.cost_ratio {
+                compare::Ratio::Times(r) => format!("{r:.2}x A's"),
+                compare::Ratio::Unbounded => "unbounded".into(),
+                compare::Ratio::Unknown => "unknown".into(),
+            };
+            println!("B's cost per accepted result: {ratio}");
+            println!(
+                "rule: B wins by {win_margin} or more at no more than {max_cost_ratio}x the cost"
+            );
+            let verdict = match c.verdict {
+                compare::Verdict::Win => "win",
+                compare::Verdict::NoWin => "no win",
+                compare::Verdict::Undecided => "undecided (a cost is unknown)",
+            };
+            println!("verdict: {verdict}");
+            Ok(ExitCode::SUCCESS)
+        }
+        BenchCmd::Page { results, out } => {
+            let report = bench::load(&results)?;
+            let out = out.unwrap_or_else(|| results.with_extension("html"));
+            std::fs::write(&out, page::render(&report))?;
+            println!("{}", out.display());
+            Ok(ExitCode::SUCCESS)
+        }
+    }
 }
