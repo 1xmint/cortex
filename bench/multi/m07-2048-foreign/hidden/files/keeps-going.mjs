@@ -1,5 +1,5 @@
 import { withPage, check } from "./lib/cortex-check.mjs";
-import { load, board, press } from "./common.mjs";
+import { load, board, press, moves } from "./common.mjs";
 
 const rows = [
   [1024, 1024, 0, 0],
@@ -19,4 +19,5 @@ await withPage(async (page, ctx) => {
   await page.locator(".keep-playing-button").click({ timeout: 2000 });
   await press(page, "ArrowRight");
   check("Keep going lets play carry on", (await board(page)) !== won, await board(page));
+  check("a save with no move count counts from 0", (await moves(page)) === "2", await moves(page));
 });

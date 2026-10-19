@@ -105,6 +105,7 @@
   });
 
   document.getElementById("clear").addEventListener("click", () => {
+    window.confirm("Clear the whole drawing?");
     fillWhite();
   });
 
