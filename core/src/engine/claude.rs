@@ -7,7 +7,8 @@
 //! `--restricted` and deny rules, so they cannot read the checks or the
 //! sign-in files the jail has to show it.
 
-use super::{CancelToken, DEFAULT_PROFILE, Engine, ModelCallRecord, SessionInput, SessionOutcome};
+use super::{CancelToken, Engine, ModelCallRecord, SessionInput, SessionOutcome};
+use crate::model::{Profile, estimate_usd_micros};
 use crate::payload::{Spend, Tokens};
 use crate::{Error, Result};
 use serde_json::Value;
@@ -29,10 +30,12 @@ pub struct ClaudeEngine {
     pub home: PathBuf,
     /// The `cortex` binary that serves the tools inside the jail.
     pub cortex: PathBuf,
+    /// Which model Claude Code runs, and its prices.
+    pub profile: Profile,
 }
 
 impl ClaudeEngine {
-    pub fn new(binary: PathBuf) -> Result<Self> {
+    pub fn new(binary: PathBuf, profile: Profile) -> Result<Self> {
         let home = std::env::var_os("HOME")
             .map(PathBuf::from)
             .ok_or_else(|| Error::Invalid("HOME is not set".into()))?;
@@ -40,6 +43,7 @@ impl ClaudeEngine {
             binary,
             home,
             cortex: std::env::current_exe()?,
+            profile,
         })
     }
 
@@ -62,6 +66,8 @@ impl ClaudeEngine {
             "--output-format",
             "stream-json",
             "--verbose",
+            "--model",
+            &self.profile.model,
             "--tools",
             FILE_TOOLS,
             "--strict-mcp-config",
@@ -133,10 +139,11 @@ fn find(binary: &Path) -> Result<PathBuf> {
 pub fn read_stream(
     reader: impl BufRead,
     session: u32,
+    profile: &Profile,
     on_line: &mut dyn FnMut(&str),
     record: &mut dyn FnMut(ModelCallRecord),
 ) -> SessionOutcome {
-    let mut parser = Stream::new(session);
+    let mut parser = Stream::new(session, profile);
     for line in reader.lines() {
         let Ok(line) = line else { break };
         on_line(&line);
@@ -152,6 +159,7 @@ pub fn read_stream(
 /// ended.
 struct Stream {
     session: u32,
+    profile: Profile,
     /// Claude Code said it bills the signed-in subscription.
     billing_ok: bool,
     rate_limited: bool,
@@ -167,9 +175,10 @@ struct Stream {
 }
 
 impl Stream {
-    fn new(session: u32) -> Self {
+    fn new(session: u32, profile: &Profile) -> Self {
         Stream {
             session,
+            profile: profile.clone(),
             billing_ok: false,
             rate_limited: false,
             resets_at: None,
@@ -240,7 +249,7 @@ impl Stream {
                     session: self.session,
                     role: "worker".into(),
                     provider: "claude-cli".into(),
-                    profile: DEFAULT_PROFILE.into(),
+                    profile: self.profile.id.clone(),
                     model: model.into(),
                     params: Value::Null,
                     tokens: Tokens::default(),
@@ -265,6 +274,10 @@ impl Stream {
     /// Records the message being read, if any.
     fn flush(&mut self, record: &mut dyn FnMut(ModelCallRecord)) {
         if let Some((_, mut rec)) = self.pending.take() {
+            // The profile's prices only fit replies from its own model.
+            if self.profile.serves(&rec.model) {
+                rec.estimated_usd_micros = estimate_usd_micros(&self.profile, &rec.tokens);
+            }
             rec.millis = self.since.elapsed().as_millis() as u64;
             self.since = Instant::now();
             record(rec);
@@ -397,7 +410,7 @@ mod jail {
             .stderr(Stdio::piped())
             .process_group(0);
         let mut child = cmd.spawn()?;
-        let outcome = watch(&mut child, &input, on_line, record, cancel);
+        let outcome = watch(engine, &mut child, &input, on_line, record, cancel);
         kill(&mut child);
         outcome
     }
@@ -426,6 +439,7 @@ mod jail {
     }
 
     fn watch(
+        engine: &ClaudeEngine,
         child: &mut Child,
         input: &SessionInput,
         on_line: &mut dyn FnMut(&str),
@@ -465,7 +479,7 @@ mod jail {
             }
         });
 
-        let mut stream = Stream::new(input.session);
+        let mut stream = Stream::new(input.session, &engine.profile);
         loop {
             if cancel.is_cancelled() {
                 stream.flush(record);

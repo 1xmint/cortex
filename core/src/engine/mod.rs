@@ -17,9 +17,6 @@ use std::time::Duration;
 /// template changes, so results can be grouped by prompt.
 pub const PROMPT_VERSION: &str = "2026-10-18";
 
-/// Profile name used until model profiles exist.
-pub const DEFAULT_PROFILE: &str = "default";
-
 #[derive(Debug, Clone)]
 pub struct SessionInput {
     pub brief: String,

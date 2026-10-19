@@ -1,0 +1,45 @@
+# The model profiles Cortex ships with. A `profiles.toml` in CORTEX_HOME
+# replaces any entry here with the same id, and adds new ones.
+#
+# Prices are US dollars per million tokens, copied from `price_source`.
+# A price that could not be confirmed is left out, so its cost reads as
+# unknown instead of a guess.
+
+[[profile]]
+id = "fake"
+engine = "fake"
+model = "fake"
+tags = ["test"]
+
+[[profile]]
+id = "claude-cli-sonnet"
+engine = "claude-cli"
+model = "claude-sonnet-5-5"
+price_in_per_mtok_usd = 2.0
+price_out_per_mtok_usd = 10.0
+price_cache_read_per_mtok_usd = 0.10
+price_cache_write_per_mtok_usd = 2.50
+tags = ["subscription"]
+price_source = "https://platform.claude.com/docs/en/about-claude/pricing (2026-10-18)"
+
+[[profile]]
+id = "claude-cli-opus"
+engine = "claude-cli"
+model = "claude-opus-5-5"
+price_in_per_mtok_usd = 4.0
+price_out_per_mtok_usd = 20.0
+price_cache_read_per_mtok_usd = 0.20
+price_cache_write_per_mtok_usd = 5.0
+tags = ["subscription"]
+price_source = "https://platform.claude.com/docs/en/about-claude/pricing (2026-10-18)"
+
+[[profile]]
+id = "api-sonnet"
+engine = "api"
+model = "claude-sonnet-5-5"
+price_in_per_mtok_usd = 2.0
+price_out_per_mtok_usd = 10.0
+price_cache_read_per_mtok_usd = 0.10
+price_cache_write_per_mtok_usd = 2.50
+tags = ["api"]
+price_source = "https://platform.claude.com/docs/en/about-claude/pricing (2026-10-18)"

@@ -23,10 +23,11 @@ failure (invariant 2).
 ## Running it
 
 ```bash
-cortex bench --engine claude
+cortex bench --worker claude-cli-sonnet
 ```
 
-`--only 03-roman` runs one prompt; `--engine api` uses the API engine. Run it
+`--only 03-roman` runs one prompt; `--worker api-sonnet` uses the API engine
+(the profiles are in [core/profiles.toml](../core/profiles.toml)). Run it
 from the repository root, or pass `--dir`. Each run writes
 `results/<UTC date>-<engine>.json`: the engine and its version, the Cortex
 commit, and per prompt whether it passed, how many sessions and seconds it

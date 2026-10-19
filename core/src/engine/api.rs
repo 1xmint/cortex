@@ -6,7 +6,8 @@
 //! bills the key in `ANTHROPIC_API_KEY`; `ReplayTransport` plays recorded
 //! replies so tests never spend money.
 
-use super::{CancelToken, DEFAULT_PROFILE, Engine, ModelCallRecord, SessionInput, SessionOutcome};
+use super::{CancelToken, Engine, ModelCallRecord, SessionInput, SessionOutcome};
+use crate::model::{Profile, builtin, estimate_usd_micros};
 use crate::payload::{Spend, Tokens};
 use crate::sandbox::{self, RunSpec};
 use crate::{Error, Result};
@@ -17,7 +18,6 @@ use std::time::{Duration, Instant};
 
 /// A session that has not finished after this many replies is stopped.
 pub const MAX_TURNS: usize = 50;
-pub const MODEL: &str = "claude-sonnet-5-5";
 const MAX_TOKENS: u32 = 8192;
 const API_URL: &str = "https://api.anthropic.com/v1/messages";
 const API_VERSION: &str = "2023-06-01";
@@ -158,11 +158,18 @@ impl Transport for ReplayTransport {
 
 pub struct ApiEngine<T: Transport> {
     pub transport: T,
+    pub profile: Profile,
 }
 
 impl<T: Transport> ApiEngine<T> {
+    /// The engine on the shipped `api-sonnet` profile.
     pub fn new(transport: T) -> Self {
-        Self { transport }
+        let profile = builtin("api-sonnet").expect("the shipped profiles name api-sonnet");
+        Self::with_profile(transport, profile)
+    }
+
+    pub fn with_profile(transport: T, profile: Profile) -> Self {
+        Self { transport, profile }
     }
 }
 
@@ -172,7 +179,7 @@ impl<T: Transport> Engine for ApiEngine<T> {
     }
 
     fn version(&self) -> Result<String> {
-        Ok(MODEL.into())
+        Ok(self.profile.model.clone())
     }
 
     fn run(
@@ -194,7 +201,7 @@ impl<T: Transport> Engine for ApiEngine<T> {
                 return Ok(SessionOutcome::TimedOut);
             }
             let body = json!({
-                "model": MODEL,
+                "model": self.profile.model,
                 "max_tokens": MAX_TOKENS,
                 "system": SYSTEM,
                 "tools": tools(),
@@ -211,16 +218,24 @@ impl<T: Transport> Engine for ApiEngine<T> {
             };
             let millis = sent.elapsed().as_millis() as u64;
             let reply_text = self.transport.redact(&reply.to_string());
+            let model = reply["model"].as_str().unwrap_or(&self.profile.model);
+            let tokens = Tokens::from_usage(&reply["usage"]);
+            // The profile's prices only fit replies from its own model.
+            let estimate = self
+                .profile
+                .serves(model)
+                .then(|| estimate_usd_micros(&self.profile, &tokens))
+                .flatten();
             record(ModelCallRecord {
                 session: input.session,
                 role: "worker".into(),
                 provider: "anthropic-api".into(),
-                profile: DEFAULT_PROFILE.into(),
-                model: reply["model"].as_str().unwrap_or(MODEL).into(),
+                profile: self.profile.id.clone(),
+                model: model.into(),
                 params: json!({"max_tokens": MAX_TOKENS}),
-                tokens: Tokens::from_usage(&reply["usage"]),
-                estimated_usd_micros: None,
-                spent: Spend::Unknown,
+                tokens,
+                estimated_usd_micros: estimate,
+                spent: estimate.map_or(Spend::Unknown, |micros| Spend::Usd { micros }),
                 millis,
                 request: Some(self.transport.redact(&body.to_string()).into_bytes()),
                 response: Some(reply_text.clone().into_bytes()),

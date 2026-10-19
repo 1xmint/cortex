@@ -2,6 +2,7 @@
 
 use cortex::engine::claude::{ClaudeEngine, RATE_LIMIT_WAIT, read_stream};
 use cortex::engine::{ModelCallRecord, SessionInput, SessionOutcome};
+use cortex::model::{Profile, builtin};
 use cortex::payload::{Spend, Tokens};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -21,6 +22,7 @@ fn engine(dir: &Path, binary: PathBuf) -> ClaudeEngine {
         binary,
         home: dir.join("home"),
         cortex: PathBuf::from(env!("CARGO_BIN_EXE_cortex")),
+        profile: builtin("claude-cli-sonnet").unwrap(),
     }
 }
 
@@ -38,11 +40,16 @@ fn parse(text: &str) -> (SessionOutcome, Vec<String>) {
 }
 
 fn parse_recorded(text: &str) -> (SessionOutcome, Vec<String>, Vec<ModelCallRecord>) {
+    parse_as(text, &builtin("claude-cli-opus").unwrap())
+}
+
+fn parse_as(text: &str, profile: &Profile) -> (SessionOutcome, Vec<String>, Vec<ModelCallRecord>) {
     let mut lines = Vec::new();
     let mut records = Vec::new();
     let outcome = read_stream(
         text.as_bytes(),
         1,
+        profile,
         &mut |l| lines.push(l.to_string()),
         &mut |r| records.push(r),
     );
@@ -62,6 +69,23 @@ fn waits_about(outcome: &SessionOutcome, secs: u64) {
     };
     let got = retry_after.as_secs();
     assert!(got <= secs && got + 15 >= secs, "{got} vs {secs}");
+}
+
+#[test]
+fn claude_args_carry_profile_model() {
+    let dir = Path::new("/tmp/t");
+    let mut e = engine(dir, PathBuf::from("/usr/bin/claude"));
+    let args = e.build_args(&input(dir, Duration::from_secs(60)));
+    assert_eq!(after(&args, "--model"), "claude-sonnet-5-5");
+    // The slice-1 tool limits still hold.
+    assert_eq!(after(&args, "--tools"), "Read,Edit,Write,Glob,Grep");
+    assert_eq!(
+        after(&args, "--allowedTools"),
+        "mcp__cortex__run,mcp__cortex__test"
+    );
+    e.profile = builtin("claude-cli-opus").unwrap();
+    let args = e.build_args(&input(dir, Duration::from_secs(60)));
+    assert_eq!(after(&args, "--model"), "claude-opus-5-5");
 }
 
 #[test]
@@ -138,16 +162,32 @@ fn claude_stream_records_one_call_per_model_message() {
             },
         ]
     );
+    // At the shipped Opus prices: $4 in, $20 out, $0.20 cache read and
+    // $5 cache write per million tokens.
+    let estimates: Vec<Option<u64>> = records.iter().map(|r| r.estimated_usd_micros).collect();
+    assert_eq!(estimates, vec![Some(1940), Some(280), Some(400)]);
     for r in &records {
         assert_eq!(r.session, 1);
         assert_eq!(r.provider, "claude-cli");
-        assert_eq!(r.profile, "default");
+        assert_eq!(r.profile, "claude-cli-opus");
         assert_eq!(r.model, "claude-opus-5-5");
         assert_eq!(r.spent, Spend::Subscription);
         assert_eq!(r.request, None);
     }
     let first = String::from_utf8(records[0].response.clone().unwrap()).unwrap();
     assert_eq!(first, format!("{}\n{}", lines[1], lines[2]));
+}
+
+#[test]
+fn claude_stream_does_not_price_another_model() {
+    let text = include_str!("fixtures/claude-stream.jsonl");
+    let (_, _, records) = parse_as(text, &builtin("claude-cli-sonnet").unwrap());
+    assert_eq!(records.len(), 3);
+    for r in &records {
+        assert_eq!(r.profile, "claude-cli-sonnet");
+        assert_eq!(r.model, "claude-opus-5-5");
+        assert_eq!(r.estimated_usd_micros, None);
+    }
 }
 
 #[test]
@@ -491,7 +531,11 @@ sleep 60
         std::fs::create_dir(d.join("work")).unwrap();
         std::fs::create_dir_all(d.join("checks/files")).unwrap();
         std::fs::write(d.join("checks/checks.toml"), "").unwrap();
-        let mut e = ClaudeEngine::new(PathBuf::from("claude")).unwrap();
+        let mut e = ClaudeEngine::new(
+            PathBuf::from("claude"),
+            cortex::model::builtin("claude-cli-sonnet").unwrap(),
+        )
+        .unwrap();
         e.cortex = PathBuf::from(env!("CARGO_BIN_EXE_cortex"));
         let input = SessionInput {
             brief: "Run the shell command `id > proof.txt` in this folder with a shell tool \
